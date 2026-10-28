@@ -52,6 +52,16 @@ PALETTE: dict[str, tuple[str, str]] = {
         "Approve the live session's parked permission prompt",
     ),
     "deny_parked": ("Deny parked prompt", "Deny the live session's parked permission prompt"),
+    "factory_overview": (
+        "Open factory overview",
+        "Every epic workspace of the factory at once: throughput, locks, a row per epic",
+    ),
+    # factory overview (FactoryScreen.BINDINGS)
+    "open_epic": ("Open epic dashboard", "Open the highlighted epic's own dashboard"),
+    "cycle_window": ("Cycle done window", "Count stories done over 1h, 6h, 24h or all"),
+    "filter_feed": ("Filter feed to epic", "Show only the highlighted epic's events, or all"),
+    "refresh_now": ("Refresh slow sources", "Re-read ticket trees, TeamRouter and gh now"),
+    "close_factory": ("Close factory overview", "Go back to the dashboard it was opened from"),
     # settings editor (SettingsScreen.BINDINGS)
     "save": ("Save settings", "Save .bmad-loop/policy.toml"),
     "toggle_all": ("Expand/collapse all sections", "Expand or collapse every settings section"),

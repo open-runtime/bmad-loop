@@ -9,6 +9,10 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- Add the factory overview, a read-only TUI screen for a factory of epic workspaces (`F` in
+  the dashboard, or `bmad-loop tui --factory [CONFIG]`): stories done per hour, cycle time,
+  tokens per hour, verify locks, scheduler roster, TeamRouter capacity and story PRs, one row
+  per epic and a merged event feed. Configured by a `factory.toml`; see the TUI guide.
 - Add `limits.quota_wait_max_min` (default 300; 0 = off): while the visible pane shows
   Claude Code waiting out a usage-window reset and the transcript is idle, freeze the
   session timeout and hold the stall nudge, so the session finishes after the CLI's own

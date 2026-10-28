@@ -1,0 +1,32 @@
+# The factory overview's built-in config (`bmad-loop tui --factory` with no path,
+# and the dashboard's `F` key, when the project has no .bmad-loop/factory.toml).
+# It describes the runtime_embeddable_memory_cli factory: one bmad-loop project per
+# epic under the Paradev worktree folder, launched by tools/bmad-factory's scheduler.
+# Read by the overview only. Engines never read it, and it names no commands: the
+# TeamRouter and gh readers are built in, with fixed arguments.
+
+[factory]
+name = "runtime_embeddable_memory_cli"
+# Every subfolder holding a .bmad-loop/ folder is one epic workspace.
+workspaces_root = "/Volumes/External-Development-Drive/Paradev/worktrees/runtime_embeddable_memory_cli/epic"
+# The scheduler's roster (schema 2): epic status, reason and workspace per epic.
+scheduler_state = "/Volumes/External-Development-Drive/Paradev/runtime_embeddable_memory_cli/.bmad-loop/scheduler-state.json"
+# Its settings: [scheduler] max_parallel_epics is the ceiling shown beside the running count.
+scheduler_config = "/Volumes/External-Development-Drive/Paradev/runtime_embeddable_memory_cli/tools/bmad-factory/scheduler.toml"
+# tools/bmad-factory/verify-lock's lock folder: holders (NAME.lock, NAME@k.lock) and queues (NAME.queue).
+locks_dir = "~/.local/state/bmad-factory/locks"
+refresh_s = 2
+
+[factory.program]
+# The main checkout's ticket tree: done and total tickets per initiative.
+root = "/Volumes/External-Development-Drive/Paradev/runtime_embeddable_memory_cli"
+initiatives = ["initiative-rem-factory-bootstrap", "initiative-rem"]
+
+[factory.capacity]
+# `teamrouter status --json`: eligible accounts of each model's own provider, and purchased credits.
+models = { "Opus" = "claude-opus-5-5", "Codex" = "gpt-6-astra" }
+
+[factory.prs]
+# `gh pr list --repo <repo> --search head:<head_prefix>`: each epic branch's story PRs.
+repo = "open-runtime/runtime_embeddable_memory_cli"
+head_prefix = "epic/"

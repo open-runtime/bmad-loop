@@ -359,6 +359,7 @@ Journal kinds are colored by the first matching substring:
 | `v`       | run `bmad-loop validate`, findings in a modal (`d` toggles detail)                            |
 | `g`       | settings editor for `.bmad-loop/policy.toml`                                                  |
 | `M`       | toggle light/dark mode                                                                        |
+| `F`       | open the [factory overview](#factory-overview): every epic workspace at once                  |
 | `y`       | copy the active Log/Attention pane to the clipboard                                           |
 | `escape`  | unpin the log view and follow new output                                                      |
 | `ctrl+w`  | enter/leave pane resize mode                                                                  |
@@ -703,6 +704,109 @@ See [Writing a bmad-loop plugin](plugin-authoring-guide.md) for the settings
 schema and trust model, and the
 [Game Engine plugin](game-engine-plugin-guide.md) and
 [Editor MCP plugin](game-engine-mcp-guide.md) guides.
+
+## Factory overview
+
+A factory runs one bmad-loop project per epic, each its own git worktree, side
+by side. The dashboard shows one project, so the factory overview reads them
+all on one read-only screen. Open it with `F` from the dashboard, or on its own:
+
+```bash
+bmad-loop tui --factory                 # the project's .bmad-loop/factory.toml, else the built-in config
+bmad-loop tui --factory path/to/factory.toml
+```
+
+It shows:
+
+- **Throughput.** Stories done in the last hour, 6 hours and 24 hours, with
+  rates per hour. Below them, a 24-hour sparkline, the median cycle time from a
+  story's first start to done, weighted tokens per hour, stalls and parks, and
+  story PRs merged.
+- **Capacity and locks.** Engines running against the scheduler's ceiling,
+  eligible TeamRouter accounts per model, purchased credits, and each verify
+  lock's holder and queue.
+- **Epics.** One row per epic workspace: ticket progress, stories done in the
+  window, the current story and stage and how long it has been there, the
+  attempt, transcript quiet time, locks held or waited on, stalls and parks,
+  weighted tokens, the latest story PR, and a note.
+- **Scheduler, program and sources.** The roster's age and counts, each
+  initiative's tickets done in the main checkout, and every source's health.
+- **Feed.** Every epic's notable journal events, newest first.
+
+The status column is green while an epic runs normally. It turns yellow at an
+owner gate, after transcript quiet past half the stall grace, on a retry, on a
+quota wait, or when the scheduler marks a live run blocked. It turns red at an
+escalation or environment pause, for a crashed or interrupted engine, and for a
+heartbeat over 2 minutes old (the engine's wait loop is not ticking).
+
+| Key            | Action                                                                |
+| -------------- | --------------------------------------------------------------------- |
+| `enter` / `o`  | open the highlighted epic's own dashboard; `q` there comes back       |
+| `t`            | cycle the done column's window: 1 hour, 6 hours, 24 hours, all        |
+| `f`            | show only the highlighted epic's feed, or every epic's again          |
+| `u`            | re-read the ticket trees, TeamRouter and gh now                       |
+| `escape` / `F` | close the overview and return to the dashboard (when opened with `F`) |
+| `q`            | quit                                                                  |
+
+The overview is a modal over the dashboard, so the run-control keys (`r`, `s`,
+`e`, `x`, `S`, `D` and the rest) do nothing while it is open. Run control
+happens in an epic's own dashboard: Enter suspends the overview and runs
+`bmad-loop tui --project <workspace>` in the same terminal. Enter on the
+dashboard's own epic just closes the overview.
+
+### Factory config
+
+A factory config is a TOML file with one `[factory]` table. Paths take `~`, and
+relative paths resolve against the config file's folder. An unknown key is an
+error, so a typo cannot switch a source off quietly.
+
+```toml
+[factory]
+name = "my-factory"
+workspaces_root = "/path/to/worktrees/epic"      # required: each subfolder with .bmad-loop/ is an epic
+scheduler_state = "/path/to/main/.bmad-loop/scheduler-state.json"
+scheduler_config = "/path/to/main/tools/bmad-factory/scheduler.toml"
+locks_dir = "~/.local/state/bmad-factory/locks"
+refresh_s = 2                                    # file poll interval, 0.5 to 60 seconds
+tickets = true                                   # read each epic's ticket progress
+
+[factory.program]                                # optional: the main checkout's tree
+root = "/path/to/main"
+initiatives = ["initiative-a", "initiative-b"]
+
+[factory.capacity]                               # optional: teamrouter status --json
+models = { "Opus" = "claude-opus-5-5", "Codex" = "gpt-6-astra" }
+
+[factory.prs]                                    # optional: gh pr list
+repo = "owner/name"
+head_prefix = "epic/"
+```
+
+The built-in config (`src/bmad_loop/data/factory/default.toml`) describes the
+runtime_embeddable_memory_cli factory. Engines never read a factory config, and
+it names no commands: the TeamRouter and gh readers are built in with fixed
+arguments.
+
+### Sources
+
+The overview reads files the engines and the scheduler already write, and
+writes nothing.
+
+| Source                                                  | Read                                                         |
+| ------------------------------------------------------- | ------------------------------------------------------------ |
+| `state.json`, `journal.jsonl` of every run              | on change, journals incrementally, every `refresh_s`         |
+| `tasks/<task>/heartbeat.json`                           | the open session's, every `refresh_s`                        |
+| the scheduler's state and config                        | on change                                                    |
+| verify locks (`NAME.lock`, `NAME@k.lock`, `NAME.queue`) | every `refresh_s`                                            |
+| `tickets.py status`                                     | when an epic's ticket files change, checked every 10 seconds |
+| `teamrouter status --json`                              | every minute                                                 |
+| `gh pr list`                                            | every 3 minutes                                              |
+
+A source that is missing reads `absent`, one left out of the config `off`, and
+one that fails `fault` with its reason on the sources line. A failed source
+keeps its last good answer. A run file that will not parse is named in the
+epic's note, and a poll that raises is shown on the sources line rather than
+closing the TUI.
 
 ## Troubleshooting
 

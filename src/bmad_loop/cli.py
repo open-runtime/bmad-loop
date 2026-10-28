@@ -9111,8 +9111,22 @@ def cmd_tui(args: argparse.Namespace) -> int:
     if args.low_frame_rate or policy_mod.load(_policy_path(project)).tui.low_frame_rate:
         os.environ.setdefault("TEXTUAL_FPS", "15")
         os.environ.setdefault("TEXTUAL_ANIMATIONS", "none")
+    factory = None
+    if args.factory is not None:
+        # The factory overview reads several projects; its config is resolved before
+        # textual loads, so a bad one is a plain error on the real terminal.
+        from . import factory_view
+
+        try:
+            factory = factory_view.resolve_config(
+                project, Path(args.factory).expanduser() if args.factory else None
+            )
+        except factory_view.FactoryConfigError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return ExitCode.FAILURE
     try:
         from .tui.app import run_tui
+        from .tui.factory_app import run_factory_tui
     except ModuleNotFoundError as e:
         # Failure-gated, not allowlisted (#678): ANY missing third-party module on
         # the TUI import chain (rich and pyte import before textual; a future dep
@@ -9126,6 +9140,8 @@ def cmd_tui(args: argparse.Namespace) -> int:
             )
             return 1
         raise
+    if factory is not None:
+        return run_factory_tui(factory)
     return run_tui(project)
 
 
@@ -9921,6 +9937,16 @@ def main(argv: list[str] | None = None) -> int:
         "tui",
         cmd_tui,
         "interactive dashboard (needs `uv tool install 'bmad-loop[tui]'`)",
+    )
+    tui_p.add_argument(
+        "--factory",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="CONFIG",
+        help="open the factory overview instead: every epic workspace of a factory at once, "
+        "read-only (CONFIG: a factory.toml; default: the project's .bmad-loop/factory.toml, "
+        "else the built-in config)",
     )
     tui_p.add_argument(
         "--low-frame-rate",

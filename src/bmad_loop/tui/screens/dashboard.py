@@ -35,7 +35,7 @@ from textual.widgets import (
 )
 from textual.widgets.option_list import Option, OptionDoesNotExist
 
-from ... import parked_answer
+from ... import factory_view, parked_answer
 from ... import policy as policy_mod
 from ... import sprintstatus, stories
 from ...adapters import multiplexer
@@ -58,6 +58,7 @@ from ..widgets import (
     status_cell,
     stopping_tag,
 )
+from .factory import FactoryScreen
 from .modals import DeferredEntryModal
 
 # Resizable-pane geometry, in terminal cells. The MIN_* floors keep a pane from
@@ -185,6 +186,9 @@ class DashboardScreen(Screen[None]):
         Binding("Y", "approve_parked", "approve"),
         Binding("N", "deny_parked", "deny"),
         Binding("ctrl+w", "resize_mode", "resize"),
+        # The factory overview: every epic workspace of the factory at once (modal,
+        # so the app's run-control keys cannot act on this project behind it).
+        Binding("F", "factory_overview", "factory"),
         # Priority so they beat the focused table/tree/list in resize mode;
         # check_action() disables them (key passes through) when not resizing.
         Binding("up", "resize_up", show=False, priority=True),
@@ -487,6 +491,16 @@ class DashboardScreen(Screen[None]):
         self._pending_jump = None
         self._log_follow_tail = True
         self._tick(force_rescan=False)
+
+    def action_factory_overview(self) -> None:
+        """Open the factory overview: the config named by this project's
+        ``.bmad-loop/factory.toml``, else the built-in one."""
+        try:
+            config = factory_view.resolve_config(self.project)
+        except factory_view.FactoryConfigError as e:
+            self.notify(f"factory overview: {e}", severity="error", timeout=15)
+            return
+        self.app.push_screen(FactoryScreen(config, origin=self.project))
 
     def action_approve_parked(self) -> None:
         self._answer_parked("approve")
