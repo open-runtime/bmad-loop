@@ -6,7 +6,9 @@ on the dashboard's own project while the operator looks at other epics. It opens
 over the dashboard with `F`, or alone as `bmad-loop tui --factory`. Enter (or
 `o`) opens the highlighted epic's own dashboard as a child `bmad-loop tui
 --project <workspace>`, with this TUI suspended until it quits, so every
-run-control key there acts on that epic's project.
+run-control key there acts on that epic's project. The child is the
+`bmad-loop` on PATH when there is one: the overview may run from another build
+(``uvx --from``), and run control belongs to the installed tool.
 
 Polling: a fast thread worker reads the files every ``refresh_s``
 (:meth:`FactoryReader.poll`) and a slow one refreshes the ticket trees, TeamRouter
@@ -18,6 +20,7 @@ is shown on the sources line instead of taking the TUI down.
 from __future__ import annotations
 
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -316,10 +319,18 @@ def feed_line(entry: fv.FeedEntry) -> Text:
     return out
 
 
+def dashboard_argv(workspace: Path) -> list[str]:
+    """The command that opens an epic's dashboard: the installed ``bmad-loop`` on
+    PATH, whose engines the factory runs, else this interpreter's own package."""
+    exe = shutil.which("bmad-loop")
+    head = [exe] if exe else [sys.executable, "-m", "bmad_loop"]
+    return [*head, "tui", "--project", str(workspace)]
+
+
 def open_dashboard(app, workspace: Path) -> str | None:
     """Run ``bmad-loop tui --project <workspace>`` in this terminal, this TUI
     suspended until it quits. Returns why it could not, or None."""
-    argv = [sys.executable, "-m", "bmad_loop", "tui", "--project", str(workspace)]
+    argv = dashboard_argv(workspace)
     try:
         with app.suspend():
             subprocess.call(argv)

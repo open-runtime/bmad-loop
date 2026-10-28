@@ -751,8 +751,10 @@ heartbeat over 2 minutes old (the engine's wait loop is not ticking).
 The overview is a modal over the dashboard, so the run-control keys (`r`, `s`,
 `e`, `x`, `S`, `D` and the rest) do nothing while it is open. Run control
 happens in an epic's own dashboard: Enter suspends the overview and runs
-`bmad-loop tui --project <workspace>` in the same terminal. Enter on the
-dashboard's own epic just closes the overview.
+`bmad-loop tui --project <workspace>` in the same terminal, with the
+`bmad-loop` on `PATH` when there is one, so run control stays with the installed
+tool even when the overview runs from another build. Enter on the dashboard's
+own epic just closes the overview.
 
 ### Factory config
 

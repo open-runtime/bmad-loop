@@ -6,6 +6,7 @@ opens an epic's dashboard on Enter, and survives a poll that raises."""
 
 from __future__ import annotations
 
+import sys
 import time
 from pathlib import Path
 
@@ -105,6 +106,18 @@ async def test_enter_opens_the_highlighted_epics_dashboard(tmp_path: Path, monke
         table.move_cursor(row=2)
         await pilot.press("o")
         await until(pilot, lambda: opened == [f.beta, f.gamma], what="o opens gamma's")
+
+
+def test_the_epic_dashboard_runs_the_installed_bmad_loop(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(factory_screen.shutil, "which", lambda name: f"/opt/bin/{name}")
+    assert factory_screen.dashboard_argv(tmp_path) == [
+        "/opt/bin/bmad-loop",
+        "tui",
+        "--project",
+        str(tmp_path),
+    ]
+    monkeypatch.setattr(factory_screen.shutil, "which", lambda name: None)
+    assert factory_screen.dashboard_argv(tmp_path)[:3] == [sys.executable, "-m", "bmad_loop"]
 
 
 async def test_window_and_feed_filter_keys(tmp_path: Path):
