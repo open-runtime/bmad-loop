@@ -74,7 +74,7 @@ Each pick reads `tickets.py next` and `status`. Candidates are the tickets ready
 
 1. an earlier epic that is still open has a `rejected` retrospective → pause at `epic-boundary`;
 2. the ticket needs refining → pause at `ticket-refine`;
-3. it is a hitl ticket → pause at `ticket-hitl`;
+3. it is a hitl ticket → pause at `ticket-hitl` (with `[tickets] hitl = "defer"`, the later ready tickets of its epic run first, and the pause comes once none is left; see the [loop recovery guide](loop-recovery-guide.md));
 4. it is refined, has a `plan_checkpoint`, and its story file is not approved → pause at `plan-checkpoint`;
 5. otherwise dispatch `ticket <ref>`.
 

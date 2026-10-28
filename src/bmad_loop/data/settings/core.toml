@@ -100,6 +100,13 @@ default_ref = "TicketsPolicy.thorough_review"
 label = "thorough review"
 description = "when a ticket gets the thorough review: high-risk (its risk is high), always, or never"
 
+[[section.field]]
+key = "hitl"
+kind = "select"
+options_ref = "TICKETS_HITL_MODES"
+default_ref = "TicketsPolicy.hitl"
+label = "hitl tickets"
+description = "halt: a hitl ticket first in build order halts the pick (upstream) · defer: it is passed over for the later ready tickets of its epic, and the pick halts on it once none is left; a later epic never starts ahead of it"
 [[section]]
 name = "limits"
 description = "cycle/attempt caps, timeout & token budget"
@@ -231,6 +238,18 @@ minimum = 0
 default_ref = "LimitsPolicy.session_budget_grace_s"
 description = "enforce mode: seconds a tripped session gets to wrap up after the nudge before it is terminated over_budget · 0 = terminate at trip, no nudge"
 
+[[section.field]]
+key = "harvest_summary_chars"
+kind = "int"
+minimum = 1
+default_ref = "LimitsPolicy.harvest_summary_chars"
+description = "characters a harvested deferred finding's summary keeps in the deferred-work ledger"
+[[section.field]]
+key = "harvest_evidence_chars"
+kind = "int"
+minimum = 1
+default_ref = "LimitsPolicy.harvest_evidence_chars"
+description = "characters a harvested deferred finding's evidence keeps in the deferred-work ledger"
 [[section]]
 name = "verify"
 description = "post-implementation verification commands"

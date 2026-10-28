@@ -55,6 +55,7 @@ STORIES_SOURCES = {"sprint-status", "stories", "tickets"}
 # sessions run the thorough review.
 TICKETS_MARK_DONE_MODES = {"auto", "never"}
 TICKETS_THOROUGH_REVIEW_MODES = {"never", "high-risk", "always"}
+TICKETS_HITL_MODES = {"halt", "defer"}
 ISOLATION_MODES = {"none", "worktree"}
 BRANCH_PER_MODES = {"story", "run"}
 # [recovery] (open-runtime fork): how a session's idle stretch is judged at the
@@ -203,6 +204,10 @@ class LimitsPolicy:
     # enforce mode: seconds a tripped session gets to wrap up after the nudge
     # before it is terminated over_budget. 0 = terminate at trip, no nudge.
     session_budget_grace_s: int = 240
+    # open-runtime fork (DW-13): the characters a harvested deferred finding's
+    # summary and evidence keep in the ledger (the upstream caps by default).
+    harvest_summary_chars: int = 200
+    harvest_evidence_chars: int = 1000
 
 
 @dataclass(frozen=True)
@@ -344,6 +349,10 @@ class TicketsPolicy:
 
     mark_done: str = "auto"
     thorough_review: str = "high-risk"
+    # open-runtime fork: a hitl ticket first in build order halts the pick
+    # ("halt", upstream) or is passed over for the later ready tickets of its
+    # epic, halting once none is left ("defer").
+    hitl: str = "halt"
 
 
 @dataclass(frozen=True)
@@ -1148,7 +1157,17 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         session_budget_grace_s=_typed_int(
             limits_d, "limits", "session_budget_grace_s", LimitsPolicy.session_budget_grace_s
         ),
+        harvest_summary_chars=_typed_int(
+            limits_d, "limits", "harvest_summary_chars", LimitsPolicy.harvest_summary_chars
+        ),
+        harvest_evidence_chars=_typed_int(
+            limits_d, "limits", "harvest_evidence_chars", LimitsPolicy.harvest_evidence_chars
+        ),
     )
+    if limits.harvest_summary_chars < 1 or limits.harvest_evidence_chars < 1:
+        raise PolicyError(
+            "limits.harvest_summary_chars and limits.harvest_evidence_chars must be >= 1"
+        )
     if limits.max_review_cycles < 1 or limits.max_dev_attempts < 1:
         raise PolicyError("limits.max_review_cycles and limits.max_dev_attempts must be >= 1")
     if limits.artifact_file_max_mb < 1:
@@ -1302,7 +1321,12 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         thorough_review=_typed_str(
             tickets_d, "tickets", "thorough_review", TicketsPolicy.thorough_review
         ).strip(),
+        hitl=_typed_str(tickets_d, "tickets", "hitl", TicketsPolicy.hitl).strip(),
     )
+    if tickets.hitl not in TICKETS_HITL_MODES:
+        raise PolicyError(
+            f"tickets.hitl must be one of {sorted(TICKETS_HITL_MODES)}: got {tickets.hitl!r}"
+        )
     if tickets.mark_done not in TICKETS_MARK_DONE_MODES:
         raise PolicyError(
             f"tickets.mark_done must be one of {sorted(TICKETS_MARK_DONE_MODES)}:"
@@ -1753,6 +1777,10 @@ spec_folder = ""
 mark_done = "auto"           # auto | never
 # When a ticket gets the thorough review: "high-risk" (its risk is high), "always", "never".
 thorough_review = "high-risk"  # never | high-risk | always
+# A hitl ticket first in build order: "halt" stops the pick for the human
+# (default); "defer" dispatches the later ready tickets of its epic first and
+# halts on it once none is left (open-runtime fork).
+# hitl = "halt"               # halt | defer
 
 [adapter]
 name = "claude"              # claude | codex | gemini | copilot | antigravity | opencode-http (alias: opencode) | <custom .bmad-loop/profiles/*.toml>

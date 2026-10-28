@@ -6423,7 +6423,12 @@ class Engine:
                     "spec remained at reconcilable nonterminal status "
                     f"{shown_status!r} while harvesting deferrals: {spec_path}"
                 )
-        findings, malformed = devcontract.parse_deferred_findings(fm)
+        # DW-13 (open-runtime fork): the ledger keeps the caps the policy names.
+        findings, malformed = devcontract.parse_deferred_findings(
+            fm,
+            summary_limit=self.policy.limits.harvest_summary_chars,
+            evidence_limit=self.policy.limits.harvest_evidence_chars,
+        )
         if not findings and not malformed:
             return
 

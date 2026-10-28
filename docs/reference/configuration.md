@@ -76,6 +76,7 @@ BMAD v7 ticket-tree runs (stories.source = tickets).
 | --- | --- | --- | --- | --- |
 | `mark_done` | string | `"auto"` | `auto` / `never` | auto: bmad-loop marks a ticket done once its build passes verify and review · never: leave the plan at built for a human |
 | `thorough_review` | string | `"high-risk"` | `always` / `high-risk` / `never` | when a ticket gets the thorough review: high-risk (its risk is high), always, or never |
+| `hitl` | string | `"halt"` | `defer` / `halt` | halt: a hitl ticket first in build order halts the pick (upstream) · defer: it is passed over for the later ready tickets of its epic, and the pick halts on it once none is left; a later epic never starts ahead of it |
 
 ### `[limits]`
 
@@ -104,6 +105,8 @@ Cycle/attempt caps, timeout & token budget.
 | `session_budget_mode` | string | `"warn"` | `enforce` / `off` / `warn` | mid-session guard on the weighted per-session spend, sampled every ~30s · off: no sampling · warn: one ATTENTION + breadcrumb · enforce: wrap-up nudge then over_budget termination (retry→defer) |
 | `max_tokens_per_session` | integer | `4000000` | ≥ 1 | weighted (cache-discounted) token cap a single session may spend before the budget guard trips; healthy sessions run ~1-2.5M weighted, so the default trips only true runaways |
 | `session_budget_grace_s` | integer | `240` | ≥ 0 | enforce mode: seconds a tripped session gets to wrap up after the nudge before it is terminated over_budget · 0 = terminate at trip, no nudge |
+| `harvest_summary_chars` | integer | `200` | ≥ 1 | characters a harvested deferred finding's summary keeps in the deferred-work ledger |
+| `harvest_evidence_chars` | integer | `1000` | ≥ 1 | characters a harvested deferred finding's evidence keeps in the deferred-work ledger |
 
 ### `[verify]`
 

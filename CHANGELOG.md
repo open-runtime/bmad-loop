@@ -24,6 +24,9 @@ breaking changes may land in a minor release.
   hook event. New journal kinds: `resume-post-story`, `plan-baseline-restamped`,
   `plan-baseline-restamp-skipped`, `turn-error`, `session-bound`, `session-resume`,
   `policy-reloaded`, `policy-reload-deferred`.
+- open-runtime fork: `[tickets] hitl = "defer"` dispatches the later ready tickets of an epic before
+  halting on its first hitl ticket (default `"halt"`, upstream), and `[limits] harvest_summary_chars` /
+  `harvest_evidence_chars` set the deferred-finding caps the ledger keeps (defaults 200 / 1000, upstream).
 
 - Add `limits.quota_wait_max_min` (default 300; 0 = off): while the visible pane shows
   Claude Code waiting out a usage-window reset and the transcript is idle, freeze the

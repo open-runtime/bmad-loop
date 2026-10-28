@@ -120,6 +120,11 @@ With `reload_policy = "story-boundary"`, the engine re-reads `policy.toml` and t
 - a change to the launch surface (verify commands, the plugin allowlist, any role's binary, flags or environment: the run's trusted `config_digest`) or to a section that shapes the run (`[scm]`, `[plugins]`, `[mux]`, `[dev]`, `[tui]`) is journaled `policy-reload-deferred` with the reason and keys, once per distinct change, and waits for `bmad-loop resume`, which re-blesses it;
 - an unreadable or invalid file is deferred the same way, and the run keeps its policy.
 
+## Two audit fixes outside the table
+
+- `[tickets] hitl = "defer"`: a hitl ticket first in build order no longer holds its epic's other ready tickets behind it. The pick passes it over (journaled as a `skipped` pick note, `hitl`), dispatches the next ready ticket of the same epic, and halts at `ticket-hitl` on it once nothing else of that epic can start. A later epic never starts ahead of it. The default `"halt"` is upstream's.
+- `[limits] harvest_summary_chars` and `harvest_evidence_chars` (defaults 200 and 1000, upstream's fixed caps) set how much of a harvested deferred finding the deferred-work ledger keeps.
+
 ## Compatibility
 
 - State: every new field loads with a default, so a run started by an upstream engine resumes here, and upstream ignores the new fields if it resumes a run this fork started.

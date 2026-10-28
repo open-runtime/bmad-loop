@@ -383,6 +383,7 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
             lambda: self.state.ticket_epic_closures,
             lambda: _pick_scope(self.state),
             acked_get=lambda: self.state.ticket_epic_closure_acked,
+            defer_hitl_get=lambda: self.policy.tickets.hitl == "defer",
         )
 
     @property
