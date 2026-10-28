@@ -272,7 +272,17 @@ pool unavailable: dev session stalled (API Error: Request rejected (429) · Loca
 environment fault: dev session stalled (failed to load workspace requirements; the CLI could not load its configuration or credentials and a nudge cannot fix that; fix the environment, then bmad-loop resolve <run>)
 ```
 
-Notifications title them `Paused (transport fault)`, `Paused (pool unavailable)` and `Paused (environment fault)`, never CRITICAL. To recover, clear the cause (wait for the pool's return or switch model; fix the CLI's config), then `bmad-loop resolve <run-id> --no-interactive`, as for a usage-limit pause.
+The exact shapes, with `<role>` one of `dev` and `review` (also `fix`, `migration`, `triage` or a workflow descriptor at those sites) and `<status>` the session verdict (`stalled`, or `crashed` when the window died first):
+
+- `transport fault: <role> session <status> (<error text>; the API connection failed and in-place nudges did not recover it; ...)`
+- `pool unavailable: <role> session <status> (<error text>; return <ISO-8601>; the model's account pool refused the request; ...)`, where `; return <ISO-8601>` appears only when the error named `Earliest estimated usable return:`; the model is the one in the error text
+- `environment fault: <role> session <status> (<error text>; the CLI could not load its configuration or credentials and a nudge cannot fix that; ...)`
+
+`session-end` for the session carries `turn_error` (`transport`, `pool`, `environment` or `usage`) and `pool_return`, and a `turn-error` journal row precedes it.
+
+Notifications title them `Paused (transport fault)`, `Paused (pool unavailable)` and `Paused (environment fault)`, never CRITICAL. Each is an escalation-stage pause: a plain `resume` pauses again. To recover, clear the cause (wait for the pool's return or switch model; fix the CLI's config), then `bmad-loop resolve <run-id> --story <key> --no-interactive --resume`, which re-arms the story with its attempt budget and resumes, as for a usage-limit pause.
+
+Two records also tell an operator or a supervisor that the engine already did what a workaround would do: `resume-post-story` (a story a resume finished fired `post_story`, so its publication ran) and `plan-baseline-restamped` (the plan's `baseline_revision` now names the recorded baseline). Blanking the plan's baseline before a re-drive stays compatible: an accepted baseline re-stamps a blank claim, and a blank claim is never re-stamped after a `pre_dev_phase` merge, so the session stamps it.
 
 With `[recovery] stall_check = "smart"`, a session parked on a question it asked shows the question in its evidence: `parked: dev session stalled (Notification(idle_prompt) -> IdlePrompt; asked: <question>; ...)`, or `(question: <question>; ...)` for a CLI without an idle notification. Answer it through `bmad-loop resolve`.
 

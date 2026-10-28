@@ -1822,6 +1822,17 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             returns = turnstate.pool_return_of(text) if kind == "pool" else None
             return kind, text or kind, returns
 
+        def note_turn_error(kind: str, evidence: str | None, source: str) -> None:
+            """One `turn-error` row per distinct error turn, whichever path saw it
+            first (the heartbeat's rollout scan, the StopFailure hook, the gate)."""
+            nonlocal turn_error_seen
+            key = self._transcript_activity_key(transcript_path) if transcript_path else None
+            signature = f"{kind}:{evidence}:{key}"
+            if signature == turn_error_seen:
+                return
+            turn_error_seen = signature
+            self._note_turn_error(handle, kind, evidence, source=source)
+
         def fault_exit(kind: str, evidence: str, returns: str | None) -> SessionResult:
             """The stall exit of a turn-error session: stalled (crashed if the
             window died), carrying the error class for an uncharged pause."""
@@ -2019,12 +2030,9 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     turn_scan_key = idle.last_key
                     turn = read_turn()
                     if turn is not None and turn.turn_ended and turn.error_class is not None:
-                        signature = f"{turn.error_class}:{turn.error_text}:{idle.last_key}"
-                        if signature != turn_error_seen:
-                            turn_error_seen = signature
-                            self._note_turn_error(
-                                handle, turn.error_class, turn.error_text, source="transcript"
-                            )
+                        seen_before = turn_error_seen
+                        note_turn_error(turn.error_class, turn.error_text, "transcript")
+                        if turn_error_seen != seen_before:
                             backoff = (
                                 TURN_ERROR_BACKOFF_S if turn.error_class == "transport" else 0.0
                             )
@@ -2475,6 +2483,9 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                             continue
                         if error is not None:
                             error_kind, evidence, returns = error
+                            note_turn_error(
+                                error_kind, evidence, "transcript" if turn is not None else "hook"
+                            )
                             if (
                                 error_kind == "transport"
                                 and transport_nudges_left > 0
@@ -2684,7 +2695,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 stop_failure = event
                 error = turn_error(None)
                 if error is not None:
-                    self._note_turn_error(handle, error[0], error[1], source="hook")
+                    note_turn_error(error[0], error[1], "hook")
                     backoff = TURN_ERROR_BACKOFF_S if error[0] == "transport" else 0.0
                     turn_error_due = time.monotonic() + backoff
                 if stall_deadline is None and self._stall_grace_s > 0:
@@ -3587,11 +3598,11 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
     def _note_session_bound(
         self, handle: SessionHandle, session_id: str, source: str | None
     ) -> None:
-        """open-runtime fork (F6): journal ``session-bound`` with the CLI session
-        id at the session's first admitted SessionStart, so the id is on record
-        even when the engine dies before ``SessionRecord`` is written."""
-        resumed = self._resumed_ids.get(handle.task_id)
-        if self.journal is None:
+        """open-runtime fork (F6, with ``[recovery] max_session_resumes`` on):
+        journal ``session-bound`` with the CLI session id at the session's first
+        admitted SessionStart, so the id is on record even when the engine dies
+        before ``SessionRecord`` is written."""
+        if self.journal is None or self.policy.recovery.max_session_resumes <= 0:
             return
         try:
             self.journal.append(
@@ -3599,7 +3610,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 task_id=handle.task_id,
                 session_id=session_id,
                 source=source or "",
-                **({"resumed_from": resumed} if resumed else {}),
+                resumed_from=self._resumed_ids.get(handle.task_id) or "",
             )
         except OSError:
             pass

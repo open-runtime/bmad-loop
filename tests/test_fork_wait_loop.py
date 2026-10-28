@@ -369,6 +369,9 @@ def test_transport_error_is_nudged_once_then_pauses_uncharged(tmp_path, monkeypa
     assert decision.action == Action.PAUSE
     assert decision.reason.startswith("transport fault: dev session stalled (API Error")
     assert pause_title(decision.reason, "3-1") == "Paused (transport fault): 3-1"
+    # one record for the error turn, though the gate read it twice
+    rows = _lifecycle_events(adapter, "turn-error")
+    assert [(r["turn_error"], r["source"]) for r in rows] == [("transport", "transcript")]
 
 
 def test_pool_refusal_pauses_at_once_with_its_return(tmp_path, monkeypatch):

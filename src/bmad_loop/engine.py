@@ -2960,6 +2960,14 @@ class Engine:
             "decision, ask it as a question and end your turn."
         )
 
+    def _head_or_none(self) -> str | None:
+        """The workspace's HEAD, or None when git cannot say (F2's before-hook read
+        must never fail a dispatch)."""
+        try:
+            return verify.rev_parse_head(self.workspace.root)
+        except (verify.GitError, OSError):
+            return None
+
     def _plan_for_restamp(self, task: StoryTask) -> Path | None:
         """The plan whose ``baseline_revision`` an F2 re-stamp moves: the recorded
         spec, re-anchored like every operator-facing spec path. ``TicketsEngine``
@@ -2974,15 +2982,15 @@ class Engine:
         baseline: str,
         *,
         site: str,
-        only_if_claims: str | None = None,
+        only_if_claims: tuple[str, ...] | None = None,
     ) -> None:
         """F2 (open-runtime fork, ``[recovery] restamp_plan_baseline``): point the
         plan's ``baseline_revision`` at ``baseline``, the baseline this engine just
         recorded, with the writer and confinement ``resolve``'s re-arm uses
         (``runs.rearm_escalation``). ``site`` is ``accept-baseline`` (the restart
         arm adopted HEAD) or ``pre-dev-merge`` (``pre_dev_phase`` moved HEAD, and
-        ``only_if_claims`` names the previous recorded baseline the plan must still
-        claim for the write to happen).
+        ``only_if_claims`` names the baselines the plan must still claim for the
+        write to happen).
 
         Observation-degrade, never a pause: a plan that is missing, unreadable or
         unwritable is journaled ``plan-baseline-restamp-skipped`` with the reason,
@@ -3014,7 +3022,7 @@ class Engine:
             return
         if claimed == baseline:
             return
-        if only_if_claims is not None and claimed != only_if_claims:
+        if only_if_claims is not None and claimed not in only_if_claims:
             return
         try:
             verify.set_frontmatter_field(
@@ -3760,21 +3768,30 @@ class Engine:
             # A fresh invocation cannot consume a snapshot armed by an earlier,
             # non-replayable invocation. Keep crash replay's snapshot intact.
             self._disarm_ledger_snapshot(task)
+        # F2 (open-runtime fork): HEAD before the hook, so a move the hook makes
+        # (a sync merge) is told apart from one made while the run was paused.
+        head_before_hook = (
+            self._head_or_none()
+            if resume_result is None and self.policy.recovery.restamp_plan_baseline
+            else None
+        )
         if self._vetoed(self._emit("pre_dev_phase", task), task):
             return False
         if resume_result is None:
             previous_baseline = task.baseline_commit
             task.baseline_commit = verify.rev_parse_head(self.workspace.root)
-            if previous_baseline and task.baseline_commit != previous_baseline:
+            if head_before_hook and task.baseline_commit != head_before_hook:
                 # F2 (open-runtime fork): `pre_dev_phase` moved HEAD (a sync merge)
-                # under a plan that still claims the previous recorded baseline —
-                # one this engine recorded or re-stamped itself. Any other claim is
-                # left for the baseline gate, which keeps its independent signal.
+                # under a plan that still claims the baseline it was dispatched on —
+                # the previous recorded baseline, or HEAD right before the hook. Any
+                # other claim is left for the baseline gate, which keeps its
+                # independent signal; a HEAD the operator moved while the run was
+                # paused is not re-stamped either (the plan is theirs as reviewed).
                 self._restamp_plan_baseline(
                     task,
                     task.baseline_commit,
                     site="pre-dev-merge",
-                    only_if_claims=previous_baseline,
+                    only_if_claims=tuple(c for c in (previous_baseline, head_before_hook) if c),
                 )
             # snapshot untracked files now so a later rollback removes only what
             # THIS attempt creates, never files the user already had on disk.

@@ -42,7 +42,7 @@ reload_policy = "story-boundary"
 The dev gate rejects a plan whose `baseline_revision` differs from the baseline the run recorded for the attempt. Two engine moves used to leave the plan's claim behind:
 
 - `bmad-loop resume --accept-baseline` adopts HEAD as the baseline. After the restart arm's rollback, the plan is re-stamped to it.
-- A `pre_dev_phase` hook that moves HEAD (a sync-with-main merge) changes the baseline `_dev_phase` records. When the plan still claims the previous recorded baseline, it is re-stamped to the new HEAD before the session launches. A claim the run never recorded is left alone, so the gate keeps its independent signal.
+- A `pre_dev_phase` hook that moves HEAD (a sync-with-main merge) changes the baseline `_dev_phase` records. When the plan still claims the baseline it was dispatched on (the previous recorded baseline, or HEAD right before the hook), it is re-stamped to the new HEAD before the session launches. A claim the run never recorded is left alone, so the gate keeps its independent signal, and so is a plan whose HEAD the operator moved while the run was paused.
 
 A landed write journals `plan-baseline-restamped` (`site`, `overwritten`, `baseline`). A plan that is missing, unreadable or unwritable journals `plan-baseline-restamp-skipped` with the reason, and the gate decides as before. In tickets mode the plan is the bound ticket's.
 
@@ -110,7 +110,7 @@ resume_subcommand = ["resume"]
 
 `resume_prompt_template` (default `{prompt}`) renders the continuation. The keys are argv tokens, so they are part of the run's trusted launch digest. A resumed Claude session keeps its id, so hook attribution is pinned to it and no new `--session-id` is passed. A resumed conversation appends to the same transcript, so the session is charged only for usage past what the transcript held at launch.
 
-Records: `session-bound` (the CLI session id at the first SessionStart), `session-resume` before a resumed launch (`session_id`, `ended`, `resumes`), and `resumed_from` on `session-end`. Session records in `state.json` gain `ended` and `resumed_from`; tasks gain `session_resumes` and `resume_blocked`.
+Records, with resumes on: `session-bound` (the CLI session id at the first SessionStart), `session-resume` before a resumed launch (`session_id`, `ended`, `resumes`), and `resumed_from` on `session-end`. Session records in `state.json` gain `ended` and `resumed_from`; tasks gain `session_resumes` and `resume_blocked`.
 
 ## Policy reload at story boundaries
 

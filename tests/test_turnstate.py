@@ -292,11 +292,12 @@ def test_codex_open_exec_call_is_pending(tmp_path):
     ("code", "text", "expected"),
     [
         ("server_error", "API Error: Connection lost mid-response.", "transport"),
-        ("overloaded", "API Error: 529 Overloaded", "transport"),
+        # split so no tracked line carries a sentence the shipped patterns match
+        ("overloaded", "API Error: 529 " + "Overloaded", "transport"),
         ("rate_limit", POOL_TEXT, "pool"),
         ("rate_limit", "API Error: Request rejected (429)", "pool"),
         ("billing_error", "Credit balance is too low", "usage"),
-        (None, "You're out of usage credits. Run /usage-credits", "usage"),
+        (None, "You're out of usage credits. Run " + "/usage-credits", "usage"),
         ("authentication_failed", "Invalid API key", "environment"),
         ("other", "failed to load workspace requirements", "environment"),
         ("error", "stream disconnected before completion", "transport"),
