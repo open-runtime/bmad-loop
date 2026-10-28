@@ -531,9 +531,17 @@ def decide_pick(
     scope: PickScope = EVERYTHING,
     *,
     acked: Sequence[str] | frozenset[str] = (),
+    defer_hitl: bool = False,
 ) -> PickDecision:
     """The next pick, per the module docstring. ``acked`` holds the epics whose
-    one closure pause the operator resumed past (``ticket_epic_closure_acked``)."""
+    one closure pause the operator resumed past (``ticket_epic_closure_acked``).
+
+    ``defer_hitl`` (open-runtime fork, ``[tickets] hitl = "defer"``): a hitl
+    candidate does not halt the pick at once. It is noted (``skipped``, ``hitl``)
+    and the scan goes on to the next candidate OF THE SAME EPIC, which is
+    dispatched (or halts for its own reason); the hitl halt comes once no later
+    candidate of that epic remains, so an epic's agent work is never held behind
+    its human-in-the-loop ticket, and no later epic starts ahead of it."""
     touched = {key: phase for key, phase in task_phases.items() if phase != Phase.ESCALATED}
     rank = build_order(status_view)
     notes: list[PickNote] = []
@@ -545,7 +553,10 @@ def decide_pick(
     notes.extend(PickNote(NOTE_FOREIGN_ACTIVE, row_label(row), row.status) for row in foreign)
 
     candidates = scoped(next_view.ready_to_refine, next_view.ready_to_start)
+    deferred_hitl: TicketRow | None = None
     for row in candidates:
+        if deferred_hitl is not None and row.epic != deferred_hitl.epic:
+            break
         if row.ref is None:
             notes.append(PickNote(NOTE_SKIPPED, row_label(row), "no-ref"))
             continue
@@ -567,6 +578,11 @@ def decide_pick(
         if needs_refine(row):
             return Halt(HALT_REFINE, row.ref, row, f"{row.ref} needs refining", held)
         if row.hitl:
+            if defer_hitl:
+                if deferred_hitl is None:
+                    deferred_hitl = row
+                notes.append(PickNote(NOTE_SKIPPED, row.ref, "hitl"))
+                continue
             return Halt(HALT_HITL, row.ref, row, f"{row.ref} is a hitl ticket", held)
         if row.refined and row.plan_checkpoint and row.ref not in approvals:
             return Halt(
@@ -578,6 +594,14 @@ def decide_pick(
             )
         return Dispatch(row, held)
 
+    if deferred_hitl is not None and deferred_hitl.ref is not None:
+        return Halt(
+            HALT_HITL,
+            deferred_hitl.ref,
+            deferred_hitl,
+            f"{deferred_hitl.ref} is a hitl ticket",
+            tuple(notes),
+        )
     held_notes = tuple(notes)
     blocked = scoped(next_view.blocked)
     for row in blocked:
@@ -695,8 +719,10 @@ class TicketsWorkSource:
         scope_get: Callable[[], PickScope] = lambda: EVERYTHING,
         *,
         acked_get: Callable[[], Sequence[str]] = lambda: (),
+        defer_hitl_get: Callable[[], bool] = lambda: False,
     ):
         self._tree_get = tree_get
+        self._defer_hitl_get = defer_hitl_get
         self._approvals_get = approvals_get
         self._closures_get = closures_get
         self._scope_get = scope_get
@@ -736,6 +762,7 @@ class TicketsWorkSource:
             frozenset(self._approvals_get()),
             self._scope_get(),
             acked=frozenset(self._acked_get()),
+            defer_hitl=self._defer_hitl_get(),
         )
 
     def pick(self, phases: Mapping[str, Phase], current_epic: int | None) -> Pick:

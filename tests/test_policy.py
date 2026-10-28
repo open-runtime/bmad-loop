@@ -115,6 +115,8 @@ def test_tickets_policy_defaults_parse_and_template():
     assert policy.loads("").to_dict()["tickets"] == {
         "mark_done": "auto",
         "thorough_review": "high-risk",
+        # open-runtime fork: the hitl pick rule, upstream's halt by default
+        "hitl": "halt",
     }
 
 

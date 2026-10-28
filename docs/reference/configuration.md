@@ -76,6 +76,7 @@ BMAD v7 ticket-tree runs (stories.source = tickets).
 | --- | --- | --- | --- | --- |
 | `mark_done` | string | `"auto"` | `auto` / `never` | auto: bmad-loop marks a ticket done once its build passes verify and review · never: leave the plan at built for a human |
 | `thorough_review` | string | `"high-risk"` | `always` / `high-risk` / `never` | when a ticket gets the thorough review: high-risk (its risk is high), always, or never |
+| `hitl` | string | `"halt"` | `defer` / `halt` | halt: a hitl ticket first in build order halts the pick (upstream) · defer: it is passed over for the later ready tickets of its epic, and the pick halts on it once none is left; a later epic never starts ahead of it |
 
 ### `[limits]`
 
@@ -104,6 +105,8 @@ Cycle/attempt caps, timeout & token budget.
 | `session_budget_mode` | string | `"warn"` | `enforce` / `off` / `warn` | mid-session guard on the weighted per-session spend, sampled every ~30s · off: no sampling · warn: one ATTENTION + breadcrumb · enforce: wrap-up nudge then over_budget termination (retry→defer) |
 | `max_tokens_per_session` | integer | `4000000` | ≥ 1 | weighted (cache-discounted) token cap a single session may spend before the budget guard trips; healthy sessions run ~1-2.5M weighted, so the default trips only true runaways |
 | `session_budget_grace_s` | integer | `240` | ≥ 0 | enforce mode: seconds a tripped session gets to wrap up after the nudge before it is terminated over_budget · 0 = terminate at trip, no nudge |
+| `harvest_summary_chars` | integer | `200` | ≥ 1 | characters a harvested deferred finding's summary keeps in the deferred-work ledger |
+| `harvest_evidence_chars` | integer | `1000` | ≥ 1 | characters a harvested deferred finding's evidence keeps in the deferred-work ledger |
 
 ### `[verify]`
 
@@ -266,6 +269,22 @@ Stories that owe external, human-only actions.
 | --- | --- | --- | --- | --- |
 | `enabled` | boolean | `true` |  | let a session finish + commit a story whose acceptance criteria need a human action (buy a domain, publish a DNS record) and park it as awaiting-operator instead of forcing done or blocked · what is owed is recorded in the story spec's operator_actions: frontmatter, and `bmad-loop confirm <story-key>` completes the story once you have done it |
 | `on_review_demotion` | string | `"escalate"` | `escalate` / `park` | escalate: a review pass is never offered the park, and one that finalizes a done story at awaiting-operator is not accepted (default) · park: the review may demote it — the board moves done -&gt; awaiting-operator, the story commits and parks · sprint mode with parks enabled only |
+
+### `[recovery]`
+
+Loop recovery (open-runtime fork): replayed stories' post_story, plan baseline re-stamps, in-place nudges, turn-error pauses, session resume, policy reload.
+
+| Key | Type | Default | Allowed | Description |
+| --- | --- | --- | --- | --- |
+| `post_story_on_resume` | boolean | `true` |  | ON: a story a resume finishes on a replay arm (recorded session, commit window, spec approval, reverify) fires post_story once, like any finished story · OFF: upstream (only the restart arm fires it) |
+| `restamp_plan_baseline` | boolean | `true` |  | ON: resume --accept-baseline and a pre_dev_phase merge re-stamp the plan's baseline_revision to the new recorded baseline, so attempt 2 passes the baseline gate · OFF: upstream (the plan keeps its stale claim) |
+| `stall_check` | string | `"classic"` | `classic` / `smart` | classic: upstream stall gate (an idle-prompt latch parks the session) · smart: park only when the last message asks a human a question or a permission/quota prompt is up; otherwise nudge in place, naming a pending command or sub-agent · bounded by limits.dev_stall_nudges_cap |
+| `turn_end_nudge_s` | integer | `0` | ≥ 0 | smart only: seconds after a result-less turn that ended on a status report before the in-place nudge · 0 = wait the full limits.dev_stall_grace_s |
+| `classify_turn_errors` | boolean | `false` |  | ON: a turn that ended on an API error is read from the transcript and the StopFailure hook — transport drops are nudged, then pause uncharged as transport fault; a pool 429 pauses uncharged as pool unavailable; a config/auth error pauses uncharged as an environment fault · OFF: upstream |
+| `transport_nudges` | integer | `1` | ≥ 0 | in-place continue nudges after a transport error before the session pauses as a transport fault · counted against limits.dev_stall_nudges_cap |
+| `nudge_via` | string | `"tmux"` | `hcom` / `tmux` | tmux: type nudges into the pane (upstream) · hcom: send them as an hcom request into the session when its relay reported an hcom name and hcom shows it listening, else tmux |
+| `max_session_resumes` | integer | `0` | ≥ 0 | consecutive dev/review retries that resume the previous CLI conversation (claude --resume, codex resume) after a stall, timeout, crash or transport fault · needs a profile with resume_flag or resume_subcommand · a failed verify or review starts fresh · 0 = off |
+| `reload_policy` | string | `"off"` | `off` / `story-boundary` | story-boundary: re-read policy.toml and profiles between stories and apply changes whose launch surface is unchanged (others wait for a resume) · off: read at run and resume only |
 
 ### `[mux]`
 

@@ -13,6 +13,24 @@ breaking changes may land in a minor release.
   the dashboard, or `bmad-loop tui --factory [CONFIG]`): stories done per hour, cycle time,
   tokens per hour, verify locks, scheduler roster, TeamRouter capacity and story PRs, one row
   per epic and a merged event feed. Configured by a `factory.toml`; see the TUI guide.
+- open-runtime fork: add the `[recovery]` policy table ([Loop recovery guide](docs/loop-recovery-guide.md)).
+  `post_story_on_resume` (default on) fires `post_story` once for a story a resume finishes on a
+  replay arm; `restamp_plan_baseline` (default on) re-stamps the plan's `baseline_revision` after
+  `resume --accept-baseline` and a `pre_dev_phase` merge; `stall_check = "smart"` parks an idle
+  session only when it asked a question and nudges it in place otherwise (`turn_end_nudge_s`);
+  `classify_turn_errors` pauses a turn that ended on an API error uncharged as `transport fault:`,
+  `pool unavailable:` or `environment fault:` (`transport_nudges`); `nudge_via = "hcom"` sends nudges
+  as hcom requests; `max_session_resumes` resumes the previous CLI conversation on a retry after a
+  stall, timeout, crash or turn error (profile keys `resume_flag`, `resume_subcommand`,
+  `resume_prompt_template`); `reload_policy = "story-boundary"` applies a policy edit between
+  stories when its launch digest is unchanged. The hook relays forward `last_assistant_message`,
+  `background_tasks`, `error`, `error_details` and the hcom identity; `StopFailure` is a canonical
+  hook event. New journal kinds: `resume-post-story`, `plan-baseline-restamped`,
+  `plan-baseline-restamp-skipped`, `turn-error`, `session-bound`, `session-resume`,
+  `policy-reloaded`, `policy-reload-deferred`.
+- open-runtime fork: `[tickets] hitl = "defer"` dispatches the later ready tickets of an epic before
+  halting on its first hitl ticket (default `"halt"`, upstream), and `[limits] harvest_summary_chars` /
+  `harvest_evidence_chars` set the deferred-finding caps the ledger keeps (defaults 200 / 1000, upstream).
 - Add `limits.quota_wait_max_min` (default 300; 0 = off): while the visible pane shows
   Claude Code waiting out a usage-window reset and the transcript is idle, freeze the
   session timeout and hold the stall nudge, so the session finishes after the CLI's own

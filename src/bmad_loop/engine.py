@@ -12,6 +12,7 @@ import contextlib
 import contextvars
 import functools
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -59,7 +60,7 @@ from .escalation import (
     session_failure_reason,
     unresolved_escalation_keys,
 )
-from .frontmatter import FrontmatterWriteError
+from .frontmatter import FrontmatterWriteError, auto_dev_baseline_of
 from .install import dev_primitive_or_default
 from .journal import SELF_MINTED_FIELDS, Journal, save_state
 from .model import (
@@ -550,6 +551,28 @@ def _retro_auto_prompt(target: str) -> str:
     return RETRO_AUTO_PROMPT.format(epic=target)
 
 
+# open-runtime fork (F6): the session statuses whose conversation a retry may
+# resume (the CLI stopped answering or exited; the conversation itself is intact).
+RESUMABLE_SESSION_STATUSES = frozenset({"stalled", "timeout", "crashed"})
+# `SessionRecord.ended` labels a resume must not continue: a session waiting on a
+# human answer (the answer arrives through resolve, not the conversation), and
+# one that never did anything.
+UNRESUMABLE_SESSION_ENDS = frozenset({"parked", "no-work"})
+
+
+def _session_ended(result: SessionResult) -> str:
+    """How a non-completed session ended beyond its status (F6's record)."""
+    if result.status == "completed":
+        return ""
+    if result.transport_fault:
+        return result.transport_fault
+    if result.parked:
+        return "parked"
+    if not result.produced_work:
+        return "no-work"
+    return ""
+
+
 def _session_task_id(story_key: str, part: str, seq: int, generation: int) -> str:
     """Single composition point for session task ids. Sanitize the whole
     composition, not the parts: two individually capped parts can still compose
@@ -1020,6 +1043,9 @@ class Engine:
         # pass vouched for. A root, not a flag: probes may be cwd-sensitive, so a
         # pass in one worktree vouches for nothing in another.
         self._env_probes_fresh_root: Path | None = None
+        # F8 (open-runtime fork): the last policy change a story-boundary reload
+        # deferred, so it is journaled once rather than at every boundary.
+        self._policy_reload_deferred: str | None = None
         # Per-unit worktree isolation + integration flow (issue #244 F-3/F-9a).
         # Built from narrow deps + engine callbacks; the same-name Engine._* worktree
         # methods below delegate to it. `emit` is late-bound (a lambda, not the bound
@@ -1648,6 +1674,9 @@ class Engine:
             # _finish_inflight on resume, and the epic boundary + run-end (the
             # StoriesEngine has no _loop override, so it is covered here too).
             self._check_stop_request()
+            # F8 (open-runtime fork): the same boundary is where no session is
+            # live, so a policy edit can take effect here without a resume.
+            self._maybe_reload_policy()
             if self.max_stories is not None and self._dispatched_count() >= self.max_stories:
                 self.journal.append("max-stories-reached", count=self._dispatched_count())
                 self._run_end_retrospective()
@@ -1674,6 +1703,94 @@ class Engine:
             self._save()
             self._run_story(task)
             self._after_story(task)
+
+    # F8 (open-runtime fork): policy sections a story-boundary reload never
+    # applies mid-run — they shape the run itself (worktree isolation and merge,
+    # the plugin set and its grants, the multiplexer, the dev skill seam, the TUI,
+    # the story source the run state froze at launch) — so a change there waits for
+    # a resume, like a launch-surface change.
+    _RELOAD_FROZEN_SECTIONS = frozenset({"scm", "plugins", "mux", "dev", "tui", "stories"})
+
+    def _maybe_reload_policy(self) -> None:
+        """F8 (open-runtime fork, ``[recovery] reload_policy = "story-boundary"``):
+        re-read ``policy.toml`` and the profiles at a story boundary, as the
+        auto-sweep does before its child run (``cli._sweep_factory``), and apply a
+        change in place when it is safe to:
+
+        * nothing changed: nothing happens;
+        * the launch surface (``runsetup.config_digest``: verify commands, plugin
+          allowlist, every role's argv tokens) differs from the run's trusted
+          digest, or a frozen section changed: the run keeps its policy and
+          journals ``policy-reload-deferred`` (once per distinct change) with the
+          reason and the changed keys; ``resume`` re-blesses such a change;
+        * otherwise the engine, its flows and its adapters take the new policy,
+          ``state.policy_snapshot`` is re-stamped, and ``policy-reloaded`` lists
+          the changed keys (limits, gates, review, model and effort, recovery).
+
+        An unreadable or invalid file is journaled as deferred too, and the run
+        goes on under the policy it has. The decision reads the policy in force,
+        so turning the key off in the file stops reloads from the next one on."""
+        if self.policy.recovery.reload_policy != "story-boundary":
+            return
+        from . import policy as policy_mod
+        from . import runsetup
+        from .runs import read_trusted_config_digest
+
+        project = self.paths.project
+        try:
+            fresh = policy_mod.load(project / policy_mod.POLICY_FILE)
+        except (policy_mod.PolicyError, OSError, UnicodeDecodeError) as e:
+            self._defer_policy_reload(f"unreadable: {type(e).__name__}", [], str(e))
+            return
+        old = self.policy.to_dict()
+        new = fresh.to_dict()
+        if new == old:
+            return
+        changed = sorted(
+            f"{section}.{key}"
+            for section in set(old) | set(new)
+            for key in set(old.get(section) or {}) | set(new.get(section) or {})
+            if (old.get(section) or {}).get(key) != (new.get(section) or {}).get(key)
+        )
+        frozen = [k for k in changed if k.split(".", 1)[0] in self._RELOAD_FROZEN_SECTIONS]
+        if frozen:
+            self._defer_policy_reload("frozen-section", changed, json.dumps(new, sort_keys=True))
+            return
+        try:
+            profiles = runsetup.resolve_profiles(fresh, project)
+            digest = runsetup.config_digest(fresh, project, profiles=profiles)
+        except Exception as e:  # a profile that does not load: keep the run's
+            self._defer_policy_reload(f"profiles: {type(e).__name__}", changed, str(e))
+            return
+        trusted, _fault = read_trusted_config_digest(project, self.state.run_id)
+        if trusted is None or digest != trusted:
+            self._defer_policy_reload("launch-surface", changed, json.dumps(new, sort_keys=True))
+            return
+        self.policy = fresh
+        verify.configure_git_timeout(fresh.limits.git_timeout_s)
+        components: tuple[object, ...] = (
+            self._worktree_flow,
+            self._recovery_flow,
+            *self.adapters.values(),
+        )
+        for component in components:
+            if hasattr(component, "policy"):
+                setattr(component, "policy", fresh)
+            reconfigure = getattr(component, "_reload_policy_knobs", None)
+            if callable(reconfigure):
+                reconfigure()
+        self.state.policy_snapshot = new
+        self._policy_reload_deferred = None
+        self.journal.append("policy-reloaded", keys=changed)
+        self._save()
+
+    def _defer_policy_reload(self, reason: str, changed: list[str], signature: str) -> None:
+        """Journal one ``policy-reload-deferred`` per distinct pending change."""
+        key = f"{reason}\0{signature}"
+        if self._policy_reload_deferred == key:
+            return
+        self._policy_reload_deferred = key
+        self.journal.append("policy-reload-deferred", reason=reason, keys=changed)
 
     def _dispatched_count(self) -> int:
         """Stories this run has dispatched, counted durably from run state so the
@@ -1898,7 +2015,13 @@ class Engine:
         # cwd-sensitive probe may have passed on config the failed attempt wrote —
         # so the next dispatch re-probes the restored tree (DW-523).
         self._env_probes_fresh_root = None
+        # F6 (open-runtime fork): a rollback that had attempt changes to undo
+        # resets the tree a resumed conversation would remember; a clean one
+        # leaves it as the session left it.
+        tree_kept = self._attempt_tree_clean(task)
         self._recovery_flow.rollback_or_pause(task, cause=cause, restart=restart)
+        if not tree_kept:
+            task.resume_blocked = True
         self._after_code_rollback(task)
 
     def _after_code_rollback(self, task: StoryTask) -> None:
@@ -2480,6 +2603,9 @@ class Engine:
             # DW-523: re-probe a dispatch-site environment pause first (re-pauses
             # unchanged while the environment is still down).
             env_role = self._take_env_dispatch_pause(task)
+            # F1 (open-runtime fork): only the restart arm below goes through
+            # `_run_story`, which brackets the story with pre_story/post_story.
+            restarted = False
             mounted = bool(task.worktree_path)
             restart_isolated = self._isolated and mounted
             if mounted and task.defer_reason is not None:
@@ -2723,6 +2849,7 @@ class Engine:
                 if restart_isolated:
                     # drop the half-built worktree; _run_story mounts a fresh one
                     self._discard_unit_for_restart(task)
+                    task.resume_blocked = True  # F6: the conversation's tree is gone
                 else:
                     # A mount live policy no longer treats as isolated. Released HERE,
                     # below `_refuse_gated_story` — that gate can raise `RunPaused`, and
@@ -2730,6 +2857,7 @@ class Engine:
                     # recovery refuse loudly instead of rewriting the main checkout.
                     self._release_orphaned_mount(task)
 
+                accepted_baseline = False
                 if not restart_isolated and task.baseline_commit:
                     # latch resolved_redrive so the corrected spec stays protected
                     # through every reset of this re-drive, not just this first one
@@ -2739,17 +2867,205 @@ class Engine:
                         # checkout BEFORE the rollback so the reset targets HEAD
                         # instead of parking commits made while the run was down.
                         self._accept_current_baseline(task)
+                        accepted_baseline = True
                     self._rollback_or_pause(
                         task, cause="resolved" if task.rearmed else "stopped", restart=True
                     )
                 task.rearmed = False  # past rollback (only reached when not paused)
                 task.phase = Phase.PENDING  # deliberate reset, not a normal transition
+                # F2 (open-runtime fork): `--accept-baseline` moved the recorded
+                # baseline; the plan's claim follows it now that the rollback (which
+                # would revert or refuse an uncommitted re-stamp) has run.
+                if accepted_baseline and task.baseline_commit:
+                    self._restamp_plan_baseline(task, task.baseline_commit, site="accept-baseline")
                 self._save()
+                restarted = True
                 self._run_story(task)
+            if not restarted:
+                self._post_story_after_replay(task)
             # a resumed story that just reached DONE gets the same post-story hook
             # the _loop path fires (e.g. the stories-mode done_checkpoint pause),
             # after any worktree integration above — no-op in the base engine.
             self._after_story(task)
+
+    def _attempt_tree_clean(self, task: StoryTask) -> bool:
+        """F6: whether the attempt left nothing for a rollback to reset (its tree
+        is the recorded baseline's). Probed only while session resume is on; any
+        doubt reads as not clean, which only ever chooses a fresh session."""
+        if self.policy.recovery.max_session_resumes <= 0 or not task.baseline_commit:
+            return False
+        try:
+            return not verify.attempt_dirty(
+                self.workspace.root, task.baseline_commit, task.baseline_untracked
+            )
+        except (verify.GitError, OSError):
+            return False
+
+    def _resume_candidate(self, task: StoryTask, role: str, seq: int) -> SessionRecord | None:
+        """F6 (open-runtime fork, ``[recovery] max_session_resumes``): the session
+        record whose CLI conversation the ``role`` launch numbered ``seq`` should
+        resume, or None for a fresh session.
+
+        All must hold: resumes are on and this chain has not used them up; the
+        role's profile declares how to resume; the role's latest record is the
+        IMMEDIATELY previous session of this chain (``seq - 1``, same
+        generation) — never an older one, so a session interrupted by an engine
+        death (no record) is not raced by a second process on its conversation;
+        it ended ``stalled``, ``timeout`` or ``crashed`` (a completed session
+        whose verify or review failed always restarts fresh), not parked on a
+        human and not without work; it ran on the adapter the role runs now; its
+        id is known and its transcript still exists; and no reset has touched the
+        tree since (``task.resume_blocked``)."""
+        limit = self.policy.recovery.max_session_resumes
+        if limit <= 0 or task.session_resumes >= limit or task.resume_blocked:
+            return None
+        adapter = self.adapters.get(role)
+        profile = getattr(adapter, "profile", None)
+        if profile is None or not getattr(profile, "resumable", False):
+            return None
+        record = next((r for r in reversed(task.sessions) if r.role == role and not r.label), None)
+        if record is None or not record.session_id:
+            return None
+        if record.task_id != _session_task_id(task.story_key, role, seq - 1, task.generation):
+            return None
+        if record.status not in RESUMABLE_SESSION_STATUSES:
+            return None
+        if record.ended in UNRESUMABLE_SESSION_ENDS:
+            return None
+        if record.adapter and record.adapter != self.policy.adapter.resolved(role).name:
+            return None
+        if record.transcript_path and not Path(record.transcript_path).is_file():
+            return None
+        return record
+
+    def _resume_prompt(self, task: StoryTask, role: str, record: SessionRecord) -> str:
+        """F6: the plain-text continuation a resumed session gets instead of the
+        skill command (which would restart the workflow's steps)."""
+        why = {
+            "stalled": "it went idle before the workflow finished",
+            "timeout": "it ran past the session timeout",
+            "crashed": "the CLI process exited",
+        }.get(record.status, f"it ended {record.status}")
+        if record.ended in ("transport", "pool", "environment", "usage"):
+            why = f"{why}, after a {record.ended} error"
+        spec = f" The story spec is `{task.spec_file}`." if task.spec_file else ""
+        work = "review" if role == "review" else "workflow"
+        return (
+            f"You are resuming your own earlier bmad-loop {role} session for story "
+            f"{task.story_key}; {why}.{spec} Continue the same {work} from where you "
+            "stopped: do not restart it, and do not re-read what you already know. "
+            "First check the working tree (git status, git log -3) in case it changed "
+            "while you were stopped. Do not end your turn while a command or sub-agent "
+            "you started is still running. Only the workflow's completion artifact (the "
+            "spec's terminal status / result file) ends this session; if you need a human "
+            "decision, ask it as a question and end your turn."
+        )
+
+    def _head_or_none(self) -> str | None:
+        """The workspace's HEAD, or None when git cannot say (F2's before-hook read
+        must never fail a dispatch)."""
+        try:
+            return verify.rev_parse_head(self.workspace.root)
+        except (verify.GitError, OSError):
+            return None
+
+    def _plan_for_restamp(self, task: StoryTask) -> Path | None:
+        """The plan whose ``baseline_revision`` an F2 re-stamp moves: the recorded
+        spec, re-anchored like every operator-facing spec path. ``TicketsEngine``
+        answers the bound ticket plan. None when the task has none yet."""
+        if not task.spec_file:
+            return None
+        return task_spec_path(task, self.state)
+
+    def _restamp_plan_baseline(
+        self,
+        task: StoryTask,
+        baseline: str,
+        *,
+        site: str,
+        only_if_claims: tuple[str, ...] | None = None,
+    ) -> None:
+        """F2 (open-runtime fork, ``[recovery] restamp_plan_baseline``): point the
+        plan's ``baseline_revision`` at ``baseline``, the baseline this engine just
+        recorded, with the writer and confinement ``resolve``'s re-arm uses
+        (``runs.rearm_escalation``). ``site`` is ``accept-baseline`` (the restart
+        arm adopted HEAD) or ``pre-dev-merge`` (``pre_dev_phase`` moved HEAD, and
+        ``only_if_claims`` names the baselines the plan must still claim for the
+        write to happen).
+
+        Observation-degrade, never a pause: a plan that is missing, unreadable or
+        unwritable is journaled ``plan-baseline-restamp-skipped`` with the reason,
+        and the baseline gate judges the stale claim as it did upstream. A plan
+        that already claims ``baseline`` is left alone. A landed write is
+        journaled ``plan-baseline-restamped`` with the claim it replaced."""
+        if not self.policy.recovery.restamp_plan_baseline or not baseline:
+            return
+        plan = self._plan_for_restamp(task)
+        if plan is None:
+            return
+        if not plan.is_file():
+            self.journal.append(
+                "plan-baseline-restamp-skipped",
+                story_key=task.story_key,
+                site=site,
+                reason="plan-missing",
+            )
+            return
+        try:
+            claimed = auto_dev_baseline_of(verify.read_frontmatter(plan))
+        except (OSError, UnicodeDecodeError) as e:
+            self.journal.append(
+                "plan-baseline-restamp-skipped",
+                story_key=task.story_key,
+                site=site,
+                reason=f"unreadable: {type(e).__name__}",
+            )
+            return
+        if claimed == baseline:
+            return
+        if only_if_claims is not None and claimed not in only_if_claims:
+            return
+        try:
+            verify.set_frontmatter_field(
+                plan,
+                "baseline_revision",
+                baseline,
+                confine_root=self._spec_confine_root(task),
+            )
+        except (OSError, UnicodeDecodeError, FrontmatterWriteError) as e:
+            self.journal.append(
+                "plan-baseline-restamp-skipped",
+                story_key=task.story_key,
+                site=site,
+                reason=f"unwritable: {type(e).__name__}",
+            )
+            return
+        self.journal.append(
+            "plan-baseline-restamped",
+            story_key=task.story_key,
+            site=site,
+            overwritten=claimed,
+            baseline=baseline,
+        )
+
+    def _post_story_after_replay(self, task: StoryTask) -> None:
+        """F1 (open-runtime fork, ``[recovery] post_story_on_resume``): a story a
+        ``_finish_inflight`` replay arm finished gets the ``post_story`` hook the
+        restart arm's ``_run_story`` would have fired, once, before ``_after_story``
+        — the same order ``_loop`` keeps. A plugin that publishes on ``post_story``
+        (push-merge) otherwise never sees a story finished by a resume.
+
+        Only a story that left the arm finished: DONE, DEFERRED or
+        AWAITING_OPERATOR, the outcomes ``_run_story`` fires the hook after. An
+        arm that paused raised before reaching here, and an ESCALATED task is a
+        pause, not a finish. Journaled ``resume-post-story`` so the record shows
+        the engine fired it, with or without a plugin bound to the stage."""
+        if not self.policy.recovery.post_story_on_resume:
+            return
+        if not task.terminal or task.phase == Phase.ESCALATED:
+            return
+        self.journal.append("resume-post-story", story_key=task.story_key, phase=str(task.phase))
+        self._emit("post_story", task)
 
     def _pending_salvage_session(self, task: StoryTask) -> tuple[str, SessionResult] | None:
         """Retry only a latched current review timeout, through normal salvage.
@@ -3453,10 +3769,31 @@ class Engine:
             # A fresh invocation cannot consume a snapshot armed by an earlier,
             # non-replayable invocation. Keep crash replay's snapshot intact.
             self._disarm_ledger_snapshot(task)
+        # F2 (open-runtime fork): HEAD before the hook, so a move the hook makes
+        # (a sync merge) is told apart from one made while the run was paused.
+        head_before_hook = (
+            self._head_or_none()
+            if resume_result is None and self.policy.recovery.restamp_plan_baseline
+            else None
+        )
         if self._vetoed(self._emit("pre_dev_phase", task), task):
             return False
         if resume_result is None:
+            previous_baseline = task.baseline_commit
             task.baseline_commit = verify.rev_parse_head(self.workspace.root)
+            if head_before_hook and task.baseline_commit != head_before_hook:
+                # F2 (open-runtime fork): `pre_dev_phase` moved HEAD (a sync merge)
+                # under a plan that still claims the baseline it was dispatched on —
+                # the previous recorded baseline, or HEAD right before the hook. Any
+                # other claim is left for the baseline gate, which keeps its
+                # independent signal; a HEAD the operator moved while the run was
+                # paused is not re-stamped either (the plan is theirs as reviewed).
+                self._restamp_plan_baseline(
+                    task,
+                    task.baseline_commit,
+                    site="pre-dev-merge",
+                    only_if_claims=tuple(c for c in (previous_baseline, head_before_hook) if c),
+                )
             # snapshot untracked files now so a later rollback removes only what
             # THIS attempt creates, never files the user already had on disk.
             # A resumed result keeps the persisted baseline: re-capturing here
@@ -3470,6 +3807,9 @@ class Engine:
             # retry rebases it onto the tree that retry deliberately keeps.
             task.baseline_ledger_digest = self._ledger_digest(task)
         feedback: Path | None = None
+        # F6 (open-runtime fork): a retry that resumes the previous conversation
+        # keeps the attempt's tree, as a fixable repair does (`feedback`).
+        kept_tree = False
         while True:
             replayed = resume_result is not None
             if resume_result is None:
@@ -3482,7 +3822,7 @@ class Engine:
                 # nothing to the rejected attempt's harvest. A fixable retry keeps
                 # that tree and ledger intentionally, so preserve its payload for a
                 # later isolated carry. Crash replay never enters this branch.
-                if feedback is None:
+                if not kept_tree:
                     task.harvested_deferrals = []
                     # The artifact-only receipt's ownership baseline (DW-273) is
                     # re-stamped on the same rule: a rolled-back attempt's IGNORED
@@ -3499,8 +3839,7 @@ class Engine:
                 # Recorded-result replay never enters this branch and therefore
                 # retains the persisted binding unchanged.
                 preserve_chain_snapshot = (
-                    feedback is not None
-                    and self._preserves_dispatched_spec_snapshot_for_repair(task)
+                    kept_tree and self._preserves_dispatched_spec_snapshot_for_repair(task)
                 )
                 if not preserve_chain_snapshot:
                     self._bind_dispatched_spec_for_attempt(task)
@@ -3531,9 +3870,19 @@ class Engine:
                 # fixable-feedback retry that kept the attempt's tree — so this
                 # never double-applies. No-op unless a restore is latched; escalates
                 # (never dispatches) if the patch fails to apply.
-                if feedback is None:
+                if not kept_tree:
                     self._restore_patch(task)
-                prompt = self._dev_prompt(task, feedback)
+                # F6 (open-runtime fork): continue the previous conversation when
+                # it ended on a stall, timeout, crash or turn error and its tree
+                # was kept; a repair with feedback is always a fresh session.
+                resume_record = (
+                    self._resume_candidate(task, "dev", task.attempt) if feedback is None else None
+                )
+                prompt = (
+                    self._resume_prompt(task, "dev", resume_record)
+                    if resume_record is not None
+                    else self._dev_prompt(task, feedback)
+                )
                 # Capture the exact bytes a fresh-baseline child will inherit after
                 # orchestrator-owned pre-launch mutations. A fixable repair validates
                 # that same path but retains the chain's first snapshot, because a
@@ -3563,6 +3912,7 @@ class Engine:
                     prompt=prompt,
                     seq=task.attempt,
                     preserve_dispatched_spec_snapshot=preserve_chain_snapshot,
+                    resume=resume_record,
                 )
             advance(task, Phase.DEV_VERIFY)
             outcome = None
@@ -3734,6 +4084,7 @@ class Engine:
                     # work exists and the failure is concrete: keep the tree,
                     # hand the failing output to a repair session
                     feedback = self._write_feedback(task, decision.reason)
+                    kept_tree = True
                     # The repair session is judged against the kept chain. Move
                     # the ledger reference onto that tree so the retained harvest
                     # is accounted for, while a new session-authored ledger edit
@@ -3743,8 +4094,17 @@ class Engine:
                     # ledger edit is NOT credited, the trade-off
                     # `_ledger_changed_since_baseline` accepts.
                     task.baseline_ledger_digest = self._ledger_digest(task)
+                elif self._resume_candidate(task, "dev", task.attempt + 1) is not None:
+                    # F6 (open-runtime fork): the session itself failed (a stall,
+                    # timeout, crash or turn error) and its conversation can be
+                    # resumed: keep the tree for it instead of rolling back, the
+                    # way the fixable leg keeps it for a repair session.
+                    feedback = None
+                    kept_tree = True
+                    task.baseline_ledger_digest = self._ledger_digest(task)
                 else:
                     feedback = None
+                    kept_tree = False
                     try:
                         self._rollback_or_pause(task)
                     finally:
@@ -4011,12 +4371,21 @@ class Engine:
                 # on its first result-less Stop (issue #160). Non-replay branch
                 # only — the replay path above launches no session.
                 snapshot = self._reset_spec_for_review(task)
+                # F6 (open-runtime fork): a review retry after a stalled, timed
+                # out or crashed review session continues that conversation; the
+                # tree is kept between review cycles.
+                review_resume = self._resume_candidate(task, "review", task.review_cycle)
                 result = self._run_session(
                     task,
                     role="review",
-                    prompt=self._review_prompt(task),
+                    prompt=(
+                        self._resume_prompt(task, "review", review_resume)
+                        if review_resume is not None
+                        else self._review_prompt(task)
+                    ),
                     seq=task.review_cycle,
                     spec_snapshot=snapshot,
+                    resume=review_resume,
                 )
             advance(task, Phase.REVIEW_VERIFY)
             self._save()
@@ -6055,7 +6424,12 @@ class Engine:
                     "spec remained at reconcilable nonterminal status "
                     f"{shown_status!r} while harvesting deferrals: {spec_path}"
                 )
-        findings, malformed = devcontract.parse_deferred_findings(fm)
+        # DW-13 (open-runtime fork): the ledger keeps the caps the policy names.
+        findings, malformed = devcontract.parse_deferred_findings(
+            fm,
+            summary_limit=self.policy.limits.harvest_summary_chars,
+            evidence_limit=self.policy.limits.harvest_evidence_chars,
+        )
         if not findings and not malformed:
             return
 
@@ -8460,6 +8834,14 @@ class Engine:
             extras["resultless_verdict"] = result.resultless_verdict
         if result.resultless_detail:
             extras["resultless_detail"] = result.resultless_detail
+        # open-runtime fork (F3, F5, F6): the turn-error class and the resumed
+        # conversation, present-only like every extra above.
+        if result.transport_fault:
+            extras["turn_error"] = result.transport_fault
+            if result.pool_return:
+                extras["pool_return"] = result.pool_return
+        if result.resumed_from:
+            extras["resumed_from"] = result.resumed_from
         # skipped usage sources: same present-only convention, so a grep finds
         # exactly the sessions whose `tokens` is a lower bound.
         if usage is not None and usage.unread:
@@ -8490,6 +8872,7 @@ class Engine:
         spec_snapshot: SpecSnapshot | None = None,
         preserve_dispatched_spec_snapshot: bool = False,
         prelaunch_validator: Callable[[], None] | None = None,
+        resume: SessionRecord | None = None,
     ) -> SessionResult:
         # A session may change the environment a probe pass vouched for, so no
         # pass survives a launch (DW-523).
@@ -8729,8 +9112,23 @@ class Engine:
             # the v6 defaults (`done`, none) for every base and stories session.
             success_statuses=self._session_success_statuses(role, label),
             fallback_result_dirs=self._session_fallback_dirs(role, label),
+            resume_session_id=resume.session_id if resume is not None else None,
+            resume_transcript_path=resume.transcript_path if resume is not None else None,
         )
+        if label is None and role in ("dev", "review"):
+            # F6 (open-runtime fork): the resume chain's bookkeeping, at launch.
+            task.session_resumes = task.session_resumes + 1 if resume is not None else 0
+            task.resume_blocked = False
         self.journal.set_active_log(task_id)
+        if resume is not None:
+            self.journal.append(
+                "session-resume",
+                task_id=task_id,
+                role=role,
+                session_id=resume.session_id or "",
+                ended=resume.ended or resume.status,
+                resumes=task.session_resumes,
+            )
         self.journal.append(
             "session-start",
             task_id=task_id,
@@ -8830,6 +9228,8 @@ class Engine:
                         else None
                     ),
                     label=label or "",
+                    ended=_session_ended(result),
+                    resumed_from=result.resumed_from or "",
                 )
             )
             # Make the completed session durable before the usage read, post-session

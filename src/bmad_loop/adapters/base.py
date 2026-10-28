@@ -246,6 +246,15 @@ class SessionSpec:
     # keep the plain timeout. The engine sets limits.quota_wait_max_min * 60 for
     # every session it drives. Kept LAST so positional constructions stay valid.
     quota_wait_max_s: float = 0.0
+    # open-runtime fork (F6): the CLI session id this launch RESUMES instead of
+    # starting a fresh conversation (`claude --resume <id>`, `codex resume <id>`),
+    # and the transcript that conversation wrote so far — read once at launch, so
+    # the resumed session's usage is charged only for its own turns. None = a
+    # fresh session (every launch upstream). `prompt` is then the plain-text
+    # continuation, rendered through the profile's `resume_prompt_template`.
+    # APPENDED with defaults.
+    resume_session_id: str | None = None
+    resume_transcript_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -372,6 +381,23 @@ class SessionResult:
     # `usage-reset-unparsed`). None = no `resets` clause on the line, or not
     # usage-limited. Named by the pause reason; journaled present-only. APPENDED.
     usage_limit_resets: str | None = None
+    # open-runtime fork (F3, F5): the API error the session's last turn ended on,
+    # read from its own transcript or a StopFailure hook, when
+    # `[recovery] classify_turn_errors` is on and in-place nudges did not recover
+    # it. `transport_fault` is the class — "transport" (a dropped or failed
+    # connection), "pool" (a 429 / pool refusal), "environment" (config or
+    # credentials) or "usage" (the CLI's own credit limit) — and
+    # `transport_evidence` the error text. `_classify_env_fault` stamps
+    # `env_fault` from it WITHOUT the #764 token veto (the error ended the turn
+    # just now; tokens spent before it cannot disprove it), so every decider
+    # pauses it uncharged. `pool_return` is the ISO time a pool refusal names.
+    # Set only on a non-completed exit. APPENDED.
+    transport_fault: str | None = None
+    transport_evidence: str | None = None
+    pool_return: str | None = None
+    # open-runtime fork (F6): the CLI session id this session resumed, None for a
+    # fresh one. Journaled on `session-end`. APPENDED.
+    resumed_from: str | None = None
 
 
 class CodingCLIAdapter(ABC):

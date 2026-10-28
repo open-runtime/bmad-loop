@@ -377,7 +377,12 @@ def _contains_nul(value: Any) -> bool:
     )
 
 
-def parse_deferred_findings(fm: dict[str, Any]) -> tuple[list[DeferredFinding], list[str]]:
+def parse_deferred_findings(
+    fm: dict[str, Any],
+    *,
+    summary_limit: int = _SUMMARY_LIMIT,
+    evidence_limit: int = _EVIDENCE_LIMIT,
+) -> tuple[list[DeferredFinding], list[str]]:
     """Parse a frontmatter ``deferred:`` list into findings and malformed notes.
 
     Missing, null, and empty lists mean no findings. Malformed items cost only
@@ -437,11 +442,11 @@ def parse_deferred_findings(fm: dict[str, Any]) -> tuple[list[DeferredFinding], 
         if bad_nul is not None:
             malformed.append(f"item {i}: `{bad_nul}` contains a NUL character")
             continue
-        summary = _flatten(summary_raw, _SUMMARY_LIMIT)
+        summary = _flatten(summary_raw, summary_limit)
         if not summary:
             malformed.append(f"item {i}: no usable `summary`")
             continue
-        evidence = _flatten(item.get("evidence"), _EVIDENCE_LIMIT)
+        evidence = _flatten(item.get("evidence"), evidence_limit)
         location = _flatten(item.get("location"), _LOCATION_LIMIT)
         declared = _flatten(item.get("severity"), _SEVERITY_LIMIT)
         severity = deferredwork.leading_severity(declared) or ""

@@ -55,8 +55,16 @@ STORIES_SOURCES = {"sprint-status", "stories", "tickets"}
 # sessions run the thorough review.
 TICKETS_MARK_DONE_MODES = {"auto", "never"}
 TICKETS_THOROUGH_REVIEW_MODES = {"never", "high-risk", "always"}
+TICKETS_HITL_MODES = {"halt", "defer"}
 ISOLATION_MODES = {"none", "worktree"}
 BRANCH_PER_MODES = {"story", "run"}
+# [recovery] (open-runtime fork): how a session's idle stretch is judged at the
+# stall-grace expiry (`classic` = the upstream gate; `smart` = nudge in place
+# unless the session asked a question), where a nudge is delivered, and whether
+# the engine re-reads policy.toml between stories.
+STALL_CHECK_MODES = {"classic", "smart"}
+NUDGE_VIA_MODES = {"tmux", "hcom"}
+RELOAD_POLICY_MODES = {"off", "story-boundary"}
 MERGE_STRATEGIES = {"ff", "merge", "squash"}
 DEV_SKILLS = {"bmad-dev-auto"}
 
@@ -196,6 +204,10 @@ class LimitsPolicy:
     # enforce mode: seconds a tripped session gets to wrap up after the nudge
     # before it is terminated over_budget. 0 = terminate at trip, no nudge.
     session_budget_grace_s: int = 240
+    # open-runtime fork (DW-13): the characters a harvested deferred finding's
+    # summary and evidence keep in the ledger (the upstream caps by default).
+    harvest_summary_chars: int = 200
+    harvest_evidence_chars: int = 1000
 
 
 @dataclass(frozen=True)
@@ -337,6 +349,10 @@ class TicketsPolicy:
 
     mark_done: str = "auto"
     thorough_review: str = "high-risk"
+    # open-runtime fork: a hitl ticket first in build order halts the pick
+    # ("halt", upstream) or is passed over for the later ready tickets of its
+    # epic, halting once none is left ("defer").
+    hitl: str = "halt"
 
 
 @dataclass(frozen=True)
@@ -415,6 +431,65 @@ class MuxPolicy:
     # where: policy.toml is writable by driven sessions, so it must not name a
     # root — see runs.resolve_psmux_registry_root.
     honor_ambient_psmux_data_dir: bool = False
+
+
+@dataclass(frozen=True)
+class RecoveryPolicy:
+    """Loop-recovery behaviours added by the open-runtime fork (F1-F8 in the
+    fork's build notes). Each key keeps the upstream behaviour by default unless
+    the upstream behaviour is a defect with no safe use (F1, F2), so a run started
+    by an upstream engine resumes unchanged under this one."""
+
+    # F1. A story a resume finishes on a replay arm (`_finish_inflight`: recorded
+    # session, commit window, spec approval, reverify, dispatch pause) gets the
+    # same `post_story` hook a normal story gets, once. Upstream fired it only on
+    # the restart arm, so a plugin publishing on `post_story` never saw such a
+    # story.
+    post_story_on_resume: bool = True
+    # F2. Re-stamp the story plan's `baseline_revision` when the recorded
+    # baseline moves under it: on `resume --accept-baseline` (after the restart
+    # arm's rollback) and when `pre_dev_phase` moved HEAD under a plan that claims
+    # the previous recorded baseline. Without it attempt 2 is rejected by the
+    # baseline gate for a claim the engine itself made stale.
+    restamp_plan_baseline: bool = True
+    # F4. How the stall-grace expiry judges an idle dev/review session. `classic`:
+    # the upstream gate (an idle-prompt latch parks the session). `smart`: read
+    # the session's last turn; park only when it asked a human a question (or a
+    # permission/quota prompt or a parked pane pattern is up), otherwise nudge it
+    # to continue in place, with a targeted text when a command or sub-agent it
+    # started is still pending. Bounded by limits.dev_stall_nudges_cap.
+    stall_check: str = "classic"
+    # F4. Seconds after a result-less turn end whose last message is a status
+    # report (not a question, nothing pending) before the in-place nudge, instead
+    # of the full dev_stall_grace_s. Only with stall_check = "smart". 0 = use the
+    # full grace.
+    turn_end_nudge_s: int = 0
+    # F3/F5. Classify a turn that ended on an API error from the session's own
+    # transcript (Claude `isApiErrorMessage`, a Codex `task_complete` error) and
+    # the StopFailure hook: a transport drop is nudged in place up to
+    # transport_nudges times, then pauses uncharged as `transport fault:`; a pool
+    # refusal (429) pauses uncharged as `pool unavailable:`; a config or auth
+    # failure pauses uncharged as `environment fault:`. Off = upstream behaviour.
+    classify_turn_errors: bool = False
+    # F3. In-place "continue" nudges a session gets after a transport error before
+    # it pauses as a transport fault. Counted against limits.dev_stall_nudges_cap.
+    transport_nudges: int = 1
+    # F7. Where wake/continue nudges go: `tmux` types into the pane (upstream);
+    # `hcom` sends an `hcom send @<name> --intent request` message into the
+    # session when its hook relay reported an hcom instance name and hcom shows
+    # it listening, falling back to tmux otherwise.
+    nudge_via: str = "tmux"
+    # F6. How many times in a row a dev or review retry may resume the previous
+    # CLI conversation (`claude --resume <id>`, `codex resume <id>`) instead of
+    # starting a fresh session, after that session stalled, timed out, crashed or
+    # hit a transport fault. Needs a profile that declares `resume_flag` or
+    # `resume_subcommand`. A failed verify or review always starts fresh. 0 = off.
+    max_session_resumes: int = 0
+    # F8. `story-boundary`: re-read policy.toml and the profiles at the top of the
+    # story loop; apply a change whose launch surface (runsetup.config_digest)
+    # still matches the run's trusted digest, and journal one that does not as
+    # deferred to the next resume. `off`: upstream (read at run/resume only).
+    reload_policy: str = "off"
 
 
 @dataclass(frozen=True)
@@ -764,6 +839,8 @@ class Policy:
     tui: TuiPolicy = field(default_factory=TuiPolicy)
     operator: OperatorPolicy = field(default_factory=OperatorPolicy)
     mux: MuxPolicy = field(default_factory=MuxPolicy)
+    # Appended last (open-runtime fork): every other section is keyword-built.
+    recovery: RecoveryPolicy = field(default_factory=RecoveryPolicy)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -995,6 +1072,7 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
     tui_d = _section(doc, "tui")
     operator_d = _section(doc, "operator")
     mux_d = _section(doc, "mux")
+    recovery_d = _section(doc, "recovery")
 
     gates = GatesPolicy(
         mode=_typed_str(gates_d, "gates", "mode", GatesPolicy.mode),
@@ -1079,7 +1157,17 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         session_budget_grace_s=_typed_int(
             limits_d, "limits", "session_budget_grace_s", LimitsPolicy.session_budget_grace_s
         ),
+        harvest_summary_chars=_typed_int(
+            limits_d, "limits", "harvest_summary_chars", LimitsPolicy.harvest_summary_chars
+        ),
+        harvest_evidence_chars=_typed_int(
+            limits_d, "limits", "harvest_evidence_chars", LimitsPolicy.harvest_evidence_chars
+        ),
     )
+    if limits.harvest_summary_chars < 1 or limits.harvest_evidence_chars < 1:
+        raise PolicyError(
+            "limits.harvest_summary_chars and limits.harvest_evidence_chars must be >= 1"
+        )
     if limits.max_review_cycles < 1 or limits.max_dev_attempts < 1:
         raise PolicyError("limits.max_review_cycles and limits.max_dev_attempts must be >= 1")
     if limits.artifact_file_max_mb < 1:
@@ -1233,7 +1321,12 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         thorough_review=_typed_str(
             tickets_d, "tickets", "thorough_review", TicketsPolicy.thorough_review
         ).strip(),
+        hitl=_typed_str(tickets_d, "tickets", "hitl", TicketsPolicy.hitl).strip(),
     )
+    if tickets.hitl not in TICKETS_HITL_MODES:
+        raise PolicyError(
+            f"tickets.hitl must be one of {sorted(TICKETS_HITL_MODES)}: got {tickets.hitl!r}"
+        )
     if tickets.mark_done not in TICKETS_MARK_DONE_MODES:
         raise PolicyError(
             f"tickets.mark_done must be one of {sorted(TICKETS_MARK_DONE_MODES)}:"
@@ -1489,6 +1582,7 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         raise PolicyError(
             f"mux.backend must be a backend name (letters, digits, . _ -): got {mux.backend!r}"
         )
+    recovery = _load_recovery(recovery_d)
     return Policy(
         gates=gates,
         limits=limits,
@@ -1507,7 +1601,53 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         tui=tui,
         operator=operator,
         mux=mux,
+        recovery=recovery,
     )
+
+
+def _load_recovery(recovery_d: dict[str, Any]) -> RecoveryPolicy:
+    """The `[recovery]` table (open-runtime fork), validated like the others: a
+    wrong type or an unknown mode is a PolicyError naming the key."""
+    recovery = RecoveryPolicy(
+        post_story_on_resume=_typed_bool(
+            recovery_d, "recovery", "post_story_on_resume", RecoveryPolicy.post_story_on_resume
+        ),
+        restamp_plan_baseline=_typed_bool(
+            recovery_d, "recovery", "restamp_plan_baseline", RecoveryPolicy.restamp_plan_baseline
+        ),
+        stall_check=_typed_str(recovery_d, "recovery", "stall_check", RecoveryPolicy.stall_check),
+        turn_end_nudge_s=_typed_int(
+            recovery_d, "recovery", "turn_end_nudge_s", RecoveryPolicy.turn_end_nudge_s
+        ),
+        classify_turn_errors=_typed_bool(
+            recovery_d, "recovery", "classify_turn_errors", RecoveryPolicy.classify_turn_errors
+        ),
+        transport_nudges=_typed_int(
+            recovery_d, "recovery", "transport_nudges", RecoveryPolicy.transport_nudges
+        ),
+        nudge_via=_typed_str(recovery_d, "recovery", "nudge_via", RecoveryPolicy.nudge_via),
+        max_session_resumes=_typed_int(
+            recovery_d, "recovery", "max_session_resumes", RecoveryPolicy.max_session_resumes
+        ),
+        reload_policy=_typed_str(
+            recovery_d, "recovery", "reload_policy", RecoveryPolicy.reload_policy
+        ),
+    )
+    for key, value, modes in (
+        ("stall_check", recovery.stall_check, STALL_CHECK_MODES),
+        ("nudge_via", recovery.nudge_via, NUDGE_VIA_MODES),
+        ("reload_policy", recovery.reload_policy, RELOAD_POLICY_MODES),
+    ):
+        if value not in modes:
+            raise PolicyError(f"recovery.{key} must be one of {sorted(modes)}: got {value!r}")
+    for key, value in (
+        ("turn_end_nudge_s", recovery.turn_end_nudge_s),
+        ("transport_nudges", recovery.transport_nudges),
+        ("max_session_resumes", recovery.max_session_resumes),
+    ):
+        if value < 0:
+            raise PolicyError(f"recovery.{key} must be >= 0: got {value}")
+    return recovery
 
 
 def _fold_deprecated_engine(
@@ -1637,6 +1777,10 @@ spec_folder = ""
 mark_done = "auto"           # auto | never
 # When a ticket gets the thorough review: "high-risk" (its risk is high), "always", "never".
 thorough_review = "high-risk"  # never | high-risk | always
+# A hitl ticket first in build order: "halt" stops the pick for the human
+# (default); "defer" dispatches the later ready tickets of its epic first and
+# halts on it once none is left (open-runtime fork).
+# hitl = "halt"               # halt | defer
 
 [adapter]
 name = "claude"              # claude | codex | gemini | copilot | antigravity | opencode-http (alias: opencode) | <custom .bmad-loop/profiles/*.toml>
@@ -1778,6 +1922,40 @@ enabled = true
 # review prompt offers the park, and a demotion that passes the verify gate
 # moves the board done -> awaiting-operator, commits, and parks the story.
 # on_review_demotion = "escalate"
+
+[recovery]
+# Loop-recovery behaviours added by the open-runtime fork of bmad-loop. Each
+# keeps upstream behaviour unless noted, so a run started by an upstream engine
+# resumes unchanged.
+# A story a resume finishes on a replay arm fires `post_story` once, like a
+# story finished by the loop (upstream fired it on the restart arm only).
+# post_story_on_resume = true
+# Re-stamp the plan's `baseline_revision` when `resume --accept-baseline` or a
+# `pre_dev_phase` merge moved the recorded baseline under it.
+# restamp_plan_baseline = true
+# "smart": at the stall-grace expiry, park an idle dev/review session only when
+# its last message asks a human a question (or a permission/quota prompt is
+# up); otherwise nudge it to continue in place. "classic": upstream behaviour.
+# stall_check = "classic"
+# smart only: seconds after a status-report turn end before that nudge (0 = the
+# full limits.dev_stall_grace_s).
+# turn_end_nudge_s = 0
+# Classify a turn that ended on an API error: transport drops are nudged
+# transport_nudges times, then pause uncharged ("transport fault:"); a pool 429
+# pauses uncharged ("pool unavailable:"); a config/auth error pauses uncharged
+# ("environment fault:").
+# classify_turn_errors = false
+# transport_nudges = 1
+# Deliver nudges as hcom messages into the session when it is in an hcom room
+# and listening ("hcom"), else by tmux keystrokes ("tmux").
+# nudge_via = "tmux"
+# Resume the previous CLI conversation (claude --resume / codex resume) on a
+# retry after a stall, timeout, crash or transport fault, up to this many times
+# in a row; needs a profile with resume_flag or resume_subcommand. 0 = off.
+# max_session_resumes = 0
+# "story-boundary": re-read policy.toml between stories, applying a change whose
+# launch surface is unchanged; "off": read at run/resume only.
+# reload_policy = "off"
 
 [mux]
 # Terminal-multiplexer backend for this machine (the transport axis — which

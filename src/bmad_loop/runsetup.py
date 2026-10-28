@@ -435,6 +435,14 @@ def config_digest(
         # a host-exec change its argv never had.
         if prof.session_id_flag:
             launch[role]["session_id_flag"] = prof.session_id_flag
+        # open-runtime fork (F6): the resume launch surface (a flag or subcommand
+        # placed in the resumed session's argv, and the continuation prompt's
+        # rendering). Same byte-identity rule: a profile that cannot resume adds
+        # no key.
+        if prof.resumable:
+            launch[role]["resume_flag"] = prof.resume_flag
+            launch[role]["resume_subcommand"] = list(prof.resume_subcommand)
+            launch[role]["resume_prompt_template"] = prof.resume_prompt_template
         # Same byte-identity rule: the default mode adds no key. A non-default
         # mode already moved `bypass_args`; the name is hashed beside it so the
         # pin also records which mapping those args came from.

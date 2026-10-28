@@ -204,6 +204,13 @@ class SessionRecord:
     # fix session — lookups of the attempt's own result skip labeled records
     # (DW-522). "" also for every record written before the field existed.
     label: str = ""
+    # open-runtime fork (F6): how a non-completed session ended beyond its status
+    # — "transport" / "pool" / "environment" / "usage" (a classified turn error),
+    # "parked" (a human prompt or question), "no-work" — or "" — and the CLI
+    # session id it resumed ("" = a fresh session). The resume rule reads both.
+    # "" for every record written before the fields existed.
+    ended: str = ""
+    resumed_from: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -217,6 +224,8 @@ class SessionRecord:
             "usage": self.usage.to_dict() if self.usage else None,
             "result_json": self.result_json,
             "label": self.label,
+            "ended": self.ended,
+            "resumed_from": self.resumed_from,
         }
 
     @classmethod
@@ -233,6 +242,8 @@ class SessionRecord:
             usage=TokenUsage.from_dict(usage) if usage else None,
             result_json=d.get("result_json"),
             label=str(d.get("label", "") or ""),
+            ended=str(d.get("ended", "") or ""),
+            resumed_from=str(d.get("resumed_from", "") or ""),
         )
 
 
@@ -818,6 +829,13 @@ class StoryTask:
     # keep it); "" when no T1 in-window mark is owed or the plan cannot be read.
     ticket_premark_status: str = ""
     ticket_premark_digest: str = ""
+    # open-runtime fork (F6): consecutive dev/review launches that resumed the
+    # previous CLI conversation (reset by a fresh launch), bounded by
+    # `[recovery] max_session_resumes`; and whether the attempt's tree was reset
+    # since the last session ended (a rollback, a discarded worktree), which makes
+    # resuming that conversation unsafe. Cleared by the next launch.
+    session_resumes: int = 0
+    resume_blocked: bool = False
 
     @property
     def terminal(self) -> bool:
@@ -935,6 +953,8 @@ class StoryTask:
             "ticket_commit_pending": self.ticket_commit_pending,
             "ticket_premark_status": self.ticket_premark_status,
             "ticket_premark_digest": self.ticket_premark_digest,
+            "session_resumes": self.session_resumes,
+            "resume_blocked": self.resume_blocked,
         }
 
     def _serialized_worktree_path(
@@ -1225,6 +1245,8 @@ class StoryTask:
             ticket_commit_pending=bool(d.get("ticket_commit_pending", False)),
             ticket_premark_status=str(d.get("ticket_premark_status", "") or ""),
             ticket_premark_digest=str(d.get("ticket_premark_digest", "") or ""),
+            session_resumes=int(d.get("session_resumes", 0) or 0),
+            resume_blocked=bool(d.get("resume_blocked", False)),
         )
 
 

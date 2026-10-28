@@ -189,6 +189,45 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
 - **Tested by:** `tests/test_engine.py`, `tests/test_cli.py`, `tests/test_runs.py`, `tests/test_journal.py`
 - **Docs:** [Stopping a run](reference/run-state.md#stopping-a-run), [Derived run status](reference/run-state.md#derived-run-status), [Run inventory](reference/run-state.md#run-inventory), [resume CLI reference](reference/cli.md#resume), [stop CLI reference](reference/cli.md#stop)
 
+### In-place nudges and turn errors
+
+- **Stability:** experimental
+- **Description:** An idle dev or review session is judged by its last turn: it is parked only when it asked a human a question, and nudged to continue in the same session otherwise, by tmux keys or as an hcom message. A turn that ended on an API error is classified and paused without charging the attempt.
+- **Properties:**
+  - With `[recovery] stall_check = "smart"`, a permission or quota prompt still parks the session; a last message that asks a question parks it with the question in its evidence; otherwise the session is nudged, naming a pending command or sub-agent when there is one.
+  - Every in-place nudge counts against `limits.dev_stall_nudges_cap`.
+  - With `[recovery] classify_turn_errors`, a transport error is nudged `transport_nudges` times and then pauses as `transport fault:`; a pool refusal pauses as `pool unavailable:` with its return time; a config or credential error pauses as `environment fault:`; none is charged.
+  - A Codex turn that ended in error is read from its rollout on the heartbeat, since Codex fires no Stop hook for it.
+  - With `[recovery] nudge_via = "hcom"`, a nudge is sent as an hcom request only to an instance hcom shows listening, and falls back to tmux otherwise.
+- **Config:** `[recovery] stall_check`, `turn_end_nudge_s`, `classify_turn_errors`, `transport_nudges`, `nudge_via`; `[limits] dev_stall_grace_s`, `dev_stall_nudges`, `dev_stall_nudges_cap`
+- **Tested by:** `tests/test_fork_wait_loop.py`, `tests/test_turnstate.py`, `tests/test_fork_relay_profile.py`
+- **Docs:** [Loop recovery guide](loop-recovery-guide.md), [Turn-error pauses](escalations-guide.md#turn-error-pauses), [[recovery] reference](reference/configuration.md#recovery)
+
+### Session resume on retry
+
+- **Stability:** experimental
+- **Description:** A dev or review retry after a stalled, timed-out, crashed or transport-failed session continues the previous CLI conversation (`claude --resume`, `codex resume`) on the kept tree instead of starting over; a failed verify or review starts fresh.
+- **Properties:**
+  - A retry resumes only the immediately previous session of the same role and adapter, with a known session id and transcript, on a tree no rollback reset since.
+  - An in-run retry that resumes skips the rollback and keeps the attempt's tree.
+  - A session parked on a human or one that did no work is never resumed, and resumes in a row are capped by `[recovery] max_session_resumes`.
+  - A resumed session is charged only for its own usage.
+- **Config:** `[recovery] max_session_resumes`; profile keys `resume_flag`, `resume_subcommand`, `resume_prompt_template`
+- **Tested by:** `tests/test_fork_session_resume.py`, `tests/test_fork_wait_loop.py`
+- **Docs:** [Session resume](loop-recovery-guide.md#session-resume), [Profile field reference](adapter-authoring-guide.md#cliprofile)
+
+### Resume and policy continuity
+
+- **Stability:** experimental
+- **Description:** A story a resume finishes fires `post_story` like any other, the plan's `baseline_revision` follows a baseline the engine moved, and a policy edited mid-run takes effect at the next story when its launch surface is unchanged.
+- **Properties:**
+  - A replay arm of in-flight recovery that finishes a story fires `post_story` once, before the done checkpoint; the restart arm still fires it once.
+  - `resume --accept-baseline` and a `pre_dev_phase` merge re-stamp a plan that claims the previous recorded baseline.
+  - With `[recovery] reload_policy = "story-boundary"`, a change whose launch digest matches the run's trusted digest is applied between stories; any other change is journaled as deferred and waits for a resume.
+- **Config:** `[recovery] post_story_on_resume`, `restamp_plan_baseline`, `reload_policy`
+- **Tested by:** `tests/test_fork_recovery_engine.py`, `tests/test_fork_policy_reload.py`
+- **Docs:** [Loop recovery guide](loop-recovery-guide.md), [[recovery] reference](reference/configuration.md#recovery)
+
 ## Human control
 
 ### Gates and checkpoints

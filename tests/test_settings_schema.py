@@ -21,16 +21,20 @@ from bmad_loop.policy import (
     GATE_MODES,
     ISOLATION_MODES,
     MERGE_STRATEGIES,
+    NUDGE_VIA_MODES,
     OPERATOR_ON_REVIEW_DEMOTION_MODES,
     PERMISSION_MODES,
     POLICY_TEMPLATE,
+    RELOAD_POLICY_MODES,
     RETRO_MODES,
     REVIEW_ON_STATUS_CONTRADICTION_MODES,
     REVIEW_TRIGGER_MODES,
     SESSION_BUDGET_MODES,
     STAGES,
+    STALL_CHECK_MODES,
     STORIES_SOURCES,
     SWEEP_AUTO_MODES,
+    TICKETS_HITL_MODES,
     TICKETS_MARK_DONE_MODES,
     TICKETS_THOROUGH_REVIEW_MODES,
     AdapterPolicy,
@@ -44,6 +48,7 @@ from bmad_loop.policy import (
     OperatorPolicy,
     PluginsPolicy,
     Policy,
+    RecoveryPolicy,
     ReviewPolicy,
     ScmPolicy,
     StageAdapterPolicy,
@@ -79,6 +84,7 @@ SECTION_DC = {
     "operator": OperatorPolicy,
     "mux": MuxPolicy,
     "dev": DevPolicy,
+    "recovery": RecoveryPolicy,
 }
 
 # Policy dataclasses that are deliberately NOT a settings section. Plugins render
@@ -88,6 +94,10 @@ NON_SECTION_DC = {PluginsPolicy, Policy}
 
 # select fields whose options are an enum set.
 OPTIONS_ENUM = {
+    ("recovery", "stall_check"): STALL_CHECK_MODES,
+    ("tickets", "hitl"): TICKETS_HITL_MODES,
+    ("recovery", "nudge_via"): NUDGE_VIA_MODES,
+    ("recovery", "reload_policy"): RELOAD_POLICY_MODES,
     ("gates", "mode"): GATE_MODES,
     ("gates", "retrospective"): RETRO_MODES,
     ("review", "trigger"): REVIEW_TRIGGER_MODES,
