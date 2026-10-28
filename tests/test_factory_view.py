@@ -553,6 +553,18 @@ def test_poll_reads_appended_events_and_withholds_a_partial_line(factory):
     assert by_label(second)["alpha"].faults == ()  # the unterminated line is not a fault yet
 
 
+def test_idle_notices_and_hooks_do_not_restart_the_stage_clock(factory):
+    with (factory.alpha_run / "journal.jsonl").open("ab") as f:
+        for event in (
+            ev(NOW - 0.2 * H, "session-idle", task_id="1.3-dev-1", idle_s=600, threshold_s=600),
+            ev(NOW - 0.1 * H, "session-active", task_id="1.3-dev-1", idle_s=900),
+            ev(NOW - 0.05 * H, "token-budget-exceeded", story_key="1.3", weighted=9, budget=1),
+        ):
+            f.write(json.dumps(event).encode("utf-8") + b"\n")
+    alpha = by_label(snapshot(factory.config))["alpha"]
+    assert alpha.since == NOW - 0.4 * H + 5  # still the open session's start
+
+
 def test_polling_writes_nothing(factory, monkeypatch):
     def tree() -> dict[str, tuple[int, str]]:
         out: dict[str, tuple[int, str]] = {}

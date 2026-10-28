@@ -114,6 +114,34 @@ GATE_STAGES = frozenset(
     }
 )
 STALL_STATUSES = frozenset({"stalled", "timeout"})
+#: The journal kinds that move a story from one stage to the next, and the run-level
+#: ones that do the same for whatever story is current.
+STAGE_EVENTS = frozenset(
+    {
+        "story-start",
+        "session-start",
+        "session-end",
+        "dev-decision",
+        "verify-command-result",
+        "review-result",
+        "review-skipped",
+        "review-not-recommended",
+        "review-verify-failed",
+        "resume-restart",
+        "resume-verify",
+        "resume-reverify",
+        "reverify-decision",
+        "story-reverify-armed",
+        "baseline-accepted",
+        "checkpoint-pause",
+        "story-escalated",
+        "story-escalation-resolved",
+        "story-deferred",
+        "story-done",
+        "ticket-mark",
+    }
+)
+RUN_STAGE_EVENTS = frozenset({"run-start", "run-paused", "run-resume"})
 
 # The journal fields the overview keeps per event (everything else, prompts and
 # output tails included, is dropped on read), and the cap on a kept string.
@@ -1921,8 +1949,10 @@ def _open_session(entries: Sequence[Mapping[str, Any]]) -> Mapping[str, Any] | N
 
 
 def _stage_since(entries: Sequence[Mapping[str, Any]], story: str | None) -> float | None:
-    """When the current stage began: the latest event of the story (by key, or by
-    the task ids its sessions ran under) or of the run's own pause and resume."""
+    """When the current stage began: the latest stage-changing event of the story
+    (:data:`STAGE_EVENTS`, matched by key or by the task ids its sessions ran
+    under) or of the run itself (:data:`RUN_STAGE_EVENTS`). A session going idle
+    or active again, a plugin hook or a budget sample changes no stage."""
     tasks: set[str] = set()
     latest: float | None = None
     for e in entries:
@@ -1934,12 +1964,12 @@ def _stage_since(entries: Sequence[Mapping[str, Any]], story: str | None) -> flo
         if kind == "session-start" and story is not None and e.get("story_key") == story:
             if isinstance(task, str):
                 tasks.add(task)
-        mine = story is not None and (
-            e.get("story_key") == story or (isinstance(task, str) and task in tasks)
+        mine = (
+            story is not None
+            and kind in STAGE_EVENTS
+            and (e.get("story_key") == story or (isinstance(task, str) and task in tasks))
         )
-        if mine and kind in ("plugin-hook", "plugins-active", "token-budget-exceeded"):
-            mine = False
-        if mine or kind in ("run-paused", "run-resume", "run-start"):
+        if mine or kind in RUN_STAGE_EVENTS:
             latest = ts if latest is None else max(latest, ts)
     return latest
 
