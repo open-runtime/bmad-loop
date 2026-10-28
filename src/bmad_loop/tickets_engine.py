@@ -282,6 +282,13 @@ def _with_trailers(message: str, trailers: list[str]) -> str:
     return body + "\n\n" + "\n".join(trailers)
 
 
+def _tickets_hitl_deferred(engine: object) -> bool:
+    """``[tickets] hitl = "defer"`` (open-runtime fork), read live at each pick. An
+    engine stand-in that carries no policy keeps upstream's halt."""
+    policy = getattr(engine, "policy", None)
+    return policy is not None and policy.tickets.hitl == "defer"
+
+
 def default_ticket_tree(project_root: Path, pinned_initiative: str | None) -> TicketTreeLike:
     """The project's installed ``tickets.py``, pinned to ``pinned_initiative``."""
     return TicketTree(project_root, pinned_initiative=pinned_initiative)
@@ -383,7 +390,7 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
             lambda: self.state.ticket_epic_closures,
             lambda: _pick_scope(self.state),
             acked_get=lambda: self.state.ticket_epic_closure_acked,
-            defer_hitl_get=lambda: self.policy.tickets.hitl == "defer",
+            defer_hitl_get=lambda: _tickets_hitl_deferred(self),
         )
 
     @property
