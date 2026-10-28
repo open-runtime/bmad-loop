@@ -12,8 +12,10 @@ from textual.dom import DOMNode
 
 from bmad_loop.tui import commands
 from bmad_loop.tui.app import BmadLoopApp
+from bmad_loop.tui.factory_app import FactoryApp
 from bmad_loop.tui.screens import modals
 from bmad_loop.tui.screens.dashboard import DashboardScreen
+from bmad_loop.tui.screens.factory import FactoryScreen
 from bmad_loop.tui.screens.settings_screen import SettingsScreen
 
 APP_ACTIONS = [
@@ -34,12 +36,13 @@ APP_ACTIONS = [
     "settings",
     "toggle_dark",
 ]
-DASHBOARD_ACTIONS = ["copy_pane", "resize_mode", "unpin_log"]
+DASHBOARD_ACTIONS = ["copy_pane", "resize_mode", "unpin_log", "factory_overview"]
 # Dashboard actions check_action gates off until a live parked prompt is
 # answerable (#855), so they are in PALETTE but not listed on a fresh dashboard.
 GATED_DASHBOARD_ACTIONS = ["approve_parked", "deny_parked"]
 SETTINGS_ACTIONS = ["save", "toggle_all", "back"]
 MODAL_ACTIONS = ["cancel", "toggle_detail"]
+FACTORY_ACTIONS = ["open_epic", "cycle_window", "filter_feed", "refresh_now", "close_factory"]
 
 
 def _title(action: str) -> str:
@@ -54,7 +57,13 @@ def _subclasses(cls: type) -> list[type]:
 
 
 def _bound_actions() -> set[str]:
-    classes: list[type[DOMNode]] = [BmadLoopApp, DashboardScreen, SettingsScreen]
+    classes: list[type[DOMNode]] = [
+        BmadLoopApp,
+        DashboardScreen,
+        SettingsScreen,
+        FactoryApp,
+        FactoryScreen,
+    ]
     classes += [modals.BaseDialog, *_subclasses(modals.BaseDialog)]
     actions: set[str] = set()
     for cls in classes:
@@ -80,7 +89,12 @@ def test_every_binding_is_in_palette_or_excluded():
     # The tables cover exactly the planned commands, so a PALETTE entry for a
     # (still bound) key cannot silently move to EXCLUDED.
     assert sorted(commands.PALETTE) == sorted(
-        APP_ACTIONS + DASHBOARD_ACTIONS + GATED_DASHBOARD_ACTIONS + SETTINGS_ACTIONS + MODAL_ACTIONS
+        APP_ACTIONS
+        + DASHBOARD_ACTIONS
+        + GATED_DASHBOARD_ACTIONS
+        + SETTINGS_ACTIONS
+        + MODAL_ACTIONS
+        + FACTORY_ACTIONS
     )
 
 
@@ -92,7 +106,7 @@ async def test_dashboard_palette_lists_app_and_dashboard_commands(project):
         for action in APP_ACTIONS + DASHBOARD_ACTIONS:
             assert _title(action) in titles, action
         assert {"Quit", "Theme"} <= titles  # Textual's built-ins stay
-        for action in SETTINGS_ACTIONS + MODAL_ACTIONS + GATED_DASHBOARD_ACTIONS:
+        for action in SETTINGS_ACTIONS + MODAL_ACTIONS + GATED_DASHBOARD_ACTIONS + FACTORY_ACTIONS:
             assert _title(action) not in titles, action
         # One entry per action even when it has several live keys.
         listed = [c.title for c in app.get_system_commands(app.screen)]
@@ -108,7 +122,26 @@ async def test_settings_palette_lists_settings_commands(project):
         titles = _titles(app)
         for action in SETTINGS_ACTIONS + APP_ACTIONS:
             assert _title(action) in titles, action
-        for action in DASHBOARD_ACTIONS + MODAL_ACTIONS:
+        for action in DASHBOARD_ACTIONS + MODAL_ACTIONS + FACTORY_ACTIONS:
+            assert _title(action) not in titles, action
+
+
+async def test_factory_palette_hides_app_and_dashboard_commands(project, tmp_path):
+    # a config of its own, so the overview reads nothing outside the test
+    (project.project / ".bmad-loop").mkdir(exist_ok=True)
+    (project.project / ".bmad-loop" / "factory.toml").write_text(
+        f'[factory]\nworkspaces_root = "{tmp_path / "none"}"\ntickets = false\n',
+        encoding="utf-8",
+    )
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("F")
+        await until(pilot, lambda: isinstance(app.screen, FactoryScreen))
+        titles = _titles(app)
+        for action in FACTORY_ACTIONS:
+            assert _title(action) in titles, action
+        for action in APP_ACTIONS + DASHBOARD_ACTIONS + SETTINGS_ACTIONS + MODAL_ACTIONS:
             assert _title(action) not in titles, action
 
 
