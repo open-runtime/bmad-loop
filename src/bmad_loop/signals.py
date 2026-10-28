@@ -53,6 +53,19 @@ class HookEvent:
     # older vendored relay that predates the field, and for a non-string value.
     # APPENDED with a default, like the fields above.
     payload_error: str | None = None
+    # open-runtime fork (F3, F4): what a Stop / StopFailure payload said about how
+    # the turn ended — the last assistant message (its tail), the in-flight
+    # background tasks' labels (None = the payload carried no list; () = none in
+    # flight), and a StopFailure's error code and details. None on every other
+    # event and on a relay that predates the fields. APPENDED with defaults.
+    last_assistant_message: str | None = None
+    background_tasks: tuple[str, ...] | None = None
+    error: str | None = None
+    error_details: str | None = None
+    # open-runtime fork (F7): the hcom instance name and room the CLI was launched
+    # under (HCOM_INSTANCE_NAME / HCOM_DIR in the relay's environment). APPENDED.
+    hcom_name: str | None = None
+    hcom_dir: str | None = None
 
 
 # The relays' lineage tags (DW-507, events._lineage). Anything else parses as None.
@@ -84,6 +97,12 @@ def _parse_event(entry: Path) -> HookEvent | None:
     source = data.get("source")
     lineage = data.get("lineage")
     payload_error = data.get("payload_error")
+    message = data.get("last_assistant_message")
+    tasks = data.get("background_tasks")
+    error = data.get("error")
+    error_details = data.get("error_details")
+    hcom_name = data.get("hcom_name")
+    hcom_dir = data.get("hcom_dir")
     # Payload values are forwarded from the CLI unvalidated, so a non-string one
     # reads as absent rather than reaching attribution's set arithmetic (#767).
     return HookEvent(
@@ -97,6 +116,14 @@ def _parse_event(entry: Path) -> HookEvent | None:
         source=source if isinstance(source, str) else None,
         lineage=lineage if isinstance(lineage, str) and lineage in LINEAGE_TAGS else None,
         payload_error=payload_error if isinstance(payload_error, str) else None,
+        last_assistant_message=message if isinstance(message, str) else None,
+        background_tasks=(
+            tuple(t for t in tasks if isinstance(t, str)) if isinstance(tasks, list) else None
+        ),
+        error=error if isinstance(error, str) else None,
+        error_details=error_details if isinstance(error_details, str) else None,
+        hcom_name=hcom_name if isinstance(hcom_name, str) and hcom_name else None,
+        hcom_dir=hcom_dir if isinstance(hcom_dir, str) and hcom_dir else None,
     )
 
 

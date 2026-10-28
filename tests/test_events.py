@@ -39,6 +39,13 @@ TWINNED = (
     "_first_workspace",
     "_notification_type",
     "_source",
+    # open-runtime fork (F3, F4, F7): the turn-end and hcom fields.
+    "_TURN_MESSAGE_MAX",
+    "_TURN_TASKS_MAX",
+    "_TURN_LABEL_MAX",
+    "_TURN_DONE_STATUSES",
+    "_turn_fields",
+    "_hcom_fields",
     # DW-507's lineage block: the tag both relays stamp on every event.
     "_LAUNCH_SHIM_WINDOW_S",
     "_proc_stat",

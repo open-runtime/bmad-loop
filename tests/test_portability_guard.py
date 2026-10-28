@@ -557,6 +557,17 @@ JOURNAL_KIND_BENIGN_FIELDS = {
     # (`codex_trust.DAEMON_ENV_HINT`), never session or operator text. Kind-scoped
     # because both names are generic.
     "session-start-missing": frozenset({"cli", "hint"}),
+    # open-runtime fork. `session-bound` / `session-resume` (F6) carry the CLI's
+    # own opaque session id (a UUID or a Codex thread id, also in state.json's
+    # session records) and, on `session-resume`, the closed `ended` label and the
+    # chain's resume count; `source` is the SessionStart's closed slug. `turn-error`
+    # (F3/F5) carries the closed error class and its source slug (its text rides
+    # the routed `detail`). `session-end` gains the closed `turn_error` class, a
+    # pool refusal's ISO `pool_return` and the resumed session id.
+    "session-bound": frozenset({"session_id", "source", "resumed_from"}),
+    "session-resume": frozenset({"session_id", "ended", "resumes"}),
+    "turn-error": frozenset({"turn_error", "source"}),
+    "session-end": frozenset({"turn_error", "pool_return", "resumed_from"}),
     "root-identity-recorded": frozenset({"dev", "ino"}),
     # DW-446: the `st_dev` a locked resume/re-arm re-bound (`old_dev` -> `dev`) under
     # a still-matching `ino` — integers only, kept for the same comparison.
@@ -1412,6 +1423,11 @@ JOURNAL_KINDS = frozenset(
         # `waited_s`/`grace_s` (declared benign), `cli` and, on a Codex profile,
         # the constant `hint` (declared benign on this kind).
         "session-start-missing",
+        # open-runtime fork, adapters/generic.py: `session-bound` (F6) at a
+        # session's first admitted SessionStart, and `turn-error` (F3/F5) when a
+        # turn ended on an API error read from the transcript or a StopFailure.
+        "session-bound",
+        "turn-error",
         # checkpoints.py
         "checkpoint-pause",
         "checkpoint-resume",
@@ -1593,6 +1609,21 @@ JOURNAL_KINDS = frozenset(
         "resume-review",
         "resume-unit-merge",
         "resume-verify",
+        # engine.py — open-runtime fork. F1: `resume-post-story` when a replay arm
+        # of `_finish_inflight` fires the post_story hook it finished a story
+        # without. F2: `plan-baseline-restamped` / `plan-baseline-restamp-skipped`
+        # when the plan's `baseline_revision` follows an accepted baseline or a
+        # pre_dev_phase merge (`site`, declared benign; `overwritten`, `baseline`
+        # and `reason` routed by name).
+        "resume-post-story",
+        "plan-baseline-restamped",
+        "plan-baseline-restamp-skipped",
+        # F6: `session-resume` before a launch that resumes a CLI conversation.
+        # F8: `policy-reloaded` / `policy-reload-deferred` at a story boundary
+        # (`keys` and `reason` are routed by name).
+        "session-resume",
+        "policy-reloaded",
+        "policy-reload-deferred",
         # DW-389: the headless epic-boundary retrospective
         # (`gates.retrospective = "auto"`). `epic`, `count` and the closed `reason`
         # / check-`errors` lines are benign or dropped; `paths` / `docs` are

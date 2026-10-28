@@ -273,10 +273,61 @@ def env_fault_pause_reason(role: str, result: SessionResult) -> str:
     survived.
 
     A session the adapter saw live behind a usage limit (``result.usage_limited``,
-    #610) gets the usage-limit reason instead, so every pause site inherits it."""
+    #610) gets the usage-limit reason instead, so every pause site inherits it.
+    A session whose last turn ended on a classified API error
+    (``result.transport_fault``, open-runtime fork F3/F5) gets that class's
+    reason the same way."""
+    if result.transport_fault in TURN_ERROR_PREFIXES:
+        return turn_error_pause_reason(role, result)
     if result.usage_limited:
         return usage_limit_pause_reason(role, result)
     return f"environment fault: {session_failure_reason(role, result)} ({env_fault_detail(result)})"
+
+
+# open-runtime fork (F3, F5): the pause-reason prefix of each turn-error class.
+# "usage" is absent on purpose: a CLI credit limit keeps the #610 wording.
+TURN_ERROR_PREFIXES = {
+    "transport": "transport fault: ",
+    "pool": "pool unavailable: ",
+    "environment": "environment fault: ",
+}
+
+
+def turn_error_pause_reason(role: str, result: SessionResult) -> str:
+    """The pause reason for a session whose last turn ended on a classified API
+    error (open-runtime fork, F3/F5), never charged:
+
+    * ``transport fault: <role> session <status> (<error>; ...)`` — the API
+      connection failed and the in-place nudges did not recover it;
+    * ``pool unavailable: ... (<error>; return <ISO>; ...)`` — the model's
+      account pool refused the request (a 429), with the return time it named;
+    * ``environment fault: ... (<error>; ...)`` — the CLI could not load its
+      configuration or credentials, which no nudge fixes.
+
+    Composed over ``session_failure_reason`` like its siblings, so the #489 and
+    #764 suffixes survive."""
+    kind = result.transport_fault or "transport"
+    prefix = TURN_ERROR_PREFIXES.get(kind, TURN_ERROR_PREFIXES["transport"])
+    evidence = result.transport_evidence or "API error"
+    base = session_failure_reason(role, result)
+    if kind == "pool":
+        ret = f"; return {result.pool_return}" if result.pool_return else ""
+        tail = (
+            "the model's account pool refused the request; wait for the return or "
+            "switch model, then bmad-loop resolve <run>"
+        )
+        return f"{prefix}{base} ({evidence}{ret}; {tail})"
+    if kind == "environment":
+        tail = (
+            "the CLI could not load its configuration or credentials and a nudge "
+            "cannot fix that; fix the environment, then bmad-loop resolve <run>"
+        )
+        return f"{prefix}{base} ({evidence}; {tail})"
+    tail = (
+        "the API connection failed and in-place nudges did not recover it; the "
+        "attempt is not charged; bmad-loop resolve <run> re-arms it"
+    )
+    return f"{prefix}{base} ({evidence}; {tail})"
 
 
 def parked_pause_reason(role: str, result: SessionResult) -> str:
@@ -350,6 +401,10 @@ def pause_title(reason: str, story_key: str, *, env_fault_site: str | None = Non
     the title; it is display only."""
     if reason.startswith("parked: "):
         kind = "parked prompt"
+    elif reason.startswith("transport fault: "):
+        kind = "transport fault"
+    elif reason.startswith("pool unavailable: "):
+        kind = "pool unavailable"
     elif reason.startswith("no work produced: "):
         kind = "no work"
     elif reason.startswith("usage limit: "):

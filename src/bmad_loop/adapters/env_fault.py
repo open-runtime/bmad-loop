@@ -247,6 +247,28 @@ class EnvFaultMixin:
         ``usage_limited=True``."""
         if result.status not in ENV_FAULT_STATUSES or result.result_json is not None:
             return result
+        if result.transport_fault is not None:
+            # open-runtime fork (F3, F5): the turn ended on a classified API error
+            # the session's own transcript (or its StopFailure hook) recorded.
+            # Veto-exempt like the live usage sighting below: tokens spent before
+            # the error cannot disprove it. A "usage" class keeps the #610 usage
+            # wording through `usage_limited`.
+            evidence = result.transport_evidence or result.transport_fault
+            self._note_lifecycle(
+                handle.task_id,
+                "env-fault-classified",
+                status=result.status,
+                evidence=evidence,
+                transport_fault=result.transport_fault,
+            )
+            if result.transport_fault == "usage":
+                return dataclasses.replace(
+                    result,
+                    env_fault=True,
+                    env_fault_evidence=evidence,
+                    usage_limited=result.usage_limited or evidence,
+                )
+            return dataclasses.replace(result, env_fault=True, env_fault_evidence=evidence)
         if result.usage_limited is not None:
             # Veto-exempt by design: the line was on the visible pane at the
             # verdict, so tokens spent BEFORE the limit cannot disprove it.

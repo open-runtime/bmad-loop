@@ -557,6 +557,70 @@ label = "review may park a done story"
 description = "escalate: a review pass is never offered the park, and one that finalizes a done story at awaiting-operator is not accepted (default) · park: the review may demote it — the board moves done -> awaiting-operator, the story commits and parks · sprint mode with parks enabled only"
 
 [[section]]
+name = "recovery"
+description = "loop recovery (open-runtime fork): replayed stories' post_story, plan baseline re-stamps, in-place nudges, turn-error pauses, session resume, policy reload"
+[[section.field]]
+key = "post_story_on_resume"
+kind = "switch"
+default_ref = "RecoveryPolicy.post_story_on_resume"
+label = "post_story for stories a resume finishes"
+description = "ON: a story a resume finishes on a replay arm (recorded session, commit window, spec approval, reverify) fires post_story once, like any finished story · OFF: upstream (only the restart arm fires it)"
+[[section.field]]
+key = "restamp_plan_baseline"
+kind = "switch"
+default_ref = "RecoveryPolicy.restamp_plan_baseline"
+label = "re-stamp the plan baseline"
+description = "ON: resume --accept-baseline and a pre_dev_phase merge re-stamp the plan's baseline_revision to the new recorded baseline, so attempt 2 passes the baseline gate · OFF: upstream (the plan keeps its stale claim)"
+[[section.field]]
+key = "stall_check"
+kind = "select"
+options_ref = "STALL_CHECK_MODES"
+default_ref = "RecoveryPolicy.stall_check"
+label = "stall check"
+description = "classic: upstream stall gate (an idle-prompt latch parks the session) · smart: park only when the last message asks a human a question or a permission/quota prompt is up; otherwise nudge in place, naming a pending command or sub-agent · bounded by limits.dev_stall_nudges_cap"
+[[section.field]]
+key = "turn_end_nudge_s"
+kind = "int"
+minimum = 0
+default_ref = "RecoveryPolicy.turn_end_nudge_s"
+label = "turn-end nudge (s)"
+description = "smart only: seconds after a result-less turn that ended on a status report before the in-place nudge · 0 = wait the full limits.dev_stall_grace_s"
+[[section.field]]
+key = "classify_turn_errors"
+kind = "switch"
+default_ref = "RecoveryPolicy.classify_turn_errors"
+label = "classify turn errors"
+description = "ON: a turn that ended on an API error is read from the transcript and the StopFailure hook — transport drops are nudged, then pause uncharged as transport fault; a pool 429 pauses uncharged as pool unavailable; a config/auth error pauses uncharged as an environment fault · OFF: upstream"
+[[section.field]]
+key = "transport_nudges"
+kind = "int"
+minimum = 0
+default_ref = "RecoveryPolicy.transport_nudges"
+label = "transport nudges"
+description = "in-place continue nudges after a transport error before the session pauses as a transport fault · counted against limits.dev_stall_nudges_cap"
+[[section.field]]
+key = "nudge_via"
+kind = "select"
+options_ref = "NUDGE_VIA_MODES"
+default_ref = "RecoveryPolicy.nudge_via"
+label = "nudge transport"
+description = "tmux: type nudges into the pane (upstream) · hcom: send them as an hcom request into the session when its relay reported an hcom name and hcom shows it listening, else tmux"
+[[section.field]]
+key = "max_session_resumes"
+kind = "int"
+minimum = 0
+default_ref = "RecoveryPolicy.max_session_resumes"
+label = "session resumes"
+description = "consecutive dev/review retries that resume the previous CLI conversation (claude --resume, codex resume) after a stall, timeout, crash or transport fault · needs a profile with resume_flag or resume_subcommand · a failed verify or review starts fresh · 0 = off"
+[[section.field]]
+key = "reload_policy"
+kind = "select"
+options_ref = "RELOAD_POLICY_MODES"
+default_ref = "RecoveryPolicy.reload_policy"
+label = "reload policy"
+description = "story-boundary: re-read policy.toml and profiles between stories and apply changes whose launch surface is unchanged (others wait for a resume) · off: read at run and resume only"
+
+[[section]]
 name = "mux"
 description = "terminal-multiplexer backend (machine-specific — policy.toml is gitignored)"
 # options are injected at build-registry time from detect_multiplexers() (plus any

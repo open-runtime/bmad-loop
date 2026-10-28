@@ -50,7 +50,7 @@ from ..journal import LOGS_DIR, TASK_CYCLE_ARTIFACTS
 from ..model import TokenUsage
 from ..policy import Policy
 from ..process_host import ProcessHostError, get_process_host
-from ..signals import REBIND_SOURCES, SessionAttribution, SignalWatcher
+from ..signals import REBIND_SOURCES, HookEvent, SessionAttribution, SignalWatcher
 from ..tokens import read_usage as tally_usage
 from ..usagereset import UsageReset, parse_reset
 from ..verify import read_frontmatter, status_of
@@ -85,8 +85,10 @@ from .env_fault import ENV_FAULT_STATUSES as ENV_FAULT_STATUSES
 from .env_fault import ENV_FAULT_TAIL_BYTES as ENV_FAULT_TAIL_BYTES
 from .env_fault import EnvFaultMixin
 from .multiplexer import MultiplexerError, TerminalMultiplexer, get_multiplexer
+from . import turnstate
+from .hcomnudge import send_nudge
 from .panematch import MatchTimeout, match_rows, screen_rows
-from .profile import PARKED_EVENTS, CLIProfile
+from .profile import PARKED_EVENTS, TURN_FAILURE_EVENT, CLIProfile
 
 if TYPE_CHECKING:
     from ..process_host import ProcessHost
@@ -264,6 +266,16 @@ def _local_now() -> datetime:
     return datetime.fromtimestamp(time.time())
 
 
+def _excerpt(text: str | None) -> str:
+    """The last non-empty line of ``text``, clipped for a crumb or a reason
+    (open-runtime fork): where a question or an error message ends."""
+    if not text:
+        return ""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    last = lines[-1] if lines else ""
+    return last if len(last) <= QUESTION_EXCERPT_MAX else last[: QUESTION_EXCERPT_MAX - 1] + "…"
+
+
 # min spacing between heartbeat.json overwrites in wait_for_completion; the
 # heartbeat's staleness is what makes a frozen orchestrator (#157) diagnosable.
 HEARTBEAT_INTERVAL_S = 30.0
@@ -297,7 +309,17 @@ FIRST_FRAME_S = 30.0
 # expiry, where it withholds the wake nudge and ends the session parked (see
 # `_parked_hook_evidence`). With claude's `idle_prompt` mapped, that is the usual
 # end of a result-less turn: the wake nudge is replaced by a pause.
-EVENT_KINDS = {"SessionStart", "Stop", "SessionEnd", "Notification"} | set(PARKED_EVENTS)
+EVENT_KINDS = {"SessionStart", "Stop", "SessionEnd", "Notification", TURN_FAILURE_EVENT} | set(
+    PARKED_EVENTS
+)
+# open-runtime fork (F3, F5): how long after a turn that ended on a transport
+# error the stall gate decides (one in-place nudge, then a transport-fault pause).
+# The CLI has already retried inside the turn (Claude Code's own retries, Codex's
+# "Reconnecting... n/5"), so a minute is backoff enough; a pool, usage or
+# environment error is decided at the next tick, since a nudge cannot fix it.
+TURN_ERROR_BACKOFF_S = 60.0
+# The longest excerpt of a session's question a parked evidence string carries.
+QUESTION_EXCERPT_MAX = 200
 # Wall-clock bound on EACH `parked_prompt_patterns` search over a captured pane
 # line (DW-350) — the `regex` module's per-search timeout, the env-fault
 # classifier's doctrine (`env_fault.ENV_FAULT_MATCH_TIMEOUT_S`). A pattern that
@@ -321,6 +343,30 @@ STALL_NUDGE_TEXT = (
     "Note: a prose reply cannot end this session — only your workflow's completion "
     "artifact (the spec's terminal status / result file) does; if the work is "
     "already complete, write it before ending your turn."
+)
+# open-runtime fork (F4, `[recovery] stall_check = "smart"`): the in-place nudges.
+# CONTINUE is for a turn that ended on a status report; PENDING names the command
+# or sub-agent the session started and left running; TRANSPORT follows a turn
+# that ended on an API or connection error. None of them invites the session to
+# stop: a session that needs a human is told to ask a question, which parks it.
+CONTINUE_NUDGE_TEXT = (
+    "You are running in bmad-loop automation mode and your turn ended before the "
+    "workflow finished. Continue the workflow from where you stopped, in this same "
+    "session; do not restart it. If a command or sub-agent you started is still "
+    "running, wait for it in the foreground before ending your turn. Only the "
+    "workflow's completion artifact (the spec's terminal status / result file) ends "
+    "this session. If you need a human decision, ask it as a question and end your turn."
+)
+PENDING_NUDGE_TEXT = (
+    "You are running in bmad-loop automation mode, which cannot re-invoke you when "
+    "background work finishes. Work you started is still pending ({pending}). Wait "
+    "for it in the foreground until it finishes (one long wait, not repeated short "
+    "polls), then continue the workflow from where you stopped, in this same "
+    "session. Do not end your turn while it is pending."
+)
+TRANSPORT_NUDGE_TEXT = (
+    "Your last request failed with an API or connection error ({error}). Continue "
+    "the workflow from where you stopped, in this same session; do not restart it."
 )
 # Wrap-up demand for a session that crossed its token budget (#158, enforce
 # mode): the guard arms a bounded grace window right after sending this, so the
@@ -1077,6 +1123,15 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # rescue), and a fault must read as one record, not three. Keyed by
         # launch, not task id alone, because a re-armed run reuses task ids.
         self._log_evidence_faulted: dict[str, int] = {}
+        # open-runtime fork (F7): task_id -> (hcom instance name, room) the
+        # session's hook relay reported, so `send_text` can deliver a nudge as an
+        # hcom message. Filled by the wait loop, evicted when it returns.
+        self._hcom_identity: dict[str, tuple[str, str | None]] = {}
+        # open-runtime fork (F6): task_id -> the usage the resumed conversation's
+        # transcript already held at launch, subtracted from what the session is
+        # charged; and task_id -> the resumed session id.
+        self._usage_base: dict[str, TokenUsage] = {}
+        self._resumed_ids: dict[str, str] = {}
 
     # --------------------------------------------------------- multiplexer
 
@@ -1148,12 +1203,25 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             from ..codex_trust import resolved_codex_binary
 
             binary = resolved_codex_binary(binary, self.profile.env) or binary
-        argv = [
-            binary,
-            *self.profile.launch_args,
-            self.profile.render_prompt(spec.prompt),
-            *extra,
-        ]
+        if spec.resume_session_id and self.profile.resumable:
+            # F6 (open-runtime fork): continue the conversation `spec.resume_session_id`
+            # names. A subcommand sits right after the binary (`codex resume`) and
+            # takes the id positionally; a flag takes it as its value
+            # (`claude --resume <id>`). The prompt is the engine's plain-text
+            # continuation, never the skill command a fresh launch renders.
+            argv = [binary, *self.profile.resume_subcommand, *self.profile.launch_args]
+            if self.profile.resume_flag:
+                argv += [self.profile.resume_flag, spec.resume_session_id]
+            else:
+                argv.append(spec.resume_session_id)
+            argv += [self.profile.render_resume_prompt(spec.prompt), *extra]
+        else:
+            argv = [
+                binary,
+                *self.profile.launch_args,
+                self.profile.render_prompt(spec.prompt),
+                *extra,
+            ]
         if spec.model:
             argv += [self.profile.model_flag, spec.model]
         return argv
@@ -1173,9 +1241,56 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         value-taking option (gemini's ``-i``) cannot swallow it. Deliberately not
         in ``interactive_argv``: resolve's human-present sessions do no attribution."""
         argv = self.interactive_argv(spec)
-        if session_id and self.profile.session_id_flag:
+        # A resumed conversation keeps its own id (F6): no new `--session-id`.
+        if session_id and self.profile.session_id_flag and not self._resuming(spec):
             argv += [self.profile.session_id_flag, session_id]
         return " ".join(shlex.quote(a) for a in argv)
+
+    def _reload_policy_knobs(self) -> None:
+        """F8 (open-runtime fork): re-derive the knobs ``__init__`` copied off the
+        policy after the engine swapped ``self.policy`` at a story boundary (no
+        session is live there). ``[adapter]`` overrides baked in at construction
+        (extra_args, usage grace, stop nudges) are launch surface and wait for a
+        resume."""
+        self._idle_threshold_s = float(self.policy.limits.dev_stall_grace_s)
+        self._session_start_grace_s = float(self.policy.limits.session_start_grace_s)
+        configure = getattr(self, "_configure_dev_knobs", None)
+        if callable(configure):
+            configure()
+
+    def _resuming(self, spec: SessionSpec) -> bool:
+        """Whether this launch resumes an earlier conversation (F6)."""
+        return bool(spec.resume_session_id) and self.profile.resumable
+
+    def _note_resume_base(self, spec: SessionSpec) -> None:
+        """F6 (open-runtime fork): read the usage the resumed conversation's
+        transcript already holds, keyed by that transcript, so this session is
+        charged only for its own turns (`_rebased`). A CLI that resumes in place
+        appends to the same file (Claude without --fork-session; a Codex rollout
+        whose token totals are per thread)."""
+        path = spec.resume_transcript_path
+        if not path or self.profile.usage_parser == "none":
+            return
+        try:
+            base = tally_usage(self.profile.usage_parser, Path(path))
+        except (OSError, ValueError):
+            return
+        if base is not None:
+            self._usage_base[path] = base
+
+    def _rebased(self, transcript_path: str | None, usage: TokenUsage | None) -> TokenUsage | None:
+        """``usage`` less what a resumed conversation held at launch (F6)."""
+        if usage is None or not transcript_path:
+            return usage
+        base = self._usage_base.get(transcript_path)
+        if base is None:
+            return usage
+        return TokenUsage(
+            input_tokens=max(0, usage.input_tokens - base.input_tokens),
+            output_tokens=max(0, usage.output_tokens - base.output_tokens),
+            cache_read_tokens=max(0, usage.cache_read_tokens - base.cache_read_tokens),
+            cache_creation_tokens=max(0, usage.cache_creation_tokens - base.cache_creation_tokens),
+        )
 
     # --------------------------------------------------------------- adapter
 
@@ -1224,6 +1339,14 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # one per launch, so wait_for_completion knows the parent before any hook
         # event arrives (signals.SessionAttribution pinning).
         pinned_session_id = str(uuid.uuid4()) if self.profile.session_id_flag else None
+        if self._resuming(spec):
+            # F6 (open-runtime fork): a resumed session reports the id it resumes
+            # (SessionStart `source: "resume"`), so attribution is pinned to it.
+            assert spec.resume_session_id is not None
+            if self.profile.session_id_flag:
+                pinned_session_id = spec.resume_session_id
+            self._resumed_ids[spec.task_id] = spec.resume_session_id
+            self._note_resume_base(spec)
         window_id = self.mux.new_window(
             self.session_name,
             spec.task_id[-40:],
@@ -1269,13 +1392,19 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         way (#855)."""
         quota = _QuotaWait()
         notice = _ParkedNotice()
-        result = self._wait_loop(handle, spec, quota, notice)
+        try:
+            result = self._wait_loop(handle, spec, quota, notice)
+        finally:
+            self._hcom_identity.pop(handle.task_id, None)
         if quota.waiting:
             self._end_quota_wait(handle, quota, "session-exit")
         if notice.open:
             self._note_session_unparked(handle, notice, "ended")
         if quota.closed_s > 0:
             result = dataclasses.replace(result, quota_wait_s=round(quota.closed_s, 3))
+        resumed = self._resumed_ids.pop(handle.task_id, None)
+        if resumed:
+            result = dataclasses.replace(result, resumed_from=resumed)
         return result
 
     def _wait_loop(
@@ -1611,6 +1740,98 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 )
             return stalled
 
+        # ---- open-runtime fork: the smart stall check (F4) and turn errors (F3, F5).
+        # Both judge the session's last turn from its own transcript
+        # (`adapters.turnstate`) and from what the Stop / StopFailure hook said.
+        # Off (the defaults), nothing below changes the upstream loop.
+        recovery = self.policy.recovery
+        smart = recovery.stall_check == "smart" and self._stall_grace_s > 0
+        classify = recovery.classify_turn_errors and self._stall_grace_s > 0
+        turn_readable = turnstate.supports(self.profile.usage_parser)
+        # In-place nudges a transport error may still earn (counted as stall
+        # nudges too, so limits.dev_stall_nudges_cap bounds them).
+        transport_nudges_left = recovery.transport_nudges
+        # The latest turn-end hook events: a Stop (its message and background
+        # tasks), and a StopFailure not yet followed by a Stop.
+        last_stop: HookEvent | None = None
+        stop_failure: HookEvent | None = None
+        # The transcript key the heartbeat's turn-error scan last read, the error
+        # it last acted on, and when that error is to be decided (monotonic; not
+        # re-armed by pane growth, which a repainting TUI produces after an error).
+        turn_scan_key: tuple[int, int] | None = None
+        turn_error_seen: str | None = None
+        turn_error_due: float | None = None
+        # The gate was opened early by a due turn error (not by the grace).
+        forced_by_turn_error = False
+        turn_read_failed = False
+        session_bound = False
+
+        def read_turn() -> turnstate.TurnState | None:
+            nonlocal turn_read_failed
+            if not turn_readable or not transcript_path:
+                return None
+            try:
+                return turnstate.read_turn_state(transcript_path, self.profile.usage_parser)
+            except (OSError, ValueError) as e:
+                if not turn_read_failed:
+                    turn_read_failed = True
+                    self._note_lifecycle(
+                        handle.task_id, "turn-read-failed", error=f"{type(e).__name__}: {e}"
+                    )
+                return None
+
+        def question_of(turn: turnstate.TurnState | None) -> str | None:
+            """The question the session's last turn asked a human, or None. The
+            transcript decides when it says anything about the turn; the last
+            Stop's message otherwise."""
+            if turn is not None and (
+                turn.last_message is not None or turn.turn_ended or turn.pending_tools
+            ):
+                if not turn.asks_question:
+                    return None
+                if any(tool in turnstate.QUESTION_TOOLS for tool in turn.pending_tools):
+                    return "AskUserQuestion pending"
+                return _excerpt(turn.last_message) or "question"
+            message = last_stop.last_assistant_message if last_stop is not None else None
+            return _excerpt(message) if turnstate.asks_question(message) else None
+
+        def pending_label(turn: turnstate.TurnState | None) -> str | None:
+            if turn is not None and turn.pending is not None:
+                return turn.pending
+            tasks = last_stop.background_tasks if last_stop is not None else None
+            return tasks[0] if tasks else None
+
+        def turn_error(turn: turnstate.TurnState | None) -> tuple[str, str, str | None] | None:
+            """(class, evidence, pool return) of the API error the turn ended on:
+            the transcript's word when it is readable, else the StopFailure's."""
+            if turn is not None:
+                if turn.error_class is None:
+                    return None
+                evidence = turn.error_text or turn.error_code or "API error"
+                return turn.error_class, evidence, turn.pool_return
+            if stop_failure is None:
+                return None
+            text = (
+                stop_failure.error_details
+                or stop_failure.last_assistant_message
+                or stop_failure.error
+            )
+            kind = turnstate.classify_error(stop_failure.error, text)
+            if kind is None:
+                return None
+            returns = turnstate.pool_return_of(text) if kind == "pool" else None
+            return kind, text or kind, returns
+
+        def fault_exit(kind: str, evidence: str, returns: str | None) -> SessionResult:
+            """The stall exit of a turn-error session: stalled (crashed if the
+            window died), carrying the error class for an uncharged pause."""
+            ended = stall_exit(None, None)
+            if ended.status == "crashed":
+                return ended
+            return dataclasses.replace(
+                ended, transport_fault=kind, transport_evidence=evidence, pool_return=returns
+            )
+
         while True:
             # Top-of-tick pane-frame sample for the no-work verdict (#727). Before
             # the timeout check so growth on the final tick still counts; before the
@@ -1782,6 +2003,32 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # has named the transcript.
                 if transcript_path:
                     sample_transcript(transcript_path, now)
+                if (
+                    classify
+                    and stall_deadline is not None
+                    and turn_readable
+                    and transcript_path
+                    and idle.last_key is not None
+                    and idle.last_key != turn_scan_key
+                ):
+                    # F3/F5 (open-runtime fork): a turn that ended on an API error
+                    # fires no Stop (Codex never runs Stop hooks on an error path;
+                    # Claude fires StopFailure, which a profile may not register).
+                    # Read the transcript when it moved; an error turn is decided
+                    # after a short backoff instead of a full stall grace.
+                    turn_scan_key = idle.last_key
+                    turn = read_turn()
+                    if turn is not None and turn.turn_ended and turn.error_class is not None:
+                        signature = f"{turn.error_class}:{turn.error_text}:{idle.last_key}"
+                        if signature != turn_error_seen:
+                            turn_error_seen = signature
+                            self._note_turn_error(
+                                handle, turn.error_class, turn.error_text, source="transcript"
+                            )
+                            backoff = (
+                                TURN_ERROR_BACKOFF_S if turn.error_class == "transport" else 0.0
+                            )
+                            turn_error_due = time.monotonic() + backoff
                 if notice.open and idle.last_key is not None:
                     # The live parked notice (#855) closes on this sample, not
                     # on pane growth: the auto-deny countdown repaints the pane
@@ -2149,7 +2396,15 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     # working, not stalled. Re-arm on any pane growth so only
                     # genuine silence for the full grace trips the stall below.
                     key = self._log_activity_key(handle.task_id)
-                    if key is not None and key != last_activity:
+                    if turn_error_due is not None and time.monotonic() >= turn_error_due:
+                        # F3/F5 (open-runtime fork): the turn ended on an API error
+                        # and its backoff is over; decide now, whatever the pane
+                        # repainted since.
+                        turn_error_due = None
+                        forced_by_turn_error = True
+                        last_activity = key
+                        stall_deadline = time.monotonic()
+                    elif key is not None and key != last_activity:
                         last_activity = key
                         stall_deadline = time.monotonic() + self._stall_grace_s
                         continue
@@ -2186,7 +2441,11 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     # neither does one on a working session (`still_working`:
                     # a silent foreground tool past the grace, say), which
                     # stalls as before #610 rather than pausing uncharged.
-                    parked_now = parked_evidence
+                    # open-runtime fork (F3, F4): an idle-prompt latch only says the
+                    # turn ended. Under the smart check or turn-error classification
+                    # it is judged below, after the human-prompt and usage looks.
+                    idle_latch = parked_kind == "IdlePrompt" and (smart or classify)
+                    parked_now = None if idle_latch else parked_evidence
                     parked_hit, usage_hit = self._pane_evidence(
                         handle,
                         self._parked_prompt_patterns if parked_now is None else (),
@@ -2202,6 +2461,63 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         resets_now = reset.value if reset is not None else None
                     if parked_now is None:
                         parked_now = usage_now
+                    nudge_text = STALL_NUDGE_TEXT
+                    nudge_kind = "stall"
+                    forced, forced_by_turn_error = forced_by_turn_error, False
+                    if parked_now is None and (smart or classify):
+                        turn = read_turn()
+                        error = turn_error(turn) if classify else None
+                        if error is None and forced:
+                            # The turn error that opened the gate early is gone
+                            # (the session went on by itself): wait out a grace.
+                            stall_deadline = time.monotonic() + self._stall_grace_s
+                            last_activity = self._log_activity_key(handle.task_id)
+                            continue
+                        if error is not None:
+                            error_kind, evidence, returns = error
+                            if (
+                                error_kind == "transport"
+                                and transport_nudges_left > 0
+                                and nudge_due
+                            ):
+                                transport_nudges_left -= 1
+                                nudge_text = TRANSPORT_NUDGE_TEXT.format(error=_excerpt(evidence))
+                                nudge_kind = "transport"
+                            else:
+                                self._note_lifecycle(
+                                    handle.task_id,
+                                    "turn-error-ended",
+                                    turn_error=error_kind,
+                                    evidence=evidence,
+                                    nudge_due=nudge_due,
+                                )
+                                return fault_exit(error_kind, evidence, returns)
+                        elif idle_latch and not smart:
+                            # classification alone: an idle latch with no error
+                            # turn parks as upstream does.
+                            parked_now = parked_evidence
+                        elif smart:
+                            question = question_of(turn)
+                            if question is not None:
+                                parked_now = (
+                                    f"{parked_evidence}; asked: {question}"
+                                    if idle_latch
+                                    else f"question: {question}"
+                                )
+                            else:
+                                if idle_latch:
+                                    self._note_lifecycle(
+                                        handle.task_id,
+                                        "idle-prompt-not-parked",
+                                        evidence=parked_evidence,
+                                    )
+                                pending = pending_label(turn)
+                                if pending is not None:
+                                    nudge_text = PENDING_NUDGE_TEXT.format(pending=pending)
+                                    nudge_kind = "pending"
+                                else:
+                                    nudge_text = CONTINUE_NUDGE_TEXT
+                                    nudge_kind = "continue"
                     if parked_now is not None:
                         self._note_lifecycle(
                             handle.task_id,
@@ -2217,8 +2533,12 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         # nudge's own echoed keystrokes can't be mistaken for the
                         # agent waking; an unresponsive session keeps draining it.
                         stall_nudges_left -= 1
+                        turn_error_due = None
+                        if nudge_kind != "stall":
+                            # open-runtime fork: which in-place nudge went out.
+                            self._note_lifecycle(handle.task_id, "nudge-sent", kind=nudge_kind)
                         try:
-                            self.send_text(handle, STALL_NUDGE_TEXT)
+                            self.send_text(handle, nudge_text)
                         except MultiplexerError as e:
                             # A dead/hung window cannot take the nudge. The
                             # bounded attempt is still spent (the cap counts
@@ -2343,9 +2663,33 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 sample_transcript(hook_path, time.monotonic())
             transcript_path = hook_path or transcript_path
             try_resolve()
+            if event.hcom_name:
+                # F7 (open-runtime fork): the hcom instance this session runs as.
+                self._hcom_identity[handle.task_id] = (event.hcom_name, event.hcom_dir)
 
             if event.event == "SessionStart":
                 saw_session_start = True
+                if not session_bound and session_id:
+                    # F6 (open-runtime fork): the CLI session id, durable in the
+                    # journal from the session's first admitted start.
+                    session_bound = True
+                    self._note_session_bound(handle, session_id, event.source)
+                continue
+            if event.event == TURN_FAILURE_EVENT:
+                # F3 (open-runtime fork): Claude's turn-end hook for a turn that
+                # ended on an API error. Inert unless classification is on.
+                if not classify:
+                    continue
+                last_stop = event
+                stop_failure = event
+                error = turn_error(None)
+                if error is not None:
+                    self._note_turn_error(handle, error[0], error[1], source="hook")
+                    backoff = TURN_ERROR_BACKOFF_S if error[0] == "transport" else 0.0
+                    turn_error_due = time.monotonic() + backoff
+                if stall_deadline is None and self._stall_grace_s > 0:
+                    stall_deadline = time.monotonic() + self._stall_grace_s
+                    last_activity = self._log_activity_key(handle.task_id)
                 continue
             if event.event == "Notification" or event.event in PARKED_EVENTS:
                 # Parked-session signal (DW-348): latch it, never act on it here.
@@ -2379,6 +2723,10 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         self._end_quota_wait(handle, quota, "latch")
                 continue
             if event.event == "Stop":
+                # open-runtime fork: the turn's own words, for the smart check.
+                last_stop = event
+                stop_failure = None
+                turn_error_due = None
                 # A completed turn proves any prompt the CLI was parked on got
                 # answered: drop the parked latch before anything else (DW-348).
                 parked_evidence = None
@@ -2454,6 +2802,21 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # only a genuinely idle gap (handled in the no-event branch above)
                 # is a stall. Bounded overall by spec.timeout_s.
                 stall_deadline = time.monotonic() + self._stall_grace_s
+                if smart and recovery.turn_end_nudge_s > 0 and not event.background_tasks:
+                    # F4 (open-runtime fork): a turn that ended on a status report,
+                    # with nothing left running, is nudged after a short wait
+                    # instead of the full grace. A question or pending work keeps
+                    # the full grace (the gate parks or names the work then).
+                    turn = read_turn()
+                    message = event.last_assistant_message or (
+                        turn.last_message if turn is not None else None
+                    )
+                    if not turnstate.asks_question(message) and (
+                        turn is None or (turn.pending is None and not turn.asks_question)
+                    ):
+                        stall_deadline = time.monotonic() + min(
+                            float(recovery.turn_end_nudge_s), self._stall_grace_s
+                        )
                 last_activity = self._log_activity_key(handle.task_id)
                 # a real turn-end proves the session is responsive: restore the
                 # wake-nudge budget so a slow-but-cooperative session can keep
@@ -3175,7 +3538,71 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         )
 
     def send_text(self, handle: SessionHandle, text: str) -> None:
+        """Deliver ``text`` into the session: every nudge goes through here.
+        With ``[recovery] nudge_via = "hcom"`` (open-runtime fork, F7) it first
+        tries an hcom request into the same session (the instance its relay
+        reported, when hcom shows it listening) and falls back to tmux keystrokes
+        on any miss; upstream, and by default, it types into the pane."""
+        if self.policy.recovery.nudge_via == "hcom" and self._send_via_hcom(handle, text):
+            return
         self.mux.send_text(handle.pane_target or handle.native_id, text)
+
+    def _send_via_hcom(self, handle: SessionHandle, text: str) -> bool:
+        identity = self._hcom_identity.get(handle.task_id)
+        if identity is None:
+            self._note_lifecycle(handle.task_id, "nudge-hcom-fallback", reason="no-identity")
+            return False
+        name, room = identity
+        outcome = send_nudge(name, room, text, thread=f"bmad-loop-{self.run_dir.name}")
+        if not outcome.sent:
+            self._note_lifecycle(
+                handle.task_id, "nudge-hcom-fallback", reason=outcome.reason, hcom_name=name
+            )
+            return False
+        self._note_lifecycle(handle.task_id, "nudge-via-hcom", hcom_name=name)
+        return True
+
+    def _note_turn_error(
+        self, handle: SessionHandle, kind: str, evidence: str | None, *, source: str
+    ) -> None:
+        """open-runtime fork (F3, F5): one crumb and one ``turn-error`` journal row
+        per API error a turn ended on (``kind`` its class, ``source`` the
+        transcript or the StopFailure hook). Observation; the stall gate decides."""
+        self._note_lifecycle(
+            handle.task_id, "turn-error", turn_error=kind, evidence=evidence, source=source
+        )
+        if self.journal is None:
+            return
+        try:
+            self.journal.append(
+                "turn-error",
+                task_id=handle.task_id,
+                turn_error=kind,
+                source=source,
+                detail=_excerpt(evidence),
+            )
+        except OSError:
+            pass
+
+    def _note_session_bound(
+        self, handle: SessionHandle, session_id: str, source: str | None
+    ) -> None:
+        """open-runtime fork (F6): journal ``session-bound`` with the CLI session
+        id at the session's first admitted SessionStart, so the id is on record
+        even when the engine dies before ``SessionRecord`` is written."""
+        resumed = self._resumed_ids.get(handle.task_id)
+        if self.journal is None:
+            return
+        try:
+            self.journal.append(
+                "session-bound",
+                task_id=handle.task_id,
+                session_id=session_id,
+                source=source or "",
+                **({"resumed_from": resumed} if resumed else {}),
+            )
+        except OSError:
+            pass
 
     def kill(self, handle: SessionHandle) -> None:
         grace = float(self.policy.limits.teardown_grace_s)
@@ -3347,6 +3774,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             usage = tally_usage(self.profile.usage_parser, Path(transcript_path))
         except (OSError, ValueError) as e:
             return None, f"{type(e).__name__}: {e}"
+        usage = self._rebased(transcript_path, usage)
         if usage is None:
             return None, None
         return usage.weighted_total(spec.cache_read_weight), None
@@ -3363,7 +3791,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         while True:
             usage = tally_usage(self.profile.usage_parser, path)
             if usage is not None or time.monotonic() >= deadline:
-                return usage
+                return self._rebased(result.transcript_path, usage)
             time.sleep(RESULT_POLL_S)
 
 

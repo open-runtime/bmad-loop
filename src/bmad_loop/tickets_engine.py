@@ -2208,6 +2208,15 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
     def _owned_plan_writer(self) -> OwnedPlanWriter | None:
         return _TicketPlanWriter(self)
 
+    def _plan_for_restamp(self, task: StoryTask) -> Path | None:
+        """F2 (open-runtime fork): a bound ticket's plan is the file whose
+        ``baseline_revision`` the dev gate judges; an unbound task keeps the
+        base's recorded spec."""
+        plan = self._bound_plan(task)
+        if plan is not None:
+            return plan
+        return super()._plan_for_restamp(task)
+
     def _route_plan(self, task: StoryTask, target: str) -> None:
         """Re-route a rolled-back plan to ``target`` through ``mark``: reason
         ``rollback`` to ``ready-for-dev``, ``rearm`` to a re-drive's

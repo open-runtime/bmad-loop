@@ -76,6 +76,64 @@ def _source(payload):
     return value if isinstance(value, str) else None
 
 
+# open-runtime fork (F3, F4, F7): what a Stop / StopFailure payload says about how
+# the turn ended, forwarded so the orchestrator can tell a status report from a
+# question or a pending task without parsing the transcript first. Only keys the
+# payload carries are written, so an event without them is unchanged. The last
+# assistant message keeps its TAIL (a question sits at the end); background tasks
+# are reduced to short labels of the in-flight ones.
+_TURN_MESSAGE_MAX = 4000
+_TURN_TASKS_MAX = 5
+_TURN_LABEL_MAX = 120
+_TURN_DONE_STATUSES = ("completed", "failed", "killed", "cancelled", "stopped")
+
+
+def _turn_fields(payload):
+    fields = {}
+    message = payload.get("last_assistant_message")
+    if isinstance(message, str) and message:
+        fields["last_assistant_message"] = message[-_TURN_MESSAGE_MAX:]
+    tasks = payload.get("background_tasks")
+    if isinstance(tasks, list):
+        labels = []
+        for task in tasks:
+            if not isinstance(task, dict) or task.get("status") in _TURN_DONE_STATUSES:
+                continue
+            label = (
+                task.get("description")
+                or task.get("command")
+                or task.get("agent_type")
+                or task.get("type")
+            )
+            if isinstance(label, str) and label:
+                labels.append(label[:_TURN_LABEL_MAX])
+            if len(labels) >= _TURN_TASKS_MAX:
+                break
+        fields["background_tasks"] = labels
+    error = payload.get("error")
+    if isinstance(error, str) and error:
+        fields["error"] = error
+    details = payload.get("error_details")
+    if isinstance(details, str) and details:
+        fields["error_details"] = details[:_TURN_MESSAGE_MAX]
+    return fields
+
+
+def _hcom_fields(environ):
+    # open-runtime fork (F7): the hcom instance this CLI runs as, when hcom
+    # launched it (the relay is a hook child of the CLI, so it inherits the
+    # launch's environment). The orchestrator can then deliver a nudge as an hcom
+    # message into the same session. Nothing is written outside an hcom launch.
+    name = environ.get("HCOM_INSTANCE_NAME")
+    if not isinstance(name, str) or not name:
+        return {}
+    fields = {"hcom_name": name}
+    room = environ.get("HCOM_DIR")
+    if isinstance(room, str) and room:
+        fields["hcom_dir"] = room
+    return fields
+
+
 # How long after the launched CLI the rest of its launch chain may start
 # (DW-507): a forking default-shell starts the CLI and a node shim starts the
 # real binary at once. Limitation: anything the CLI itself starts at launch (an
@@ -369,6 +427,7 @@ def shape_event(
     payload: dict[str, Any],
     lineage: str | None = None,
     payload_error: str | None = None,
+    environ: Any = None,
 ) -> dict[str, Any]:
     """The event record the orchestrator consumes, built from one hook payload.
 
@@ -407,6 +466,10 @@ def shape_event(
     }
     if payload_error:
         event["payload_error"] = payload_error
+    # open-runtime fork: present-only turn and hcom fields (see `_turn_fields`).
+    event.update(_turn_fields(payload))
+    if environ is not None:
+        event.update(_hcom_fields(environ))
     return event
 
 
@@ -467,6 +530,7 @@ def relay(event_name: str, stdin: IO[str]) -> int:
         payload,
         _lineage(event_name, ("bmad-loop", "relay")),
         payload_error,
+        os.environ,
     )
     # $BMAD_LOOP_EVENTS_DIR when the orchestrator names one (#494 moved the
     # channel out of the project tree), else the legacy in-tree location — the

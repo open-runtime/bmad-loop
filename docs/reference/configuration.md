@@ -267,6 +267,22 @@ Stories that owe external, human-only actions.
 | `enabled` | boolean | `true` |  | let a session finish + commit a story whose acceptance criteria need a human action (buy a domain, publish a DNS record) and park it as awaiting-operator instead of forcing done or blocked · what is owed is recorded in the story spec's operator_actions: frontmatter, and `bmad-loop confirm <story-key>` completes the story once you have done it |
 | `on_review_demotion` | string | `"escalate"` | `escalate` / `park` | escalate: a review pass is never offered the park, and one that finalizes a done story at awaiting-operator is not accepted (default) · park: the review may demote it — the board moves done -&gt; awaiting-operator, the story commits and parks · sprint mode with parks enabled only |
 
+### `[recovery]`
+
+Loop recovery (open-runtime fork): replayed stories' post_story, plan baseline re-stamps, in-place nudges, turn-error pauses, session resume, policy reload.
+
+| Key | Type | Default | Allowed | Description |
+| --- | --- | --- | --- | --- |
+| `post_story_on_resume` | boolean | `true` |  | ON: a story a resume finishes on a replay arm (recorded session, commit window, spec approval, reverify) fires post_story once, like any finished story · OFF: upstream (only the restart arm fires it) |
+| `restamp_plan_baseline` | boolean | `true` |  | ON: resume --accept-baseline and a pre_dev_phase merge re-stamp the plan's baseline_revision to the new recorded baseline, so attempt 2 passes the baseline gate · OFF: upstream (the plan keeps its stale claim) |
+| `stall_check` | string | `"classic"` | `classic` / `smart` | classic: upstream stall gate (an idle-prompt latch parks the session) · smart: park only when the last message asks a human a question or a permission/quota prompt is up; otherwise nudge in place, naming a pending command or sub-agent · bounded by limits.dev_stall_nudges_cap |
+| `turn_end_nudge_s` | integer | `0` | ≥ 0 | smart only: seconds after a result-less turn that ended on a status report before the in-place nudge · 0 = wait the full limits.dev_stall_grace_s |
+| `classify_turn_errors` | boolean | `false` |  | ON: a turn that ended on an API error is read from the transcript and the StopFailure hook — transport drops are nudged, then pause uncharged as transport fault; a pool 429 pauses uncharged as pool unavailable; a config/auth error pauses uncharged as an environment fault · OFF: upstream |
+| `transport_nudges` | integer | `1` | ≥ 0 | in-place continue nudges after a transport error before the session pauses as a transport fault · counted against limits.dev_stall_nudges_cap |
+| `nudge_via` | string | `"tmux"` | `hcom` / `tmux` | tmux: type nudges into the pane (upstream) · hcom: send them as an hcom request into the session when its relay reported an hcom name and hcom shows it listening, else tmux |
+| `max_session_resumes` | integer | `0` | ≥ 0 | consecutive dev/review retries that resume the previous CLI conversation (claude --resume, codex resume) after a stall, timeout, crash or transport fault · needs a profile with resume_flag or resume_subcommand · a failed verify or review starts fresh · 0 = off |
+| `reload_policy` | string | `"off"` | `off` / `story-boundary` | story-boundary: re-read policy.toml and profiles between stories and apply changes whose launch surface is unchanged (others wait for a resume) · off: read at run and resume only |
+
 ### `[mux]`
 
 Terminal-multiplexer backend (machine-specific — policy.toml is gitignored).

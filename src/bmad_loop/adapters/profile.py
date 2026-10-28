@@ -77,9 +77,19 @@ HOOK_DIALECTS = {
 # event straight to one, or through the `Notification` carrier plus
 # `hooks.notification_types` (native subtype -> parked kind).
 PARKED_EVENTS = frozenset({"PermissionPrompt", "IdlePrompt", "QuotaPrompt"})
-CANONICAL_EVENTS = {"SessionStart", "Stop", "SessionEnd", "PreCompact", "Notification"} | set(
-    PARKED_EVENTS
-)
+# `StopFailure` (open-runtime fork, F3): Claude Code's turn-end hook for a turn
+# that ended on an API error (its payload carries `error`, `error_details` and the
+# rendered `last_assistant_message`). It never completes a session; the wait loop
+# records it and, with `[recovery] classify_turn_errors`, classifies the error.
+TURN_FAILURE_EVENT = "StopFailure"
+CANONICAL_EVENTS = {
+    "SessionStart",
+    "Stop",
+    "SessionEnd",
+    "PreCompact",
+    "Notification",
+    TURN_FAILURE_EVENT,
+} | set(PARKED_EVENTS)
 USER_PROFILES_REL = Path(".bmad-loop") / "profiles"
 
 # Legacy adapter names from older policy.toml files, plus friendly short names.
@@ -344,6 +354,24 @@ class CLIProfile:
     # a mode absent here is refused for this CLI. APPENDED after parked_answers
     # for the same positional-compatibility reason.
     permission_modes: dict[str, PermissionModeSpec] = field(default_factory=dict)
+    # open-runtime fork (F6): how this CLI resumes an earlier conversation by its
+    # session id, for `[recovery] max_session_resumes`. Either a flag that takes
+    # the id (claude: "--resume"), placed where a fresh launch puts the prompt's
+    # first token, or a subcommand placed right after the binary that takes the id
+    # positionally before the prompt (codex: ["resume"]). Both empty = this CLI
+    # never resumes (every retry is a fresh session). Argv tokens, so both are in
+    # runsetup.config_digest's launch surface. APPENDED with defaults.
+    resume_flag: str = ""
+    resume_subcommand: tuple[str, ...] = ()
+    # The continuation prompt's rendering on a resume ({prompt} = the engine's
+    # plain-text continuation). Not `prompt_template`: a resume must not re-invoke
+    # the skill, which would restart its steps.
+    resume_prompt_template: str = "{prompt}"
+
+    @property
+    def resumable(self) -> bool:
+        """Whether this profile can launch a resume of an earlier session."""
+        return bool(self.resume_flag or self.resume_subcommand)
 
     @property
     def hookless(self) -> bool:
@@ -371,6 +399,12 @@ class CLIProfile:
             head, _, rest = prompt[1:].partition(" ")
             skill, args = head, rest.strip()
         return self.prompt_template.format(prompt=prompt, skill=skill, args=args)
+
+    def render_resume_prompt(self, prompt: str) -> str:
+        """The continuation prompt of a resumed session (F6), through
+        ``resume_prompt_template``. A plain substitution: the prompt is prose,
+        and a skill command would restart the workflow the session is resuming."""
+        return self.resume_prompt_template.replace("{prompt}", prompt)
 
     def for_permission_mode(self, mode: str, platform: str = sys.platform) -> CLIProfile:
         """This profile with ``bypass_args`` set to ``mode``'s launch args.
@@ -575,6 +609,38 @@ def _validate_profile(profile: CLIProfile, source: str) -> None:
                 'hookless profiles (dialect = "none") must not set session_id_flag: '
                 "it pins hook-event attribution, and a hookless profile has no hook events"
             )
+
+    # open-runtime fork (F6): the resume launch surface. One flag token (like
+    # session_id_flag) or a list of subcommand words, never both; a hookless
+    # profile has no hook events to attribute a resumed session by.
+    resume_flag = profile.resume_flag
+    if resume_flag and (
+        not resume_flag.startswith("-")
+        or resume_flag.strip("-") == ""
+        or "=" in resume_flag
+        or any(c.isspace() for c in resume_flag)
+    ):
+        raise fail(
+            "resume_flag must be one option token starting with '-', with no whitespace "
+            f"and no '=' (the session id is the next argument, e.g. \"--resume\"): got {resume_flag!r}"
+        )
+    for word in profile.resume_subcommand:
+        if not word or word.startswith("-") or any(c.isspace() for c in word):
+            raise fail(
+                "resume_subcommand must list plain words (no options, no whitespace), "
+                f'e.g. ["resume"]: got {list(profile.resume_subcommand)!r}'
+            )
+    if resume_flag and profile.resume_subcommand:
+        raise fail("set resume_flag or resume_subcommand, not both")
+    if profile.resumable and profile.hookless:
+        raise fail(
+            'hookless profiles (dialect = "none") must not set resume_flag/resume_subcommand'
+        )
+    if "{prompt}" not in profile.resume_prompt_template:
+        raise fail(
+            "resume_prompt_template must contain {prompt}: got "
+            f"{profile.resume_prompt_template!r}"
+        )
 
     # Only an explicit non-empty template is checked: None derives from a known
     # usage_parser, "" is off. "{stem}" is required — a tree shared by sibling
@@ -880,6 +946,17 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
 
     # None (absent) is meaningful — it derives the default from usage_parser — so
     # it is kept, and anything present must already be a string.
+    # open-runtime fork (F6): argv tokens, so a TOML array or number must not be
+    # `str()`-coerced into a flag (the `adapter` / `session_id_flag` rule).
+    raw_resume_flag = doc.get("resume_flag", "")
+    if not isinstance(raw_resume_flag, str):
+        raise fail(f"resume_flag must be a string: got {type(raw_resume_flag).__name__}")
+    raw_resume_template = doc.get("resume_prompt_template", "{prompt}")
+    if not isinstance(raw_resume_template, str):
+        raise fail(
+            f"resume_prompt_template must be a string: got {type(raw_resume_template).__name__}"
+        )
+
     raw_subagent_dir = doc.get("subagent_transcript_dir")
     if raw_subagent_dir is not None and not isinstance(raw_subagent_dir, str):
         raise fail(
@@ -923,6 +1000,9 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
         subagent_transcript_dir=raw_subagent_dir,
         parked_answers=parked_answers,
         permission_modes=permission_modes,
+        resume_flag=raw_resume_flag,
+        resume_subcommand=str_list("resume_subcommand"),
+        resume_prompt_template=raw_resume_template,
     )
     _validate_profile(profile, source)
     return profile

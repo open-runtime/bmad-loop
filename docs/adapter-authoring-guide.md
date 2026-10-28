@@ -337,6 +337,16 @@ a new `name` extends the set. The aliases `claude-code-tmux` and `opencode` reso
 on hookless profiles. Set it only when the CLI's `SessionStart` payload reports the id you
 passed.
 
+Three more keys say how a CLI resumes an earlier conversation, for `[recovery]
+max_session_resumes` ([Loop recovery guide](loop-recovery-guide.md#session-resume)). Set one
+of `resume_flag` (one `-`-prefixed token that takes the session id as its value, claude:
+`--resume`) or `resume_subcommand` (plain words placed right after the binary that take the
+id positionally, codex: `["resume"]`); `resume_prompt_template` (default `{prompt}`, must
+contain `{prompt}`) renders the engine's plain-text continuation. All three are refused on
+hookless profiles and are part of the launch digest. `[hooks] events` may also map
+Claude Code's `StopFailure` to the canonical `StopFailure` event, which the loop reads only
+with `[recovery] classify_turn_errors`.
+
 An overlay that changes `usage_parser` away from `claude-jsonl` must set
 `subagent_transcript_dir` itself; it is refused on hookless profiles.
 

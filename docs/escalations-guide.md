@@ -262,6 +262,20 @@ To recover:
 
 A session-window limit the CLI waits out by itself does not pause at all at first. While the pane shows that wait and the transcript is idle, the session timeout stands still and no stall nudge is sent, so the session finishes after the CLI continues. `[limits] quota_wait_max_min` (default 300, one five-hour window; 0 = off) caps the minutes one session may spend waiting. Past the cap, or when the parsed reset already lies beyond what is left of it, the session pauses with the reason above. A heartbeat shows the wait as `quota_waiting` / `quota_wait_s` / `quota_resets_at`, and the TUI header as `quota wait`.
 
+### Turn-error pauses
+
+With `[recovery] classify_turn_errors` ([Loop recovery guide](loop-recovery-guide.md#turn-errors)), a session whose last turn ended on an API error, and that in-place nudges did not recover, pauses uncharged with a reason that names the class:
+
+```text
+transport fault: dev session stalled (API Error: Connection lost mid-response.; the API connection failed and in-place nudges did not recover it; the attempt is not charged; bmad-loop resolve <run> re-arms it)
+pool unavailable: dev session stalled (API Error: Request rejected (429) · Local TeamRouter pool unavailable for <model> ...; return <ISO>; the model's account pool refused the request; wait for the return or switch model, then bmad-loop resolve <run>)
+environment fault: dev session stalled (failed to load workspace requirements; the CLI could not load its configuration or credentials and a nudge cannot fix that; fix the environment, then bmad-loop resolve <run>)
+```
+
+Notifications title them `Paused (transport fault)`, `Paused (pool unavailable)` and `Paused (environment fault)`, never CRITICAL. To recover, clear the cause (wait for the pool's return or switch model; fix the CLI's config), then `bmad-loop resolve <run-id> --no-interactive`, as for a usage-limit pause.
+
+With `[recovery] stall_check = "smart"`, a session parked on a question it asked shows the question in its evidence: `parked: dev session stalled (Notification(idle_prompt) -> IdlePrompt; asked: <question>; ...)`, or `(question: <question>; ...)` for a CLI without an idle notification. Answer it through `bmad-loop resolve`.
+
 ## Worktree merge-back failures
 
 Under `[scm] isolation = "worktree"`, each story merges back into the target branch in the main checkout. When the merge fails, the unit escalates: its branch `bmad-loop/<run-id>[/<story>]` and worktree are kept, the diff is saved to `.bmad-loop/runs/<run-id>/failed/<unit>/changes.patch`, and the run pauses at `escalation`.

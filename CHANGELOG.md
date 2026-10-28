@@ -9,6 +9,22 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- open-runtime fork: add the `[recovery]` policy table ([Loop recovery guide](docs/loop-recovery-guide.md)).
+  `post_story_on_resume` (default on) fires `post_story` once for a story a resume finishes on a
+  replay arm; `restamp_plan_baseline` (default on) re-stamps the plan's `baseline_revision` after
+  `resume --accept-baseline` and a `pre_dev_phase` merge; `stall_check = "smart"` parks an idle
+  session only when it asked a question and nudges it in place otherwise (`turn_end_nudge_s`);
+  `classify_turn_errors` pauses a turn that ended on an API error uncharged as `transport fault:`,
+  `pool unavailable:` or `environment fault:` (`transport_nudges`); `nudge_via = "hcom"` sends nudges
+  as hcom requests; `max_session_resumes` resumes the previous CLI conversation on a retry after a
+  stall, timeout, crash or turn error (profile keys `resume_flag`, `resume_subcommand`,
+  `resume_prompt_template`); `reload_policy = "story-boundary"` applies a policy edit between
+  stories when its launch digest is unchanged. The hook relays forward `last_assistant_message`,
+  `background_tasks`, `error`, `error_details` and the hcom identity; `StopFailure` is a canonical
+  hook event. New journal kinds: `resume-post-story`, `plan-baseline-restamped`,
+  `plan-baseline-restamp-skipped`, `turn-error`, `session-bound`, `session-resume`,
+  `policy-reloaded`, `policy-reload-deferred`.
+
 - Add `limits.quota_wait_max_min` (default 300; 0 = off): while the visible pane shows
   Claude Code waiting out a usage-window reset and the transcript is idle, freeze the
   session timeout and hold the stall nudge, so the session finishes after the CLI's own

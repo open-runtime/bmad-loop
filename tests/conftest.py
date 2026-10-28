@@ -1140,6 +1140,11 @@ def _isolate_mux_registry(monkeypatch):
     monkeypatch.delenv("TMUX", raising=False)
     monkeypatch.delenv("TMUX_PANE", raising=False)
     monkeypatch.delenv("PSMUX_BARE_ENV", raising=False)
+    # open-runtime fork (F7): a test run inside an hcom-launched agent session
+    # inherits its hcom identity, which the hook relays now forward on every
+    # event; scrub it like the multiplexer's own identity above.
+    monkeypatch.delenv("HCOM_INSTANCE_NAME", raising=False)
+    monkeypatch.delenv("HCOM_DIR", raising=False)
     monkeypatch.setattr(psmux_backend, "_DISPLACED_ROOT", None)
     monkeypatch.setattr(psmux_backend.PsmuxMultiplexer, "_pwsh_path", lambda self: PINNED_PWSH)
     monkeypatch.setattr(psmux_backend.PsmuxMultiplexer, "_psmux_path", lambda self: PINNED_PSMUX)
