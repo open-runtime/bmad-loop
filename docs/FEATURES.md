@@ -515,6 +515,20 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
 - **Tested by:** `tests/test_tui_app.py`, `tests/test_tui_launch.py`, `tests/test_tui_settings.py`, `tests/test_tui_data.py`, `tests/test_parked_answer.py`
 - **Docs:** [TUI guide](tui-guide.md), [Observer/launcher architecture](tui-guide.md#architecture-observerlauncher-never-the-engine), [TUI: tickets mode](tui-guide.md#tickets-mode), [Answering a parked permission prompt](tui-guide.md#answering-a-parked-permission-prompt), [CLI: tui](reference/cli.md#tui)
 
+### Factory overview
+
+- **Stability:** experimental
+- **Description:** A read-only TUI screen (`F` in the dashboard, or `bmad-loop tui --factory`) that shows every epic workspace of a factory at once: throughput, capacity and locks, one row per epic, and a merged event feed.
+- **Properties:**
+  - It writes nothing: it reads run files, the scheduler's state, the verify locks and three fixed read-only commands (`tickets.py status`, `teamrouter status --json`, `gh pr list`).
+  - Stories done, cycle time and tokens per hour come from the runs' own journals, read incrementally.
+  - A missing or failing source is shown as absent or as a fault on the sources line, and keeps its last good answer.
+  - Opened over the dashboard it is a modal, so the run-control keys cannot act behind it. Enter opens an epic's own dashboard.
+  - Its config is a separate `factory.toml` with no commands in it. Engines never read it.
+- **Config:** `bmad-loop tui --factory [CONFIG]`, `.bmad-loop/factory.toml`
+- **Tested by:** `tests/test_factory_view.py`, `tests/test_tui_factory.py`, `tests/test_tui_commands.py`
+- **Docs:** [TUI: factory overview](tui-guide.md#factory-overview), [CLI: tui](reference/cli.md#tui)
+
 ### Session and disk cleanup
 
 - **Stability:** stable

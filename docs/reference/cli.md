@@ -425,12 +425,13 @@ JSON: [`clean --json`](#clean---json).
 Opens the interactive dashboard. Needs the `tui` extra (`uv tool install 'bmad-loop[tui]'`); without it, prints an install hint and exits 1. See the [TUI guide](../tui-guide.md).
 
 ```text
-bmad-loop tui [--project PROJECT] [--low-frame-rate]
+bmad-loop tui [--project PROJECT] [--factory [CONFIG]] [--low-frame-rate]
 ```
 
-| Option             | Description                                                                                                                                                              |
-| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `--low-frame-rate` | Cap rendering at 15 fps and turn off animations (for slow or SSH links). `[tui] low_frame_rate` does the same. Existing `TEXTUAL_FPS` / `TEXTUAL_ANIMATIONS` values win. |
+| Option               | Description                                                                                                                                                                                                                                                                                                                                                   |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--factory [CONFIG]` | Open the [factory overview](../tui-guide.md#factory-overview) instead of the dashboard: every epic workspace of a factory at once, read-only. `CONFIG` names a factory config; without it, `<project>/.bmad-loop/factory.toml` is read, else the built-in config. A config that cannot be read or parsed prints `error: …` and exits 1 before the TUI starts. |
+| `--low-frame-rate`   | Cap rendering at 15 fps and turn off animations (for slow or SSH links). `[tui] low_frame_rate` does the same. Existing `TEXTUAL_FPS` / `TEXTUAL_ANIMATIONS` values win.                                                                                                                                                                                      |
 
 ### `relay`
 

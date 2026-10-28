@@ -9,6 +9,10 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- Add the factory overview, a read-only TUI screen for a factory of epic workspaces (`F` in
+  the dashboard, or `bmad-loop tui --factory [CONFIG]`): stories done per hour, cycle time,
+  tokens per hour, verify locks, scheduler roster, TeamRouter capacity and story PRs, one row
+  per epic and a merged event feed. Configured by a `factory.toml`; see the TUI guide.
 - open-runtime fork: add the `[recovery]` policy table ([Loop recovery guide](docs/loop-recovery-guide.md)).
   `post_story_on_resume` (default on) fires `post_story` once for a story a resume finishes on a
   replay arm; `restamp_plan_baseline` (default on) re-stamps the plan's `baseline_revision` after
@@ -27,7 +31,6 @@ breaking changes may land in a minor release.
 - open-runtime fork: `[tickets] hitl = "defer"` dispatches the later ready tickets of an epic before
   halting on its first hitl ticket (default `"halt"`, upstream), and `[limits] harvest_summary_chars` /
   `harvest_evidence_chars` set the deferred-finding caps the ledger keeps (defaults 200 / 1000, upstream).
-
 - Add `limits.quota_wait_max_min` (default 300; 0 = off): while the visible pane shows
   Claude Code waiting out a usage-window reset and the transcript is idle, freeze the
   session timeout and hold the stall nudge, so the session finishes after the CLI's own
