@@ -117,7 +117,7 @@ Records, with resumes on: `session-bound` (the CLI session id at the first Sessi
 With `reload_policy = "story-boundary"`, the engine re-reads `policy.toml` and the profiles at the top of the story loop, where no session is live:
 
 - a change limited to keys that do not reach the launch surface (limits, gates, review, model and effort, recovery, notify) is applied: the engine, its flows and its adapters take the new policy, `state.policy_snapshot` is re-stamped, and `policy-reloaded` lists the changed keys;
-- a change to the launch surface (verify commands, the plugin allowlist, any role's binary, flags or environment: the run's trusted `config_digest`) or to a section that shapes the run (`[scm]`, `[plugins]`, `[mux]`, `[dev]`, `[tui]`) is journaled `policy-reload-deferred` with the reason and keys, once per distinct change, and waits for `bmad-loop resume`, which re-blesses it;
+- a change to the launch surface (verify commands, the plugin allowlist, any role's binary, flags or environment: the run's trusted `config_digest`) or to a section that shapes the run (`[scm]`, `[plugins]`, `[mux]`, `[dev]`, `[tui]`, `[stories]`) is journaled `policy-reload-deferred` with the reason and keys, once per distinct change, and waits for `bmad-loop resume`, which re-blesses it;
 - an unreadable or invalid file is deferred the same way, and the run keeps its policy.
 
 ## Two audit fixes outside the table

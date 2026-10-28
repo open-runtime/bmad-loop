@@ -129,3 +129,15 @@ def test_an_invalid_policy_file_is_deferred_once(project):
     assert summary.done == 2
     rows = _rows(engine, "policy-reload-deferred")
     assert len(rows) == 1 and rows[0]["reason"].startswith("unreadable: PolicyError")
+
+
+def test_a_story_source_change_waits_for_a_resume(project):
+    """`[stories]` is frozen with the run state that froze the source at launch."""
+    path, policy = _setup(project)
+    engine, _adapter, _summary = _run(
+        project, path, policy, '\n[stories]\nsource = "stories"\nspec_folder = "epic-1"\n'
+    )
+
+    (row,) = _rows(engine, "policy-reload-deferred")
+    assert row["reason"] == "frozen-section"
+    assert row["keys"] == ["stories.source", "stories.spec_folder"]

@@ -1706,9 +1706,10 @@ class Engine:
 
     # F8 (open-runtime fork): policy sections a story-boundary reload never
     # applies mid-run — they shape the run itself (worktree isolation and merge,
-    # the plugin set and its grants, the multiplexer, the dev skill seam, the TUI)
-    # — so a change there waits for a resume, like a launch-surface change.
-    _RELOAD_FROZEN_SECTIONS = frozenset({"scm", "plugins", "mux", "dev", "tui"})
+    # the plugin set and its grants, the multiplexer, the dev skill seam, the TUI,
+    # the story source the run state froze at launch) — so a change there waits for
+    # a resume, like a launch-surface change.
+    _RELOAD_FROZEN_SECTIONS = frozenset({"scm", "plugins", "mux", "dev", "tui", "stories"})
 
     def _maybe_reload_policy(self) -> None:
         """F8 (open-runtime fork, ``[recovery] reload_policy = "story-boundary"``):
