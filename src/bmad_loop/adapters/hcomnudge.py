@@ -63,9 +63,7 @@ def hcom_env(room: str | None, base: Mapping[str, str] | None = None) -> dict[st
     return env
 
 
-def _run(
-    runner: Callable[..., Any], argv: list[str], env: dict[str, str]
-) -> tuple[int, str, str]:
+def _run(runner: Callable[..., Any], argv: list[str], env: dict[str, str]) -> tuple[int, str, str]:
     proc = runner(
         argv,
         env=env,
