@@ -73,6 +73,24 @@ async def test_factory_app_shows_every_epic_and_the_throughput(tmp_path: Path):
         await until(pilot, lambda: not app.is_running, what="q quits")
 
 
+@pytest.mark.parametrize("size", [(80, 24), (120, 30)])
+async def test_a_small_terminal_still_draws_every_part(tmp_path: Path, size):
+    f = build_factory(tmp_path, time.time())
+    app = FactoryApp(f.config)
+    async with app.run_test(size=size) as pilot:
+        await until(pilot, lambda: _filled(app), what="three epic rows")
+        await pilot.pause()
+        screen = app.screen
+        for selector in (
+            "#factory-throughput",
+            "#factory-capacity",
+            "#factory-epics",
+            "#factory-strip",
+        ):
+            assert screen.query_one(selector).region.height > 0, selector
+        assert app._exception is None
+
+
 async def test_enter_opens_the_highlighted_epics_dashboard(tmp_path: Path, monkeypatch):
     f = build_factory(tmp_path, time.time())
     opened: list[Path] = []

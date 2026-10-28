@@ -742,6 +742,30 @@ def test_ticket_progress_is_read_per_epic_and_only_when_the_tree_changes(
     assert [c[0] for c in fake_tree.calls[calls:]] == [factory.alpha]  # only the changed tree
 
 
+def test_tickets_are_read_on_the_first_slow_poll_after_the_first_fast_one(factory, monkeypatch):
+    # TICKETS_EVERY_S keeps its real value here: a slow poll that ran before any
+    # fast poll had no targets, and must not push the first read a whole interval out.
+    monkeypatch.setattr(tickettree, "TicketTree", _FakeTree)
+    _FakeTree.trees = {factory.alpha: [ticket_row("1.1", epic="epic-alpha", status="done")]}
+    _FakeTree.calls, _FakeTree.fail = [], None
+    folder = factory.gamma / "_bmad-output" / "init-a"
+    monkeypatch.setattr(fv, "_initiative_folder", lambda root, initiative: (folder, "init-a"))
+    config = fv.FactoryConfig(**{**factory.config.__dict__, "tickets": True})
+    reader = fv.FactoryReader(config, clock=lambda: NOW)
+    reader.poll_slow()
+    snap = reader.poll()
+    assert snap is not None
+    state = snap.source("tickets")
+    assert state is not None and state.state == "pending"
+    reader.poll_slow()
+    assert {call[0] for call in _FakeTree.calls} == {factory.alpha, factory.beta, factory.gamma}
+    snap = reader.poll()
+    assert snap is not None
+    state = snap.source("tickets")
+    assert state is not None and state.state == "ok"
+    assert by_label(snap)["alpha"].tickets == fv.TicketProgress(1, 1, (("done", 1),), None, NOW)
+
+
 def test_ticket_fault_keeps_the_last_progress(factory, fake_tree):
     fake_tree.trees[factory.alpha] = [ticket_row("1.1", epic="epic-alpha", status="done")]
     config = fv.FactoryConfig(**{**factory.config.__dict__, "tickets": True})
