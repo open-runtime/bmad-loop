@@ -5261,7 +5261,7 @@ class Engine:
         self._save()
         self._finalize_commit_phase(task)
 
-    def _finalization_target_ref(self) -> str:
+    def _finalization_target(self) -> tuple[str, str]:
         """The publication target, using the same resolved settings as its hook.
 
         Local worktree merge-back targets are independent of publication. Prefer
@@ -5282,7 +5282,7 @@ class Engine:
         branch = settings.get(branch_key, "main")
         if not isinstance(remote, str) or not isinstance(branch, str):
             raise verify.GitError("finalization target remote and branch must be strings")
-        return f"refs/remotes/{remote or 'origin'}/{branch or 'main'}"
+        return remote or "origin", f"refs/remotes/{remote or 'origin'}/{branch or 'main'}"
 
     def _finalize_commit_phase(self, task: StoryTask) -> None:
         """Drive an already-COMMITTING task to DONE: regenerate the message,
@@ -5369,7 +5369,17 @@ class Engine:
             if legacy_commit_replay:
                 sha = task.commit_sha
             else:
-                target_ref = self._finalization_target_ref()
+                publication_remote, target_ref = self._finalization_target()
+
+                def record_finalization(plan: verify.FinalizationPlan) -> None:
+                    self.journal.append(
+                        "finalization-strategy",
+                        story_key=task.story_key,
+                        strategy=plan.strategy,
+                        baseline=plan.baseline if plan.squash else None,
+                        commit=plan.baseline,
+                        target_branch=target_ref,
+                    )
 
                 def adopted_baseline(old: str, new: str) -> None:
                     self.journal.append(
@@ -5388,6 +5398,9 @@ class Engine:
                     committed_validator=committed_validator,
                     target_ref=target_ref,
                     on_baseline_adopted=adopted_baseline,
+                    publication_remote=publication_remote,
+                    publication_branch=task.branch,
+                    on_plan=record_finalization,
                 )
             task.commit_sha = sha or task.baseline_commit
             # the corrected spec is now durable in HEAD; later attempts need no

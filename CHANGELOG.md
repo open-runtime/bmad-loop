@@ -7,6 +7,12 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+## [0.13.4] — 2026-11-04
+
+### Fixed
+
+- Preserve published branch ancestry and main-sync merge commits during story finalization.
+
 ## [0.13.3] — 2026-11-04
 
 ### Added
@@ -6769,7 +6775,8 @@ enforced in CI.
   implementation phase, driven by a Python control loop with hook-based session transport and
   resumable on-disk run state.
 
-[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.13.3...HEAD
+[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.13.4...HEAD
+[0.13.4]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.4
 [0.13.3]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.3
 [0.13.2]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.13.2
 [0.13.1]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.13.1

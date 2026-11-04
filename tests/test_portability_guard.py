@@ -1479,6 +1479,9 @@ JOURNAL_KINDS = frozenset(
         # Finalization's publication boundary; SHA/branch fields use existing
         # diagnostic aliases. Native replay coverage: test_fork_finalize_target.
         "baseline-adopted-from-target",
+        # The chosen squash/preserve rule and pinned commit use routed fields;
+        # actual fast-forward publication is covered by test_fork_finalize_published.
+        "finalization-strategy",
         # adapters/generic.py — the only adapter-side writer. The engine hands its
         # `Journal` to every adapter it owns (`CodingCLIAdapter.journal`, #680) so
         # the wait loop can record what only it sees: the live transcript's idle

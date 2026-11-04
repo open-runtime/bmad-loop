@@ -149,19 +149,21 @@ def _synced_target_sidearm(project, private_baseline):
 def test_finalize_preserves_synced_target_sidearm(project, private_baseline):
     """Syncing main into the story must not squash the published merge parent.
 
-    A private story baseline can itself be incomparable with the target tip;
-    its bytes remain in the squash while the target's ancestry stays intact.
+    Preserve the sync merge itself and both parent histories, including a
+    private story baseline incomparable with the target tip.
     """
     repo, baseline, first_published, target = _synced_target_sidearm(project, private_baseline)
+    head = git(repo, "rev-parse", "HEAD")
+    ancestry = git(repo, "rev-list", "HEAD")
     tree = git(repo, "rev-parse", "HEAD^{tree}")
     published_objects = [git(repo, "cat-file", "commit", sha) for sha in (first_published, target)]
 
     result = verify.finalize_commit(repo, baseline, "unpublished story delta")
 
-    assert result == git(repo, "rev-parse", "HEAD")
-    assert git(repo, "rev-parse", "HEAD^") == target
+    assert result == git(repo, "rev-parse", "HEAD") == head
     assert git(repo, "rev-parse", "HEAD^{tree}") == tree
-    assert git(repo, "rev-list", "--count", f"{target}..HEAD") == "1"
+    assert git(repo, "rev-list", "HEAD") == ancestry
+    assert baseline in ancestry.splitlines() and target in ancestry.splitlines()
     assert [
         git(repo, "cat-file", "commit", sha) for sha in (first_published, target)
     ] == published_objects
@@ -169,27 +171,28 @@ def test_finalize_preserves_synced_target_sidearm(project, private_baseline):
     assert set(git(repo, "diff", "--name-only", target, "HEAD").splitlines()) == expected
 
 
-def test_finalize_repeats_after_squashing_private_baseline(project):
-    """A successful squash replaces private ancestry but must remain replayable."""
+def test_finalize_repeats_without_squashing_private_baseline(project):
+    """Repeated finalization preserves both the private baseline and sync merge."""
     repo, baseline, _first_published, target = _synced_target_sidearm(project, True)
+    head = git(repo, "rev-parse", "HEAD")
+    ancestry = git(repo, "rev-list", "HEAD")
     tree = git(repo, "rev-parse", "HEAD^{tree}")
     target_object = git(repo, "cat-file", "commit", target)
     first = verify.finalize_commit(repo, baseline, "finalized private story")
-    assert first == git(repo, "rev-parse", "HEAD")
-    assert baseline not in git(repo, "rev-list", "HEAD").splitlines()
+    assert first == git(repo, "rev-parse", "HEAD") == head
 
     repeated = verify.finalize_commit(repo, baseline, "finalized private story")
 
-    assert repeated == git(repo, "rev-parse", "HEAD")
-    assert git(repo, "rev-parse", "HEAD^") == target
+    assert repeated == git(repo, "rev-parse", "HEAD") == head
     assert git(repo, "rev-parse", "HEAD^{tree}") == tree
-    assert git(repo, "rev-list", "--count", f"{target}..HEAD") == "1"
+    assert git(repo, "rev-list", "HEAD") == ancestry
+    assert baseline in ancestry.splitlines() and target in ancestry.splitlines()
     assert git(repo, "cat-file", "commit", target) == target_object
     assert git(repo, "status", "--porcelain") == ""
 
 
-def test_native_resume_after_private_baseline_squash_crash_finishes_done(project, monkeypatch):
-    """Death after the squash but before DONE cannot strand a COMMITTING task."""
+def test_native_resume_after_private_baseline_commit_crash_finishes_done(project, monkeypatch):
+    """Death after a bookkeeping commit preserves the whole branch on resume."""
     repo = project.project
     git(repo, "checkout", "-q", "-b", "epic")
     _commit(repo, "seed.txt", "private baseline\n")
@@ -202,7 +205,11 @@ def test_native_resume_after_private_baseline_squash_crash_finishes_done(project
     git(repo, "update-ref", "refs/remotes/origin/main", target)
     git(repo, "checkout", "-q", "epic")
     git(repo, "merge", "--no-ff", "-m", "sync main", "main")
-    tree = git(repo, "rev-parse", "HEAD^{tree}")
+    head = git(repo, "rev-parse", "HEAD")
+    ancestry = git(repo, "rev-list", "HEAD").splitlines()
+    (repo / "bookkeeping.txt").write_text("story done\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    tree = git(repo, "write-tree")
     target_object = git(repo, "cat-file", "commit", target)
     finalize = verify.finalize_commit
     landed = []
@@ -221,7 +228,8 @@ def test_native_resume_after_private_baseline_squash_crash_finishes_done(project
     assert crashed.phase == Phase.COMMITTING and crashed.commit_sha is None
     assert crashed.baseline_commit == baseline
     assert landed == [git(repo, "rev-parse", "HEAD")]
-    assert baseline not in git(repo, "rev-list", "HEAD").splitlines()
+    assert git(repo, "rev-parse", "HEAD^") == head
+    assert all(sha in git(repo, "rev-list", "HEAD").splitlines() for sha in ancestry)
     monkeypatch.setattr(verify, "finalize_commit", finalize)
 
     resumed, adapter = resume_engine(project, engine, [])
@@ -230,12 +238,16 @@ def test_native_resume_after_private_baseline_squash_crash_finishes_done(project
     final = load_state(resumed.run_dir).tasks["1-1-a"]
     assert final.phase == Phase.DONE
     assert final.baseline_commit == baseline
-    assert final.commit_sha == git(repo, "rev-parse", "HEAD")
-    assert git(repo, "rev-parse", "HEAD^") == target
+    assert final.commit_sha == git(repo, "rev-parse", "HEAD") == landed[0]
+    assert git(repo, "rev-parse", "HEAD^") == head
     assert git(repo, "rev-parse", "HEAD^{tree}") == tree
-    assert git(repo, "rev-list", "--count", f"{target}..HEAD") == "1"
+    assert all(sha in git(repo, "rev-list", "HEAD").splitlines() for sha in ancestry)
     assert git(repo, "cat-file", "commit", target) == target_object
     assert adapter.sessions == []
+    decisions = [row for row in resumed.journal.entries() if row["kind"] == "finalization-strategy"]
+    assert [row["strategy"] for row in decisions] == ["merge-history", "merge-history"]
+    assert [row["baseline"] for row in decisions] == [None, None]
+    assert [row["commit"] for row in decisions] == [head, landed[0]]
 
 
 def _snapshot(repo):
