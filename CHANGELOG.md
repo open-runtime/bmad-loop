@@ -7,6 +7,12 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+## [0.13.5] — 2026-11-04
+
+### Fixed
+
+- Honor configured commit signing for engine bookkeeping while keeping repository hooks disabled.
+
 ## [0.13.4] — 2026-11-04
 
 ### Fixed
@@ -6775,7 +6781,8 @@ enforced in CI.
   implementation phase, driven by a Python control loop with hook-based session transport and
   resumable on-disk run state.
 
-[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.13.4...HEAD
+[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.13.5...HEAD
+[0.13.5]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.5
 [0.13.4]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.4
 [0.13.3]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.3
 [0.13.2]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.13.2
