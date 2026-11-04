@@ -56,14 +56,30 @@ The recorded attempt baseline and plan baseline remain unchanged for verificatio
 Each adoption journals `baseline-adopted-from-target` with `old_baseline`,
 `baseline` (the effective boundary) and `target_branch` (the remote-tracking ref).
 
+Finalization also protects the unit branch's same-name remote-tracking ref on the
+publication remote. If squashing would drop its published tip, or any merge lies
+above the story baseline, the branch keeps HEAD and commits only outstanding
+changes on top. Earlier stories and main-sync merge commits keep their identities,
+so an ordinary fast-forward push remains possible. A published tip absent from
+HEAD requires synchronization before finalization. A historical baseline removed
+by an earlier squash also preserves HEAD on replay.
+
+Every decision journals `finalization-strategy`: `strategy` names the rule,
+`baseline` names the squash boundary or is null when no reset occurs, and `commit`
+names the pinned parent for any new commit. The rules are `story-baseline`,
+`published-target`, `published-branch`, `merge-history` and `historical-baseline`.
+
 The target comes from the resolved `push-merge` plugin settings (`remote`,
 `target_branch`), then `sync-with-main` (`remote`, `branch`), then `origin/main`.
 Explicit policy settings also apply when the hook is absent. Local worktree
 merge-back targets do not select the publication target. The guard reads the local
-remote-tracking ref; the sync workflow owns refreshing it. A configured remote
+remote-tracking refs; the sync workflow owns refreshing them. A configured remote
 whose target ref is missing must be fetched before retrying. Unreadable or
 ambiguous ancestry refuses finalization before changing Git state. Repositories
-with neither the target ref nor its remote retain offline finalization.
+with neither the target ref nor its remote retain offline finalization, including
+the protection for merge history. A missing same-name branch ref permits its first
+publication. Git's configured upstream does not override the publisher's explicit
+remote and branch destination.
 
 ## The smart stall check
 

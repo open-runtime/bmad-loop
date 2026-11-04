@@ -10715,6 +10715,72 @@ def _finalization_baseline(repo: Path, baseline: str, head: str, target_ref: str
     return shared
 
 
+class FinalizationPlan(NamedTuple):
+    """Pinned commit boundary and the rule that permits or prevents a squash."""
+
+    baseline: str
+    strategy: str
+    squash: bool
+
+
+def _finalization_plan(
+    repo: Path,
+    baseline: str,
+    head: str,
+    target_ref: str,
+    publication_remote: str,
+    publication_branch: str | None,
+) -> FinalizationPlan:
+    """Keep publication history and merge commits out of a story's squash.
+
+    The publisher pushes the unit branch to the same name on its configured
+    remote, independently of Git's upstream configuration. Pin that tracking
+    ref when present. A remote tip not contained in HEAD requires a sync before
+    finalization; a missing same-name ref permits the branch's first publication.
+    Merges above the attempt baseline and a historical baseline removed by an
+    earlier squash retain HEAD. These conservative cases append only the staged
+    delta, keeping earlier stories and merge parents byte-for-byte reachable.
+    """
+    candidate = _finalization_baseline(repo, baseline, head, target_ref)
+
+    def ancestor(older: str, newer: str) -> bool:
+        rc, out = _git(repo, "merge-base", "--is-ancestor", older, newer)
+        if rc not in (0, 1):
+            raise GitError(f"cannot prove publication ancestry {older}..{newer}: {out}")
+        return rc == 0
+
+    branch = (
+        publication_branch
+        if publication_branch and branch_exists_checked(repo, publication_branch)
+        else current_branch(repo)
+    )
+    published = None
+    if branch != "HEAD":
+        published_ref = f"refs/remotes/{publication_remote}/{branch}"
+        rc, detail = _git(repo, "check-ref-format", published_ref)
+        if rc != 0:
+            raise GitError(f"invalid publication branch ref {published_ref}: {detail}")
+        if ref_exists_checked(repo, published_ref):
+            published = rev_parse_revision(repo, published_ref)
+            if not ancestor(published, head):
+                raise GitError(
+                    f"published branch {published_ref} is not contained in HEAD; sync before retrying"
+                )
+    if published is not None and not ancestor(published, candidate):
+        return FinalizationPlan(head, "published-branch", False)
+    if not ancestor(baseline, head):
+        return FinalizationPlan(head, "historical-baseline", False)
+    rc, merges, detail = _git_out(
+        repo, "rev-list", "--max-count=1", "--merges", f"{baseline}..{head}"
+    )
+    if rc != 0:
+        raise GitError(f"cannot inspect finalization merge history: {detail}")
+    if merges:
+        return FinalizationPlan(head, "merge-history", False)
+    strategy = "published-target" if candidate != baseline else "story-baseline"
+    return FinalizationPlan(candidate, strategy, candidate != head)
+
+
 def finalize_commit(
     repo: Path,
     baseline: str | None,
@@ -10724,8 +10790,11 @@ def finalize_commit(
     committed_validator: Callable[[str, object], None] | None = None,
     target_ref: str = "refs/remotes/origin/main",
     on_baseline_adopted: Callable[[str, str], None] | None = None,
+    publication_remote: str = "origin",
+    publication_branch: str | None = None,
+    on_plan: Callable[[FinalizationPlan], None] | None = None,
 ) -> str | None:
-    """Collapse the unpublished delta since `baseline` into ONE commit.
+    """Finalize the story without rewriting published branch or merge history.
 
     Commits already reachable from ``target_ref`` are immutable: advance the
     effective baseline to their shared tip before staging or resetting. Report
@@ -10733,16 +10802,23 @@ def finalize_commit(
     caller's historical verification baseline. A clean, already-published HEAD
     is returned unchanged; uncommitted bookkeeping still commits on top of it.
 
+    When that boundary would discard the branch's own published tip, or the
+    attempt includes a merge, keep HEAD and append only the outstanding index
+    delta. A historical baseline absent from HEAD's ancestry also keeps HEAD,
+    covering replay after older finalizers already squashed private history.
+    ``on_plan`` receives the pinned strategy before any Git mutation. Preserving
+    HEAD skips the soft reset entirely and retains the same publication validators.
+
     bmad-build-auto now commits its own work at the end of each iteration (one
     commit for the dev pass, one for each follow-up review pass), while the
     orchestrator still writes its own bookkeeping (sprint-status.yaml for
     stories, the deferred-work ledger for sweep bundles) into the working tree
     uncommitted. This squashes that whole chain — the skill's per-iteration
     unpublished commits PLUS the orchestrator's uncommitted writes — back onto the
-    effective baseline
-    as a single commit carrying the orchestrator's message, so the one-commit-
-    per-story invariant and the message template / pre_commit hook stay
-    authoritative regardless of how many times the skill committed.
+    effective baseline as a single commit carrying the orchestrator's message
+    when the history is safe to squash. Published branches and merges take
+    precedence over the one-commit-per-story convention; the message template
+    and pre_commit hook still govern any new commit.
 
     Mechanics: stage the working tree (`add -A`), invoke the optional exact-index
     validator, move HEAD back to `baseline` keeping that same index (`reset
@@ -10784,17 +10860,23 @@ def finalize_commit(
     original_head = rev_parse_head(repo)
     recorded_baseline = baseline
     baseline_oid = rev_parse_revision(repo, baseline)
-    baseline = _finalization_baseline(repo, baseline_oid, original_head, target_ref)
+    plan = _finalization_plan(
+        repo, baseline_oid, original_head, target_ref, publication_remote, publication_branch
+    )
+    baseline = plan.baseline
+    if on_plan is not None:
+        on_plan(plan)
     adopted = baseline != baseline_oid
-    if adopted and on_baseline_adopted is not None:
+    if plan.strategy == "published-target" and adopted and on_baseline_adopted is not None:
         on_baseline_adopted(recorded_baseline, baseline)
     rc, out = _git(repo, "add", "-A")
     if rc != 0:
         raise GitError(f"git add failed: {out}")
     staged_snapshot = staged_validator() if staged_validator is not None else None
-    rc, out = _git(repo, "reset", "--soft", baseline)
-    if rc != 0:
-        raise GitError(f"git reset --soft {baseline} failed: {out}")
+    if plan.squash:
+        rc, out = _git(repo, "reset", "--soft", baseline)
+        if rc != 0:
+            raise GitError(f"git reset --soft {baseline} failed: {out}")
     # index now holds the cumulative diff vs baseline; nothing staged → no-op
     rc, _ = _git(repo, "diff", "--cached", "--quiet")
     if rc == 0:
