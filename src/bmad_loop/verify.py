@@ -10665,6 +10665,55 @@ def commit_story(repo: Path, message: str) -> str:
     return rev_parse_head(repo)
 
 
+def _finalization_baseline(repo: Path, baseline: str, head: str, target_ref: str) -> str:
+    """Pin the squash boundary without discarding target-reachable history.
+
+    Read the local remote-tracking ref; refreshing it belongs to the caller's
+    sync workflow. A repository with neither that ref nor its remote retains
+    offline finalization. A configured remote with missing evidence, a failed
+    graph probe or incomparable common ancestors must refuse before any write.
+    A unique merge base covers every ancestor shared with the publication target,
+    including a target merged into a private story branch after its baseline.
+    """
+    if not target_ref.startswith("refs/remotes/"):
+        raise GitError(f"finalization target must be a remote-tracking ref: {target_ref}")
+    rc, detail = _git(repo, "check-ref-format", target_ref)
+    if rc != 0:
+        raise GitError(f"invalid finalization target ref {target_ref}: {detail}")
+    if not ref_exists_checked(repo, target_ref):
+        rc, remotes, detail = _git_out(repo, "remote")
+        if rc != 0:
+            raise GitError(f"cannot inspect finalization target remotes: {detail}")
+        if any(target_ref.startswith(f"refs/remotes/{remote}/") for remote in remotes.splitlines()):
+            raise GitError(
+                f"finalization target ref {target_ref} is missing; fetch it before retrying"
+            )
+        return baseline
+
+    target = rev_parse_revision(repo, target_ref)
+
+    def ancestor(older: str, newer: str) -> bool:
+        rc, out = _git(repo, "merge-base", "--is-ancestor", older, newer)
+        if rc not in (0, 1):
+            raise GitError(f"cannot prove finalization ancestry {older}..{newer}: {out}")
+        return rc == 0
+
+    if not ancestor(baseline, head):
+        raise GitError("finalization baseline is not an ancestor of HEAD")
+    rc, out, detail = _git_out(repo, "merge-base", "--all", head, target)
+    if rc == 1 and not out:
+        return baseline  # independent histories, nothing shared with the target
+    if rc != 0:
+        raise GitError(f"cannot read finalization target ancestry: {detail}")
+    common = out.splitlines()
+    if len(common) != 1:
+        raise GitError("ambiguous finalization target ancestry; refusing to rewrite shared history")
+    shared = common[0]
+    if ancestor(shared, baseline):
+        return baseline
+    return shared
+
+
 def finalize_commit(
     repo: Path,
     baseline: str | None,
@@ -10672,15 +10721,24 @@ def finalize_commit(
     *,
     staged_validator: Callable[[], object] | None = None,
     committed_validator: Callable[[str, object], None] | None = None,
+    target_ref: str = "refs/remotes/origin/main",
+    on_baseline_adopted: Callable[[str, str], None] | None = None,
 ) -> str | None:
-    """Collapse everything since `baseline` into ONE commit with `message`.
+    """Collapse the unpublished delta since `baseline` into ONE commit.
+
+    Commits already reachable from ``target_ref`` are immutable: advance the
+    effective baseline to their shared tip before staging or resetting. Report
+    that adoption through ``on_baseline_adopted(old, new)`` without rewriting the
+    caller's historical verification baseline. A clean, already-published HEAD
+    is returned unchanged; uncommitted bookkeeping still commits on top of it.
 
     bmad-build-auto now commits its own work at the end of each iteration (one
     commit for the dev pass, one for each follow-up review pass), while the
     orchestrator still writes its own bookkeeping (sprint-status.yaml for
     stories, the deferred-work ledger for sweep bundles) into the working tree
     uncommitted. This squashes that whole chain — the skill's per-iteration
-    commits PLUS the orchestrator's uncommitted writes — back onto `baseline`
+    unpublished commits PLUS the orchestrator's uncommitted writes — back onto the
+    effective baseline
     as a single commit carrying the orchestrator's message, so the one-commit-
     per-story invariant and the message template / pre_commit hook stay
     authoritative regardless of how many times the skill committed.
@@ -10712,15 +10770,23 @@ def finalize_commit(
     residue into the story commit too — an intentional divergence from the skill's
     scoped commit. The loop must end each story on a clean tree because story
     N+1's step-01 HALTs on a dirty tree, so the orchestrator squashes EVERYTHING
-    since baseline (skill commits + its own bookkeeping + any residue) into the one
-    story commit rather than leaving the tree dirty for the next story to trip on.
+    above the effective baseline (unpublished skill commits + its own bookkeeping
+    + any residue) into the one story commit rather than leaving the tree dirty
+    for the next story to trip on.
 
     Returns the new HEAD sha, or None when there is nothing to finalize: no
     version control (`baseline` falsy or NO_VCS) or the tree already equals
-    `baseline` (no skill commits and no bookkeeping delta)."""
+    `baseline` (no skill commits and no bookkeeping delta). When the effective
+    baseline advances and already contains the full tree, return its SHA."""
     if not baseline or baseline == "NO_VCS":
         return None
     original_head = rev_parse_head(repo)
+    recorded_baseline = baseline
+    baseline_oid = rev_parse_revision(repo, baseline)
+    baseline = _finalization_baseline(repo, baseline_oid, original_head, target_ref)
+    adopted = baseline != baseline_oid
+    if adopted and on_baseline_adopted is not None:
+        on_baseline_adopted(recorded_baseline, baseline)
     rc, out = _git(repo, "add", "-A")
     if rc != 0:
         raise GitError(f"git add failed: {out}")
@@ -10744,7 +10810,7 @@ def finalize_commit(
                         f"HEAD to {original_head[:12]}: {restore_out}"
                     ) from exc
                 raise
-        return None
+        return baseline if adopted else None
     rc, out = _git(repo, "commit", "-m", message)
     if rc != 0:
         # The soft reset already rewound HEAD to baseline; a failed commit would

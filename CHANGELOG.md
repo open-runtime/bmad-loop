@@ -7,6 +7,8 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+## [0.13.3] — 2026-11-04
+
 ### Added
 
 - Add the factory overview, a read-only TUI screen for a factory of epic workspaces (`F` in
@@ -169,6 +171,8 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Preserve target-reachable history when finalizing resumed or reverified stories; squash only
+  the unpublished delta.
 - Rebase project-owned spec paths in replayed session results after a project move without
   changing recorded history or weakening ticket-plan verification.
 - Redact Windows drive paths reported as model IDs in diagnostic dumps.
@@ -6765,7 +6769,8 @@ enforced in CI.
   implementation phase, driven by a Python control loop with hook-based session transport and
   resumable on-disk run state.
 
-[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.13.2...HEAD
+[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.13.3...HEAD
+[0.13.3]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.3
 [0.13.2]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.13.2
 [0.13.1]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.13.1
 [0.13.0]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.13.0

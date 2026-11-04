@@ -46,6 +46,25 @@ The dev gate rejects a plan whose `baseline_revision` differs from the baseline 
 
 A landed write journals `plan-baseline-restamped` (`site`, `overwritten`, `baseline`). A plan that is missing, unreadable or unwritable journals `plan-baseline-restamp-skipped` with the reason, and the gate decides as before. In tickets mode the plan is the bound ticket's.
 
+## Finalization preserves published history
+
+Normal completion, commit replay and `resolve --reverify` share a finalization guard.
+Before squashing a story's commits, it advances the effective squash boundary past
+history already reachable from the publication target. A clean HEAD already on that
+target is recorded unchanged; new uncommitted changes are committed on top of it.
+The recorded attempt baseline and plan baseline remain unchanged for verification.
+Each adoption journals `baseline-adopted-from-target` with `old_baseline`,
+`baseline` (the effective boundary) and `target_branch` (the remote-tracking ref).
+
+The target comes from the resolved `push-merge` plugin settings (`remote`,
+`target_branch`), then `sync-with-main` (`remote`, `branch`), then `origin/main`.
+Explicit policy settings also apply when the hook is absent. Local worktree
+merge-back targets do not select the publication target. The guard reads the local
+remote-tracking ref; the sync workflow owns refreshing it. A configured remote
+whose target ref is missing must be fetched before retrying. Unreadable or
+ambiguous ancestry refuses finalization before changing Git state. Repositories
+with neither the target ref nor its remote retain offline finalization.
+
 ## The smart stall check
 
 A dev or review session that stays silent for `limits.dev_stall_grace_s` reaches the stall gate. With `stall_check = "smart"` the gate reads the session's last turn from its own transcript (Claude Code's JSONL, Codex's rollout) and from what its Stop hook reported, and decides in this order:
