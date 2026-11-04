@@ -5300,12 +5300,11 @@ class Engine:
         COMMITTING→DEFERRED move (#115).
 
         Re-drive contract: safe to call again after a host death anywhere
-        inside it. ``finalize_commit`` is content-idempotent across both crash
-        states — pre-squash (skill commit chain above baseline) squashes
-        normally; post-squash (squashed commit at HEAD, clean tree)
-        re-squashes to an equivalent-content commit, orphaning the pre-crash
-        squash (harmless; "equivalent" rather than "identical" because a park
-        record regenerated across midnight carries a new ``parked_at``).
+        inside it. ``finalize_commit`` rechecks publication and merge history.
+        Protected chains retain HEAD and append only new bookkeeping; a clean
+        replay records HEAD unchanged. An unpublished linear chain can still
+        be re-squashed to equivalent content. A park record regenerated across
+        midnight can carry a new ``parked_at`` and therefore require a new commit.
         ``commit_sha`` is stamped only here and is write-only (never routing),
         so the empty persisted value is harmless."""
         message = self._commit_message(task)
