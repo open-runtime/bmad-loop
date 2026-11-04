@@ -199,12 +199,12 @@ The sweep commits each ledger or store change it makes as its own file-scoped co
 
 Every run, sweep or not, also commits the ledger changes it left uncommitted itself (harvested deferrals, bundle closes, a restored ledger), so a session that refuses to finish on a dirty tree never stops on the engine's own writes:
 
-| Commit message                                                   | When                                                                                                                                                                             |
-| ---------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `chore(deferred-work): engine bookkeeping before <role> (<key>)` | right before a review session (every cycle), a repair dev session, or a dev retry after a rollback; `<role>` is `review` or `dev`. Squashed into the unit's commit when it lands |
-| `chore(deferred-work): restore ledger after deferring <key>`     | after an in-place defer resets the attempt and restores the ledger; stays on the target branch                                                                                   |
+| Commit message                                                   | When                                                                                                                                                                                              |
+| ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `chore(deferred-work): engine bookkeeping before <role> (<key>)` | right before a review session (every cycle), a repair dev session, or a dev retry after a rollback; `<role>` is `review` or `dev`. Squashed into the unit's commit when history is safe to squash |
+| `chore(deferred-work): restore ledger after deferring <key>`     | after an in-place defer resets the attempt and restores the ledger; stays on the target branch                                                                                                    |
 
-Each commits the ledger file alone, with repository hooks and commit signing disabled, and holds only bytes the engine had already written. Nothing is committed when the ledger is gitignored, outside the repository, in a ticket store, or unchanged. A rollback treats these commits as the run's own: it restores a ledger they added and parks no `attempt-preserve` ref for a range that holds only them. A failed commit is journaled (`engine-ledger-commit-failed`) and the session launches anyway.
+Each commits the ledger file alone, with repository hooks disabled and repository signing settings preserved, and holds only bytes the engine had already written. A checkout configured with `commit.gpgsign=true` signs these commits; a signing failure is never retried unsigned. Nothing is committed when the ledger is gitignored, outside the repository, in a ticket store, or unchanged. A rollback treats these commits as the run's own: it restores a ledger they added and parks no `attempt-preserve` ref for a range that holds only them. A failed commit, including a signing failure, is journaled (`engine-ledger-commit-failed`) and the session launches anyway.
 
 ### Publication refusals
 

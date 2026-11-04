@@ -8876,15 +8876,12 @@ def test_commit_paths_run_hooks_false_skips_pre_commit_and_commit_msg_hooks(
     assert [name for name in _HOOK_NAMES if (repo / f"hook-{name}").exists()] == list(_HOOK_NAMES)
 
 
-def test_commit_paths_run_hooks_false_ignores_gpgsign(project, tmp_path):
-    """#772: `run_hooks=False` commits with `commit.gpgsign=false`, so a repo that
-    signs every commit cannot block (or, unattended, hang on a pinentry) the
-    engine's bookkeeping commit. A `gpg.program` that does not exist makes signing
-    fail outright — portable, and the default call's `GitError` below proves the
-    configuration bites before the hookless call is trusted.
+def test_commit_paths_run_hooks_false_preserves_signing_failure(project, tmp_path):
+    """Hook isolation cannot authorize an unsigned commit when signing fails.
 
-    Ablation: drop `commit.gpgsign=false` from `_hookless_git_config` and the
-    hookless commit raises the same `GitError`."""
+    Ablation: restore `commit.gpgsign=false` in `_hookless_git_config`; the
+    hookless call silently commits instead of raising the configured failure.
+    """
     repo = project.project
     git(repo, "config", "commit.gpgsign", "true")
     git(repo, "config", "gpg.program", (tmp_path / "no-such-gpg").as_posix())
@@ -8895,11 +8892,10 @@ def test_commit_paths_run_hooks_false_ignores_gpgsign(project, tmp_path):
         verify.commit_paths(repo, "chore: signed", [repo / "src.txt"])
     assert verify.rev_parse_head(repo) == base
 
-    sha = verify.commit_paths(repo, "chore: unsigned", [repo / "src.txt"], run_hooks=False)
-
-    assert sha is not None and sha != base
-    assert sha == verify.rev_parse_head(repo)
-    assert git(repo, "log", "-1", "--format=%s") == "chore: unsigned"
+    with pytest.raises(verify.GitError, match="git commit failed"):
+        verify.commit_paths(repo, "chore: signed bookkeeping", [repo / "src.txt"], run_hooks=False)
+    assert verify.rev_parse_head(repo) == base
+    assert (repo / "src.txt").read_text() == "signed?\n"
 
 
 def test_commit_paths_default_still_runs_hooks(project):

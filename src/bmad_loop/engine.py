@@ -8191,12 +8191,13 @@ class Engine:
         self, task: StoryTask, *, site: str, message: str | None = None
     ) -> None:
         """Commit the engine's own uncommitted ledger bookkeeping — that one file,
-        hooks and signing off — so the next session starts on a tree whose only
-        dirt is not the orchestrator's (#772: the build skill's finalization
-        HALTs `blocked` on any leftover change, and the engine's harvests, closes
-        and restores leave the ledger dirty on purpose for `finalize_commit` to
-        squash). It WRITES NO CONTENT: it records bytes the engine already wrote,
-        so the squash still lands the same story commit.
+        hooks off and repository signing settings preserved — so the next session
+        starts on a tree whose only dirt is not the orchestrator's (#772: the build
+        skill's finalization HALTs `blocked` on any leftover change, and the engine's
+        harvests, closes and restores leave the ledger dirty for finalization).
+        It WRITES NO CONTENT: it records bytes the engine already wrote,
+        so finalization retains the same ledger bytes whether history is squashed
+        or preserved.
 
         Best-effort: a git or filesystem fault is journaled
         (`engine-ledger-commit-failed`), never raised, and the session launches
@@ -9455,8 +9456,9 @@ class Engine:
         if commit_engine_ledger:
             # #772: the build skill's finalization HALTs `blocked` on any leftover
             # change, and the engine's harvests, closes and restores leave the ledger
-            # dirty on purpose. Commit that one file (hooks and signing off) after
-            # every session hook, so plugin `pre_*_session` ledger writes ride along,
+            # dirty on purpose. Commit that one file with hooks off and repository
+            # signing settings preserved after every session hook, so plugin
+            # `pre_*_session` ledger writes ride along,
             # and only here on the live launch path: the veto return above and the
             # callers' replay arms launch nothing, so they commit nothing.
             self._commit_engine_ledger(task, site=role)

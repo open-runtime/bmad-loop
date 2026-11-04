@@ -11223,16 +11223,17 @@ def unpublishable_target(target: Path, family: Literal["ledger", "store"]) -> (
 @contextmanager
 def _hookless_git_config() -> Iterator[tuple[str, ...]]:
     """Yield the `-c` arguments that run one git command with NO repository hooks
-    and NO commit signing: `core.hooksPath` at a fresh empty directory, and
-    `commit.gpgsign=false`.
+    while preserving repository signing settings: `core.hooksPath` at a fresh
+    empty directory.
 
     `core.hooksPath`, not `--no-verify`: the flag skips only `pre-commit` and
     `commit-msg`, leaving `prepare-commit-msg`, `post-commit` and
     `post-index-change` to run — and it does not exist on `git add`, whose index
     write fires `post-index-change`. An empty directory pointed at by the config
     silences every hook, including one a repo-configured `core.hooksPath`
-    names, since the command-line `-c` wins over every config file. Signing is
-    off so a pinentry prompt cannot hang an unattended commit.
+    names, since the command-line `-c` wins over every config file. Commit signing
+    follows Git's configuration; signer failures use the normal Git error path
+    without an unsigned fallback.
 
     The directory lives for the `with` block alone; a failed mkdir raises
     `GitError` rather than running the command with hooks live."""
@@ -11242,7 +11243,7 @@ def _hookless_git_config() -> Iterator[tuple[str, ...]]:
             hooks_dir.mkdir()
         except OSError as exc:
             raise GitError(f"hook isolation directory could not be prepared: {exc}") from exc
-        yield ("-c", f"core.hooksPath={hooks_dir}", "-c", "commit.gpgsign=false")
+        yield ("-c", f"core.hooksPath={hooks_dir}")
 
 
 def commit_paths(
@@ -11299,10 +11300,10 @@ def commit_paths(
     suppresses; there is simply nothing left here that suppresses.
 
     ``run_hooks=False`` runs the `add`, `status` and `commit` under
-    :func:`_hookless_git_config` — no repository hook of any kind and no commit
-    signing — for an orchestrator bookkeeping commit that records bytes the engine
-    already wrote and must neither run project code nor block on a pinentry. The
-    default keeps every existing caller's hooks live."""
+    :func:`_hookless_git_config` — no repository hook of any kind, with repository
+    signing settings preserved — for an orchestrator bookkeeping commit that
+    records bytes the engine already wrote and must not run project hook code.
+    The default keeps every existing caller's hooks live."""
     if not run_hooks:
         with _hookless_git_config() as hookless:
             return _commit_paths(repo, message, paths, hookless)
