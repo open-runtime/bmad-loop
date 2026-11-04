@@ -169,6 +169,8 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Redact Windows drive paths reported as model IDs in diagnostic dumps.
+- Keep version-gated relay events disabled across profiles sharing a hook configuration.
 - Classify a socket substituted for an owned spec as authority loss on macOS during recovery.
 - Preserve unfinished session-owned ledger edits when resuming dev or review conversations.
 - Keep StopFailure account and quota handling compatible with fork recovery, clear stale quota

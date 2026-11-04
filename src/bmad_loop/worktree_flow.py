@@ -71,7 +71,7 @@ from .install import (
     _walk_traversable_files,
     _worktree_local_exclude,
     dev_primitive_or_default,
-    gated_hook_events,
+    gated_hook_profiles,
     merge_hooks,
     missing_stories_support,
     renderer_stub_resolved,
@@ -1545,7 +1545,7 @@ def provision_worktree(
     # per-CLI signal-hook registration, baked to the main repo's relay (absolute).
     # Hookless profiles (HTTP/SSE transport) have no config to merge.
     stripped_paths: set[Path] = set()
-    for profile in profiles:
+    for profile, events, gate_notes in gated_hook_profiles(dst_root, profiles):
         if profile.hookless:
             continue
         raw_config_path = dst_root / profile.hooks.config_path
@@ -1637,10 +1637,9 @@ def provision_worktree(
                     "terminal, so repairing the file alone does not put the story "
                     "back in the run (#592)"
                 ) from e
-        # The same version gate `init` applies (#865): a hook event the installed
-        # CLI is too old for (or whose version cannot be read) stays out, because
-        # one unknown key can make the CLI skip the whole config — Stop included.
-        events, gate_notes = gated_hook_events(profile)
+        # The shared version gate `init` applies (#865): an event ANY CLI
+        # reading this config is too old for stays out of every profile's merge,
+        # because one unknown key can make it skip the whole config, Stop included.
         if on_hook_gated is not None:
             for note in gate_notes:
                 on_hook_gated(note)

@@ -170,6 +170,61 @@ def _make_flow(
     return flow
 
 
+@pytest.mark.parametrize("old_first", [True, False], ids=["old-first", "new-first"])
+def test_provision_shared_config_keeps_version_gates(project, tmp_path, monkeypatch, old_first):
+    """Shared settings keep Stop but cannot regain a relay rejected by either CLI.
+
+    Ablation: omit the shared gate intersection and the old-first row re-adds
+    StopFailure after its seeded relay was stripped by the old profile.
+    """
+    from bmad_loop import install
+    from bmad_loop.adapters.profile import get_profile
+
+    claude = get_profile("claude")
+    old = replace(claude, name="old-claude", binary="old-claude")
+    new = replace(claude, name="new-claude", binary="new-claude")
+    profiles = [old, new] if old_first else [new, old]
+    monkeypatch.setattr(
+        install, "cli_version", lambda p: (2, 1, 77) if p.binary == old.binary else (2, 1, 78)
+    )
+    wt = tmp_path / "wt"
+    config = wt / claude.hooks.config_path
+    config.parent.mkdir(parents=True)
+    user_stop = {"hooks": [{"type": "command", "command": "make lint"}]}
+    config.write_text(
+        json.dumps(
+            {
+                "env": {"KEEP": "yes"},
+                "hooks": {
+                    "Stop": [user_stop],
+                    "StopFailure": [
+                        {
+                            "hooks": [
+                                {"type": "command", "command": "/old/bmad-loop relay StopFailure"}
+                            ]
+                        }
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    notes = []
+
+    provision_worktree(wt, profiles, project.project, on_hook_gated=notes.append)
+
+    installed = json.loads(config.read_text(encoding="utf-8"))
+    assert "StopFailure" not in installed["hooks"]
+    assert user_stop in installed["hooks"]["Stop"]
+    assert installed["env"] == {"KEEP": "yes"}
+    assert any(
+        h["command"].endswith(" relay Stop")
+        for group in installed["hooks"]["Stop"]
+        for h in group["hooks"]
+    )
+    assert len(notes) == 1 and notes[0].startswith("StopFailure hook not registered (old-claude)")
+
+
 # --------------------------------------------------------------- pure predicates
 
 

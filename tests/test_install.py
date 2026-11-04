@@ -1584,6 +1584,102 @@ def test_init_strips_a_gated_relay_after_a_downgrade(tmp_path, monkeypatch):
     assert _installed_relay_suffix("Stop") in hooks["Stop"][0]["hooks"][0]["command"]
 
 
+@pytest.mark.parametrize("old_first", [True, False], ids=["old-first", "new-first"])
+@pytest.mark.parametrize("old_version", [(2, 1, 77), None], ids=["old", "unreadable"])
+@pytest.mark.parametrize("user_failure_hook", [False, True], ids=["relay-only", "user-hook"])
+def test_init_shared_config_uses_all_profiles_version_gates(
+    tmp_path, monkeypatch, capsys, old_first, old_version, user_failure_hook
+):
+    """A newer alias cannot re-add an event the older shared-config CLI rejects.
+
+    Ablation: omit the shared gate intersection and the old-first rows retain
+    the managed StopFailure relay. Stop and operator hooks must still survive.
+    """
+    claude = get_profile("claude")
+    old = dataclasses.replace(claude, name="old-claude", binary="old-claude")
+    new = dataclasses.replace(claude, name="new-claude", binary="new-claude")
+    separate = dataclasses.replace(
+        new,
+        name="separate-claude",
+        hooks=dataclasses.replace(new.hooks, config_path=".separate/settings.json"),
+    )
+    profiles = [old, new] if old_first else [new, old]
+    profiles.append(separate)
+    monkeypatch.setattr(install_mod, "load_profiles", lambda _: {p.name: p for p in profiles})
+    probed = []
+
+    def cli_version(profile):
+        probed.append(profile.name)
+        return old_version if profile.binary == old.binary else (2, 1, 78)
+
+    monkeypatch.setattr(install_mod, "cli_version", cli_version)
+    config = tmp_path / claude.hooks.config_path
+    config.parent.mkdir(parents=True)
+    user_stop = {"hooks": [{"type": "command", "command": "make lint"}]}
+    data = {"env": {"KEEP": "yes"}, "hooks": {"Stop": [user_stop]}}
+    if user_failure_hook:
+        data["hooks"]["StopFailure"] = [{"hooks": [{"type": "command", "command": "notify-me"}]}]
+    config.write_text(json.dumps(data), encoding="utf-8")
+
+    assert install_into(tmp_path, [p.name for p in profiles], skills=False) == 0
+
+    installed = json.loads(config.read_text(encoding="utf-8"))
+    hooks = installed["hooks"]
+    failure_commands = [
+        h["command"] for group in hooks.get("StopFailure", []) for h in group["hooks"]
+    ]
+    assert failure_commands == (["notify-me"] if user_failure_hook else [])
+    if not user_failure_hook:
+        assert "StopFailure" not in hooks
+    assert installed["env"] == {"KEEP": "yes"}
+    assert user_stop in hooks["Stop"]
+    assert any(
+        _installed_relay_suffix("Stop") in h["command"]
+        for group in hooks["Stop"]
+        for h in group["hooks"]
+    )
+    separate_hooks = json.loads((tmp_path / separate.hooks.config_path).read_text())["hooks"]
+    assert "StopFailure" in separate_hooks
+    assert capsys.readouterr().out.count("StopFailure hook not registered (old-claude)") == 1
+    assert probed == [p.name for p in profiles]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+@pytest.mark.parametrize("old_first", [True, False], ids=["old-first", "new-first"])
+def test_init_shared_config_version_gate_follows_in_project_symlinks(
+    tmp_path, monkeypatch, old_first
+):
+    """Init permits in-project config links; their target gets the shared gate.
+
+    Ablation: group by lexical config paths and old-first re-adds StopFailure.
+    """
+    claude = get_profile("claude")
+    old = dataclasses.replace(claude, name="old-claude", binary="old-claude")
+    new = dataclasses.replace(
+        claude,
+        name="new-claude",
+        hooks=dataclasses.replace(claude.hooks, config_path=".claude/alias.json"),
+    )
+    profiles = [old, new] if old_first else [new, old]
+    monkeypatch.setattr(install_mod, "load_profiles", lambda _: {p.name: p for p in profiles})
+    monkeypatch.setattr(
+        install_mod, "cli_version", lambda p: (2, 1, 77) if p.binary == old.binary else (2, 1, 78)
+    )
+    config = tmp_path / claude.hooks.config_path
+    config.parent.mkdir(parents=True)
+    config.write_text('{"env": {"KEEP": "yes"}}', encoding="utf-8")
+    alias = tmp_path / new.hooks.config_path
+    alias.symlink_to(config.name)
+
+    assert install_into(tmp_path, [p.name for p in profiles], skills=False) == 0
+
+    installed = json.loads(config.read_text(encoding="utf-8"))
+    assert "StopFailure" not in installed["hooks"]
+    assert _installed_relay_suffix("Stop") in installed["hooks"]["Stop"][0]["hooks"][0]["command"]
+    assert installed["env"] == {"KEEP": "yes"}
+    assert alias.is_symlink()
+
+
 def test_gated_hook_events_never_probes_a_profile_without_floors(monkeypatch):
     """Only a profile declaring `hooks.event_min_versions` spawns `--version`: every
     other built-in registers exactly as before, with no process launched."""

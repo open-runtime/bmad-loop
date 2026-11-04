@@ -2640,6 +2640,43 @@ def gated_hook_events(profile: CLIProfile) -> tuple[dict[str, str], list[str]]:
     return events, notes
 
 
+def gated_hook_profiles(
+    project: Path, profiles: Sequence[CLIProfile]
+) -> list[tuple[CLIProfile, dict[str, str], list[str]]]:
+    """Gate each profile once, then exclude events any shared-config CLI rejects.
+
+    A newer alias must not reintroduce an event an older CLI cannot parse: that
+    CLI can reject the whole settings file, including its completion hook.
+    Group by the resolved config path, including init's permitted in-project
+    symlinks, rather than by profile name or dialect. Callers still own path
+    confinement; an unresolvable path keeps its lexical key until they refuse it.
+    Original gate notes stay attached to the rejecting profile exactly once.
+    """
+    rows = []
+    excluded: dict[Path, set[str]] = {}
+    for profile in profiles:
+        events, notes = ({}, []) if profile.hookless else gated_hook_events(profile)
+        path = project / profile.hooks.config_path
+        try:
+            path = path.resolve()
+        except (OSError, RuntimeError, ValueError):
+            pass  # The writer's existing confinement guard owns this refusal.
+        excluded.setdefault(path, set()).update(set(profile.hooks.events) - events.keys())
+        rows.append((profile, path, events, notes))
+    return [
+        (
+            profile,
+            {
+                native: canonical
+                for native, canonical in events.items()
+                if native not in excluded[path]
+            },
+            notes,
+        )
+        for profile, path, events, notes in rows
+    ]
+
+
 def strip_event_relays(config: dict, dialect: str, natives: Iterable[str]) -> bool:
     """Drop managed relay commands registered under ``natives``. True if any went.
 
@@ -2650,7 +2687,12 @@ def strip_event_relays(config: dict, dialect: str, natives: Iterable[str]) -> bo
     return _strip_commands(hook_event_container(config, dialect), _relay_command, natives)
 
 
-def _register_hooks(project: Path, profile: CLIProfile) -> int:
+def _register_hooks(
+    project: Path,
+    profile: CLIProfile,
+    *,
+    gated_events: tuple[dict[str, str], list[str]] | None = None,
+) -> int:
     if profile.hookless:
         print(f"  no hooks needed ({profile.name}): HTTP/SSE transport")
         return 0
@@ -2666,7 +2708,7 @@ def _register_hooks(project: Path, profile: CLIProfile) -> int:
         except json.JSONDecodeError:
             print(f"FAIL: {config_path} is not valid JSON; fix it and re-run init")
             return 1
-    events, gate_notes = gated_hook_events(profile)
+    events, gate_notes = gated_hook_events(profile) if gated_events is None else gated_events
     try:
         registrations = {
             native: _hook_command(project, profile, canonical)
@@ -4307,9 +4349,9 @@ def install_into(
             return 1
     bmad_loop_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. per-CLI hook registration
-    for profile in profiles:
-        if _register_hooks(project, profile) != 0:
+    # 1. per-CLI hook registration, respecting every CLI sharing each config.
+    for profile, events, notes in gated_hook_profiles(project, profiles):
+        if _register_hooks(project, profile, gated_events=(events, notes)) != 0:
             return 1
     if any(not profile.hookless for profile in profiles):
         _warn_unsafe_relay_path()

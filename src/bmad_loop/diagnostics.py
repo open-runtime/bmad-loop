@@ -1121,8 +1121,9 @@ def _reserved_output_names(
 
 # A model id as the coding CLIs report it: `claude-opus-4-6[1m]`,
 # `anthropic/claude-sonnet-4-5`, `gpt-5.5-codex`, `models/gemini-3-pro@001`.
-# Starts alphanumeric, so an absolute path (`/home/…`) never matches.
-_MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/\[\]-]{0,127}$")
+# Reject Windows drive prefixes (absolute or drive-relative) before allowing
+# model tags with colons; the alphanumeric start also excludes POSIX/UNC paths.
+_MODEL_ID_RE = re.compile(r"^(?![A-Za-z]:)[A-Za-z0-9][A-Za-z0-9._:@/\[\]-]{0,127}$")
 _REDACTED_STR = "<redacted:str>"
 
 

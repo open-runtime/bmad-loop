@@ -1562,6 +1562,50 @@ def test_session_model_row_keeps_model_id():
         assert redacted["model"] == "<redacted:str>"
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "C:/clients/zephyr/private-model",
+        "z:/clients/zephyr/private-model",
+        "C:clients/zephyr/private-model",
+    ],
+)
+def test_observed_models_redact_windows_drive_paths(path):
+    """Drive-rooted and drive-relative paths cannot masquerade as model ids.
+
+    Unlike home paths, these paths survive the egress guard, so both observed
+    model fields must redact them themselves. Provider/model ids with tags
+    remain useful diagnostics. Ablation: remove the drive-prefix exclusion in
+    `_MODEL_ID_RE` and every row leaks its path through both journal routes.
+    """
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    model = "ollama/llama3:8b"
+    start = diagnostics._scrub_entry({"kind": "session-model", "model": path}, pseudo, {}, None)
+    end = diagnostics._scrub_entry(
+        {"kind": "session-end", "models": [path, model, "models/gemini-3-pro@001"]},
+        pseudo,
+        {},
+        None,
+    )
+    assert start["model"] == "<redacted:str>"
+    assert end["models"] == ["<redacted:str>", model, "models/gemini-3-pro@001"]
+
+
+def test_diagnostic_dump_does_not_publish_windows_model_paths(project):
+    path = "C:/clients/zephyr/private-model"
+    model = "anthropic/claude-sonnet-4-5"
+    run_dir = _seed_run(
+        project.project,
+        extra_journal=[
+            ("session-model", {"model": path}),
+            ("session-end", {"models": [path, model]}),
+        ],
+    )
+    _diag, _pseudo, rendered = _render_all([run_dir])
+    assert path not in rendered
+    assert model in rendered
+
+
 def test_unpinned_artifact_observation_keeps_the_fs_type_and_drops_the_paths():
     """`artifact-observation-unpinned` (DW-444) names the absolute artifacts root
     and a filesystem label that embeds its volume path — both host paths, routed
