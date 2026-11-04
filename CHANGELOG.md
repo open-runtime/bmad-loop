@@ -7,6 +7,12 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+## [0.13.6] — 2026-11-04
+
+### Fixed
+
+- Re-arm deferred in-place stories after a dev timeout while preserving their partial work.
+
 ## [0.13.5] — 2026-11-04
 
 ### Fixed
@@ -6781,7 +6787,8 @@ enforced in CI.
   implementation phase, driven by a Python control loop with hook-based session transport and
   resumable on-disk run state.
 
-[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.13.5...HEAD
+[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.13.6...HEAD
+[0.13.6]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.6
 [0.13.5]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.5
 [0.13.4]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.4
 [0.13.3]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.3
