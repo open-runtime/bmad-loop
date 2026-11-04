@@ -91,12 +91,14 @@ If the agent exits without writing a resolution, resolve says `no resolution rec
 
 ### Re-arm after fixing the spec yourself
 
-A deferred in-place story whose latest dev session timed out also needs a fresh dev attempt. Use `bmad-loop resolve <run-id> --story <key> --no-interactive --no-resume`, then resume when ready. The run must still be paused on that story, with no later story picked. The re-arm advances its baseline to HEAD, preserves the session history and starts a new session generation. Commit any partial source changes you want to keep before resolving: the existing restart preserves committed work, BMAD artifact edits and pre-existing untracked files, but rolls back other uncommitted tracked changes. Dirty bookkeeping stays available to the new attempt. A failed baseline read refuses the re-arm; worktree isolation and restore-patch mode are not supported for this deferred-timeout path.
-
 1. Edit the frozen spec. Under worktree isolation, commit the edit.
 2. `bmad-loop resolve <run-id> --no-interactive`. No agent runs. Answer the re-arm prompt, or pass `--resume`/`--no-resume`.
 
 Use this path too when the dev CLI has no interactive mode.
+
+### Re-arm a deferred in-place timeout
+
+A deferred in-place story whose latest dev session timed out also needs a fresh dev attempt. Use `bmad-loop resolve <run-id> --story <key> --no-interactive --no-resume`, then resume when ready. The run must still be paused on that story, with no later story picked. The re-arm advances its baseline to HEAD, preserves the session history and starts a new session generation. Commit any partial source changes you want to keep before resolving: the existing restart preserves committed work, BMAD artifact edits and pre-existing untracked files, but rolls back other uncommitted tracked changes. Dirty bookkeeping stays available to the new attempt. A failed baseline read refuses the re-arm; worktree isolation and restore-patch mode are not supported for this deferred-timeout path.
 
 ### Restore an intent-gap patch
 
@@ -145,7 +147,7 @@ No dev session and no resolve agent run. `--reverify` is refused, with the run u
 - the baseline is not an ancestor of HEAD, or nothing sits above the baseline (the attempt was rolled back);
 - a worktree unit's worktree is gone, on the wrong branch, or has nothing above its baseline.
 
-Plain `resolve` on a deferred story with a completed dev attempt points you here: `to re-verify its kept work: bmad-loop resolve <id> --reverify`. If its latest dev session timed out, use the [in-place re-arm procedure](#re-arm-after-fixing-the-spec-yourself) to finish the partial attempt in a fresh dev session; `--reverify` still refuses an unfinished session's result.
+Plain `resolve` on a deferred story with a completed dev attempt points you here: `to re-verify its kept work: bmad-loop resolve <id> --reverify`. If its latest dev session timed out, use the [in-place re-arm procedure](#re-arm-a-deferred-in-place-timeout) to finish the partial attempt in a fresh dev session; `--reverify` still refuses an unfinished session's result.
 
 <a id="resolve-reverify-finished"></a>
 
@@ -214,7 +216,7 @@ When a story runs out of budget without a CRITICAL reason (`[limits] max_dev_att
 - **In place with `rollback_on_failure = true`, or a clean tree:** the attempt is parked and reset, its spec is stashed under the run's `deferred/<story>/`, the deferred-work ledger is restored, and the run continues. When that restore leaves a git-visible ledger changed, the engine tries to commit it as `chore(deferred-work): restore ledger after deferring <story>` (a gitignored or unchanged ledger gets no commit; a failed commit is journaled as `engine-ledger-commit-failed`). The notice gives the recovery ref and the `git merge --no-edit` line that restores it (marked commits-only when the uncommitted part could not be saved).
 - **Under worktree isolation:** the unit's branch is kept, the run continues, and the notice names the branch plus any earlier attempt's ref.
 
-To finish a deferred story with a completed dev attempt, use [`resolve --reverify`](#resolve-reverify) while the run is paused on that defer, or for a kept worktree unit. For an in-place timeout, [re-arm a fresh dev attempt](#re-arm-after-fixing-the-spec-yourself). After an auto-rollback, restore the ref and re-run the story instead. A story being re-driven after you resolved it re-escalates instead of deferring.
+To finish a deferred story with a completed dev attempt, use [`resolve --reverify`](#resolve-reverify) while the run is paused on that defer, or for a kept worktree unit. For an in-place timeout, [re-arm a fresh dev attempt](#re-arm-a-deferred-in-place-timeout). After an auto-rollback, restore the ref and re-run the story instead. A story being re-driven after you resolved it re-escalates instead of deferring.
 
 ## Human-only actions
 

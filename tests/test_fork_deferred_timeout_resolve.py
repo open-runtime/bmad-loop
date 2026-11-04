@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import json
 
 import pytest
 from conftest import dev_effect, git, install_bmad_config, spec_path, write_ledger, write_sprint
@@ -369,5 +370,39 @@ def test_resolve_rechecks_isolation_after_confirmation(project, tmp_path, monkey
 
     assert rc == 1 and confirms == [True]
     assert calls == []
+    assert (engine.run_dir / "state.json").read_bytes() == before
+    assert spec_path(project, KEY).read_bytes() == spec
+
+
+@pytest.mark.parametrize("phase", [Phase.DEFERRED, Phase.ESCALATED])
+def test_resolve_context_matches_deferred_timeout_restore_refusal(project, tmp_path, phase):
+    """The resolve agent must not advertise a restoration its re-arm rejects.
+
+    Removing the shared deferred-timeout guard turns restore_supported back on
+    for that row; the same in-place fixture remains restorable when escalated.
+    """
+    engine, _marker = _deferred_attempt(project, tmp_path)
+    state = load_state(engine.run_dir)
+    task = state.tasks[KEY]
+    task.phase = phase
+    before = (engine.run_dir / "state.json").read_bytes()
+    spec = spec_path(project, KEY).read_bytes()
+
+    path, _withheld, _unreadable = resolve.build_context(
+        state,
+        engine.run_dir,
+        KEY,
+        isolation="none",
+        project_root=project.project,
+        code_root=project.repo_root,
+    )
+
+    supported = phase == Phase.ESCALATED
+    assert json.loads(path.read_text(encoding="utf-8"))["restore_supported"] is supported
+    refusal = runs.validate_restore_latch(state, task, KEY)
+    if supported:
+        assert refusal is None
+    else:
+        assert refusal is not None and "timeout" in refusal and "restore" in refusal
     assert (engine.run_dir / "state.json").read_bytes() == before
     assert spec_path(project, KEY).read_bytes() == spec

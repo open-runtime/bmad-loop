@@ -4754,6 +4754,11 @@ def validate_restore_latch(
     Path resolution and trusted-roots containment stay CLI-side: they need
     `--project` and the loaded bmad config, neither of which run state carries.
     """
+    if deferred_timeout_rearmable(state, task, story_key):
+        return (
+            f"story {story_key}'s deferred timeout requires a fresh dev attempt from "
+            "its kept work, not a restore patch — re-run resolve without --restore-patch"
+        )
     # A sentinel-wedged story escalated BEFORE planning — there is no attempted
     # implementation to restore, and its re-arm re-dispatches a planning leg.
     # Keyed on the recorded detection verdict (task.sentinel_kind), not the on-disk
