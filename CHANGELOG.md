@@ -7,6 +7,10 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Fixed
+
+- Verify and accept interrupted development work before resuming review when its spec was already bound.
+
 ## [0.13.6] — 2026-11-04
 
 ### Fixed

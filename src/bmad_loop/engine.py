@@ -3152,11 +3152,9 @@ class Engine:
         returns None and the caller falls through to resume-restart (#100: that
         restart used to discard a completed-``done`` attempt's commits).
 
-        DEV_VERIFY reaches this matcher only when no persisted defer identifies
-        an interrupted decision and ``task.spec_file`` is empty (verify did not
-        fully pass before the death): _finish_inflight checks the defer-replay
-        and spec-approval-gate arms first, so a DEV_VERIFY task WITH a verified
-        spec keeps its _resume_after_dev_verify recovery."""
+        DEV_VERIFY also reaches this matcher through _resume_after_dev_verify
+        when a spec was bound before the host died but no accepted dev decision
+        was persisted. A bound spec alone does not prove acceptance."""
         if task.phase in (Phase.DEV_RUNNING, Phase.DEV_VERIFY):
             role, seq = "dev", task.attempt
         elif task.phase in (Phase.REVIEW_RUNNING, Phase.REVIEW_VERIFY):
@@ -7817,8 +7815,10 @@ class Engine:
         return verification_sequence
 
     def _resume_after_dev_verify(self, task: StoryTask) -> None:
-        """Resume a task the run paused at DEV_VERIFY (dev verified, spec on disk).
-        Base: the spec-approval-gate resume — run the review loop + commit.
+        """Resume DEV_VERIFY with a bound spec. Accepted work takes the
+        spec-approval-gate path: run the review loop + commit. A spec bound
+        before acceptance instead replays its completed dev result through
+        verification and the PROCEED acceptance boundary before any review.
         StoriesEngine overrides this to re-drive the implement leg of a
         plan-checkpoint-paused story (leg-2) instead.
 
@@ -7832,6 +7832,18 @@ class Engine:
         Every fresh entry starts at ``review_cycle`` 0, except a restart-arm
         re-drive. That re-drive keeps its counters and so reviews once instead of
         skipping, which is the conservative direction."""
+        if task.accepted_dev_session_index is None:
+            resumable = self._resumable_session(task)
+            if resumable is None:
+                self._escalate(
+                    task,
+                    f"cannot verify unaccepted dev work for {task.story_key}: "
+                    "no completed current-attempt session result was recorded",
+                )
+                return
+            self.journal.append("resume-verify", story_key=task.story_key, role="dev")
+            self._drive_story(task, dev_resume=resumable[1])
+            return
         self.journal.append("resume-review", story_key=task.story_key)
         self._finish_post_dev_accepted_sync(task)
         self._review_and_commit(task, resumed_loop=task.review_cycle > 0)
