@@ -7818,7 +7818,8 @@ class Engine:
         """Resume DEV_VERIFY with a bound spec. Accepted work takes the
         spec-approval-gate path: run the review loop + commit. A spec bound
         before acceptance instead replays its completed dev result through
-        verification and the PROCEED acceptance boundary before any review.
+        verification and the PROCEED acceptance boundary before any review. A
+        successful reverify's persisted PROCEED receipt also permits continuation.
         StoriesEngine overrides this to re-drive the implement leg of a
         plan-checkpoint-paused story (leg-2) instead.
 
@@ -7832,7 +7833,9 @@ class Engine:
         Every fresh entry starts at ``review_cycle`` 0, except a restart-arm
         re-drive. That re-drive keeps its counters and so reviews once instead of
         skipping, which is the conservative direction."""
-        if task.accepted_dev_session_index is None:
+        # A successful reverify is a durable PROCEED receipt without a matching
+        # current-generation dev session; its approval resume is already verified.
+        if task.accepted_dev_session_index is None and not task.reverify_replayed:
             resumable = self._resumable_session(task)
             if resumable is None:
                 self._escalate(

@@ -26918,11 +26918,17 @@ def test_reverify_honors_the_spec_approval_gate(project, tmp_path):
     assert summary.paused and engine2.state.paused_stage == PAUSE_SPEC_APPROVAL
     task = load_state(engine2.run_dir).tasks["1-1-a"]
     assert task.phase == Phase.DEV_VERIFY and task.reverify_from == ""
+    # Reverify does not invent acceptance for an old-generation dev record. Its
+    # persisted PROCEED receipt is sufficient for the spec-approval continuation.
+    assert task.accepted_dev_session_index is None
+    assert task.reverify_replayed == "deferred"
 
     engine3, adapter3 = resume_engine(project, engine2, [])
-    engine3.run()
+    result = engine3.run()
+    assert not result.paused and not result.crashed
     assert adapter3.sessions == []
     assert engine3.state.tasks["1-1-a"].phase == Phase.DONE
+    assert engine3.state.tasks["1-1-a"].accepted_dev_session_index is None
     kinds = [e["kind"] for e in Journal(engine3.run_dir).entries()]
     assert kinds.count("reverify-decision") == 1 and "resume-review" in kinds
 
