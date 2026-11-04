@@ -129,13 +129,7 @@ def test_finalize_explicit_target_reports_adopted_baseline(project):
     assert adopted == [(baseline, prefix)]
 
 
-@pytest.mark.parametrize("private_baseline", [False, True])
-def test_finalize_preserves_synced_target_sidearm(project, private_baseline):
-    """Syncing main into the story must not squash the published merge parent.
-
-    A private story baseline can itself be incomparable with the target tip;
-    its bytes remain in the squash while the target's ancestry stays intact.
-    """
+def _synced_target_sidearm(project, private_baseline):
     repo = project.project
     fork = git(repo, "rev-parse", "HEAD")
     git(repo, "checkout", "-q", "-b", "epic")
@@ -148,6 +142,17 @@ def test_finalize_preserves_synced_target_sidearm(project, private_baseline):
     git(repo, "checkout", "-q", "epic")
     git(repo, "merge", "--no-ff", "-m", "sync main", "main")
     _commit(repo, "review.txt", "private review\n")
+    return repo, baseline, first_published, target
+
+
+@pytest.mark.parametrize("private_baseline", [False, True])
+def test_finalize_preserves_synced_target_sidearm(project, private_baseline):
+    """Syncing main into the story must not squash the published merge parent.
+
+    A private story baseline can itself be incomparable with the target tip;
+    its bytes remain in the squash while the target's ancestry stays intact.
+    """
+    repo, baseline, first_published, target = _synced_target_sidearm(project, private_baseline)
     tree = git(repo, "rev-parse", "HEAD^{tree}")
     published_objects = [git(repo, "cat-file", "commit", sha) for sha in (first_published, target)]
 
@@ -162,6 +167,75 @@ def test_finalize_preserves_synced_target_sidearm(project, private_baseline):
     ] == published_objects
     expected = {"dev.txt", "review.txt"} | ({"seed.txt"} if private_baseline else set())
     assert set(git(repo, "diff", "--name-only", target, "HEAD").splitlines()) == expected
+
+
+def test_finalize_repeats_after_squashing_private_baseline(project):
+    """A successful squash replaces private ancestry but must remain replayable."""
+    repo, baseline, _first_published, target = _synced_target_sidearm(project, True)
+    tree = git(repo, "rev-parse", "HEAD^{tree}")
+    target_object = git(repo, "cat-file", "commit", target)
+    first = verify.finalize_commit(repo, baseline, "finalized private story")
+    assert first == git(repo, "rev-parse", "HEAD")
+    assert baseline not in git(repo, "rev-list", "HEAD").splitlines()
+
+    repeated = verify.finalize_commit(repo, baseline, "finalized private story")
+
+    assert repeated == git(repo, "rev-parse", "HEAD")
+    assert git(repo, "rev-parse", "HEAD^") == target
+    assert git(repo, "rev-parse", "HEAD^{tree}") == tree
+    assert git(repo, "rev-list", "--count", f"{target}..HEAD") == "1"
+    assert git(repo, "cat-file", "commit", target) == target_object
+    assert git(repo, "status", "--porcelain") == ""
+
+
+def test_native_resume_after_private_baseline_squash_crash_finishes_done(project, monkeypatch):
+    """Death after the squash but before DONE cannot strand a COMMITTING task."""
+    repo = project.project
+    git(repo, "checkout", "-q", "-b", "epic")
+    _commit(repo, "seed.txt", "private baseline\n")
+    engine, _ = make_engine(project, [])
+    baseline = committing_crash_state(project, engine)
+    _commit(repo, "dev.txt", "private development and verified bookkeeping\n")
+    git(repo, "checkout", "-q", "main")
+    _commit(repo, "shared.txt", "published main first\n")
+    target = _commit(repo, "shared.txt", "published main second\n")
+    git(repo, "update-ref", "refs/remotes/origin/main", target)
+    git(repo, "checkout", "-q", "epic")
+    git(repo, "merge", "--no-ff", "-m", "sync main", "main")
+    tree = git(repo, "rev-parse", "HEAD^{tree}")
+    target_object = git(repo, "cat-file", "commit", target)
+    finalize = verify.finalize_commit
+    landed = []
+
+    class HostDied(BaseException):
+        pass
+
+    def finalize_then_die(*args, **kwargs):
+        landed.append(finalize(*args, **kwargs))
+        raise HostDied
+
+    monkeypatch.setattr(verify, "finalize_commit", finalize_then_die)
+    with pytest.raises(HostDied):
+        engine._finalize_commit_phase(engine.state.tasks["1-1-a"])
+    crashed = load_state(engine.run_dir).tasks["1-1-a"]
+    assert crashed.phase == Phase.COMMITTING and crashed.commit_sha is None
+    assert crashed.baseline_commit == baseline
+    assert landed == [git(repo, "rev-parse", "HEAD")]
+    assert baseline not in git(repo, "rev-list", "HEAD").splitlines()
+    monkeypatch.setattr(verify, "finalize_commit", finalize)
+
+    resumed, adapter = resume_engine(project, engine, [])
+    resumed._finish_inflight()
+
+    final = load_state(resumed.run_dir).tasks["1-1-a"]
+    assert final.phase == Phase.DONE
+    assert final.baseline_commit == baseline
+    assert final.commit_sha == git(repo, "rev-parse", "HEAD")
+    assert git(repo, "rev-parse", "HEAD^") == target
+    assert git(repo, "rev-parse", "HEAD^{tree}") == tree
+    assert git(repo, "rev-list", "--count", f"{target}..HEAD") == "1"
+    assert git(repo, "cat-file", "commit", target) == target_object
+    assert adapter.sessions == []
 
 
 def _snapshot(repo):

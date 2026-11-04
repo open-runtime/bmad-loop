@@ -10698,8 +10698,9 @@ def _finalization_baseline(repo: Path, baseline: str, head: str, target_ref: str
             raise GitError(f"cannot prove finalization ancestry {older}..{newer}: {out}")
         return rc == 0
 
-    if not ancestor(baseline, head):
-        raise GitError("finalization baseline is not an ancestor of HEAD")
+    # A completed squash can remove a private baseline from HEAD's ancestry
+    # before the engine saves DONE. Re-derive the protected boundary on replay;
+    # the historical verification baseline need not remain on the rewritten arm.
     rc, out, detail = _git_out(repo, "merge-base", "--all", head, target)
     if rc == 1 and not out:
         return baseline  # independent histories, nothing shared with the target
