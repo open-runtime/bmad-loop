@@ -5261,6 +5261,29 @@ class Engine:
         self._save()
         self._finalize_commit_phase(task)
 
+    def _finalization_target_ref(self) -> str:
+        """The publication target, using the same resolved settings as its hook.
+
+        Local worktree merge-back targets are independent of publication. Prefer
+        push-merge, then sync-with-main's configured main branch, then origin/main.
+        Explicit policy tables also apply when the corresponding hook is absent.
+        """
+        settings = {}
+        branch_key = "target_branch"
+        for name, key in (("push-merge", "target_branch"), ("sync-with-main", "branch")):
+            plugin = self._registry.get(name)
+            if plugin is not None and plugin.active:
+                settings, branch_key = plugin.settings, key
+                break
+            if name in self.policy.plugins.settings:
+                settings, branch_key = self.policy.plugins.settings[name], key
+                break
+        remote = settings.get("remote", "origin")
+        branch = settings.get(branch_key, "main")
+        if not isinstance(remote, str) or not isinstance(branch, str):
+            raise verify.GitError("finalization target remote and branch must be strings")
+        return f"refs/remotes/{remote or 'origin'}/{branch or 'main'}"
+
     def _finalize_commit_phase(self, task: StoryTask) -> None:
         """Drive an already-COMMITTING task to DONE: regenerate the message,
         emit ``pre_commit`` (rewrite honored; a pause veto escalates —
@@ -5317,8 +5340,9 @@ class Engine:
             plan_undo = self._terminal_plan_write(task)
 
             # bmad-build-auto commits its own work each iteration; the orchestrator
-            # squashes that chain plus its uncommitted bookkeeping back onto the
-            # pre-dev baseline as one commit carrying `message`. None means there
+            # squashes the unpublished chain plus its uncommitted bookkeeping
+            # onto the protected target boundary as one commit carrying `message`.
+            # None means there
             # was nothing to finalize (NO_VCS, or the tree already at baseline).
             def validate_staged_publication() -> object:
                 return self._worktree_flow.validate_staged_publication(task, self.workspace.paths)
@@ -5345,12 +5369,25 @@ class Engine:
             if legacy_commit_replay:
                 sha = task.commit_sha
             else:
+                target_ref = self._finalization_target_ref()
+
+                def adopted_baseline(old: str, new: str) -> None:
+                    self.journal.append(
+                        "baseline-adopted-from-target",
+                        story_key=task.story_key,
+                        old_baseline=old,
+                        baseline=new,
+                        target_branch=target_ref,
+                    )
+
                 sha = verify.finalize_commit(
                     self.workspace.root,
                     task.baseline_commit,
                     message,
                     staged_validator=staged_validator,
                     committed_validator=committed_validator,
+                    target_ref=target_ref,
+                    on_baseline_adopted=adopted_baseline,
                 )
             task.commit_sha = sha or task.baseline_commit
             # the corrected spec is now durable in HEAD; later attempts need no
