@@ -2612,6 +2612,72 @@ def test_resume_bound_spec_failed_dev_gate_never_reviews_or_accepts(project):
     assert all(row["action"] != "proceed" for row in _rows(resumed, "dev-decision"))
 
 
+def test_resume_bound_spec_rearmed_acceptance_cannot_bypass_current_dev_verify(project):
+    """An older generation's acceptance cannot authorize a new attempt's tree.
+
+    The supported re-arm preserves append-only sessions and their old acceptance
+    index. The new completed result must still earn its own PROCEED receipt.
+    Ablation: use only a non-None index in the resume gate and the review launches.
+    """
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    engine.policy = dataclasses.replace(
+        engine.policy,
+        limits=LimitsPolicy(max_dev_attempts=1),
+        verify=VerifyPolicy(commands=(_FAIL,)),
+    )
+    _baseline, sp = _dev_verify_crash_state(project, engine, "done")
+    task = engine.state.tasks["1-1-a"]
+    task.spec_file = str(sp)
+    task.accepted_dev_session_index = 0
+    task.phase = Phase.ESCALATED
+    engine.state.paused_stage = PAUSE_ESCALATION
+    engine.state.paused_story_key = task.story_key
+    engine._save()
+    runs.rearm_escalation(
+        engine.run_dir,
+        isolated_redrive=False,
+        resolution_recorded=True,
+        project_root=project.project,
+    )
+
+    pending, _ = resume_engine(project, engine, [])
+    task = pending.state.tasks["1-1-a"]
+    assert task.phase == Phase.PENDING and task.generation == 1
+    assert task.accepted_dev_session_index == 0 and len(task.sessions) == 1
+    task.attempt = 1
+    task.phase = Phase.DEV_VERIFY
+    task.followup_review_recommended = True
+    write_spec(sp, "done", task.baseline_commit)
+    task.record_session(
+        SessionRecord(
+            task_id=_session_task_id(task.story_key, "dev", task.attempt, task.generation),
+            role="dev",
+            status="completed",
+            result_json={
+                **task.sessions[0].result_json,
+                "baseline_commit": task.baseline_commit,
+                "followup_review_recommended": True,
+            },
+        )
+    )
+    pending._save()
+
+    resumed, adapter = resume_engine(
+        project, pending, [review_effect(project, "1-1-a", clean=True)]
+    )
+    summary = resumed.run()
+
+    assert not summary.crashed and summary.done == 0
+    assert adapter.sessions == []
+    assert not _rows(resumed, "resume-review")
+    decisions = _rows(resumed, "dev-decision")
+    assert decisions and all(row["action"] != "proceed" for row in decisions)
+    saved = load_state(resumed.run_dir).tasks[task.story_key]
+    assert saved.accepted_dev_session_index == 0 and len(saved.sessions) == 2
+    assert not resumed._accepted_dev_session_matches(saved)
+
+
 def test_resume_bound_spec_without_completed_record_pauses_before_review(project):
     write_sprint(project, {"1-1-a": "ready-for-dev"})
     engine, _ = make_engine(project, [])
