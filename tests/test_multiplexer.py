@@ -167,6 +167,14 @@ def test_a_backend_without_send_keys_inherits_the_seam_refusal():
         StubMux().send_keys("@1", "Enter")
 
 
+def test_a_backend_without_rename_window_inherits_the_seam_refusal():
+    """A backend written before the verb existed (StubMux overrides no
+    `rename_window`) still constructs, and a rename raises the seam error the
+    caller reads as a rename that did not land, never a silent no-op."""
+    with pytest.raises(MultiplexerError, match="StubMux cannot rename a window"):
+        StubMux().rename_window("=ctl:@1", "run-b")
+
+
 def test_window_alive_matches_a_session_qualified_id(monkeypatch):
     """A tmux-family backend may mint `session:@N` ids (psmux does, and a plugin
     subclass may too) while list-panes rows carry bare `@N`; the base compares
@@ -370,6 +378,7 @@ def test_seam_methods_never_leak_raw_subprocess_error(boom_run, tmp_path):
         lambda: mux.set_session_option("s", "opt", "val"),
         lambda: mux.new_parked_window("s", "n", tmp_path, ["echo", "hi"], ""),
         lambda: mux.send_text("@1", "hi"),
+        lambda: mux.rename_window("@1", "n"),
         lambda: mux.has_session("s"),  # already-correct raiser — lock it in
     ]
     for call in raisers:
@@ -1304,6 +1313,35 @@ def test_kill_window_is_silent_when_the_kill_lands(monkeypatch, capsys):
     assert len(calls) == 1  # a landed kill never pays for the survivor probe
 
 
+def test_rename_window_sends_the_target_and_name_verbatim(monkeypatch):
+    # One spawn, no option write: tmux's rename-window turns the window's
+    # automatic-rename off itself, so the name sticks with nothing else sent.
+    calls = _kill_fake(monkeypatch, kill_rc=0)
+    assert TmuxMultiplexer().rename_window("=ctl:@3", "run-b") is None
+    assert calls == [["tmux", "-u", "rename-window", "-t", "=ctl:@3", "run-b"]]
+
+
+def test_rename_window_raises_when_the_rename_did_not_land(monkeypatch):
+    """A rename is CHECKED, unlike select_window: a nonzero exit raises the seam
+    type naming the target and the binary's own stderr, so the caller can say
+    the window is still under its old name. Ablation (performed): make
+    rename_window swallow failures the way select_window does and this FAILS."""
+    _kill_fake(monkeypatch, kill_rc=1, kill_err="can't find window: @9\n")
+    with pytest.raises(tmux_base.TmuxError, match="rename-window on ctl:@9 exited 1") as excinfo:
+        TmuxMultiplexer().rename_window("ctl:@9", "run-b")
+    assert "can't find window: @9" in str(excinfo.value)
+
+
+def test_rename_window_raises_on_a_transport_failure(monkeypatch):
+    def boom(*_a, **_k):
+        raise OSError("tmux vanished")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", boom)
+    with pytest.raises(MultiplexerError, match="tmux vanished") as excinfo:
+        TmuxMultiplexer().rename_window("ctl:@3", "run-b")
+    assert not isinstance(excinfo.value, OSError)
+
+
 # -------------------------------- version() is one bounded line, always (#321)
 #
 # Consumers render version() inline (the `mux` table, validate's preflight
@@ -1330,6 +1368,9 @@ def test_version_folds_a_multi_line_probe_onto_one_line(monkeypatch):
     assert got is not None and "\n" not in got
     # Folded, not truncated: dropping the tail would hide which binary runs.
     assert got == "tmux 3.3.7; psmux 3.3.7 (05cc5d4 2026-07-20)"
+    # The bound must clear the probes that actually exist by a wide margin —
+    # otherwise it trades one unreadable cell for a useless one.
+    assert len(got) < multiplexer.VERSION_MAX_CHARS
     # Order is load-bearing — PsmuxMultiplexer.available() anchors its version
     # match at position 0, so the compat line must stay first.
     assert got.startswith("tmux 3.3.7")
@@ -1450,17 +1491,6 @@ def test_version_error_of_a_backend_that_keeps_no_record_is_none():
     instantiated to hold any)."""
     assert "version_error" not in multiplexer.TerminalMultiplexer.__abstractmethods__
     assert multiplexer.TerminalMultiplexer.version_error(object()) is None  # type: ignore[arg-type]
-
-
-def test_version_of_a_real_probe_is_never_truncated(monkeypatch):
-    # The bound must clear the probes that actually exist by a wide margin —
-    # otherwise it trades one unreadable cell for a useless one.
-    _version_stdout(monkeypatch, "tmux 3.3.7\npsmux 3.3.7 (05cc5d4 2026-07-20)\n")
-
-    got = TmuxMultiplexer().version()
-
-    assert got == "tmux 3.3.7; psmux 3.3.7 (05cc5d4 2026-07-20)"
-    assert len(got) < multiplexer.VERSION_MAX_CHARS
 
 
 # ---------------------------------------------- _run seam: encoding + env (#40)

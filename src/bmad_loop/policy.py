@@ -32,10 +32,12 @@ POLICY_FILE = Path(".bmad-loop") / "policy.toml"
 GATE_MODES = {"none", "per-epic", "per-story-spec-approval"}
 RETRO_MODES = {"never", "notify", "auto"}
 SESSION_BUDGET_MODES = {"off", "warn", "enforce"}
+# [limits] usage_limit_action: what a usage-limited session end does (#959).
+USAGE_LIMIT_ACTIONS = frozenset({"pause", "relaunch"})
 SWEEP_AUTO_MODES = {"never", "per-epic", "run-end"}
 REVIEW_TRIGGER_MODES = {"always", "recommended"}
 REVIEW_ON_TIMEOUT_MODES = {"retry", "salvage-if-done", "defer"}
-REVIEW_ON_STATUS_CONTRADICTION_MODES = {"escalate", "retry"}
+REVIEW_ON_STATUS_CONTRADICTION_MODES = {"escalate"}
 OPERATOR_ON_REVIEW_DEMOTION_MODES = {"escalate", "park"}
 # [adapter] permission_mode: "bypass" (default) launches a profile's bypass_args;
 # any other mode launches the profile's `[permission_modes.<mode>]` args instead,
@@ -77,14 +79,17 @@ _MUX_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _TOML_SECTION_RE = re.compile(r"^\s*\[(?P<name>[^\]]+)\]\s*(?:#.*)?$")
 _MUX_KEY_RE = re.compile(r"^\s*#?\s*backend\s*=")
 
-# Deprecated [engine] keys, folded into [plugins.unity] at load time. The
-# game-engine layer is now a plugin; [engine] is a one-release compatibility
-# alias (see _fold_deprecated_engine).
-_ENGINE_SETTING_KEYS = ("editor_mode", "mcp", "unity_path", "ready_timeout_sec", "ready_grace_sec")
-
 
 class PolicyError(Exception):
     pass
+
+
+class PolicyDeprecationWarning(FutureWarning):
+    """A policy.toml key or value that still loads but is going away.
+
+    A ``FutureWarning`` because Python shows that category to application end
+    users by default, while ``DeprecationWarning`` is hidden outside
+    ``__main__`` (#835). The CLI formats it in ``cli._format_warning``."""
 
 
 @dataclass(frozen=True)
@@ -208,6 +213,18 @@ class LimitsPolicy:
     # summary and evidence keep in the ledger (the upstream caps by default).
     harvest_summary_chars: int = 200
     harvest_evidence_chars: int = 1000
+    # what a dev/review/fix session that ended without completing because of a
+    # usage limit (or an account-level StopFailure) does (#959). "pause" = the
+    # uncharged usage-limit pause `resolve` clears. "relaunch" = relaunch the
+    # session at once as an UNCHARGED retry (attempt/review_cycle still bump for
+    # session identity; a refund counter keeps the budget whole), so a wrapper
+    # or pre_session plugin can rotate accounts keyed on BMAD_LOOP_USAGE_RELAUNCH.
+    usage_limit_action: str = "pause"
+    # relaunch mode: the per-story cap on uncharged usage relaunches (dev, fix
+    # and review together). At the cap the session falls back to the pause, so
+    # a repeated or forged limit signal can never loop unbounded. 0 = relaunch
+    # mode never relaunches (always pauses).
+    max_usage_relaunches: int = 3
 
 
 @dataclass(frozen=True)
@@ -305,11 +322,10 @@ class ReviewPolicy:
     # stage contradicts that — and nothing in the review loop re-advances the
     # board, so every remaining cycle re-reads the same failure and the story
     # ends deferred + rolled back.
-    #   "escalate" (default) — pause the run naming both sides of the
-    #       disagreement, so a human resolves it instead of the budget burning
-    #       down onto a rollback.
-    #   "retry" — legacy behavior: treat it as an ordinary verify failure, burn
-    #       review cycles to limits.max_review_cycles, then defer.
+    # "escalate" is the only legal value: a revoked sign-off always pauses the
+    # run naming both sides of the disagreement, so a human resolves it instead
+    # of the budget burning down onto a rollback. `loads()` refuses the removed
+    # "retry" mode with migration text.
     # Keys on sprint-status only: the spec's own frontmatter status legitimately
     # cycles (in-review/in-progress) while a review patches, and `status: blocked`
     # remains the sanctioned way for a review to hand a story back to a human.
@@ -1067,7 +1083,7 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
     sweep_d = _section(doc, "sweep")
     scm_d = _section(doc, "scm")
     cleanup_d = _section(doc, "cleanup")
-    engine_d = _section(doc, "engine")  # deprecated; folded into [plugins] below
+    engine_d = _section(doc, "engine")  # removed; refused or ignored below, never read
     plugins_d = _section(doc, "plugins")
     tui_d = _section(doc, "tui")
     operator_d = _section(doc, "operator")
@@ -1163,6 +1179,12 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         harvest_evidence_chars=_typed_int(
             limits_d, "limits", "harvest_evidence_chars", LimitsPolicy.harvest_evidence_chars
         ),
+        usage_limit_action=_typed_str(
+            limits_d, "limits", "usage_limit_action", LimitsPolicy.usage_limit_action
+        ).strip(),
+        max_usage_relaunches=_typed_int(
+            limits_d, "limits", "max_usage_relaunches", LimitsPolicy.max_usage_relaunches
+        ),
     )
     if limits.harvest_summary_chars < 1 or limits.harvest_evidence_chars < 1:
         raise PolicyError(
@@ -1223,6 +1245,15 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         raise PolicyError(
             f"limits.session_budget_mode must be one of {sorted(SESSION_BUDGET_MODES)}: "
             f"got {limits.session_budget_mode!r}"
+        )
+    if limits.usage_limit_action not in USAGE_LIMIT_ACTIONS:
+        raise PolicyError(
+            f"limits.usage_limit_action must be one of {sorted(USAGE_LIMIT_ACTIONS)}: "
+            f"got {limits.usage_limit_action!r}"
+        )
+    if limits.max_usage_relaunches < 0:
+        raise PolicyError(
+            f"limits.max_usage_relaunches must be >= 0: got {limits.max_usage_relaunches}"
         )
     if limits.max_tokens_per_story < 1:
         raise PolicyError(
@@ -1294,6 +1325,12 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         raise PolicyError(
             f"review.on_timeout must be one of {sorted(REVIEW_ON_TIMEOUT_MODES)}:"
             f" got {review.on_timeout!r}"
+        )
+    if review.on_status_contradiction == "retry":
+        raise PolicyError(
+            'review.on_status_contradiction = "retry" was removed — a review that walks'
+            " sprint-status or a ticket plan back from done now always pauses with an"
+            ' escalation naming both sides; delete the key or set it to "escalate"'
         )
     if review.on_status_contradiction not in REVIEW_ON_STATUS_CONTRADICTION_MODES:
         raise PolicyError(
@@ -1541,11 +1578,8 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
     plugin_settings = {
         str(k): dict(v) for k, v in plugins_d.items() if k != "enabled" and isinstance(v, dict)
     }
-    # The game-engine layer is now a plugin. Fold a deprecated [engine] block into
-    # [plugins] (enable the named plugin + map its keys to [plugins.<name>]) so
-    # existing Unity configs keep working for one release; explicit [plugins.*]
-    # values win over the folded ones.
-    _fold_deprecated_engine(engine_d, enabled, plugin_settings)
+    if "engine" in doc:
+        _refuse_removed_engine(engine_d)
     if plugin_schemas:
         for name, raw_settings in plugin_settings.items():
             _validate_plugin_settings(name, raw_settings, plugin_schemas.get(name))
@@ -1650,33 +1684,36 @@ def _load_recovery(recovery_d: dict[str, Any]) -> RecoveryPolicy:
     return recovery
 
 
-def _fold_deprecated_engine(
-    engine_d: dict[str, Any], enabled: list[str], plugin_settings: dict[str, dict[str, Any]]
-) -> None:
-    """Translate a legacy ``[engine]`` block into the plugin surface in place.
+def _refuse_removed_engine(engine_d: dict[str, Any]) -> None:
+    """Refuse a named ``[engine]`` block; warn on an empty-name one.
 
-    ``[engine] name = "unity"`` becomes ``[plugins] enabled = ["unity"]`` plus a
-    ``[plugins.unity]`` table carrying editor_mode/mcp/unity_path/ready_*; the
-    editor_mode↔scm.isolation coupling is now validated by the plugin itself
-    (``UnityPlugin.validate``), not here. A no-op when ``[engine]`` is absent or
-    its ``name`` is empty (the old "disabled" state)."""
-    if not engine_d:
-        return
+    The game-engine layer is a plugin (``[plugins] enabled`` + ``[plugins.<name>]``).
+    A named block is refused rather than ignored because ``loads`` never rejects
+    unknown sections: dropping it silently would disable the Unity plugin, its
+    editor_mode↔scm.isolation check and its Editor readiness gate with no signal.
+    An absent, empty or whitespace ``name`` (a bare ``[engine]`` table included)
+    only warns: the v0.4.3/v0.4.4 init templates wrote an inert
+    ``[engine] name = ""`` into every project, and it never enabled anything, so
+    its keys are ignored and the advice is to delete the section."""
+    raw_name = engine_d.get("name", "")
+    if not isinstance(raw_name, str):
+        raise PolicyError(
+            '[engine] was removed — use [plugins] enabled = ["<name>"] with a '
+            f"[plugins.<name>] table instead (engine.name must be a string: got {raw_name!r})"
+        )
+    name = raw_name.strip()
+    if name:
+        raise PolicyError(
+            "[engine] was removed — the game-engine layer is a plugin: use [plugins] "
+            f'enabled = ["{name}"] and move editor_mode, mcp, unity_path, '
+            f"ready_timeout_sec and ready_grace_sec into [plugins.{name}]"
+        )
     warnings.warn(
-        "[engine] in policy.toml is deprecated; the game-engine layer is now a "
-        'plugin. Use [plugins] enabled = ["unity"] with a [plugins.unity] table. '
-        "[engine] will be removed in a future release.",
-        DeprecationWarning,
+        "[engine] in policy.toml is ignored: the game-engine layer is a plugin and an "
+        "empty name enables nothing; remove the [engine] section.",
+        PolicyDeprecationWarning,
         stacklevel=3,
     )
-    name = _typed_str(engine_d, "engine", "name", "").strip()
-    if not name:
-        return
-    if name not in enabled:
-        enabled.append(name)
-    folded = {k: engine_d[k] for k in _ENGINE_SETTING_KEYS if k in engine_d}
-    # explicit [plugins.<name>] values take precedence over the folded [engine] ones
-    plugin_settings[name] = {**folded, **plugin_settings.get(name, {})}
 
 
 POLICY_TEMPLATE = """\
@@ -1708,6 +1745,8 @@ cache_read_weight = 0.1      # cache reads bill at ~0.1x input on all vendors; 1
 session_budget_mode = "warn"  # off | warn | enforce — weighted per-SESSION cap sampled every ~30s mid-session; warn = one ATTENTION + breadcrumb; enforce = wrap-up nudge (best-effort courtesy; the kill is the guarantee) then over_budget termination (retry→defer). Live-verified on claude; other transcript parsers sample best-effort (mid-turn flush unverified); inert where no mid-session usage signal exists (usage_parser "none", copilot's shutdown-only flush)
 max_tokens_per_session = 4000000 # weighted cap a single session may spend before the guard trips; healthy sessions run ~1-2.5M weighted, so the default trips only true runaways (#158)
 session_budget_grace_s = 240 # enforce mode: seconds a tripped session gets to wrap up after the nudge before over_budget termination. 0 = terminate at trip, no nudge
+usage_limit_action = "pause" # pause | relaunch — a session that ends on a usage limit or account StopFailure: pause = the uncharged usage-limit pause; relaunch = relaunch it at once as an uncharged retry (BMAD_LOOP_USAGE_RELAUNCH=<n> in the session env, for account rotation) (#959)
+max_usage_relaunches = 3     # relaunch mode: uncharged usage relaunches per story (dev, fix and review together); at the cap the session pauses instead. 0 = always pause
 
 [verify]
 # Deterministic gates run by the orchestrator after a clean review, before commit.
@@ -1749,11 +1788,10 @@ trigger = "recommended"
 #                        commit it and refile the outstanding follow-up to deferred work.
 #   "defer"           -> give up on the first timeout-like verdict.
 on_timeout = "retry"
-# What a review that writes sprint-status back off `done` (the sign-off the
-# orchestrator recorded at dev time) costs. Nothing in the review loop
-# re-advances the board, so every remaining cycle re-reads the same failure:
-#   "escalate" -> pause the run naming both sides of the disagreement (default).
-#   "retry"    -> legacy: burn review cycles to max_review_cycles, then defer.
+# A review that writes sprint-status back off `done` (the sign-off the
+# orchestrator recorded at dev time) pauses the run naming both sides of the
+# disagreement: nothing in the review loop re-advances the board.
+# "escalate" is the only value.
 on_status_contradiction = "escalate"
 
 [stories]
@@ -1889,8 +1927,6 @@ enabled = []                 # e.g. ["unity"]
 #   unity_path = ""              # Editor binary for a per_worktree launch ("" = auto-detect)
 #   ready_timeout_sec = 600      # how long the readiness gate waits for the Editor + MCP
 #   ready_grace_sec = -1         # delay before the first probe (-1 = auto: per_worktree waits)
-# (The legacy [engine] block still loads with a deprecation warning, folded into
-#  [plugins.unity] — migrate to [plugins] when convenient.)
 
 [tui]
 # low_frame_rate = true caps Textual to 15fps and disables animations (sets

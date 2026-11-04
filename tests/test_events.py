@@ -46,6 +46,11 @@ TWINNED = (
     "_TURN_DONE_STATUSES",
     "_turn_fields",
     "_hcom_fields",
+    "_fully_idle",
+    # #865's StopFailure fields: the bound, the str-only cut and the key map.
+    "RELAY_TEXT_MAX",
+    "_bounded_text",
+    "_STOP_FAILURE_FIELDS",
     # DW-507's lineage block: the tag both relays stamp on every event.
     "_LAUNCH_SHIM_WINDOW_S",
     "_proc_stat",
@@ -229,6 +234,67 @@ def test_both_relay_twins_forward_the_notification_type(tmp_path, monkeypatch, p
     assert from_relay["notification_type"] == expected
 
 
+_STOP_KEYS = ("stop_error", "stop_error_details", "stop_message")
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        (
+            {
+                "error": "server_error",
+                "error_details": "529 Overloaded",
+                "last_assistant_message": "API Error: Connection lost mid-response",
+            },
+            {
+                "stop_error": "server_error",
+                "stop_error_details": "529 Overloaded",
+                "stop_message": "API Error: Connection lost mid-response",
+            },
+        ),
+        # optional fields absent -> their keys are absent, the present one still rides
+        ({"error": "billing_error"}, {"stop_error": "billing_error"}),
+        # not a StopFailure payload at all -> no key written
+        ({}, {}),
+        # only a string is forwarded — a profile table keys on str
+        ({"error": 7, "error_details": None, "last_assistant_message": ["x"]}, {}),
+        # over-long text is cut to RELAY_TEXT_MAX, never dropped
+        (
+            {"error": "unknown", "last_assistant_message": "x" * (events.RELAY_TEXT_MAX + 50)},
+            {"stop_error": "unknown", "stop_message": "x" * events.RELAY_TEXT_MAX},
+        ),
+    ],
+)
+def test_both_relay_twins_forward_the_stop_failure_fields(tmp_path, monkeypatch, payload, expected):
+    """#865: a StopFailure payload's `error` / `error_details` /
+    `last_assistant_message` reach the event file from BOTH writers as
+    `stop_error` / `stop_error_details` / `stop_message` — present-only, str-only,
+    bounded. The hook shapes inline in `main()`, so this pins it behaviorally.
+
+    Ablation: drop the `_STOP_FAILURE_FIELDS` loop from either writer and the
+    present cases fail on that side alone."""
+    hook_run, relay_run = tmp_path / "hook", tmp_path / "relay"
+    proc = subprocess.run(
+        [sys.executable, str(HOOK), "StopFailure"],
+        input=json.dumps(payload),
+        env={
+            "PATH": os.environ.get("PATH", ""),
+            **({"SYSTEMROOT": os.environ.get("SYSTEMROOT", "")} if os.name == "nt" else {}),
+            "BMAD_LOOP_RUN_DIR": str(hook_run),
+            "BMAD_LOOP_TASK_ID": "1-1-a-dev-1",
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert _relay("StopFailure", payload, monkeypatch, relay_run, task_id="1-1-a-dev-1") == 0
+    from_hook = json.loads(next((hook_run / "events").glob("*.json")).read_text(encoding="utf-8"))
+    from_relay = json.loads(next((relay_run / "events").glob("*.json")).read_text(encoding="utf-8"))
+    assert {k: from_hook[k] for k in _STOP_KEYS if k in from_hook} == expected
+    assert {k: from_relay[k] for k in _STOP_KEYS if k in from_relay} == expected
+
+
 @pytest.mark.parametrize(
     ("payload", "expected"),
     [
@@ -269,6 +335,95 @@ def test_both_relay_twins_forward_the_session_start_source(
     from_relay = json.loads(next((relay_run / "events").glob("*.json")).read_text())
     assert from_hook["source"] == expected
     assert from_relay["source"] == expected
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"model": "claude-opus-4-6[1m]"}, "claude-opus-4-6[1m]"),
+        ({"model": "gpt-5.5-codex"}, "gpt-5.5-codex"),
+        # only a non-empty string is forwarded; anything else leaves the key out
+        ({"model": 7}, None),
+        ({"model": ["gpt-5.5"]}, None),
+        ({"model": ""}, None),
+        ({}, None),
+    ],
+)
+def test_both_relay_twins_forward_the_hook_model(tmp_path, monkeypatch, payload, expected):
+    """#859: a hook payload's `model` reaches the event file from BOTH writers,
+    and only when it is a non-empty string — otherwise the key is absent, so an
+    event without one is unchanged (`test_relay_and_the_hook_shape_the_same_event`).
+
+    Ablation: drop the `model` write from either writer and the string cases fail
+    on that side; write it unconditionally and the absent cases fail."""
+    hook_run, relay_run = tmp_path / "hook", tmp_path / "relay"
+    proc = subprocess.run(
+        [sys.executable, str(HOOK), "SessionStart"],
+        input=json.dumps(payload),
+        env={
+            "PATH": os.environ.get("PATH", ""),
+            **({"SYSTEMROOT": os.environ.get("SYSTEMROOT", "")} if os.name == "nt" else {}),
+            "BMAD_LOOP_RUN_DIR": str(hook_run),
+            "BMAD_LOOP_TASK_ID": "1-1-a-dev-1",
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert _relay("SessionStart", payload, monkeypatch, relay_run, task_id="1-1-a-dev-1") == 0
+    from_hook = json.loads(next((hook_run / "events").glob("*.json")).read_text(encoding="utf-8"))
+    from_relay = json.loads(next((relay_run / "events").glob("*.json")).read_text(encoding="utf-8"))
+    if expected is None:
+        assert "model" not in from_hook
+        assert "model" not in from_relay
+    else:
+        assert from_hook["model"] == expected
+        assert from_relay["model"] == expected
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"fullyIdle": False}, False),
+        ({"fullyIdle": True}, True),
+        # only a JSON boolean is forwarded; anything else writes no key at all
+        ({"fullyIdle": "false"}, None),
+        ({"fullyIdle": 0}, None),
+        ({"fullyIdle": None}, None),
+        ({}, None),
+    ],
+)
+def test_both_relay_twins_forward_a_boolean_fully_idle(tmp_path, monkeypatch, payload, expected):
+    """DW-548: agy's Stop `fullyIdle` reaches the event file from BOTH writers as
+    `fully_idle`, and only as a boolean. Without one the key is ABSENT, not null,
+    so every other CLI's event stays exactly what it was.
+
+    Ablation: drop the `fully_idle` write from either writer and the boolean
+    rows fail on that side; write it unconditionally and the absent rows fail."""
+    hook_run, relay_run = tmp_path / "hook", tmp_path / "relay"
+    proc = subprocess.run(
+        [sys.executable, str(HOOK), "Stop"],
+        input=json.dumps(payload),
+        env={
+            "PATH": os.environ.get("PATH", ""),
+            **({"SYSTEMROOT": os.environ.get("SYSTEMROOT", "")} if os.name == "nt" else {}),
+            "BMAD_LOOP_RUN_DIR": str(hook_run),
+            "BMAD_LOOP_TASK_ID": "1-1-a-dev-1",
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert _relay("Stop", payload, monkeypatch, relay_run, task_id="1-1-a-dev-1") == 0
+    from_hook = json.loads(next((hook_run / "events").glob("*.json")).read_text())
+    from_relay = json.loads(next((relay_run / "events").glob("*.json")).read_text())
+    for event in (from_hook, from_relay):
+        if expected is None:
+            assert "fully_idle" not in event
+        else:
+            assert event["fully_idle"] is expected
 
 
 # ---------------------------------------------------------- lineage (DW-507)

@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import tomllib
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -167,6 +168,61 @@ def _make_flow(
     )
     flow.calls = calls
     return flow
+
+
+@pytest.mark.parametrize("old_first", [True, False], ids=["old-first", "new-first"])
+def test_provision_shared_config_keeps_version_gates(project, tmp_path, monkeypatch, old_first):
+    """Shared settings keep Stop but cannot regain a relay rejected by either CLI.
+
+    Ablation: omit the shared gate intersection and the old-first row re-adds
+    StopFailure after its seeded relay was stripped by the old profile.
+    """
+    from bmad_loop import install
+    from bmad_loop.adapters.profile import get_profile
+
+    claude = get_profile("claude")
+    old = replace(claude, name="old-claude", binary="old-claude")
+    new = replace(claude, name="new-claude", binary="new-claude")
+    profiles = [old, new] if old_first else [new, old]
+    monkeypatch.setattr(
+        install, "cli_version", lambda p: (2, 1, 77) if p.binary == old.binary else (2, 1, 78)
+    )
+    wt = tmp_path / "wt"
+    config = wt / claude.hooks.config_path
+    config.parent.mkdir(parents=True)
+    user_stop = {"hooks": [{"type": "command", "command": "make lint"}]}
+    config.write_text(
+        json.dumps(
+            {
+                "env": {"KEEP": "yes"},
+                "hooks": {
+                    "Stop": [user_stop],
+                    "StopFailure": [
+                        {
+                            "hooks": [
+                                {"type": "command", "command": "/old/bmad-loop relay StopFailure"}
+                            ]
+                        }
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    notes = []
+
+    provision_worktree(wt, profiles, project.project, on_hook_gated=notes.append)
+
+    installed = json.loads(config.read_text(encoding="utf-8"))
+    assert "StopFailure" not in installed["hooks"]
+    assert user_stop in installed["hooks"]["Stop"]
+    assert installed["env"] == {"KEEP": "yes"}
+    assert any(
+        h["command"].endswith(" relay Stop")
+        for group in installed["hooks"]["Stop"]
+        for h in group["hooks"]
+    )
+    assert len(notes) == 1 and notes[0].startswith("StopFailure hook not registered (old-claude)")
 
 
 # --------------------------------------------------------------- pure predicates
@@ -419,124 +475,85 @@ def test_accepted_spec_delivery_resolution_fault_records_uncertainty(
     ]
 
 
-def test_ledger_seed_names_a_ledger_the_checkout_cannot_deliver(tmp_path):
-    """The default shape: a gitignored ledger is absent from a tracked-only
-    checkout, so the orchestrator's own close would be written to — and read back
-    from — a file that does not exist."""
+# ------------------------------------------------------- ledger and board seeds
+#
+# `_board_seed` is `_ledger_seed`'s sibling for the sprint board (#350): both
+# delegate to `_artifact_seed`, so the same three exclusions and the same
+# worktree-presence predicate run arm for arm, and every row runs for both
+# artifacts. What differs is the failure when the artifact is missing from a unit
+# worktree: the ledger's orchestrator close is written to and read back from a file
+# that does not exist, so its gate re-bundles (#426 livelock), while `verify_dev`
+# RAISES (SprintStatusError) on an absent board. Unit-level because two of the
+# exclusions are silent in the journal by design.
+
+_SEED_ARTIFACTS = [
+    pytest.param("_ledger_seed", "deferred_work", id="ledger"),
+    pytest.param("_board_seed", "sprint_status", id="board"),
+]
+
+
+@pytest.mark.parametrize(("method", "attr"), _SEED_ARTIFACTS)
+def test_artifact_seed_names_an_artifact_the_checkout_cannot_deliver(tmp_path, method, attr):
+    """The default shape: a gitignored ledger or board is absent from a
+    tracked-only checkout, so the orchestrator's own close (ledger) or advance
+    (board) would be written to — and read back from — a file that does not
+    exist; for the board the read-back raises."""
     flow = _artifact_flow(tmp_path)
-    flow.paths.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    configured: Path = getattr(flow.paths, attr)
+    configured.write_text("# Deferred Work\n", encoding="utf-8")
     worktree = tmp_path / "wt"
     worktree.mkdir()
 
-    assert flow._ledger_seed(worktree) == (
-        "_bmad-output/implementation-artifacts/deferred-work.md",
-    )
+    rel = configured.relative_to(flow.paths.repo_root).as_posix()
+    assert getattr(flow, method)(worktree) == (rel,)
 
 
-def test_ledger_seed_skips_a_ledger_the_checkout_already_has(tmp_path):
-    """A tracked ledger is delivered by `git worktree add`. Seeding it anyway
-    copies nothing and journals `worktree-seed-skipped` — a diagnostic meaning "a
-    seed you asked for did nothing" — on every isolated unit of every ordinary
-    project."""
+@pytest.mark.parametrize(("method", "attr"), _SEED_ARTIFACTS)
+def test_artifact_seed_skips_an_artifact_the_checkout_already_has(tmp_path, method, attr):
+    """A tracked ledger or board (the common shape for the board) is delivered by
+    `git worktree add`. Seeding it anyway copies nothing and journals
+    `worktree-seed-skipped` — a diagnostic meaning "a seed you asked for did
+    nothing" — on every isolated unit of every such project."""
     flow = _artifact_flow(tmp_path)
-    flow.paths.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    configured: Path = getattr(flow.paths, attr)
+    configured.write_text("# Deferred Work\n", encoding="utf-8")
     worktree = tmp_path / "wt"
-    delivered = worktree / "_bmad-output" / "implementation-artifacts" / "deferred-work.md"
+    delivered = worktree / configured.relative_to(flow.paths.repo_root)
     delivered.parent.mkdir(parents=True)
     delivered.write_text("# Deferred Work\n", encoding="utf-8")
 
-    assert flow._ledger_seed(worktree) == ()
+    assert getattr(flow, method)(worktree) == ()
 
 
-def test_ledger_seed_skips_an_absent_ledger(tmp_path):
-    """No ledger yet is the commonest state — the first harvest is what creates
-    it. A seed entry naming a non-existent source is dropped by the seed loop
-    without `worktree-seed-skipped` OR `worktree-seed-dropped`, so it would be
-    invisible rather than merely inert."""
+@pytest.mark.parametrize(("method", "attr"), _SEED_ARTIFACTS)
+def test_artifact_seed_skips_an_absent_artifact(tmp_path, method, attr):
+    """No artifact yet is a real state: no ledger is the commonest one (the first
+    harvest is what creates it), and no board is real for the run types that need
+    none (sweep, stories). A seed entry naming a non-existent source is dropped by
+    the seed loop without `worktree-seed-skipped` OR `worktree-seed-dropped`, so it
+    would be invisible rather than merely inert."""
     flow = _artifact_flow(tmp_path)
     worktree = tmp_path / "wt"
     worktree.mkdir()
 
-    assert not flow.paths.deferred_work.exists()
-    assert flow._ledger_seed(worktree) == ()
+    assert not getattr(flow.paths, attr).exists()
+    assert getattr(flow, method)(worktree) == ()
 
 
-def test_ledger_seed_skips_a_ledger_outside_the_project_tree(tmp_path):
+@pytest.mark.parametrize(("method", "attr"), _SEED_ARTIFACTS)
+def test_artifact_seed_skips_an_artifact_outside_the_project_tree(tmp_path, method, attr):
     """`ProjectPaths.rebased` leaves an out-of-tree artifacts dir unmoved, so the
     worktree already reads this very file and there is nothing to deliver."""
     shared = tmp_path / "shared-artifacts"
     shared.mkdir()
     flow = _artifact_flow(tmp_path, artifacts=shared)
-    flow.paths.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    configured: Path = getattr(flow.paths, attr)
+    configured.write_text("# Deferred Work\n", encoding="utf-8")
     worktree = tmp_path / "wt"
     worktree.mkdir()
 
-    assert flow.paths.rebased(worktree).deferred_work == flow.paths.deferred_work
-    assert flow._ledger_seed(worktree) == ()
-
-
-# -------------------------------------------------------------------- board seed
-#
-# `_board_seed` is `_ledger_seed`'s sibling for the sprint board (#350): same three
-# exclusions, same worktree-presence predicate, different artifact — and a harsher
-# failure when it is missing, since `verify_dev` RAISES on an absent board where
-# the ledger's gate merely re-bundles. Unit-level for the ledger's reason: two of
-# the exclusions are silent in the journal by design.
-
-
-def test_board_seed_names_a_board_the_checkout_cannot_deliver(tmp_path):
-    """A gitignored board is absent from a tracked-only checkout, so the
-    orchestrator's own advance would be written to — and read back from — a file
-    that does not exist, and the read-back raises."""
-    flow = _artifact_flow(tmp_path)
-    flow.paths.sprint_status.write_text("development_status:\n  1-1-a: ready-for-dev\n")
-    worktree = tmp_path / "wt"
-    worktree.mkdir()
-
-    assert flow._board_seed(worktree) == (
-        "_bmad-output/implementation-artifacts/sprint-status.yaml",
-    )
-
-
-def test_board_seed_skips_a_board_the_checkout_already_has(tmp_path):
-    """A tracked board — the common shape for this file — is delivered by `git
-    worktree add`. Seeding it anyway copies nothing and journals
-    `worktree-seed-skipped` on every isolated unit of every such project."""
-    flow = _artifact_flow(tmp_path)
-    flow.paths.sprint_status.write_text("development_status:\n  1-1-a: ready-for-dev\n")
-    worktree = tmp_path / "wt"
-    delivered = worktree / "_bmad-output" / "implementation-artifacts" / "sprint-status.yaml"
-    delivered.parent.mkdir(parents=True)
-    delivered.write_text("development_status:\n  1-1-a: ready-for-dev\n")
-
-    assert flow._board_seed(worktree) == ()
-
-
-def test_board_seed_skips_an_absent_board(tmp_path):
-    """No board at all is a real state for the run types that need none (sweep,
-    stories). A seed entry naming a non-existent source is dropped by the seed loop
-    without `worktree-seed-skipped` OR `worktree-seed-dropped`, so it would be
-    invisible rather than merely inert."""
-    flow = _artifact_flow(tmp_path)
-    worktree = tmp_path / "wt"
-    worktree.mkdir()
-
-    assert not flow.paths.sprint_status.exists()
-    assert flow._board_seed(worktree) == ()
-
-
-def test_board_seed_skips_a_board_outside_the_project_tree(tmp_path):
-    """`ProjectPaths.rebased` leaves an out-of-tree artifacts dir unmoved, so the
-    worktree already reads this very file and there is nothing to deliver."""
-    shared = tmp_path / "shared-artifacts"
-    shared.mkdir()
-    flow = _artifact_flow(tmp_path, artifacts=shared)
-    flow.paths.sprint_status.write_text("development_status:\n  1-1-a: ready-for-dev\n")
-    worktree = tmp_path / "wt"
-    worktree.mkdir()
-
-    assert flow.paths.rebased(worktree).sprint_status == flow.paths.sprint_status
-    assert flow._board_seed(worktree) == ()
+    assert getattr(flow.paths.rebased(worktree), attr) == configured
+    assert getattr(flow, method)(worktree) == ()
 
 
 def test_worktree_tickets_unit_never_seeds_board(tmp_path):
@@ -568,12 +585,7 @@ def test_worktree_tickets_unit_never_seeds_board(tmp_path):
 #
 # DW-377 (was #462): a leaf-symlinked ledger or board was relativized through its
 # TARGET, so the copy landed where no worktree reader looks. Both seeds share
-# `_artifact_seed`, so every row runs for both artifacts.
-
-_SEED_ARTIFACTS = [
-    pytest.param("_ledger_seed", "deferred_work", id="ledger"),
-    pytest.param("_board_seed", "sprint_status", id="board"),
-]
+# `_artifact_seed`, so every row runs for both artifacts (`_SEED_ARTIFACTS`).
 
 
 @pytest.mark.parametrize(("method", "attr"), _SEED_ARTIFACTS)
@@ -621,23 +633,10 @@ def test_artifact_seed_names_the_target_behind_a_tracked_dangling_link(tmp_path,
     assert getattr(flow, method)(worktree) == ()
 
 
-@pytest.mark.parametrize(("method", "attr"), _SEED_ARTIFACTS)
-def test_artifact_seed_skips_a_leaf_symlink_escaping_the_repo(tmp_path, method, attr):
-    """The out-of-repo exclusion survives the fix: the seed loop refuses such a
-    source whatever rel it is handed."""
-    flow = _artifact_flow(tmp_path)
-    configured: Path = getattr(flow.paths, attr)
-    outside = tmp_path / "outside.md"
-    outside.write_text("# Deferred Work\n", encoding="utf-8")
-    configured.symlink_to(outside)
-    worktree = tmp_path / "wt"
-    worktree.mkdir()
-
-    assert getattr(flow, method)(worktree) == ()
-
-
-# DW-432: the out-of-project exclusion above stays, but the drop is named. The rows
-# call the module probe and the flow method both, over each artifact.
+# DW-432: the out-of-project exclusion stays (the seed loop refuses an escaping
+# source whatever rel it is handed, so the seed answers `()`), but the drop is
+# named. The rows call the module probe and the flow method both, over each
+# artifact.
 
 
 def _dropped(flow: WorktreeFlow, attr: str, worktree: Path) -> tuple[str, ...]:
@@ -1475,7 +1474,9 @@ def test_run_isolated_records_every_pinned_rewrite(tmp_path, monkeypatch):
 
     monkeypatch.setattr(worktree_flow, "provision_worktree", provision)
     monkeypatch.setattr(worktree_flow, "worktree_seed_undelivered", stop)
-    state = SimpleNamespace(target_branch="main", run_id="run-1", source="sprint", tasks={})
+    state = SimpleNamespace(
+        target_branch="main", run_id="run-1", source="sprint", tasks={}, parent_initiative=None
+    )
     flow = _make_flow(
         tmp_path,
         paths=paths,
@@ -1530,19 +1531,12 @@ def test_worktree_profiles_dedups_dev_and_review(tmp_path):
     assert [p.name for p in profiles] == ["claude"]
 
 
-def test_worktree_profiles_ignores_fakes_without_a_profile(tmp_path):
-    flow = _make_flow(
-        tmp_path, adapters_get=lambda: {"dev": _FakeAdapter(), "review": _FakeAdapter()}
-    )
-    assert flow.worktree_profiles() == []
-
-
 def test_worktree_profiles_reads_live_adapters(tmp_path):
     # the getter is live, so a caller (e.g. a test) that rebinds the adapters dict
     # after construction is reflected here — mirrors engine.adapters reassignment.
     holder = {"a": {"dev": _FakeAdapter(), "review": _FakeAdapter()}}
     flow = _make_flow(tmp_path, adapters_get=lambda: holder["a"])
-    assert flow.worktree_profiles() == []
+    assert flow.worktree_profiles() == []  # fakes without a profile contribute nothing
     holder["a"] = {"dev": _FakeAdapter("codex"), "review": _FakeAdapter("codex")}
     assert [p.name for p in flow.worktree_profiles()] == ["codex"]
 
@@ -2425,18 +2419,23 @@ class _AfterRedirect(Exception):
     there without a session."""
 
 
-def _isolated_v7_flow(tmp_path, monkeypatch, layout):
+def _isolated_v7_flow(tmp_path, monkeypatch, layout, *, shared=True, child=None):
     """`run_isolated` over a REAL git worktree of ``layout``'s code repo with the
-    store shared, provisioning stubbed (it copies only the personal config layer,
-    as `_seed_bmad_tree` does) and the first result probe raising
-    :class:`_AfterRedirect`. Returns ``(flow, unit, task)``."""
+    store shared (unless not ``shared``), provisioning stubbed (it copies only the
+    personal config layer, as `_seed_bmad_tree` does) and the first result probe
+    raising :class:`_AfterRedirect`. A ``child`` makes the run chained: it builds
+    that child initiative of the layout's (parent) initiative, on the child's
+    paths. Returns ``(flow, unit, task)``."""
     import dataclasses
 
     import bmad_loop.worktree_flow as worktree_flow
     from bmad_loop import bmadconfig, ticketstore
 
     paths = bmadconfig.load_paths(layout.project, want_tickets=True)
-    paths = dataclasses.replace(paths, shared_store=paths.output_folder)
+    if shared:
+        paths = dataclasses.replace(paths, shared_store=paths.output_folder)
+    if child is not None:
+        paths = paths.with_initiative(child)
     wt = tmp_path / "mount"
     git(layout.project, "worktree", "add", "-q", "-b", "bmad-loop/run-1/1.1", str(wt))
     unit = UnitWorkspace(
@@ -2457,7 +2456,14 @@ def _isolated_v7_flow(tmp_path, monkeypatch, layout):
 
     monkeypatch.setattr(worktree_flow, "provision_worktree", provision)
     monkeypatch.setattr(worktree_flow, "worktree_seed_undelivered", stop)
-    state = SimpleNamespace(target_branch="main", run_id="run-1", source="tickets", tasks={})
+    state = SimpleNamespace(
+        target_branch="main",
+        run_id="run-1",
+        source="tickets",
+        tasks={},
+        initiative=child or layout.initiative,
+        parent_initiative=None if child is None else layout.initiative,
+    )
     flow = _make_flow(
         tmp_path,
         paths=paths,
@@ -2489,6 +2495,37 @@ def test_run_isolated_redirects_ignored_store(tmp_path, monkeypatch, project_v7_
     assert task.phase != Phase.ESCALATED
 
 
+def test_run_isolated_writes_a_chained_childs_initiative_into_the_mount(
+    tmp_path, monkeypatch, project_v7
+):
+    """A chained run over a tracked store (T1, no redirect of its own) still gets
+    its mount's personal config rewritten — `active_initiative` names the child,
+    and only that key changes — while the user's own file in the main checkout
+    keeps its bytes (its `active_initiative` still names the parent). Ablation
+    (performed): drop the initiative from the `redirect_mount_config` call site in
+    `run_isolated` and this FAILS (the mount still names the parent)."""
+    from bmad_loop import bmadconfig, ticketstore
+
+    main_config = project_v7.project / ticketstore.USER_CONFIG_REL
+    before = main_config.read_bytes()
+    flow, unit, task = _isolated_v7_flow(
+        tmp_path, monkeypatch, project_v7, shared=False, child="initiative-child"
+    )
+
+    with pytest.raises(_AfterRedirect):
+        flow.run_isolated(task, lambda _t: pytest.fail("drove a session"))
+
+    assert bmadconfig.active_initiative(unit.path) == "initiative-child"
+    expected = tomllib.loads(before.decode("utf-8"))
+    expected["core"]["active_initiative"] = "initiative-child"
+    mounted = (unit.path / ticketstore.USER_CONFIG_REL).read_text(encoding="utf-8")
+    assert tomllib.loads(mounted) == expected  # no output_folder on a T1 store
+    assert main_config.read_bytes() == before
+    assert bmadconfig.active_initiative(project_v7.project) == project_v7.initiative
+    assert git(unit.path, "status", "--porcelain") == ""
+    assert task.phase != Phase.ESCALATED
+
+
 def test_redirect_failure_escalates_unit(tmp_path, monkeypatch, project_v7_store_repo):
     """A redirect that cannot be written escalates the unit before any result probe
     or session. Ablation (performed): drop the `TicketStoreError` catch in
@@ -2500,7 +2537,7 @@ def test_redirect_failure_escalates_unit(tmp_path, monkeypatch, project_v7_store
     def refuse(*_a, **_k):
         raise ticketstore.TicketStoreError("config.user.toml cannot take the redirect")
 
-    monkeypatch.setattr(ticketstore, "redirect_mount_store", refuse)
+    monkeypatch.setattr(ticketstore, "redirect_mount_config", refuse)
 
     with pytest.raises(_Pause) as excinfo:
         flow.run_isolated(task, lambda _t: pytest.fail("drove a session"))
@@ -2510,3 +2547,29 @@ def test_redirect_failure_escalates_unit(tmp_path, monkeypatch, project_v7_store
     assert "cannot take the redirect" in excinfo.value.reason
     assert flow.journal.events() == ["worktree-opened", "story-escalated"]
     assert flow.calls.pauses == [(excinfo.value.reason, "1.1")]
+
+
+def test_chained_redirect_failure_names_the_child_initiative(tmp_path, monkeypatch, project_v7):
+    """A chained mount whose config cannot take the child escalates the unit
+    before any session, the reason naming the child initiative (and no shared
+    store on a T1 layout)."""
+    from bmad_loop import ticketstore
+
+    flow, _unit, task = _isolated_v7_flow(
+        tmp_path, monkeypatch, project_v7, shared=False, child="initiative-child"
+    )
+    seen = {}
+
+    def refuse(_project, **kwargs):
+        seen.update(kwargs)
+        raise ticketstore.TicketStoreError("config.user.toml cannot take the redirect")
+
+    monkeypatch.setattr(ticketstore, "redirect_mount_config", refuse)
+
+    with pytest.raises(_Pause) as excinfo:
+        flow.run_isolated(task, lambda _t: pytest.fail("drove a session"))
+
+    assert seen == {"main_store": None, "initiative": "initiative-child"}
+    assert task.phase == Phase.ESCALATED
+    assert "the child initiative 'initiative-child'" in excinfo.value.reason
+    assert "shared ticket store" not in excinfo.value.reason

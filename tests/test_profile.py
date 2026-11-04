@@ -1,8 +1,10 @@
 import dataclasses
 import json
+import operator
 import re
+import tomllib
 from importlib import resources
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 from conftest import fault_read_text
@@ -16,6 +18,7 @@ from bmad_loop.adapters.profile import (
     ProfileError,
     get_profile,
     load_profiles,
+    parse_cli_version,
 )
 
 MINIMAL_PROFILE = """
@@ -66,6 +69,13 @@ def test_builtin_profiles_load():
         "sessionEnd": "SessionEnd",
     }
     assert profiles["copilot"].usage_parser == "copilot-events"
+    # copilot confirms tool calls, file paths and URL fetches separately; an
+    # unattended session needs all three bypassed, or a URL fetch parks it
+    assert profiles["copilot"].bypass_args == (
+        "--allow-all-tools",
+        "--allow-all-paths",
+        "--allow-all-urls",
+    )
     # copilot writes token totals only on shutdown (poll grace) and fires
     # agentStop per turn (multi-turn reviews need more nudges)
     assert profiles["copilot"].usage_grace_s == 8.0
@@ -119,31 +129,42 @@ def test_builtin_profiles_load():
         assert profiles[name].hookless is False
 
 
-def test_usage_grace_and_nudges_default_when_unset(tmp_path):
-    # MINIMAL_PROFILE omits both -> 0.0 / None
+_MINIMAL_PROFILE_DEFAULTS = [
+    ("usage_grace_s", 0.0),
+    ("stop_without_result_nudges", None),
+    ("subagent_stop_without_transcript", False),
+    ("seed_files", ()),
+    # classification inert
+    ("env_fault_patterns", ()),
+    # parked-signal fields: both inert (DW-348/DW-350)
+    ("hooks.notification_types", {}),
+    ("hooks.stop_failure_types", {}),
+    ("parked_prompt_patterns", ()),
+    # usage fields: both inert (#610)
+    ("usage_limit_patterns", ()),
+    ("usage_wait_patterns", ()),
+    # the overlay parse-time default, separate from the dataclass default
+    ("skill_tree", ".claude/skills"),
+]
+
+
+@pytest.mark.parametrize(
+    "field,expected",
+    _MINIMAL_PROFILE_DEFAULTS,
+    ids=[field for field, _ in _MINIMAL_PROFILE_DEFAULTS],
+)
+def test_minimal_profile_field_defaults(tmp_path, field, expected):
+    """MINIMAL_PROFILE, loaded as a user overlay, declares none of these fields, so
+    each takes its default. One row per field, so one wrong default never hides
+    another."""
     profiles_dir = tmp_path / ".bmad-loop" / "profiles"
     profiles_dir.mkdir(parents=True)
-    (profiles_dir / "mycli.toml").write_text(MINIMAL_PROFILE)
+    (profiles_dir / "mycli.toml").write_text(MINIMAL_PROFILE, encoding="utf-8")
     prof = load_profiles(tmp_path)["mycli"]
-    assert prof.usage_grace_s == 0.0
-    assert prof.stop_without_result_nudges is None
-    assert prof.subagent_stop_without_transcript is False
-
-
-def test_seed_files_default_empty_when_unset(tmp_path):
-    # MINIMAL_PROFILE omits seed_files -> defaults to ()
-    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
-    profiles_dir.mkdir(parents=True)
-    (profiles_dir / "mycli.toml").write_text(MINIMAL_PROFILE)
-    assert load_profiles(tmp_path)["mycli"].seed_files == ()
-
-
-def test_env_fault_patterns_default_empty_when_unset(tmp_path):
-    # MINIMAL_PROFILE omits env_fault_patterns -> defaults to () (classification inert)
-    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
-    profiles_dir.mkdir(parents=True)
-    (profiles_dir / "mycli.toml").write_text(MINIMAL_PROFILE)
-    assert load_profiles(tmp_path)["mycli"].env_fault_patterns == ()
+    got = operator.attrgetter(field)(prof)
+    assert got == expected
+    if expected is None or isinstance(expected, bool):
+        assert got is expected
 
 
 def test_env_fault_patterns_parse_from_overlay(tmp_path):
@@ -192,15 +213,6 @@ def test_deeply_nested_pattern_is_a_profile_error_not_a_bare_recursion_error(tmp
     assert isinstance(excinfo.value.__cause__, RecursionError)
 
 
-def test_parked_signal_fields_default_empty_when_unset(tmp_path):
-    # MINIMAL_PROFILE declares neither -> both inert (DW-348/DW-350)
-    (tmp_path / ".bmad-loop" / "profiles").mkdir(parents=True)
-    (tmp_path / ".bmad-loop" / "profiles" / "mycli.toml").write_text(MINIMAL_PROFILE)
-    prof = load_profiles(tmp_path)["mycli"]
-    assert prof.hooks.notification_types == {}
-    assert prof.parked_prompt_patterns == ()
-
-
 def test_parked_signal_fields_parse_from_overlay(tmp_path):
     (tmp_path / ".bmad-loop" / "profiles").mkdir(parents=True)
     (tmp_path / ".bmad-loop" / "profiles" / "mycli.toml").write_text(
@@ -241,6 +253,65 @@ def test_claude_maps_its_parked_notification_subtypes():
         if name != "claude":
             assert prof.hooks.notification_types == {}, name
             assert prof.parked_prompt_patterns == (), name
+
+
+def test_claude_maps_its_stop_failure_types():
+    """#865: the claude profile relays `StopFailure` and maps every `error` value
+    the hooks reference documents, plus the 2.1.316 build's undocumented
+    `verification_required`, onto an action. `invalid_request` is context-shape (a
+    fresh session fixes it), so it is transient, not an account error. Every
+    other built-in stays `{}`: none has a StopFailure event."""
+    claude = get_profile("claude")
+    assert claude.hooks.events["StopFailure"] == "StopFailure"
+    assert claude.hooks.stop_failure_types == {
+        "overloaded": "transient",
+        "server_error": "transient",
+        "unknown": "transient",
+        "max_output_tokens": "transient",
+        "invalid_request": "transient",
+        "rate_limit": "rate_limit",
+        "billing_error": "account",
+        "authentication_failed": "account",
+        "oauth_org_not_allowed": "account",
+        "account_on_hold": "account",
+        "verification_required": "account",
+        "cloud_credential_error": "account",
+        "model_not_found": "account",
+    }
+    # Claude Code before 2.1.78 skips the WHOLE settings file over an unknown hook
+    # key, so registration gates the event on the installed version.
+    assert claude.hooks.event_min_versions == {"StopFailure": "2.1.78"}
+    for name, prof in load_profiles().items():
+        if name != "claude":
+            assert prof.hooks.stop_failure_types == {}, name
+            assert "StopFailure" not in prof.hooks.events.values(), name
+            assert prof.hooks.event_min_versions == {}, name
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("2.1.316 (Claude Code)", (2, 1, 316)),
+        ("codex-cli 0.164.0", (0, 164, 0)),
+        ("Python 3.12.3\n", (3, 12, 3)),
+        ("v2.1", None),
+        ("", None),
+    ],
+)
+def test_parse_cli_version(text, expected):
+    assert parse_cli_version(text) == expected
+
+
+def test_stop_failure_types_parse_from_overlay(tmp_path):
+    (tmp_path / ".bmad-loop" / "profiles").mkdir(parents=True)
+    (tmp_path / ".bmad-loop" / "profiles" / "mycli.toml").write_text(
+        MINIMAL_PROFILE.replace('Stop = "Stop" }', 'Stop = "Stop", Fail = "StopFailure" }')
+        + '[hooks.stop_failure_types]\nquota = "rate_limit"\nnoise = "ignore"\n',
+        encoding="utf-8",
+    )
+    prof = load_profiles(tmp_path)["mycli"]
+    assert prof.hooks.stop_failure_types == {"quota": "rate_limit", "noise": "ignore"}
+    assert prof.hooks.events["Fail"] == "StopFailure"
 
 
 # The #727 captured pane lines (Claude Code 2.1.246, run 20260826-114252-3da1),
@@ -301,16 +372,6 @@ def _wrapped_hits(text: str, patterns) -> list[tuple[int, str]]:
 
 
 _USAGE_FIELDS = ("usage_limit_patterns", "usage_wait_patterns")
-
-
-def test_usage_fields_default_empty_when_unset(tmp_path):
-    # MINIMAL_PROFILE declares neither -> both inert (#610)
-    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
-    profiles_dir.mkdir(parents=True)
-    (profiles_dir / "mycli.toml").write_text(MINIMAL_PROFILE, encoding="utf-8", newline="")
-    prof = load_profiles(tmp_path)["mycli"]
-    assert prof.usage_limit_patterns == ()
-    assert prof.usage_wait_patterns == ()
 
 
 def test_usage_fields_parse_from_overlay(tmp_path):
@@ -590,6 +651,14 @@ def test_permission_modes_table_parses_into_its_spec(tmp_path):
         ),
         ('\n[permission_modes.sandboxed]\nargs = "--x"\n', "args must be a list"),
         ("\n[permission_modes]\nsandboxed = 1\n", "sandboxed must be a table"),
+        (
+            _PERMISSION_MODES_TABLE + 'linked_worktree_args = "{gitdir}"\n',
+            "linked_worktree_args must be a list",
+        ),
+        (
+            _PERMISSION_MODES_TABLE + 'linked_worktree_args = ["--grant", "/fixed"]\n',
+            "must use at least one of",
+        ),
     ],
 )
 def test_malformed_permission_modes_is_a_profile_error(tmp_path, table, match):
@@ -607,6 +676,38 @@ def test_for_permission_mode_resolves_the_mode_into_bypass_args(tmp_path):
     assert sandboxed.name == prof.name and sandboxed.launch_args == prof.launch_args
     # extra_args still replaces the resolved args, so a drop is reported against them
     assert sandboxed.missing_bypass_tokens(("--yes",)) == ("--sandbox", '{"a": 1}')
+
+
+def test_for_permission_mode_carries_the_linked_worktree_args(tmp_path):
+    """DW-599: the mode's grant template rides onto the resolved profile beside
+    its args; bypass (and a mode that declares none) carries none."""
+    body = MINIMAL_PROFILE + _PERMISSION_MODES_TABLE + 'linked_worktree_args = ["-g={gitdir}"]\n'
+    prof = _mode_profiles(tmp_path, body)["mycli"]
+    assert prof.permission_modes["sandboxed"].linked_worktree_args == ("-g={gitdir}",)
+    assert prof.linked_worktree_args == ()
+    assert prof.for_permission_mode("sandboxed", platform="linux").linked_worktree_args == (
+        "-g={gitdir}",
+    )
+    assert (
+        get_profile("claude").for_permission_mode("sandboxed", "linux").linked_worktree_args == ()
+    )
+
+
+def test_render_linked_worktree_args_writes_each_path_as_one_toml_string():
+    """Each placeholder becomes a TOML basic string, so a path holding a quote,
+    a backslash or a control character cannot break out of the value Codex
+    parses; one substitution pass, so a path spelling a placeholder stays put; a
+    path TOML cannot carry (a lone surrogate) raises."""
+    prof = dataclasses.replace(
+        get_profile("claude"), linked_worktree_args=("{gitdir}={common_dir}", "plain")
+    )
+    gitdir = PurePosixPath('/a"b\\c\td/{common_dir}')  # Posix: the bytes are the point
+    rendered = prof.render_linked_worktree_args(gitdir, PurePosixPath("/r"))
+    assert rendered == ('"/a\\"b\\\\c\\u0009d/{common_dir}"="/r"', "plain")
+    key = rendered[0].partition("=")[0]
+    assert tomllib.loads(f"k = {key}")["k"] == str(gitdir)
+    with pytest.raises(ValueError):
+        prof.render_linked_worktree_args(PurePosixPath("/a\udcff"), PurePosixPath("/r"))
 
 
 def test_for_permission_mode_refuses_an_excluded_platform(tmp_path):
@@ -634,6 +735,10 @@ def test_shipped_sandboxed_mappings_parse_and_resolve():
     }
     codex = get_profile("codex").for_permission_mode("sandboxed", platform="darwin")
     assert codex.bypass_args[-2:] == ("--ask-for-approval", "never")
+    # DW-599: a child of the mode's permission profile with the two exact paths,
+    # selected by a `default_permissions` placed after the mode's own
+    assert codex.linked_worktree_args[-1] == 'default_permissions="bmad_loop_worktree"'
+    assert any("{gitdir}" in a and "{common_dir}" in a for a in codex.linked_worktree_args)
     assert "--dangerously-bypass-approvals-and-sandbox" not in codex.bypass_args
     for name in ("claude", "codex"):
         with pytest.raises(ProfileError, match="not win32"):
@@ -684,17 +789,17 @@ def test_shipped_claude_answer_guards_match_the_captured_855_screen():
     assert _wrapped_hits(text, patterns) == []
 
 
-def test_only_claude_seeds_usage_patterns():
-    # the other built-ins opt in on their own captured evidence; none has yet
+def test_only_claude_and_opencode_seed_usage_patterns():
+    # the other built-ins opt in on their own captured evidence; none has yet.
+    # opencode-http seeds the blocked list only: its 2.x quota refusal is never
+    # retried, and no 2.x provider error is a window that resets (DW-592).
     for name, prof in load_profiles().items():
-        if name != "claude":
+        if name == "opencode-http":
+            assert prof.usage_limit_patterns != (), name
+            assert prof.usage_wait_patterns == (), name
+        elif name != "claude":
             assert prof.usage_limit_patterns == (), name
             assert prof.usage_wait_patterns == (), name
-
-
-def test_skill_tree_defaults_when_unset():
-    # MINIMAL_PROFILE omits skill_tree -> defaults to .claude/skills
-    assert get_profile("claude").skill_tree == ".claude/skills"
 
 
 def test_legacy_alias_resolves():
@@ -997,6 +1102,58 @@ def test_hookless_profile_cannot_set_a_subagent_transcript_dir(tmp_path):
         load_profiles(tmp_path)
 
 
+def test_subagent_spawn_marker_defaults_off_and_agy_ships_one(tmp_path):
+    """Unset is off; the packaged agy profile names its spawn file (DW-548)."""
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "mycli.toml").write_text(MINIMAL_PROFILE)
+    profiles = load_profiles(tmp_path)
+    assert profiles["mycli"].subagent_spawn_marker is None
+    assert profiles["claude"].subagent_spawn_marker is None
+    assert (
+        profiles["antigravity"].subagent_spawn_marker
+        == ".system_generated/subagents/{session_id}.json"
+    )
+
+
+@pytest.mark.parametrize(
+    ("value", "match"),
+    [
+        # shape: never `str()`-coerced into a path template
+        ("5", "subagent_spawn_marker must be a string"),
+        # value: relative, under a conversation folder
+        ('"/abs/{session_id}.json"', "relative path"),
+        ('"../{session_id}.json"', "relative path"),
+        ('"x/../{session_id}.json"', "relative path"),
+        # value: exactly the {session_id} placeholder, so the marker names one child
+        ('"subagents/child.json"', "{session_id}"),
+        ('"{stem}.json"', "{session_id}"),
+        ('"{session_id!r}.json"', "{session_id}"),
+        ('"{session_id"', "not a valid template"),
+        ('"{session_id}\\u0000.json"', "NUL"),
+    ],
+)
+def test_malformed_subagent_spawn_marker_is_a_profile_error(tmp_path, value, match):
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "bad.toml").write_text(
+        MINIMAL_PROFILE.replace("[hooks]", f"subagent_spawn_marker = {value}\n[hooks]")
+    )
+    with pytest.raises(ProfileError, match=re.escape(match)):
+        load_profiles(tmp_path)
+
+
+def test_hookless_profile_cannot_set_a_subagent_spawn_marker(tmp_path):
+    """The marker drops a child's Stop hook, and a hookless profile has none."""
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "bad.toml").write_text(
+        HOOKLESS_PROFILE.replace("[hooks]", 'subagent_spawn_marker = "{session_id}.json"\n[hooks]')
+    )
+    with pytest.raises(ProfileError, match="must not set subagent_spawn_marker"):
+        load_profiles(tmp_path)
+
+
 def test_claude_subagent_root_matches_the_tally_anchor(tmp_path):
     """The idle notice watches the same tree tokens.tally sums for claude."""
     transcript = tmp_path / "x.jsonl"
@@ -1261,6 +1418,64 @@ def test_user_profile_overlay(tmp_path):
         (
             MINIMAL_PROFILE + "[hooks.notification_types]\npermission_prompt = 1\n",
             "notification_types must map",
+        ),
+        # StopFailure signals (#865): an error value must map onto an ACTION, not
+        # a canonical event or parked kind...
+        (
+            MINIMAL_PROFILE.replace(
+                'Stop = "Stop" }', 'Stop = "Stop", StopFailure = "StopFailure" }'
+            )
+            + '[hooks.stop_failure_types]\nbilling_error = "PermissionPrompt"\n',
+            "stop_failure_types values must be actions",
+        ),
+        # ...needs a native event mapped to the canonical StopFailure it rides on...
+        (
+            MINIMAL_PROFILE + '[hooks.stop_failure_types]\nbilling_error = "account"\n',
+            "canonical 'StopFailure' event",
+        ),
+        # ...is hook plumbing a hookless profile must not carry...
+        (
+            HOOKLESS_PROFILE + '[hooks.stop_failure_types]\nbilling_error = "account"\n',
+            "hookless",
+        ),
+        # ...and must be a table of strings, funnelled rather than coerced.
+        (
+            MINIMAL_PROFILE.replace("[hooks]", "[hooks]\nstop_failure_types = 5"),
+            "stop_failure_types must map",
+        ),
+        (
+            MINIMAL_PROFILE + "[hooks.stop_failure_types]\nbilling_error = 1\n",
+            "stop_failure_types must map",
+        ),
+        # hook-event version floors (#865): the key must be a mapped native event...
+        (
+            MINIMAL_PROFILE + '[hooks.event_min_versions]\nStopFailure = "2.1.78"\n',
+            "which hooks.events does not map",
+        ),
+        # ...never the Stop carrier (gating it out would end every session on the
+        # stall path)...
+        (
+            MINIMAL_PROFILE + '[hooks.event_min_versions]\nStop = "2.1.78"\n',
+            "carries the canonical 'Stop' completion event",
+        ),
+        # ...must be an X.Y.Z version...
+        (
+            MINIMAL_PROFILE + '[hooks.event_min_versions]\nSessionStart = "latest"\n',
+            "must be an X.Y.Z version",
+        ),
+        # ...is hook plumbing a hookless profile must not carry...
+        (
+            HOOKLESS_PROFILE + '[hooks.event_min_versions]\nStopFailure = "2.1.78"\n',
+            "hookless",
+        ),
+        # ...and must be a table of strings.
+        (
+            MINIMAL_PROFILE.replace("[hooks]", "[hooks]\nevent_min_versions = 5"),
+            "event_min_versions must map",
+        ),
+        (
+            MINIMAL_PROFILE + "[hooks.event_min_versions]\nSessionStart = 2\n",
+            "event_min_versions must map",
         ),
         # a parked_prompt_patterns entry that is not a valid regex fails fast at parse
         (
@@ -1742,6 +1957,12 @@ def test_profile_scan_failure_degrades(profile_scan):
             {"permission_modes": {"sandboxed": PermissionModeSpec(("--x",), ("haiku",))}},
             "platforms must name",
         ),
+        # the DW-599 linked-worktree grant: per mode and on the resolved field
+        (
+            {"permission_modes": {"sandboxed": PermissionModeSpec(("--x",), (), ("--y",))}},
+            "must use at least one of",
+        ),
+        ({"linked_worktree_args": ("{gitdir}", "")}, "non-empty strings"),
         # the remaining value-level knobs
         ({"usage_parser": "magic"}, "usage_parser"),
         ({"usage_grace_s": -1.0}, "usage_grace_s"),

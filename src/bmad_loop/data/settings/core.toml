@@ -57,13 +57,10 @@ options_ref = "REVIEW_ON_TIMEOUT_MODES"
 default_ref = "ReviewPolicy.on_timeout"
 label = "review timeout policy"
 description = "retry: burn a review cycle per timeout (default) · salvage-if-done: commit the verified dev product and refile the follow-up · defer: give up on the first timeout"
-[[section.field]]
-key = "on_status_contradiction"
-kind = "select"
-options_ref = "REVIEW_ON_STATUS_CONTRADICTION_MODES"
-default_ref = "ReviewPolicy.on_status_contradiction"
-label = "review revokes sprint sign-off"
-description = "escalate: pause naming both sides when a review writes sprint-status back off done (default) · retry: legacy — burn review cycles, then defer + roll back"
+# `on_status_contradiction` is reserved and deliberately has no field here (HIDDEN
+# in tests/test_settings_schema.py): `escalate` is its only value and the default.
+# policy.py parses it, but a review that revokes the sign-off always pauses,
+# naming both sides.
 
 [[section]]
 name = "stories"
@@ -237,6 +234,19 @@ kind = "int"
 minimum = 0
 default_ref = "LimitsPolicy.session_budget_grace_s"
 description = "enforce mode: seconds a tripped session gets to wrap up after the nudge before it is terminated over_budget · 0 = terminate at trip, no nudge"
+[[section.field]]
+key = "usage_limit_action"
+kind = "select"
+options_ref = "USAGE_LIMIT_ACTIONS"
+default_ref = "LimitsPolicy.usage_limit_action"
+label = "usage limit action"
+description = "what a session that ends on a usage limit or an account StopFailure does · pause: the uncharged usage-limit pause `resolve` clears · relaunch: relaunch it at once as an uncharged retry (BMAD_LOOP_USAGE_RELAUNCH=<n> in the session env, for account rotation), capped by max_usage_relaunches"
+[[section.field]]
+key = "max_usage_relaunches"
+kind = "int"
+minimum = 0
+default_ref = "LimitsPolicy.max_usage_relaunches"
+description = "relaunch mode: uncharged usage relaunches per story (dev, fix and review together) · at the cap the session takes the usage-limit pause instead · 0 = always pause"
 
 [[section.field]]
 key = "harvest_summary_chars"
@@ -325,7 +335,7 @@ description = "reasoning effort, free-form (provider/model-specific, e.g. high, 
 [[section.field]]
 key = "extra_args"
 kind = "args"
-description = "when set, replaces the CLI profile's permission-bypass flags (its bypass_args), so repeat them (e.g. claude: --permission-mode bypassPermissions) or unattended sessions may stall on permission prompts"
+description = "when set, replaces the CLI profile's permission-bypass flags (its bypass_args), so repeat them (e.g. claude: --permission-mode bypassPermissions) or unattended sessions may stall on permission prompts · under a sandboxed permission_mode it also drops the mode's linked-worktree gitdir grant, so a sandboxed codex session under worktree isolation cannot commit"
 [[section.field]]
 key = "permission_mode"
 kind = "select"

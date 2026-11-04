@@ -36,7 +36,14 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Literal, NamedTuple
 
 from . import bmadconfig, childrun, ticketlayout, ticketmodel, ticketstore, tickettree
-from .adapters.profile import ALIASES, CANONICAL_EVENTS, CLIProfile, ProfileError, load_profiles
+from .adapters.profile import (
+    ALIASES,
+    CANONICAL_EVENTS,
+    CLIProfile,
+    ProfileError,
+    load_profiles,
+    parse_cli_version,
+)
 from .checks import Finding
 from .platform_util import atomic_write_bytes, atomic_write_text, file_lock
 from .policy import POLICY_TEMPLATE
@@ -834,6 +841,8 @@ def _tickets_store_findings(
     isolation: str,
     extra_args_roles: Sequence[str],
     sandboxed_roles: Sequence[str] = (),
+    *,
+    chained: bool = False,
 ) -> list[Finding]:
     """The store-topology findings for the active initiative's folder (it exists):
     the classified layout (``tickets.store-topology``), or the refusal under the
@@ -841,8 +850,10 @@ def _tickets_store_findings(
     ``tickets.store-sandbox`` warning when sessions write a shared store outside
     their cwd while a role's ``extra_args`` replace the profile's bypass flags or
     a role runs ``adapter.permission_mode = "sandboxed"``, whose sandbox confines
-    writes to the working directory."""
-    result = ticketstore.assess_store(paths, isolation)
+    writes to the working directory. ``chained``: ``paths`` are re-rooted on a
+    child initiative of the active (parent) one, classified as a chained run
+    (:func:`ticketstore.classify_store`), and every finding names the child."""
+    result = ticketstore.assess_store(paths, isolation, chained=chained)
     if result is None:
         return []
     conflict = ticketstore.store_topology_conflict(result)
@@ -851,14 +862,20 @@ def _tickets_store_findings(
         "repo_root": str(paths.repo_root),
         "isolation": isolation,
     }
+    prefix = ""
+    if chained:
+        detail["initiative"] = paths.active_initiative
+        prefix = f"child initiative {paths.active_initiative!r}: "
     if isinstance(result, ticketstore.StoreRefusal):
         assert conflict is not None
-        return [Finding(result.check, "problem", conflict, {**detail, "refusal": result.code})]
+        return [
+            Finding(result.check, "problem", prefix + conflict, {**detail, "refusal": result.code})
+        ]
     findings = [
         Finding(
             "tickets.store-topology",
             "ok" if conflict is None else "problem",
-            conflict or f"ticket store {ticketstore.describe_topology(result)}",
+            prefix + (conflict or f"ticket store {ticketstore.describe_topology(result)}"),
             {**detail, "topology": result.to_dict()},
         )
     ]
@@ -879,17 +896,128 @@ def _tickets_store_findings(
             Finding(
                 "tickets.store-sandbox",
                 "warning",
-                f"sessions write the shared ticket store {result.store_root} outside their "
-                f"working directory, and {'; '.join(causes)} — a sandboxed CLI may refuse "
-                "those writes",
+                f"{prefix}sessions write the shared ticket store {result.store_root} outside "
+                f"their working directory, and {'; '.join(causes)} — a sandboxed CLI may "
+                "refuse those writes",
                 {
                     "store_root": str(result.store_root),
                     "roles": list(extra_args_roles),
                     "sandboxed_roles": list(sandboxed_roles),
+                    **({"initiative": paths.active_initiative} if chained else {}),
                 },
             )
         )
     return findings
+
+
+def _tickets_parent_findings(
+    paths: bmadconfig.ProjectPaths,
+    children: Sequence[str],
+    isolation: str,
+    retrospective: str | None,
+    extra_args_roles: Sequence[str],
+    sandboxed_roles: Sequence[str],
+) -> list[Finding]:
+    """The findings for an active initiative that is a parent of ``children``.
+
+    Refused (a ``tickets.initiative-parent`` problem) unless ``[scm] isolation``
+    is ``"worktree"`` — sessions in the main checkout read the user config, which
+    names the parent; only a worktree mount can name a child — and
+    ``gates.retrospective`` is not ``"auto"``, whose session runs in the main
+    checkout and reads the parent. Accepted, it is an ok line naming the children,
+    followed by :func:`_tickets_store_findings` for each child that has a folder
+    (``paths`` re-rooted on it, classified as chained); a child declared but not
+    sliced yet has none and is skipped. A child slug that is no single folder
+    name is refused, and a child folder that cannot be statted is a
+    ``tickets.initiative-missing`` problem naming the error."""
+    listed = ", ".join(children) or "none listed"
+    detail: dict[str, object] = {
+        "initiative": paths.active_initiative,
+        "children": list(children),
+        "isolation": isolation,
+        "retrospective": retrospective,
+    }
+    causes: list[str] = []
+    if isolation != "worktree":
+        causes.append(
+            f'`[scm] isolation = "{isolation}"` runs sessions in the main checkout, which '
+            'reads the parent from the user config — set `isolation = "worktree"`'
+        )
+    if retrospective == "auto":
+        causes.append(
+            '`gates.retrospective = "auto"` runs its session in the main checkout, which '
+            'reads the parent — set it to "notify" or "never"'
+        )
+    child_paths: list[bmadconfig.ProjectPaths] = []
+    if not causes:
+        for child in children:
+            try:
+                child_paths.append(paths.with_initiative(child))
+            except ValueError:
+                causes.append(f"child initiative {child!r} is not a single folder name")
+    if causes:
+        return [
+            Finding(
+                "tickets.initiative-parent",
+                "problem",
+                f"active initiative {paths.active_initiative!r} is a parent initiative "
+                f"(children: {listed}) and {'; '.join(causes)} — or set `[core] "
+                "active_initiative` to one child (ask the `bmad` skill to switch it)",
+                detail,
+            )
+        ]
+    store_findings: list[Finding] = []
+    skipped: list[str] = []
+    for child in child_paths:
+        folder = child.initiative_folder
+        assert folder is not None and child.active_initiative is not None  # with_initiative
+        present, fault = _probe_fault(folder, "dir")
+        if fault:
+            store_findings.append(
+                _probe_unreadable("tickets.initiative-missing", str(folder), fault)
+            )
+        elif not present:
+            skipped.append(child.active_initiative)
+        else:
+            store_findings.extend(
+                _tickets_store_findings(
+                    child, isolation, extra_args_roles, sandboxed_roles, chained=True
+                )
+            )
+    message = (
+        f"active initiative {paths.active_initiative!r} is a parent initiative "
+        f"(children: {listed}), accepted under worktree isolation"
+    )
+    if skipped:
+        message += (
+            f"; {', '.join(skipped)} {'has' if len(skipped) == 1 else 'have'} no folder "
+            "yet (declared, not sliced) and the store checks skip "
+            f"{'it' if len(skipped) == 1 else 'them'}"
+        )
+    return [
+        Finding("tickets.initiative-parent", "ok", message, {**detail, "skipped": skipped}),
+        *store_findings,
+    ]
+
+
+def tickets_parent_problems(
+    paths: bmadconfig.ProjectPaths, isolation: str, retrospective: str | None
+) -> list[Finding]:
+    """The problems :func:`tickets_preflight` refuses a parent active initiative
+    with (:func:`_tickets_parent_findings`: ``tickets.initiative-parent`` and the
+    store of a child it refuses), or the fault that kept the parent read from
+    answering — for a caller that does not run the whole preflight (the dry-run
+    banner). Empty when the active initiative is no parent."""
+    folder = paths.initiative_folder
+    if paths.era != "v7" or folder is None or not paths.active_initiative:
+        return []
+    children, breakdown, fault = _initiative_children(folder)
+    if fault:
+        return [_probe_unreadable("tickets.initiative-parent", str(breakdown), fault)]
+    if children is None:
+        return []
+    findings = _tickets_parent_findings(paths, children, isolation, retrospective, (), ())
+    return [f for f in findings if f.severity == "problem"]
 
 
 def tickets_preflight(
@@ -901,19 +1029,25 @@ def tickets_preflight(
     isolation: str = "none",
     extra_args_roles: Sequence[str] = (),
     sandboxed_roles: Sequence[str] = (),
+    retrospective: str | None = None,
 ) -> list[Finding]:
     """Tickets mode's project checks, as :class:`Finding` s (``paths`` is the
     paths loaded for tickets mode, ``trees`` the dev skill trees, ``branch_per``
     the policy's ``[scm] branch_per``; None skips its check; ``isolation`` the
     policy's ``[scm] isolation``; ``extra_args_roles`` the launch roles whose
     resolved adapter sets ``extra_args``; ``sandboxed_roles`` those whose
-    ``permission_mode`` is not bypass).
+    ``permission_mode`` is not bypass; ``retrospective`` the policy's
+    ``gates.retrospective``, None read as not ``"auto"``).
 
     Static checks, in order: the script (``tickets.script-missing``), the BMad
     config reader it imports (``tickets.config-utils-missing``), ``uv`` on PATH
     (``tickets.uv-missing``: bmad-build-auto runs the script through uv even when
     bmad-loop runs it directly), the active initiative (``tickets.initiative-unset``
-    / ``tickets.initiative-missing``), the store topology
+    / ``tickets.initiative-missing``), a parent initiative
+    (``tickets.initiative-parent``, :func:`_tickets_parent_findings`: refused
+    unless ``isolation`` is ``"worktree"`` and ``retrospective`` is not
+    ``"auto"``, else an ok line and the store topology of each child that has a
+    folder), the store topology
     (:func:`_tickets_store_findings`: ``tickets.store-topology``,
     ``tickets.tree-untracked``, ``tickets.own-repo-isolation``,
     ``tickets.workspace-unsupported``, and the ``tickets.store-sandbox`` warning),
@@ -1020,15 +1154,14 @@ def tickets_preflight(
                         _probe_unreadable("tickets.initiative-parent", str(breakdown), parent_fault)
                     )
                 elif children is not None:
-                    findings.append(
-                        Finding(
-                            "tickets.initiative-parent",
-                            "problem",
-                            f"active initiative {paths.active_initiative!r} is a parent "
-                            f"initiative (children: {', '.join(children) or 'none listed'}) "
-                            "— set `[core] active_initiative` to one child (ask the `bmad` "
-                            "skill to switch it)",
-                            {"initiative": paths.active_initiative, "children": list(children)},
+                    findings.extend(
+                        _tickets_parent_findings(
+                            paths,
+                            children,
+                            isolation,
+                            retrospective,
+                            extra_args_roles,
+                            sandboxed_roles,
                         )
                     )
                 else:
@@ -2220,6 +2353,31 @@ def relay_registered(config: dict, dialect: str, events: Mapping[str, str]) -> b
     return all(native in satisfied for native in stop_natives)
 
 
+def missing_relay_events(config: dict, dialect: str, events: Mapping[str, str]) -> list[str]:
+    """Native events in ``events`` with no executed relay reporting their canonical
+    event, in map order.
+
+    `relay_registered` answers only for the completion signal: a config written
+    before a profile mapped a newer event (claude's ``StopFailure``) still passes
+    it while that event never reaches the loop. This names what such a config
+    lacks; ``bmad-loop init`` registers it in place. A relay that reports a
+    different canonical event does not count — `relay_registered` refuses that
+    config outright.
+    """
+    container = hook_event_container(config, dialect)
+    missing: list[str] = []
+    for native, canonical in events.items():
+        handlers = container.get(native)
+        present = isinstance(handlers, list) and any(
+            _relay_canonical_event(command) == canonical
+            for handler in handlers
+            for command in _executed_commands_in_handler(handler)
+        )
+        if not present:
+            missing.append(native)
+    return missing
+
+
 def foreign_group_relay_hazards(
     config: dict, dialect: str, events: Mapping[str, str]
 ) -> list[tuple[str, str]]:
@@ -2408,7 +2566,133 @@ def _confined_to(target: Path, root: Path) -> bool:
         return False
 
 
-def _register_hooks(project: Path, profile: CLIProfile) -> int:
+# Bound on one `<binary> --version` probe for the hook-event version gate.
+CLI_VERSION_TIMEOUT_S = 10.0
+# Successful probes by resolved binary path and profile env: one launch per
+# binary per process, so worktree provisioning does not respawn the CLI for every
+# story. The env is part of the key because a launcher's answer can depend on it
+# (a version-manager shim, an `env node` launcher). A failed probe is not cached
+# — the next registration tries again.
+_cli_versions: dict[tuple[str, tuple[tuple[str, str], ...]], tuple[int, int, int]] = {}
+
+
+def cli_version(profile: CLIProfile) -> tuple[int, int, int] | None:
+    """The installed CLI's version from ``<binary> --version``, or None when the
+    binary is not on PATH, the run fails (spawn error, timeout, stop, nonzero exit)
+    or prints no ``X.Y.Z``. Never raises: every None is an answer the caller turns
+    into a visible "version unknown" note. The environment is the session's own
+    (the profile's ``env`` over this process's), both to resolve the binary, as
+    `codex_trust` does, and to run it: a launcher that finds its interpreter on
+    the profile's PATH must find it here too."""
+    session_env = {**os.environ, **profile.env}
+    resolved = shutil.which(profile.binary, path=session_env.get("PATH"))
+    if resolved is None:
+        return None
+    key = (resolved, tuple(sorted(profile.env.items())))
+    cached = _cli_versions.get(key)
+    if cached is not None:
+        return cached
+    try:
+        run = childrun.run_argv(
+            [resolved, "--version"],
+            cwd=None,
+            timeout=CLI_VERSION_TIMEOUT_S,
+            env=session_env if profile.env else None,
+        )
+    except (OSError, subprocess.SubprocessError, ProcessHostError):
+        return None
+    if run.timed_out or run.interrupted or run.returncode != 0:
+        return None
+    version = parse_cli_version((run.stdout or "") + "\n" + (run.stderr or ""))
+    if version is not None:
+        _cli_versions[key] = version
+    return version
+
+
+def gated_hook_events(profile: CLIProfile) -> tuple[dict[str, str], list[str]]:
+    """The profile's ``native -> canonical`` events this CLI install can carry, and
+    one note per event left out (#865).
+
+    A native event in ``hooks.event_min_versions`` is registered only when
+    :func:`cli_version` reads a version at or above its floor: an older CLI may
+    reject the whole hook config over one unknown key (Claude Code before 2.1.78
+    skips the entire settings file, Stop relay included), so an unreadable
+    version leaves the event out too. A profile with no floors never spawns the
+    probe, and the validator refuses a floor on a Stop carrier, so the
+    completion signal is never gated. Every caller surfaces the notes."""
+    events = dict(profile.hooks.events)
+    floors = profile.hooks.event_min_versions
+    if not floors:
+        return events, []
+    version = cli_version(profile)
+    notes: list[str] = []
+    for native, floor in floors.items():
+        need = parse_cli_version(floor)
+        if native not in events or (version is not None and need is not None and version >= need):
+            continue
+        del events[native]
+        found = "an unreadable version" if version is None else ".".join(map(str, version))
+        notes.append(
+            f"{native} hook not registered ({profile.name}): it needs {profile.binary} "
+            f">= {floor}, found {found} — upgrade it and re-run "
+            f"`bmad-loop init --cli {profile.name}`"
+        )
+    return events, notes
+
+
+def gated_hook_profiles(
+    project: Path, profiles: Sequence[CLIProfile]
+) -> list[tuple[CLIProfile, dict[str, str], list[str]]]:
+    """Gate each profile once, then exclude events any shared-config CLI rejects.
+
+    A newer alias must not reintroduce an event an older CLI cannot parse: that
+    CLI can reject the whole settings file, including its completion hook.
+    Group by the resolved config path, including init's permitted in-project
+    symlinks, rather than by profile name or dialect. Callers still own path
+    confinement; an unresolvable path keeps its lexical key until they refuse it.
+    Original gate notes stay attached to the rejecting profile exactly once.
+    """
+    rows = []
+    excluded: dict[Path, set[str]] = {}
+    for profile in profiles:
+        events, notes = ({}, []) if profile.hookless else gated_hook_events(profile)
+        path = project / profile.hooks.config_path
+        try:
+            path = path.resolve()
+        except (OSError, RuntimeError, ValueError):
+            pass  # The writer's existing confinement guard owns this refusal.
+        excluded.setdefault(path, set()).update(set(profile.hooks.events) - events.keys())
+        rows.append((profile, path, events, notes))
+    return [
+        (
+            profile,
+            {
+                native: canonical
+                for native, canonical in events.items()
+                if native not in excluded[path]
+            },
+            notes,
+        )
+        for profile, path, events, notes in rows
+    ]
+
+
+def strip_event_relays(config: dict, dialect: str, natives: Iterable[str]) -> bool:
+    """Drop managed relay commands registered under ``natives``. True if any went.
+
+    The other half of the version gate: a config written while the CLI was new
+    enough keeps its gated relay after a downgrade, and that one entry can make
+    the older CLI skip the whole file — so registration strips what it gated out.
+    User handlers under the same native event stay."""
+    return _strip_commands(hook_event_container(config, dialect), _relay_command, natives)
+
+
+def _register_hooks(
+    project: Path,
+    profile: CLIProfile,
+    *,
+    gated_events: tuple[dict[str, str], list[str]] | None = None,
+) -> int:
     if profile.hookless:
         print(f"  no hooks needed ({profile.name}): HTTP/SSE transport")
         return 0
@@ -2424,15 +2708,21 @@ def _register_hooks(project: Path, profile: CLIProfile) -> int:
         except json.JSONDecodeError:
             print(f"FAIL: {config_path} is not valid JSON; fix it and re-run init")
             return 1
+    events, gate_notes = gated_hook_events(profile) if gated_events is None else gated_events
     try:
         registrations = {
             native: _hook_command(project, profile, canonical)
-            for native, canonical in profile.hooks.events.items()
+            for native, canonical in events.items()
         }
     except ProfileError as e:
         print(f"FAIL: {e}")
         return 1
+    gated_out = [native for native in profile.hooks.events if native not in events]
+    stripped = strip_event_relays(config, profile.hooks.dialect, gated_out)
     config, changed = merge_hooks(config, registrations, profile.hooks.dialect)
+    changed |= stripped
+    for note in gate_notes:
+        print(f"  warning: {note}")
     if changed:
         # atomic_write_text, never write_text (#379), the same rule
         # `_worktree_local_exclude` states for its bytes sibling. This is a
@@ -4059,9 +4349,9 @@ def install_into(
             return 1
     bmad_loop_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. per-CLI hook registration
-    for profile in profiles:
-        if _register_hooks(project, profile) != 0:
+    # 1. per-CLI hook registration, respecting every CLI sharing each config.
+    for profile, events, notes in gated_hook_profiles(project, profiles):
+        if _register_hooks(project, profile, gated_events=(events, notes)) != 0:
             return 1
     if any(not profile.hookless for profile in profiles):
         _warn_unsafe_relay_path()

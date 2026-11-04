@@ -71,6 +71,7 @@ from .install import (
     _walk_traversable_files,
     _worktree_local_exclude,
     dev_primitive_or_default,
+    gated_hook_profiles,
     merge_hooks,
     missing_stories_support,
     renderer_stub_resolved,
@@ -78,6 +79,7 @@ from .install import (
 )
 from .install import skills_root as _skills_root
 from .install import (
+    strip_event_relays,
     strip_relay_hooks,
 )
 from .model import Phase
@@ -1197,6 +1199,7 @@ def provision_worktree(
     on_degraded: Callable[[str], None] | None = None,
     on_pinned: Callable[[str, str, str], None] | None = None,
     project: Path | None = None,
+    on_hook_gated: Callable[[str], None] | None = None,
 ) -> list[str]:
     """Make a freshly-created git worktree a self-sufficient bmad-loop project.
 
@@ -1542,7 +1545,7 @@ def provision_worktree(
     # per-CLI signal-hook registration, baked to the main repo's relay (absolute).
     # Hookless profiles (HTTP/SSE transport) have no config to merge.
     stripped_paths: set[Path] = set()
-    for profile in profiles:
+    for profile, events, gate_notes in gated_hook_profiles(dst_root, profiles):
         if profile.hookless:
             continue
         raw_config_path = dst_root / profile.hooks.config_path
@@ -1634,10 +1637,16 @@ def provision_worktree(
                     "terminal, so repairing the file alone does not put the story "
                     "back in the run (#592)"
                 ) from e
+        # The shared version gate `init` applies (#865): an event ANY CLI
+        # reading this config is too old for stays out of every profile's merge,
+        # because one unknown key can make it skip the whole config, Stop included.
+        if on_hook_gated is not None:
+            for note in gate_notes:
+                on_hook_gated(note)
         try:
             registrations = {
                 native: _hook_command(src_root, profile, canonical)
-                for native, canonical in profile.hooks.events.items()
+                for native, canonical in events.items()
             }
         except ProfileError as e:
             raise verify.GitError(f"cannot register worktree relay: {e}") from e
@@ -1653,6 +1662,13 @@ def provision_worktree(
         if config_path not in stripped_paths:
             strip_relay_hooks(config, profile.hooks.dialect)
             stripped_paths.add(config_path)
+        # A seeded relay under a gated-out event goes too, even on a later
+        # profile's pass over a shared config (the full strip above runs once).
+        strip_event_relays(
+            config,
+            profile.hooks.dialect,
+            [native for native in profile.hooks.events if native not in events],
+        )
         config, _ = merge_hooks(config, registrations, profile.hooks.dialect)
         # Write — and pin — only when the strip+merge actually changed the parsed
         # config. A tracked config may already carry exactly the installed command,
@@ -2653,6 +2669,11 @@ class WorktreeFlow:
                 on_degraded=lambda msg: self._exclude_degraded(task.story_key, msg),
                 on_pinned=_record_pin,
                 project=self.paths.project,
+                # A hook event the installed CLI is too old for stays out of the
+                # worktree's config (#865); journaled so the gap is visible.
+                on_hook_gated=lambda note: self.journal.append(
+                    "worktree-hook-gated", story_key=task.story_key, reason=note
+                ),
             )
         except verify.GitError as e:
             # Every provisioning refusal carries its own cause — an unresolvable
@@ -2664,16 +2685,25 @@ class WorktreeFlow:
         # A shared ticket store (no checkout carries its own copy) is read and
         # written in place: point the mount's `tickets.py` and renderer at it before
         # anything inside the mount resolves `output_folder`, and before the
-        # escalating gates below, so a failed redirect never reaches a session.
-        if self.paths.shared_store is not None:
+        # escalating gates below, so a failed redirect never reaches a session. A
+        # chained run's child initiative is written the same way on every layout:
+        # the live `active_initiative` names the parent, and inside the mount the
+        # child is the active initiative (the user's own file is never written).
+        store = self.paths.shared_store
+        child = self.state.initiative if self.state.parent_initiative is not None else None
+        if store is not None or child is not None:
             try:
-                ticketstore.redirect_mount_store(
-                    unit.workspace.paths.project, self.paths.shared_store
+                ticketstore.redirect_mount_config(
+                    unit.workspace.paths.project, main_store=store, initiative=child
                 )
             except ticketstore.TicketStoreError as e:
+                targets = [
+                    *(["the shared ticket store"] if store is not None else []),
+                    *([f"the child initiative {child!r}"] if child is not None else []),
+                ]
                 reason = (
-                    f"cannot point the worktree for {task.story_key} at the shared ticket "
-                    f"store: {e}"
+                    f"cannot point the worktree for {task.story_key} at "
+                    f"{' and '.join(targets)}: {e}"
                 )
                 self.escalate_unit(task, reason)  # always raises RunPaused
         # Before any session launches in the worktree: a CLI that gates sessions

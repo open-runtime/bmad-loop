@@ -164,6 +164,11 @@ ticket: state glyph and label, the ref, the epic folder, a three-slot flags cell
 and the title. The state is the plan's status when the ticket has a plan, else
 `planned` (or `refine` when it must be refined first).
 
+A run that builds one child of a parent initiative shows that child's tickets,
+read as `bmad-loop status` reads them: through the child's folder, with the tree
+pinned to the parent that `[core] active_initiative` names. A config that no
+longer names the parent shows as the board's fault.
+
 `tickets.py` is the project's own code, so the board reads it on the poll worker,
 never the UI thread. It runs again only when a `tickets.toml` or `.md` file in the
 initiative tree (its `tickets/` folders and epic folders, in either layout), the
@@ -200,8 +205,10 @@ start time, current epic, and a counts line: tasks, done, deferred, escalated,
 at `limits.cache_read_weight`.
 
 The **agent line** names who is driving. While a session is open it reads
-`agent <name> · <model> · <role>` (`model` omitted when the CLI profile's
-default is used; `role` is the session's stage, such as `dev`, `review`,
+`agent <name> · <model> · <role>` (`model` is the one the CLI reported on its
+SessionStart hook when it sent one, as Claude and Codex do, else the configured
+model; it is omitted only when the CLI reported none and the profile default is
+configured; `role` is the session's stage, such as `dev`, `review`,
 `triage` or `retro`), with a yellow
 `· idle <age>` once the session's transcript (and any subagent transcripts its
 profile declares) has been quiet past
@@ -264,7 +271,7 @@ One row per story (or sweep bundle and triage task) in the selected run:
 | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `story`  | story key, or the sweep task id                                                                                                                                                                                                                |
 | `phase`  | `pending` → `dev-running` → `dev-verify` → `review-running` → `review-verify` → `committing` → `done`, or `deferred` / `escalated` / `awaiting-operator` (committed, human action owed); sweep triage shows `triage-running` / `triage-verify` |
-| `agent`  | `<name·model>` of the adapter driving or last driving this row (`·model` dropped for the profile default); `-` if none recorded                                                                                                                |
+| `agent`  | `<name·model>` of the adapter driving or last driving this row (while a session drives it, the model its CLI reported, as on the agent line, else the configured model; `·model` dropped only when neither is known); `-` if none recorded     |
 | `dev`    | dev attempt counter, `×N`                                                                                                                                                                                                                      |
 | `review` | review cycle counter, `×N`                                                                                                                                                                                                                     |
 | `tokens` | cost-weighted token total (cache reads at `limits.cache_read_weight`), the total budgets judge; `-` until known                                                                                                                                |
@@ -346,7 +353,7 @@ Journal kinds are colored by the first matching substring:
 | `s`       | start a deferred-work sweep (modal)                                                           |
 | `e`       | resume the selected paused/interrupted run (confirm modal)                                    |
 | `p`       | review the selected paused run in its HITL viewer                                             |
-| `R`       | resolve a run paused at an escalation, then re-arm                                            |
+| `R`       | resolve a run paused at an escalation, then re-arm; close a tickets epic                      |
 | `V`       | re-verify a story's kept work (pick target)                                                   |
 | `d`       | answer deferred-work decisions sweeps left open (modal walk)                                  |
 | `a`       | attach to the selected run's live session or window                                           |
@@ -394,8 +401,15 @@ To return to the default proportions, delete the `[tui]` size keys from
 - **source**: `sprint mode` (walks `sprint-status.yaml`), `stories mode`
   (folder-and-id dispatch) or `tickets mode` (the BMAD v7 ticket tree),
   prefilled from `[stories]`. Tickets mode previews the active initiative: its
-  ticket counts and the refs that pause on hitl or a checkpoint. A tickets pick
-  launches only while `[stories] source = "tickets"`. Under that policy a
+  ticket counts and the refs that pause on hitl or a checkpoint. On a parent
+  initiative it lists the children in build order, each with its status, closed
+  and total tickets, what it waits on and a tag (`first ready`, `ready`,
+  `waiting`, `no folder`, `closes first`, `done` or `dropped`), then the counts
+  and checkpoint refs of the `first ready` child (the first ready child with a
+  folder once a run closes the drained ones), or why no child can start. A run
+  passes over a ready child with nothing to dispatch and keeps open a drained
+  one with an epic to close, so `run --dry-run` names the child it builds first. A
+  tickets pick launches only while `[stories] source = "tickets"`. Under that policy a
   stories pick still launches (its `--spec` overrides the policy source); a
   sprint pick does not.
 - **spec folder**: stories mode only. The epic spec folder holding
@@ -469,7 +483,8 @@ orphaned worktrees; it has no TUI key. See
 [Reclaiming sessions and disk](reference/run-state.md#reclaiming-sessions-and-disk).
 
 `D` (delete) and `A` (archive) act on one run directory and refuse a live run
-with `run <id> is live — stop it first`.
+with `run <id> is live — stop it first`. Both also refuse a sweep run holding
+unlanded ledger closes, with an error toast naming the entries.
 
 ## Resolving an escalation (`R`)
 
@@ -490,6 +505,13 @@ story), and refuses a run whose engine may still be live. A CRITICAL escalation 
 4. Detach (`ctrl-b d` on tmux) to return to the dashboard.
    For every resolve mode, see
    [Resolving an escalation](escalations-guide.md#resolving-an-escalation).
+
+At a tickets `epic-boundary` pause, `R` confirms `open bmad-agent-po for epic
+<slug>?` and launches the [epic-close resolve](escalations-guide.md#epic-closure-in-tickets-mode)
+in a control window: close and commit the epic there, and the run resumes in
+that window once bmad-loop has checked the closure. When the epic's
+retrospective has not run or is not committed, or the pause names no epic, `R`
+shows the step to take instead.
 
 At an `environment` pause, `R` refuses: fix the environment, then resume with
 `e`. At a pause whose
@@ -552,7 +574,7 @@ run `tickets.py`, always off the UI thread.
 | `ticket-hitl`     | `hitl`   | The pause reason: the next ticket needs a person in the loop. Build it, then **Resume**.                                                                                                                                                                                                                                                                     |
 | `ticket-refine`   | `refine` | The pause reason: the next ticket needs refining with `bmad-agent-po`. Refine it, then **Resume**.                                                                                                                                                                                                                                                           |
 | `ticket-tree`     | `tree`   | The pause reason: the pinned initiative changed, `tickets.py` failed, the initiative folder is dirty, or only other tickets block progress.                                                                                                                                                                                                                  |
-| `epic-boundary`   | `epic`   | The epic-closure viewer: the retrospective verdict the run recorded, the retrospective's path, and the closure steer.                                                                                                                                                                                                                                        |
+| `epic-boundary`   | `epic`   | The epic-closure viewer: the retrospective verdict the run recorded, the retrospective's path, and the closure steer. **Close with bmad-agent-po** launches the same epic-close resolve as `R`; it is absent when `R` would show a step instead.                                                                                                             |
 | `plan-checkpoint` | `plan`   | The plan viewer. **Request replan** marks the plan `draft` through `tickets.py mark` (reason `replan`), never by editing frontmatter, then resumes. The run stays paused on a refused or no-op mark, a changed ticket store, an isolation layout resume would refuse, a swapped worktree mount, or a run another controller moved to a different checkpoint. |
 
 The run header labels an `epic-boundary` pause `epic closure` in tickets mode.

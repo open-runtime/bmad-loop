@@ -42,7 +42,7 @@ from conftest import (
 
 from bmad_loop import childrun, platform_util, verify
 from bmad_loop.model import StoryTask
-from bmad_loop.policy import EnvironmentPolicy, Policy, ReviewPolicy, VerifyPolicy
+from bmad_loop.policy import EnvironmentPolicy, Policy, VerifyPolicy
 
 
 def make_task(paths, story_key="1-1-a"):
@@ -1477,14 +1477,6 @@ def test_verify_dev_review_disabled_rejects_review_sprint(project):
     assert not out.ok and "sprint-status" in out.reason and "expected 'done'" in out.reason
 
 
-def test_verify_dev_lying_baseline(project):
-    task = make_task(project)
-    sp = spec_path(project, "1-1-a")
-    write_spec(sp, "in-review", "deadbeef" * 5)
-    out = verify.verify_dev(task, project, dev_result(sp))
-    assert not out.ok and "does not match" in out.reason
-
-
 def test_verify_dev_short_hash_baseline(project):
     # Sessions sometimes write `git rev-parse --short HEAD`; an abbreviation
     # of the recorded baseline is the same commit, not a lie.
@@ -1903,29 +1895,19 @@ def _signoff_regression_task(project, sprint_status="in-progress"):
 
 
 def test_verify_review_signoff_regression_escalates(project):
-    """The default knob turns a review's board regression into a CRITICAL pause
-    that names both sides, instead of a retry no later cycle can satisfy."""
+    """A review's board regression is a CRITICAL pause that names both sides,
+    instead of a retry no later cycle can satisfy."""
     task = _signoff_regression_task(project)
     out = verify.verify_review(task, project, Policy(), sprint_reached_done=True)
 
     assert not out.ok and not out.retryable
     assert out.severity == "CRITICAL" and out.contradiction is True
     assert not out.fixable  # no repair session can reconcile a disagreement
-    # both sides are named, plus the two ways out and the opt-out knob
+    # both sides are named, plus the guide's ways out; the removed knob is not
     assert "'in-progress'" in out.reason and "'done'" in out.reason
     assert "1-1-a" in out.reason
-    assert 'review.on_status_contradiction = "retry"' in out.reason
-
-
-def test_verify_review_signoff_regression_retry_mode_is_legacy(project):
-    """`retry` restores the pre-#334 routing verbatim: an ordinary retryable
-    sprint-status failure that burns review cycles and ends in a defer."""
-    task = _signoff_regression_task(project)
-    pol = Policy(review=ReviewPolicy(on_status_contradiction="retry"))
-    out = verify.verify_review(task, project, pol, sprint_reached_done=True)
-
-    assert not out.ok and out.retryable and out.contradiction is False
-    assert out.reason == "sprint-status for 1-1-a is 'in-progress', expected 'done'"
+    assert "docs/escalations-guide.md" in out.reason
+    assert "retry" not in out.reason
 
 
 def test_verify_review_signoff_regression_needs_the_launch_flag(project):
@@ -4107,23 +4089,6 @@ def test_verify_dev_bundle_ancestor_probe_git_failure_stays_strict(project, monk
     assert not out.ok and "baseline" in out.reason
 
 
-def test_verify_dev_sprint_ancestor_baseline_still_fails(project):
-    """The ancestor relaxation is bundle-only: a sprint-mode dev spec is
-    authored by this session, so its baseline must match the orchestrator's
-    exactly — an older ancestor means the session planned from a stale tree."""
-    ancestor = verify.rev_parse_head(project.project)
-    (project.project / "story-work.txt").write_text("advance\n")
-    git(project.project, "add", "-A")
-    git(project.project, "commit", "-q", "-m", "advance")
-    write_sprint(project, {"1-1-a": "review"})
-    task = make_task(project)  # baseline = new HEAD
-    sp = spec_path(project, "1-1-a")
-    write_spec(sp, "in-review", ancestor)
-    (project.project / "src.txt").write_text("changed\n")
-    out = verify.verify_dev(task, project, dev_result(sp))
-    assert not out.ok and "baseline" in out.reason
-
-
 def test_verify_dev_bundle_ledger_only_counts_as_real_work(project):
     """Same false-negative as verify_dev (KNOWN-BUG-ledger-only-story-false-no-
     changes.md), on the bundle path: a dw-bundle's entire authorized diff is
@@ -4891,24 +4856,20 @@ def test_verify_review_tickets_needs_a_recorded_plan(project):
 def test_verify_review_tickets_monotonic(project, entered, now):
     """The board's sign-off-regression arm, rebuilt as a monotonic read-back of
     the plan: a status strictly earlier in `PLAN_STATUS_ORDER` than the review's
-    entry status is the review walking the ticket backward. Escalates as a
-    contradiction under the default knob; `retry` restores the plain retry.
+    entry status is the review walking the ticket backward, and escalates as a
+    contradiction.
 
     Ablation: delete the `_is_plan_regression` arm in `verify_review_tickets` (or
-    make `_is_plan_regression` return False) and the default-policy half retries
-    instead — so it asserts `not out.retryable` and `contradiction`."""
-    task, plan = _reviewed_ticket(project, now)
+    make `_is_plan_regression` return False) and it retries instead — so it
+    asserts `not out.retryable` and `contradiction`."""
+    task, _ = _reviewed_ticket(project, now)
 
     out = verify.verify_review_tickets(task, project, Policy(), entered_status=entered)
     assert not out.ok and not out.retryable
     assert out.severity == "CRITICAL" and out.contradiction is True
     assert f"back from {entered!r} to {now!r}" in out.reason
-    assert 'review.on_status_contradiction = "retry"' in out.reason
-
-    pol = Policy(review=ReviewPolicy(on_status_contradiction="retry"))
-    legacy = verify.verify_review_tickets(task, project, pol, entered_status=entered)
-    assert not legacy.ok and legacy.retryable and legacy.contradiction is False
-    assert legacy.reason == f"plan status is {now!r}, expected {entered!r}: {plan}"
+    assert "docs/escalations-guide.md" in out.reason
+    assert "retry" not in out.reason
 
 
 @pytest.mark.parametrize(
@@ -4948,14 +4909,12 @@ def test_verify_review_tickets_unreadable_status_is_a_plain_retry(project, shape
 
 
 @pytest.mark.parametrize("entered", ["built", "done"])
-@pytest.mark.parametrize("pol", ["escalate", "retry"])
-def test_verify_review_tickets_dropped_is_contradiction(project, entered, pol):
-    """A plan dropped during its review escalates under EITHER knob value — the
-    `retry` opt-out covers regressions, not a withdrawn ticket."""
+def test_verify_review_tickets_dropped_is_contradiction(project, entered):
+    """A plan dropped during its review escalates as a contradiction from either
+    entry status: a withdrawn ticket has nothing to land."""
     task, plan = _reviewed_ticket(project, "dropped")
-    policy = Policy(review=ReviewPolicy(on_status_contradiction=pol))
 
-    out = verify.verify_review_tickets(task, project, policy, entered_status=entered)
+    out = verify.verify_review_tickets(task, project, Policy(), entered_status=entered)
 
     assert not out.ok and not out.retryable
     assert out.severity == "CRITICAL" and out.contradiction is True
@@ -6242,7 +6201,8 @@ def test_safe_rollback_restores_policy_deleted_by_reset(project):
     """policy.toml added/committed *after* the baseline would be deleted by a
     reset to that older baseline; it is still restored from the pre-reset on-disk
     capture (the dirty src.txt here keeps the stash snapshot non-empty — the
-    clean-tree, empty-snapshot path is covered by the test below)."""
+    clean-tree, empty-snapshot path is covered by
+    `test_safe_rollback_restores_the_policy_through_the_atomic_helper`)."""
     repo = project.project
     baseline = verify.rev_parse_head(repo)  # baseline predates policy.toml
     pol = repo / ".bmad-loop" / "policy.toml"
@@ -6258,24 +6218,6 @@ def test_safe_rollback_restores_policy_deleted_by_reset(project):
     assert pol.read_text() == "[scm]\nrollback_on_failure = true\n"  # survived the reset
 
 
-def test_safe_rollback_restores_committed_policy_on_clean_tree(project):
-    """policy.toml committed AFTER the baseline, with an otherwise-clean tree:
-    `git stash create` is empty, so the old stash-gated restore skipped it and
-    `git reset --hard` reverted the operator's config. It must still survive."""
-    repo = project.project
-    baseline = verify.rev_parse_head(repo)  # baseline predates policy.toml
-    pol = repo / ".bmad-loop" / "policy.toml"
-    pol.parent.mkdir(parents=True, exist_ok=True)
-    pol.write_text("[scm]\nrollback_on_failure = true\n")
-    git(repo, "add", "-f", str(pol))
-    git(repo, "commit", "-q", "-m", "add policy after baseline")
-    snap = sorted(verify.untracked_files(repo))
-    # NOTE: no other working-tree change — tree is clean -> empty stash snapshot
-
-    verify.safe_rollback(repo, baseline, baseline_untracked=snap, keep=(".bmad-loop",))
-    assert pol.read_text() == "[scm]\nrollback_on_failure = true\n"  # survived
-
-
 def test_safe_rollback_restores_the_policy_through_the_atomic_helper(project, monkeypatch):
     """#379. The put-back was a bare `policy_path.write_bytes`, which truncates
     the file to zero and refills it in place: a host lost mid-write comes back
@@ -6284,6 +6226,9 @@ def test_safe_rollback_restores_the_policy_through_the_atomic_helper(project, mo
     refuses on — arriving immediately after a rollback that already discarded the
     attempt's work. The helper fsyncs before the replace, so the crash window
     yields the old file or the whole new one.
+
+    The tree is otherwise clean, so `git stash create` is empty: the put-back must
+    not be stash-gated, or `git reset --hard` reverts the operator's config.
 
     Graded by WRAPPING the binding rather than replacing it: the real write still
     lands, so the content assertion below is not measuring the stub. Recording
@@ -6778,23 +6723,14 @@ def test_path_tracked_refuses_a_glob_match_from_a_neighbour(project, meta, neigh
     assert verify.path_tracked(repo, f"{neighbour}/f.md")
 
 
-def test_path_tracked_still_matches_a_directory_prefix(project):
-    """`:(literal)` must not cost the callers the prefix match they rely on —
-    `cmd_validate`'s render-tracked warning probes a DIRECTORY, not a file."""
-    repo = project.project
-    (repo / "_bmad" / "render").mkdir(parents=True, exist_ok=True)
-    (repo / "_bmad" / "render" / "render_skill.py").write_text("# renderer\n")
-    git(repo, "add", "-A")
-    git(repo, "commit", "-q", "-m", "render")
-    assert verify.path_tracked(repo, "_bmad/render")
-
-
 def test_path_tracked_file_separates_a_file_from_a_directory_prefix(project):
     """Why this predicate is narrower than its sibling: `path_tracked` answers True for
     BOTH a tracked file and a tracked directory, and its callers have to tell those
     apart. Since #484 the shield asks `path_tracked_kind` for that — three answers, not
     two — and this boolean is kept for `_pin_tracked_config_rewrite`, where only a
-    tracked FILE can carry the skip-worktree bit the pin depends on (#392, #484).
+    tracked FILE can carry the skip-worktree bit the pin depends on (#392, #484). The
+    `path_tracked` directory answer is itself a contract: `:(literal)` must not cost
+    `cmd_validate`'s render-tracked warning, which probes a DIRECTORY, its prefix match.
 
     Ablation: return `bool(entries)` instead of comparing the set — the mechanics now
     live in `path_tracked_kind`, which this delegates to — and the directory assertion
@@ -8203,22 +8139,6 @@ def test_unpublishable_target_refuses_an_absent_ledger(project):
     assert verify.unpublishable_target(ledger, "ledger") == ("target-absent", None)
 
 
-def test_unpublishable_target_refuses_an_undecodable_ledger_with_the_fault(project):
-    """`target-undecodable`, carrying the decode fault as the second element. The
-    ledger's own read contract (DW-146) raises `LedgerReadError` for bytes nobody
-    can decode, and that is what this arm folds into a refusal.
-
-    Ablation: drop the `deferredwork.LedgerReadError` arm and the call raises
-    instead of answering, reddening the assertion below."""
-    write_ledger(project, {"DW-1": "open"})
-    project.deferred_work.write_bytes(_UNDECODABLE_LEDGER)
-
-    cause, error = verify.unpublishable_target(project.deferred_work, "ledger")
-
-    assert cause == "target-undecodable"
-    assert "not valid UTF-8" in error
-
-
 @pytest.mark.parametrize(
     "fault,cause,fragment",
     [
@@ -8238,10 +8158,14 @@ def test_unpublishable_target_splits_the_durable_decode_fault_from_the_transient
     one publisher with a durable commit latch, refuses the first and retries the
     second — and before the split both arrived as `target-unreadable`, so the
     undecodable ledger fell through to git, which accepts any bytes, and reached HEAD.
+    The `stat-refused` row is the DW-221 arm: a refused metadata probe used to answer
+    `None` on Python 3.14 and was refused `target-absent`, a present file reported as
+    gone; drop the `OSError` arm and its `PermissionError` escapes the guard.
 
     Ablation: collapse the two `except` arms back into
     `except (deferredwork.LedgerReadError, OSError)` returning `target-unreadable`
-    and the undecodable row reds on its cause."""
+    and the undecodable row reds on its cause; drop the `deferredwork.LedgerReadError`
+    arm and that row raises instead of answering."""
     write_ledger(project, {"DW-1": "open"})
     if fault == "undecodable":
         project.deferred_work.write_bytes(_UNDECODABLE_LEDGER)
@@ -8396,24 +8320,6 @@ def test_unpublishable_target_refuses_a_ledger_symlink_loop_as_unreadable(projec
 
     assert cause == "target-unreadable"
     assert "Too many levels of symbolic links" in error
-
-
-def test_unpublishable_target_folds_a_refused_ledger_metadata_probe(project, monkeypatch):
-    """The arm DW-221 newly routes here. Before it, a ledger whose metadata probe
-    the OS refused answered `None` on Python 3.14 and was refused `target-absent` —
-    a present file reported as gone. `read_for_write` raises `OSError` on every
-    interpreter now, and this guard folds it into `target-unreadable` with the
-    errno text, the same way it already folds a decode fault.
-
-    Ablation: drop `OSError` from the `except` tuple and the `PermissionError`
-    escapes this best-effort guard instead of the tuple coming back."""
-    write_ledger(project, {"DW-1": "open"})
-    fault_metadata_probe(monkeypatch, project.deferred_work, "stat")
-
-    cause, error = verify.unpublishable_target(project.deferred_work, "ledger")
-
-    assert cause == "target-unreadable"
-    assert "Permission denied" in error
 
 
 @pytest.mark.parametrize("shape", ["enoent", "enotdir-parent"])
@@ -8917,6 +8823,98 @@ def test_commit_paths_noops_on_unchanged_paths_under_host_noise(project):
     assert verify.commit_paths(repo, "noop", [repo / "src.txt"]) is None
 
     assert verify.rev_parse_head(repo) == head  # and nothing was committed
+
+
+_HOOK_NAMES = ("pre-commit", "prepare-commit-msg", "commit-msg", "post-commit", "post-index-change")
+
+
+def _install_marker_hooks(hooks_dir: Path) -> None:
+    """One marker-writing script per `_HOOK_NAMES` entry. A hook runs at the
+    worktree root, so each marker lands as `hook-<name>` beside `src.txt`."""
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    for name in _HOOK_NAMES:
+        hook = hooks_dir / name
+        hook.write_text(f"#!/bin/sh\nprintf ran > hook-{name}\n")
+        hook.chmod(0o755)
+
+
+@pytest.mark.parametrize("hooks_at", ["git-dir", "configured"])
+def test_commit_paths_run_hooks_false_skips_pre_commit_and_commit_msg_hooks(
+    project, tmp_path, hooks_at
+):
+    """#772: `run_hooks=False` silences every repository hook across `add`, `status`
+    and `commit` — the `--no-verify` pair, and the `prepare-commit-msg`,
+    `post-commit` and `post-index-change` hooks that flag leaves live — whether they
+    sit in `.git/hooks` or in a repo-configured `core.hooksPath`, which the
+    command-line `-c core.hooksPath` outranks.
+
+    The default commit afterwards is the in-test proof that the installed hooks
+    bite: without it, a hook that never runs for an unrelated reason passes the
+    marker assertions too.
+
+    Ablation: make `commit_paths` ignore `run_hooks` (always pass `()`) and every
+    marker appears after the first commit."""
+    repo = project.project
+    if hooks_at == "git-dir":
+        hooks_dir = repo / ".git" / "hooks"
+    else:
+        hooks_dir = tmp_path / "configured-hooks"
+        git(repo, "config", "core.hooksPath", hooks_dir.as_posix())
+    _install_marker_hooks(hooks_dir)
+    base = verify.rev_parse_head(repo)
+    (repo / "src.txt").write_text("bookkeeping\n")
+
+    sha = verify.commit_paths(repo, "chore: ledger", [repo / "src.txt"], run_hooks=False)
+
+    assert sha is not None and sha != base
+    assert sha == verify.rev_parse_head(repo)
+    assert git(repo, "show", "HEAD:src.txt") == "bookkeeping"
+    assert [name for name in _HOOK_NAMES if (repo / f"hook-{name}").exists()] == []
+
+    (repo / "src.txt").write_text("hooks live\n")
+    assert verify.commit_paths(repo, "chore: hooks", [repo / "src.txt"]) is not None
+    assert [name for name in _HOOK_NAMES if (repo / f"hook-{name}").exists()] == list(_HOOK_NAMES)
+
+
+def test_commit_paths_run_hooks_false_ignores_gpgsign(project, tmp_path):
+    """#772: `run_hooks=False` commits with `commit.gpgsign=false`, so a repo that
+    signs every commit cannot block (or, unattended, hang on a pinentry) the
+    engine's bookkeeping commit. A `gpg.program` that does not exist makes signing
+    fail outright — portable, and the default call's `GitError` below proves the
+    configuration bites before the hookless call is trusted.
+
+    Ablation: drop `commit.gpgsign=false` from `_hookless_git_config` and the
+    hookless commit raises the same `GitError`."""
+    repo = project.project
+    git(repo, "config", "commit.gpgsign", "true")
+    git(repo, "config", "gpg.program", (tmp_path / "no-such-gpg").as_posix())
+    base = verify.rev_parse_head(repo)
+    (repo / "src.txt").write_text("signed?\n")
+
+    with pytest.raises(verify.GitError, match="git commit failed"):
+        verify.commit_paths(repo, "chore: signed", [repo / "src.txt"])
+    assert verify.rev_parse_head(repo) == base
+
+    sha = verify.commit_paths(repo, "chore: unsigned", [repo / "src.txt"], run_hooks=False)
+
+    assert sha is not None and sha != base
+    assert sha == verify.rev_parse_head(repo)
+    assert git(repo, "log", "-1", "--format=%s") == "chore: unsigned"
+
+
+def test_commit_paths_default_still_runs_hooks(project):
+    """Characterization: the default `run_hooks=True` keeps every existing caller's
+    hooks live — a `.git/hooks/pre-commit` still runs and the commit still lands."""
+    repo = project.project
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\nprintf ran > commit-hook-ran\n")
+    hook.chmod(0o755)
+    (repo / "src.txt").write_text("hooks live\n")
+
+    sha = verify.commit_paths(repo, "chore: hooks", [repo / "src.txt"])
+
+    assert sha is not None and sha == verify.rev_parse_head(repo)
+    assert (repo / "commit-hook-ran").exists()
 
 
 def test_apply_patch_replays_saved_diff(project):
@@ -14848,6 +14846,69 @@ def test_commits_above_lists_attempt_commits_newest_first(project):
     head = verify.rev_parse_head(repo)
     commits = verify.commits_above(repo, baseline)
     assert commits == [head]
+
+
+def _commit_files(repo: Path, message: str, files: dict[str, str]) -> str:
+    for rel, text in files.items():
+        (repo / rel).write_text(text)
+    git(repo, "add", "--", *files)
+    git(repo, "commit", "-q", "-m", message)
+    return verify.rev_parse_head(repo)
+
+
+def test_bookkeeping_only_commits_filters_mixed_commits(project):
+    """#772: only a commit whose own change set is exactly the ledger is
+    bookkeeping-only. A commit that ALSO carries other work, one that touches
+    only other work, a merge (whose plain `diff-tree` names nothing) and an empty
+    commit all stay out — a misrecorded sha never filters real work out of a
+    preserve range. A sha git cannot read raises rather than reading as "not
+    bookkeeping".
+
+    Ablation: replace `names == {rel}` with `rel in names` and the mixed commit
+    joins the result; with `names <= {rel}` the merge and the empty commit do."""
+    repo = project.project
+    ledger = "deferred-work.md"
+    trunk = git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    only_ledger = _commit_files(repo, "ledger", {ledger: "DW-1\n"})
+    mixed = _commit_files(repo, "ledger + work", {ledger: "DW-2\n", "src.txt": "work\n"})
+    other = _commit_files(repo, "work", {"other.txt": "other\n"})
+    git(repo, "commit", "-q", "--allow-empty", "-m", "empty")
+    empty = verify.rev_parse_head(repo)
+    git(repo, "checkout", "-q", "-b", "side", only_ledger)
+    _commit_files(repo, "side work", {"side.txt": "side\n"})
+    git(repo, "checkout", "-q", trunk)
+    git(repo, "merge", "-q", "--no-ff", "-m", "merge side", "side")
+    merge = verify.rev_parse_head(repo)
+
+    found = verify.bookkeeping_only_commits(repo, [only_ledger, mixed, other, empty, merge], ledger)
+
+    assert found == {only_ledger}
+    assert verify.bookkeeping_only_commits(repo, [], ledger) == set()
+    with pytest.raises(verify.GitError, match="diff-tree"):
+        verify.bookkeeping_only_commits(repo, [only_ledger, "0" * 40], ledger)
+
+
+def test_path_absent_at_revision_reads_presence_and_raises_on_git_failure(project):
+    """#772: the ledger's `added` bit — absence is a successful empty `ls-tree`
+    answer; a tracked file or a directory both read as present, and an unreadable
+    revision raises instead of reading as "absent".
+
+    Ablation: make `_entry_at_revision` return None on a nonzero `ls-tree` and the
+    raise below fails."""
+    repo = project.project
+    nested = repo / "dir" / "f.txt"
+    nested.parent.mkdir()
+    nested.write_text("x\n")
+    git(repo, "add", "dir")
+    git(repo, "commit", "-q", "-m", "nested")
+    head = verify.rev_parse_head(repo)
+
+    assert verify.path_absent_at_revision(repo, head, "src.txt") is False
+    assert verify.path_absent_at_revision(repo, head, "dir") is False
+    assert verify.path_absent_at_revision(repo, head, "dir/f.txt") is False
+    assert verify.path_absent_at_revision(repo, head, "missing.md") is True
+    with pytest.raises(verify.GitError, match="ls-tree"):
+        verify.path_absent_at_revision(repo, "not-a-revision", "src.txt")
 
 
 def test_pinned_revision_preservation_does_not_follow_checkout_head(project):

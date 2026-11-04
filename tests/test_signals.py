@@ -57,6 +57,23 @@ def test_parse_event_reads_the_session_start_source(tmp_path, extra, expected):
 @pytest.mark.parametrize(
     ("extra", "expected"),
     [
+        ({"model": "claude-opus-4-6[1m]"}, "claude-opus-4-6[1m]"),
+        ({"model": 3}, None),  # a non-string is dropped, not coerced
+        ({}, None),  # an older vendored relay forwards no model at all
+    ],
+)
+def test_parse_event_reads_the_hook_model(tmp_path, extra, expected):
+    """#859: the relay's forwarded hook `model` lands on the HookEvent (str only)."""
+    watcher = SignalWatcher(tmp_path / "events")
+    write_event(watcher.events_dir, 1, "t1", "SessionStart", **extra)
+    (event,) = watcher.poll()
+    assert event.event == "SessionStart"
+    assert event.model == expected
+
+
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [
         ({"lineage": "match"}, "match"),
         ({"lineage": "mismatch"}, "mismatch"),
         ({"lineage": "unknown"}, "unknown"),
@@ -98,6 +115,61 @@ def test_parse_event_keeps_string_payload_error_only(tmp_path, extra, expected):
     write_event(watcher.events_dir, 1, "t1", "Stop", **extra)
     (event,) = watcher.poll()
     assert event.payload_error == expected
+
+
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [
+        ({"fully_idle": True}, True),
+        ({"fully_idle": False}, False),
+        ({"fully_idle": "false"}, None),  # a non-boolean is dropped, not coerced
+        ({"fully_idle": 0}, None),  # 0 is falsy, but not False: still dropped
+        ({}, None),  # every CLI but agy (or an older relay) carries no key
+    ],
+)
+def test_parse_event_keeps_boolean_fully_idle_only(tmp_path, extra, expected):
+    """DW-548: agy's forwarded `fullyIdle` lands on the HookEvent only as a bool,
+    so the wait loop's `is False` yield test never matches a stray value.
+
+    Ablation: drop the `isinstance(fully_idle, bool)` check and the "false"/0
+    rows fail."""
+    watcher = SignalWatcher(tmp_path / "events")
+    write_event(watcher.events_dir, 1, "t1", "Stop", **extra)
+    (event,) = watcher.poll()
+    assert event.fully_idle is expected
+
+
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [
+        (
+            {
+                "stop_error": "billing_error",
+                "stop_error_details": "402 Payment Required",
+                "stop_message": "Credit balance is too low",
+            },
+            ("billing_error", "402 Payment Required", "Credit balance is too low"),
+        ),
+        ({"stop_error": "server_error"}, ("server_error", None, None)),
+        # a non-string is dropped, not coerced
+        (
+            {"stop_error": 3, "stop_error_details": ["429"], "stop_message": {"m": 1}},
+            (None, None, None),
+        ),
+        ({}, (None, None, None)),  # every other event, or an older relay
+    ],
+)
+def test_parse_event_reads_the_stop_failure_fields(tmp_path, extra, expected):
+    """#865: the relay's forwarded StopFailure fields land on the HookEvent only
+    as strings, so the profile's `stop_failure_types` lookup never keys on a
+    stray value.
+
+    Ablation: drop any of the three `isinstance(..., str)` gates and the
+    non-string row fails."""
+    watcher = SignalWatcher(tmp_path / "events")
+    write_event(watcher.events_dir, 1, "t1", "StopFailure", **extra)
+    (event,) = watcher.poll()
+    assert (event.stop_error, event.stop_error_details, event.stop_message) == expected
 
 
 @pytest.mark.parametrize("value", [["A", "B"], {"id": "A"}, 3], ids=["list", "dict", "int"])

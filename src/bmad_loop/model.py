@@ -137,6 +137,14 @@ class TokenUsage:
     # Diagnostic only, and left out of equality, `add` and `to_dict`. The engine
     # journals it on `session-end` as `usage_unread`. APPENDED.
     unread: tuple[str, ...] = field(default=(), compare=False)
+    # The distinct model ids the session ran, as its parser observed them:
+    # None = this parser has no model source (and every hand-built TokenUsage);
+    # () = the parser tracks models and found none; otherwise first-seen order,
+    # main session first, so element 0 is the launched session's model. Parsers
+    # set it through the constructor (`add` drops it). Diagnostic only, and left
+    # out of equality, `add` and `to_dict` like `unread`. The engine journals it
+    # on `session-end` as `models` / `models_unresolved`. APPENDED.
+    models: tuple[str, ...] | None = field(default=None, compare=False)
 
     def add(self, other: "TokenUsage") -> None:
         self.input_tokens += other.input_tokens
@@ -211,9 +219,15 @@ class SessionRecord:
     # "" for every record written before the fields existed.
     ended: str = ""
     resumed_from: str = ""
+    # the distinct model ids the session was observed to run (TokenUsage.models,
+    # first-seen order, main session first), copied by attach_session_usage. ()
+    # means none observed OR the CLI is untracked; the journal's session-end row
+    # (`models` / `models_unresolved`) carries that distinction. Never the
+    # configured `model` above, which keeps its meaning. APPENDED.
+    models: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d: dict[str, Any] = {
             "task_id": self.task_id,
             "role": self.role,
             "status": self.status,
@@ -227,10 +241,20 @@ class SessionRecord:
             "ended": self.ended,
             "resumed_from": self.resumed_from,
         }
+        # written only when observed, so legacy-shaped state stays byte-stable
+        if self.models:
+            d["models"] = list(self.models)
+        return d
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "SessionRecord":
         usage = d.get("usage")
+        raw_models: object = d.get("models")
+        models: tuple[str, ...] = ()
+        if isinstance(raw_models, list):
+            items = cast(list[object], raw_models)
+            if all(isinstance(m, str) for m in items):
+                models = tuple(cast(list[str], items))
         return cls(
             task_id=d["task_id"],
             role=d["role"],
@@ -244,6 +268,7 @@ class SessionRecord:
             label=str(d.get("label", "") or ""),
             ended=str(d.get("ended", "") or ""),
             resumed_from=str(d.get("resumed_from", "") or ""),
+            models=models,
         )
 
 
@@ -283,6 +308,29 @@ def _rebased_on(path: str | None, root: Path) -> str | None:
     if not path or Path(path).is_absolute():
         return path
     return str(root / path)
+
+
+def _bookkeeping_ledger_from(raw: object) -> dict[str, Any] | None:
+    """Rehydrate `StoryTask.bookkeeping_ledger` from state.json: exactly
+    ``{"baseline": <str>, "added": <bool>, "shas": [<str>, ...]}``. Anything else —
+    a pre-upgrade absent key, or a shape a hand edit mangled — reads as "no
+    record", which only ever re-enables the conservative pre-bookkeeping paths
+    (a restore that skips, a gate that counts the ledger, a preserve that parks)."""
+    if not isinstance(raw, dict):
+        return None
+    record = cast(dict[object, object], raw)
+    baseline = record.get("baseline")
+    added = record.get("added")
+    shas = record.get("shas")
+    if (
+        not isinstance(baseline, str)
+        or not baseline
+        or not isinstance(added, bool)
+        or not isinstance(shas, list)
+        or not all(isinstance(sha, str) and sha for sha in shas)
+    ):
+        return None
+    return {"baseline": baseline, "added": added, "shas": [str(sha) for sha in shas]}
 
 
 def _baseline_artifacts_from(raw: object) -> dict[str, list[int] | None] | None:
@@ -540,6 +588,13 @@ class StoryTask:
     post_engine_ledger_digest: str | None = None
     harvest_wrote_ledger: bool = False
     ledger_changed_before_harvest: bool = False
+    # The engine's own ledger bookkeeping commits above `baseline_commit` (#772):
+    # ``{"baseline": <sha it was minted on>, "added": <ledger absent from that
+    # baseline's tree>, "shas": [<commit sha>, ...]}``. Saved BEFORE each commit so a
+    # crash can only leave a record without its commit, never the reverse. It is
+    # SELF-INVALIDATING — read it through `bookkeeping_for_baseline()`, which drops it
+    # the moment `baseline_commit` moves, so no baseline reset site has to clear it.
+    bookkeeping_ledger: dict[str, Any] | None = None
     # JSON-native containers only; callers persist these through state.json.
     harvested_deferrals: list[dict[str, Any]] = field(default_factory=list)
     bundle_closes_intended: list[str] = field(default_factory=list)
@@ -655,7 +710,7 @@ class StoryTask:
     # — an `attempt-preserve/*` branch (commits above baseline) or, when the tree
     # was also dirty, the `refs/attempt-preserve-dirty/*` snapshot, which is
     # parented at the attempt's HEAD and therefore subsumes the branch (last
-    # writer wins, so one `git merge --ff-only <ref>` recovers the whole attempt
+    # writer wins, so one `git merge --no-edit <ref>` recovers the whole attempt
     # — unless `preserve_partial` is set). Set by RecoveryFlow, cleared at the top
     # of every auto-rollback so it can never name a *previous* attempt's ref; read
     # by `_defer` (notification), projected into `status`, and — once verified
@@ -836,10 +891,39 @@ class StoryTask:
     # resuming that conversation unsafe. Cleared by the next launch.
     session_resumes: int = 0
     resume_blocked: bool = False
+    # Uncharged usage relaunches (#959, `limits.usage_limit_action = "relaunch"`):
+    # how many of `attempt` (dev + fix sessions) and `review_cycle` (review
+    # sessions) were relaunches of a session that ended on a usage limit or an
+    # account StopFailure. The counters still bump on every launch, so session
+    # task ids and resume identity are untouched; these refunds are subtracted
+    # only in budget checks (`charged_attempts` / `charged_review_cycles`).
+    # Invariant: each refund is <= its counter, so every site that resets
+    # `attempt` (or `review_cycle`) to 0 zeroes its refund too. Their sum is
+    # capped per story by `limits.max_usage_relaunches`.
+    dev_usage_relaunches: int = 0
+    review_usage_relaunches: int = 0
 
     @property
     def terminal(self) -> bool:
         return self.phase in TERMINAL_PHASES
+
+    @property
+    def charged_attempts(self) -> int:
+        """Dev attempts charged against `limits.max_dev_attempts`: every launch
+        minus the uncharged usage relaunches (#959)."""
+        return self.attempt - self.dev_usage_relaunches
+
+    @property
+    def charged_review_cycles(self) -> int:
+        """Review cycles charged against `limits.max_review_cycles`: every launch
+        minus the uncharged usage relaunches (#959)."""
+        return self.review_cycle - self.review_usage_relaunches
+
+    @property
+    def usage_relaunches(self) -> int:
+        """Uncharged usage relaunches this story has spent, dev and review
+        together: the count `limits.max_usage_relaunches` caps (#959)."""
+        return self.dev_usage_relaunches + self.review_usage_relaunches
 
     def record_session(self, record: SessionRecord) -> None:
         self.sessions.append(record)
@@ -849,7 +933,8 @@ class StoryTask:
     def attach_session_usage(self, task_id: str, usage: TokenUsage | None) -> None:
         """Fold usage into the most recent session for `task_id`. Usage is
         best-effort metadata attached after the session itself is saved, so a
-        failed usage read never costs the recorded session."""
+        failed usage read never costs the recorded session. Observed
+        ``usage.models`` also land on the record's ``models`` when non-empty."""
         if usage is None:
             return
         for record in reversed(self.sessions):
@@ -858,8 +943,22 @@ class StoryTask:
             if record.usage is None:
                 record.usage = usage
                 self.tokens.add(usage)
+            if usage.models:
+                record.models = tuple(usage.models)
             return
         raise KeyError(task_id)
+
+    def bookkeeping_for_baseline(self) -> dict[str, Any] | None:
+        """`bookkeeping_ledger` while it still describes THIS attempt's baseline, else
+        None. The record names the baseline it was minted on; once `baseline_commit`
+        moves (a new attempt, a re-arm, a mount release that clears it) the recorded
+        shas are no longer "above baseline" in any sense a reader may rely on."""
+        record = self.bookkeeping_ledger
+        if record is None or self.baseline_commit is None:
+            return None
+        if record.get("baseline") != self.baseline_commit:
+            return None
+        return record
 
     def to_dict(self, mount_project: Path | None = None) -> dict[str, Any]:
         """``mount_project`` anchors the relative spec spellings: see
@@ -871,6 +970,8 @@ class StoryTask:
             "attempt": self.attempt,
             "review_cycle": self.review_cycle,
             "followup_reviews_spent": self.followup_reviews_spent,
+            "dev_usage_relaunches": self.dev_usage_relaunches,
+            "review_usage_relaunches": self.review_usage_relaunches,
             "generation": self.generation,
             "escalations_resolved_upto": self.escalations_resolved_upto,
             "followup_review_recommended": self.followup_review_recommended,
@@ -896,6 +997,7 @@ class StoryTask:
             "post_engine_ledger_digest": self.post_engine_ledger_digest,
             "harvest_wrote_ledger": self.harvest_wrote_ledger,
             "ledger_changed_before_harvest": self.ledger_changed_before_harvest,
+            "bookkeeping_ledger": deepcopy(self.bookkeeping_ledger),
             "harvested_deferrals": self.harvested_deferrals,
             "bundle_closes_intended": self.bundle_closes_intended,
             "story_closes_intended": self.story_closes_intended,
@@ -1132,6 +1234,8 @@ class StoryTask:
             attempt=int(d.get("attempt", 0)),
             review_cycle=int(d.get("review_cycle", 0)),
             followup_reviews_spent=int(d.get("followup_reviews_spent", 0)),
+            dev_usage_relaunches=int(d.get("dev_usage_relaunches", 0)),
+            review_usage_relaunches=int(d.get("review_usage_relaunches", 0)),
             generation=int(d.get("generation", 0)),
             escalations_resolved_upto=int(d.get("escalations_resolved_upto", 0)),
             followup_review_recommended=bool(d.get("followup_review_recommended", False)),
@@ -1177,6 +1281,7 @@ class StoryTask:
             ),
             harvest_wrote_ledger=bool(d.get("harvest_wrote_ledger", False)),
             ledger_changed_before_harvest=bool(d.get("ledger_changed_before_harvest", False)),
+            bookkeeping_ledger=_bookkeeping_ledger_from(d.get("bookkeeping_ledger")),
             harvested_deferrals=[deepcopy(dict(item)) for item in d.get("harvested_deferrals", [])],
             bundle_closes_intended=[str(i) for i in d.get("bundle_closes_intended", [])],
             story_closes_intended=[str(i) for i in d.get("story_closes_intended", [])],
@@ -1292,7 +1397,7 @@ def env_fault_site_reverifiable(task: StoryTask) -> bool:
 
 @dataclass(frozen=True)
 class PauseSnapshot:
-    """The six fields :meth:`RunState.clear_pause` clears, captured just before a
+    """The eight fields :meth:`RunState.clear_pause` clears, captured just before a
     resume clears them so a resume that fails before its engine starts can put
     them back (:meth:`RunState.restore_pause`). Without it that failure left an
     escalated story behind a run with no pause stage, which ``resolve`` refused."""
@@ -1300,6 +1405,8 @@ class PauseSnapshot:
     paused_reason: str | None
     paused_stage: str | None
     paused_story_key: str | None
+    paused_reset_at: str | None
+    paused_limit_class: str | None
     stopped: bool
     crashed: bool
     crash_error: str | None
@@ -1397,6 +1504,15 @@ class RunState:
     paused_reason: str | None = None
     paused_stage: str | None = None
     paused_story_key: str | None = None
+    # A usage-limit pause's structured facts (DW-591), recorded with the pause by
+    # :meth:`record_pause` so `resolve --at-reset` never parses the reason prose.
+    # `paused_reset_at`: the limit's reset as ISO-8601, only when it resolved
+    # (an unresolved clause keeps its raw text in `paused_reason` alone).
+    # `paused_limit_class`: the list the live sighting matched
+    # (`SessionResult.usage_limit_class`, "blocked" | "wait"). Both None on every
+    # other pause and on state written before they existed.
+    paused_reset_at: str | None = None
+    paused_limit_class: str | None = None
     finished: bool = False
     # deliberately stopped (bmad-loop stop / engine SIGTERM); distinct from a
     # crash. Resume clears it via clear_pause(), so a stopped run is resumable.
@@ -1442,6 +1558,12 @@ class RunState:
     # the pin existed.
     initiative: str = ""
     initiative_folder: str = ""
+    # BMAD v7 tickets runs only: the parent initiative whose child this run
+    # builds (`initiative`/`initiative_folder` then name the child, a sibling
+    # folder of the parent's), or None for a run that builds the active
+    # initiative itself — every run today, and every state.json written before
+    # the field existed.
+    parent_initiative: str | None = None
     # tickets mode only. `ticket_epic_filter`: the `--epic` selector as an epic
     # slug ("" = every epic). `ticket_story_approvals`: refs whose refined
     # `plan_checkpoint` story file an operator approved this run, so the pick
@@ -1585,10 +1707,30 @@ class RunState:
         """Story keys this run already drove to a terminal phase."""
         return {k for k, t in self.tasks.items() if t.terminal}
 
+    def record_pause(
+        self,
+        reason: str,
+        stage: str,
+        story_key: str | None,
+        *,
+        reset_at: str | None = None,
+        limit_class: str | None = None,
+    ) -> None:
+        """Record a pause. The usage-limit facts are written on every pause, so a
+        pause that is not a usage limit stores None rather than inheriting a
+        previous pause's values."""
+        self.paused_reason = reason
+        self.paused_stage = stage
+        self.paused_story_key = story_key
+        self.paused_reset_at = reset_at
+        self.paused_limit_class = limit_class
+
     def clear_pause(self) -> None:
         self.paused_reason = None
         self.paused_stage = None
         self.paused_story_key = None
+        self.paused_reset_at = None
+        self.paused_limit_class = None
         self.stopped = False
         self.crashed = False
         self.crash_error = None
@@ -1599,6 +1741,8 @@ class RunState:
             paused_reason=self.paused_reason,
             paused_stage=self.paused_stage,
             paused_story_key=self.paused_story_key,
+            paused_reset_at=self.paused_reset_at,
+            paused_limit_class=self.paused_limit_class,
             stopped=self.stopped,
             crashed=self.crashed,
             crash_error=self.crash_error,
@@ -1609,6 +1753,8 @@ class RunState:
         self.paused_reason = snapshot.paused_reason
         self.paused_stage = snapshot.paused_stage
         self.paused_story_key = snapshot.paused_story_key
+        self.paused_reset_at = snapshot.paused_reset_at
+        self.paused_limit_class = snapshot.paused_limit_class
         self.stopped = snapshot.stopped
         self.crashed = snapshot.crashed
         self.crash_error = snapshot.crash_error
@@ -1650,6 +1796,8 @@ class RunState:
             "paused_reason": self.paused_reason,
             "paused_stage": self.paused_stage,
             "paused_story_key": self.paused_story_key,
+            "paused_reset_at": self.paused_reset_at,
+            "paused_limit_class": self.paused_limit_class,
             "finished": self.finished,
             "stopped": self.stopped,
             "crashed": self.crashed,
@@ -1662,6 +1810,7 @@ class RunState:
             "spec_folder": self.spec_folder,
             "initiative": self.initiative,
             "initiative_folder": self.initiative_folder,
+            "parent_initiative": self.parent_initiative,
             "ticket_epic_filter": self.ticket_epic_filter,
             "ticket_story_approvals": list(self.ticket_story_approvals),
             "ticket_epic_closures": dict(self.ticket_epic_closures),
@@ -1700,6 +1849,8 @@ class RunState:
             paused_reason=d.get("paused_reason"),
             paused_stage=d.get("paused_stage"),
             paused_story_key=d.get("paused_story_key"),
+            paused_reset_at=d.get("paused_reset_at"),
+            paused_limit_class=d.get("paused_limit_class"),
             finished=bool(d.get("finished", False)),
             stopped=bool(d.get("stopped", False)),
             crashed=bool(d.get("crashed", False)),
@@ -1712,6 +1863,7 @@ class RunState:
             spec_folder=str(d.get("spec_folder", "")),
             initiative=str(d.get("initiative", "")),
             initiative_folder=str(d.get("initiative_folder", "")),
+            parent_initiative=str(d.get("parent_initiative") or "") or None,
             ticket_epic_filter=str(d.get("ticket_epic_filter", "")),
             ticket_story_approvals=[str(r) for r in d.get("ticket_story_approvals", [])],
             ticket_epic_closures={

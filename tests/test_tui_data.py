@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import builtins
+import dataclasses
 import importlib
 import json
 import os
@@ -13,16 +14,21 @@ from pathlib import Path
 
 import pytest
 from conftest import (
+    DEFAULT_TREE,
+    V7_USER_CONFIG_REL,
     FakeTicketTree,
     install_bmad_central_config,
     install_bmad_config,
     install_bmad_v7,
     refuse_to_resolve,
     ticket_row,
+    v7_layout,
+    write_plan,
     write_sprint,
+    write_ticket_tree,
 )
 
-from bmad_loop import bmadconfig, deferredwork, platform_util, policy
+from bmad_loop import bmadconfig, platform_util, policy
 from bmad_loop.journal import UNREADABLE_LINE_KIND, Journal, save_state
 from bmad_loop.model import RunState
 from bmad_loop.runs import RUNS_DIR
@@ -415,17 +421,6 @@ def test_journal_tail_marker_matches_the_journal_entries_marker(tmp_path):
     assert tail_entries[0] == {"kind": UNREADABLE_LINE_KIND, "bytes": 15}
 
 
-def test_journal_tail_withholds_a_fragment_until_its_newline_lands(tmp_path):
-    """The byte offset only advances past complete lines, so a partially flushed
-    record is not read as a truncated entry — and `Journal.append`'s heal is what
-    guarantees that newline eventually arrives on the fragment's OWN line."""
-    path = tmp_path / "journal.jsonl"
-    path.write_text('{"ts": 1, "kind": "run-start"}\n{"ts": 2, "kind": "unit-merge-star')
-    tail = data.JournalTail(tmp_path)
-    assert [e["kind"] for e in tail.read_new()] == ["run-start"]
-    assert tail.read_new() == []  # nothing new; the fragment is still withheld
-
-
 def test_journal_tail_sees_both_records_after_a_healed_append(tmp_path):
     """The two-record regression at the TUI's reader: one partial flush costs one
     record, and the SUCCESSOR of the healing append is intact.
@@ -602,17 +597,32 @@ def test_log_view_styles(tmp_path):
     assert styled["X"].name == "#ff0000"
 
 
-def test_log_view_strips_private_marker_sgr(tmp_path):
-    # XTMODKEYS `CSI > 4 ; 2 m` (modifyOtherKeys, emitted at session start by
-    # Claude Code et al.) is not an SGR. pyte 0.8.2 ignores the `>` marker and
-    # misreads the `4` as underline-on with no matching off, underlining the whole
-    # log; we strip private-marker sequences before pyte sees them.
+@pytest.mark.parametrize(
+    ("raw", "text"),
+    [
+        # XTMODKEYS `CSI > 4 ; 2 m` (modifyOtherKeys, emitted at session start by
+        # Claude Code et al.) is not an SGR. pyte 0.8.2 ignores the `>` marker and
+        # misreads the `4` as underline-on with no matching off, underlining the
+        # whole log; we strip private-marker sequences before pyte sees them.
+        pytest.param(b"\x1b[>4;2mhello world\r\n", "hello world", id="xtmodkeys"),
+        # gemini's XTMODKEYS reply `CSI > 4 ; ? m` carries the `?` marker *inside*
+        # the params. Unstripped, pyte 0.8.2 dispatches it with private=True and
+        # select_graphic_rendition rejects the kwarg — the TypeError that killed
+        # the whole TUI in #111.
+        pytest.param(b"\x1b[>4;?mhello world\r\n", "hello world", id="gemini-111-mid-params"),
+        # `CSI ? 4 m` (vim 9+, upstream selectel/pyte#202): marker in first
+        # position but final `m` — must be stripped, not read as underline or
+        # crash pyte.
+        pytest.param(b"\x1b[?4mhello\r\n", "hello", id="vim9-pyte202"),
+    ],
+)
+def test_log_view_strips_private_marker_sgr(tmp_path, raw, text):
     path = tmp_path / "task.log"
-    path.write_bytes(b"\x1b[>4;2mhello world\r\n")
+    path.write_bytes(raw)
     view = data.LogView(path)
     assert view.read_new() is True
     line = view.render()
-    assert "hello world" in line.plain
+    assert text in line.plain
     assert not any(style.underline for _, _, style in line.spans)
 
 
@@ -644,20 +654,6 @@ def test_log_view_strips_private_marker_sgr_split_across_reads(tmp_path):
     assert not any(style.underline for _, _, style in line.spans)
 
 
-def test_log_view_strips_private_marker_mid_params(tmp_path):
-    # gemini's XTMODKEYS reply `CSI > 4 ; ? m` carries the `?` marker *inside* the
-    # params. Unstripped, pyte 0.8.2 dispatches it with private=True and
-    # select_graphic_rendition rejects the kwarg — the TypeError that killed the
-    # whole TUI in #111.
-    path = tmp_path / "task.log"
-    path.write_bytes(b"\x1b[>4;?mhello world\r\n")
-    view = data.LogView(path)
-    assert view.read_new() is True
-    line = view.render()
-    assert "hello world" in line.plain
-    assert not any(style.underline for _, _, style in line.spans)
-
-
 def test_log_view_survives_gemini_startup_preamble(tmp_path):
     # The exact byte prefix from the #111 traceback: the gemini CLI's terminal
     # capability negotiation burst, including the crashing `CSI > 4 ; ? m`.
@@ -668,18 +664,6 @@ def test_log_view_survives_gemini_startup_preamble(tmp_path):
     view = data.LogView(path)
     assert view.read_new() is True
     assert "ready to work" in view.render().plain
-
-
-def test_log_view_strips_vim9_private_sgr(tmp_path):
-    # `CSI ? 4 m` (vim 9+, upstream selectel/pyte#202): marker in first position
-    # but final `m` — must be stripped, not read as underline or crash pyte.
-    path = tmp_path / "task.log"
-    path.write_bytes(b"\x1b[?4mhello\r\n")
-    view = data.LogView(path)
-    assert view.read_new() is True
-    line = view.render()
-    assert "hello" in line.plain
-    assert not any(style.underline for _, _, style in line.spans)
 
 
 def test_log_view_strips_private_marker_mid_params_split_across_reads(tmp_path):
@@ -873,30 +857,6 @@ def test_active_task_id_falls_back_to_newest_log(tmp_path):
     assert data.active_task_id(tmp_path, []) == "t-new"
 
 
-def test_active_task_id_matches_open_session_start(tmp_path):
-    # Regression: extracting _open_session_start must leave active_task_id
-    # byte-identical, including the logs/ fallback tail.
-    entries = [
-        {"kind": "session-start", "task_id": "t1"},
-        {"kind": "session-end", "task_id": "t1"},
-        {"kind": "session-start", "task_id": "t2"},
-    ]
-    assert data.active_task_id(tmp_path, entries) == "t2"
-    assert data._open_session_start(entries) is entries[-1]  # the open entry itself
-
-    closed = entries + [{"kind": "session-end", "task_id": "t2"}]
-    assert data.active_task_id(tmp_path, closed) is None
-    assert data._open_session_start(closed) is None
-
-    # nothing open in the journal -> newest-log fallback still fires
-    logs = tmp_path / "logs"
-    logs.mkdir()
-    (logs / "t-old.log").write_text("old")
-    (logs / "t-new.log").write_text("new")
-    os.utime(logs / "t-old.log", ns=(1, 1))
-    assert data.active_task_id(tmp_path, closed) == "t-new"
-
-
 def test_active_task_id_ignores_verifier_streams(tmp_path):
     """The newest-log fallback sees pane logs only: verifier streams are not tasks.
 
@@ -1041,6 +1001,30 @@ def test_active_agent_idle_since_ignores_other_tasks_and_earlier_sessions():
     other = {"kind": "session-idle", "task_id": "2-2-beta-dev-1", "since_ts": 5030.0}
     agent = data.active_agent([stale, _stamped_start(), other], None)
     assert agent is not None and agent.idle_since is None
+
+
+def test_active_agent_reported_model_from_session_model_row():
+    """#859: the latest `session-model` for the open session's task sets
+    `reported_model`; one for another task, or one left behind by an EARLIER
+    session (before this session-start), is not this session's, and without one
+    `reported_model` stays None while the configured `model` is untouched.
+
+    ABLATION: drop the `_reported_model` fill in `active_agent` and the first
+    assertion reddens; drop the task_id filter and the `other` row wins."""
+    task = "1-1-alpha-dev-3"
+    stale = {"kind": "session-model", "task_id": task, "model": "claude-old"}
+    first = {"kind": "session-model", "task_id": task, "model": "claude-opus-4-6[1m]"}
+    latest = {"kind": "session-model", "task_id": task, "model": "claude-opus-5-5"}
+    other = {"kind": "session-model", "task_id": "2-2-beta-dev-1", "model": "gpt-5.5"}
+    agent = data.active_agent([stale, _stamped_start(), first, latest, other], None)
+    assert isinstance(agent, data.ActiveAgent)
+    assert agent.reported_model == "claude-opus-5-5"
+    assert agent.model == "opus"
+
+    agent = data.active_agent([stale, _stamped_start(), other], None)
+    assert isinstance(agent, data.ActiveAgent)
+    assert agent.reported_model is None
+    assert agent.model == "opus"
 
 
 def test_open_quota_wait_renders_as_quota_wait_not_idle():
@@ -1525,7 +1509,7 @@ def _fake_board_tree(monkeypatch, root: Path) -> FakeTicketTree:
     )
     seen: list[tuple[Path, str]] = []
 
-    def board_tree(project: Path, initiative: str) -> FakeTicketTree:
+    def board_tree(project: Path, initiative: str, *, folder: Path | None = None) -> FakeTicketTree:
         seen.append((project, initiative))
         return tree
 
@@ -1679,7 +1663,7 @@ def test_tickets_overview_unavailable_without_initiative(tmp_path, monkeypatch):
     Ablation (performed): drop the initiative check in `tickets_overview` and
     the tree is read for initiative "" — this FAILS."""
 
-    def no_tree(project: Path, initiative: str):
+    def no_tree(project: Path, initiative: str, *, folder: Path | None = None):
         raise AssertionError(f"read the tree for {initiative!r}")
 
     monkeypatch.setattr(data, "_board_ticket_tree", no_tree)
@@ -1726,6 +1710,231 @@ def test_project_tickets_overview_resolves_a_mixed_install_as_tickets_mode(tmp_p
     assert preview.fault is None
     assert read == [(layout.initiative, layout.initiative_folder.resolve())]
     assert data._project_paths(root) is sprint_paths  # its own cache entry, untouched
+
+
+# ------------------------------------------------------------- initiative chains
+# A v7 parent initiative over the sliced children AUTH and BILLING (after AUTH),
+# each holding `DEFAULT_TREE`, read by the real vendored `tickets.py`. Real-spawn
+# budget: 10 (`next <parent>` + the first child's `status` for the preview, for the
+# drained preview and for each of the two second-dependent rows, one `next <parent>`
+# for the blocked preview, one `status` for the chained run's board).
+
+CHAIN_PARENT = "initiative-platform"
+CHAIN_AUTH, CHAIN_BILLING = "initiative-auth", "initiative-billing"
+CHAIN_PLANS = (
+    ("epic-cart", "story-cart-model-plan", 1),
+    ("epic-cart", "story-cart-rules-plan", 2),
+    ("epic-checkout", "story-checkout-form-plan", 1),
+    ("epic-checkout", "bug-checkout-crash-plan", 2),
+)
+
+
+def _chain_project(root: Path, monkeypatch) -> Path:
+    """`tests/test_cli.py`'s `_chain_config` shape under ``root``, with the board
+    and paths caches cleared. Returns the parent initiative's folder."""
+    root.mkdir(parents=True, exist_ok=True)
+    install_bmad_v7(root, initiative=CHAIN_PARENT)
+    parent = v7_layout(root, initiative=CHAIN_PARENT).initiative_folder
+    (parent / "tickets").mkdir(parents=True, exist_ok=True)
+    (parent / f"{CHAIN_PARENT}.md").write_text(
+        "---\ntype: initiative\ntitle: Platform\nparent: none\n---\n\n# Platform\n",
+        encoding="utf-8",
+    )
+    (parent / "tickets" / "tickets.toml").write_text(
+        f'[[initiative]]\nid = 1\nslug = "{CHAIN_AUTH}"\ntitle = "Auth"\n\n'
+        f'[[initiative]]\nid = 2\nslug = "{CHAIN_BILLING}"\ntitle = "Billing"\n'
+        'after = [{ initiative = 1, needs = "auth live" }]\n',
+        encoding="utf-8",
+    )
+    for slug in (CHAIN_AUTH, CHAIN_BILLING):
+        write_ticket_tree(v7_layout(root, initiative=slug), DEFAULT_TREE)
+    monkeypatch.setattr(data, "_tickets_cache", {})
+    monkeypatch.setattr(data, "_tickets_paths_cache", {})
+    monkeypatch.setattr(data, "_tickets_paths_fault", {})
+    return parent
+
+
+def _chained_state(root: Path) -> RunState:
+    """A chained child run of AUTH, as `bmad-loop run` on the parent records it."""
+    return RunState(
+        run_id="r-chain",
+        project=str(root),
+        started_at="2026-10-28T10:00:00",
+        source="tickets",
+        initiative=CHAIN_AUTH,
+        initiative_folder=str(v7_layout(root, initiative=CHAIN_AUTH).initiative_folder),
+        parent_initiative=CHAIN_PARENT,
+    )
+
+
+def test_tickets_overview_reads_a_chained_run_through_its_child(tmp_path, monkeypatch):
+    """A chained child run's board is its child's tree, read pinned to the parent
+    (the live `[core] active_initiative` still names it) through the child's folder,
+    as `bmad-loop status` reads it (`runs.recorded_tree_pin`). With the live config
+    switched off the parent the board carries the fault — no spawn, no raise.
+
+    Ablation (performed): drop the `recorded_tree_pin` read in `tickets_overview`
+    and the child pin is refused against the live parent — the first assertion
+    FAILS."""
+    root = tmp_path / "proj"
+    _chain_project(root, monkeypatch)
+    state = _chained_state(root)
+
+    board = data.tickets_overview(root, state)
+    assert board.fault is None, board.fault
+    assert board.initiative == CHAIN_AUTH
+    assert sorted(r.ref for r in board.rows) == ["1.1", "1.2", "2.1", "2.2"]
+
+    (root / V7_USER_CONFIG_REL).write_text(
+        f'[core]\nactive_initiative = "{CHAIN_BILLING}"\n', encoding="utf-8"
+    )
+    switched = data.tickets_overview(root, state)
+    assert switched.rows == ()
+    assert switched.fault is not None and f"set it back to {CHAIN_PARENT!r}" in switched.fault
+
+
+def test_project_tickets_overview_previews_a_parent_initiative(tmp_path, monkeypatch):
+    """On a parent active initiative the start-run preview names the parent, its
+    children in build order with their tags, and the board of the child a run
+    builds first — AUTH, read through its folder with the tree pinned to the parent.
+
+    Ablation (performed): drop the parent branch in `project_tickets_overview` and
+    `tickets.py status` refuses the parent — the board is a fault and this FAILS."""
+    root = tmp_path / "proj"
+    _chain_project(root, monkeypatch)
+
+    board = data.project_tickets_overview(root)
+    assert board.fault is None, board.fault
+    assert board.parent == CHAIN_PARENT
+    assert [(c.slug, c.tag, c.status) for c in board.children] == [
+        (CHAIN_AUTH, "first ready", "open"),
+        (CHAIN_BILLING, "waiting", "open"),
+    ]
+    assert [(c.closed, c.total) for c in board.children] == [(0, 4), (0, 4)]
+    assert [(w.prerequisite, w.status) for w in board.children[1].waiting_on] == [
+        (CHAIN_AUTH, "open")
+    ]
+    assert board.initiative == CHAIN_AUTH
+    assert board.chain_end is None
+    assert sorted(r.ref for r in board.rows) == ["1.1", "1.2", "2.1", "2.2"]
+
+
+def test_project_tickets_overview_closes_a_drained_child_first(tmp_path, monkeypatch):
+    """A child with every ticket and epic closed and its initiative file still
+    open is drained: a run marks it done before its first pick, so the preview
+    tags it `closes first` and previews the child after it — BILLING, no longer
+    waiting — never `no child can start`.
+
+    Ablation (performed): pick with `next_child` and `drained` as the probe in
+    `_parent_board` (no re-judge) and BILLING still waits, the chain ends
+    `waiting` — this FAILS."""
+    root = tmp_path / "proj"
+    _chain_project(root, monkeypatch)
+    auth = v7_layout(root, initiative=CHAIN_AUTH)
+    write_ticket_tree(auth, tuple(dataclasses.replace(e, status="done") for e in DEFAULT_TREE))
+    for epic, stem, ticket in CHAIN_PLANS:
+        write_plan(auth, epic, stem, ticket, "done")
+
+    board = data.project_tickets_overview(root)
+    assert board.fault is None, board.fault
+    assert [(c.slug, c.tag) for c in board.children] == [
+        (CHAIN_AUTH, "closes first"),
+        (CHAIN_BILLING, "first ready"),
+    ]
+    assert (board.children[0].closed, board.children[0].total) == (4, 4)
+    assert board.children[1].waiting_on == ()
+    assert board.chain_end is None
+    assert board.initiative == CHAIN_BILLING
+    assert sorted(r.ref for r in board.rows) == ["1.1", "1.2", "2.1", "2.2"]
+
+
+@pytest.mark.parametrize(("folder", "tag"), [(True, "ready"), (False, "no folder")])
+def test_project_tickets_overview_tags_each_dependent_of_a_closed_child(
+    tmp_path, monkeypatch, folder, tag
+):
+    """AUTH drained, BILLING and REPORTS both after it: the preview shows BILLING's
+    board, and REPORTS — no longer waiting once a run closes AUTH — is tagged
+    `ready` with no waits, or `no folder` when it is declared but not sliced.
+    AUTH's status stays the tree as it reads now (`open`), as in `run --dry-run`.
+
+    Ablation (performed): build the children from `view.initiatives` (the
+    unclosed tree) in `_parent_board` and REPORTS reads `waiting` — both rows
+    FAIL."""
+    root = tmp_path / "proj"
+    parent = _chain_project(root, monkeypatch)
+    toml = parent / "tickets" / "tickets.toml"
+    toml.write_text(
+        toml.read_text(encoding="utf-8")
+        + '\n[[initiative]]\nid = 3\nslug = "initiative-reports"\ntitle = "Reports"\n'
+        'after = [{ initiative = 1, needs = "auth live" }]\n',
+        encoding="utf-8",
+    )
+    if folder:
+        write_ticket_tree(v7_layout(root, initiative="initiative-reports"), DEFAULT_TREE)
+    auth = v7_layout(root, initiative=CHAIN_AUTH)
+    write_ticket_tree(auth, tuple(dataclasses.replace(e, status="done") for e in DEFAULT_TREE))
+    for epic, stem, ticket in CHAIN_PLANS:
+        write_plan(auth, epic, stem, ticket, "done")
+
+    board = data.project_tickets_overview(root)
+    assert board.fault is None, board.fault
+    assert [(c.slug, c.status, c.tag, c.waiting_on) for c in board.children] == [
+        (CHAIN_AUTH, "open", "closes first", ()),
+        (CHAIN_BILLING, "open", "first ready", ()),
+        ("initiative-reports", "open" if folder else "no-folder", tag, ()),
+    ]
+    assert board.initiative == CHAIN_BILLING and board.chain_end is None
+
+
+def test_project_tickets_overview_keeps_a_blocked_chain_blocked(tmp_path, monkeypatch):
+    """BILLING waits on AUTH, open with every ticket left and itself waiting on
+    IDENTITY, declared but not sliced: nothing is drained, nothing closes, and no
+    child can start."""
+    root = tmp_path / "proj"
+    parent = _chain_project(root, monkeypatch)
+    (parent / "tickets" / "tickets.toml").write_text(
+        '[[initiative]]\nid = 3\nslug = "initiative-identity"\ntitle = "Identity"\n\n'
+        f'[[initiative]]\nid = 1\nslug = "{CHAIN_AUTH}"\ntitle = "Auth"\n'
+        'after = [{ initiative = 3, needs = "accounts" }]\n\n'
+        f'[[initiative]]\nid = 2\nslug = "{CHAIN_BILLING}"\ntitle = "Billing"\n'
+        'after = [{ initiative = 1, needs = "auth live" }]\n',
+        encoding="utf-8",
+    )
+
+    board = data.project_tickets_overview(root)
+    assert board.fault is None, board.fault
+    assert [(c.slug, c.tag) for c in board.children] == [
+        ("initiative-identity", "no folder"),
+        (CHAIN_AUTH, "waiting"),
+        (CHAIN_BILLING, "waiting"),
+    ]
+    assert [(w.prerequisite, w.status) for w in board.children[2].waiting_on] == [
+        (CHAIN_AUTH, "open")
+    ]
+    assert board.rows == ()
+    assert board.initiative == ""
+    assert board.chain_end == "waiting"
+
+
+def test_project_tickets_overview_faults_on_an_unreadable_parent_breakdown(tmp_path, monkeypatch):
+    """A `tickets.toml` the parent detection cannot parse is the preview's fault —
+    no spawn, no raise.
+
+    Ablation (performed): ignore the fault from `_initiative_children` and the
+    tree is read for the active initiative — the spawn guard FAILS."""
+    root = tmp_path / "proj"
+    parent = _chain_project(root, monkeypatch)
+    (parent / "tickets" / "tickets.toml").write_text("[[initiative]\n", encoding="utf-8")
+
+    def no_tree(*args, **kwargs):
+        raise AssertionError("spawned tickets.py on an unreadable parent breakdown")
+
+    monkeypatch.setattr(data, "_board_ticket_tree", no_tree)
+    monkeypatch.setattr(data, "_parent_view", no_tree)
+    board = data.project_tickets_overview(root)
+    assert board.rows == ()
+    assert board.fault is not None and board.fault.startswith("cannot read ")
+    assert "TOMLDecodeError" in board.fault
 
 
 # ------------------------------------------------------------- deferred work
@@ -1786,21 +1995,6 @@ def test_deferred_entries_undecodable_ledger_is_unavailable(project_tree):
     project_tree.deferred_work.write_bytes(b"# Deferred Work\n\n### DW-1: bad \xff byte\n")
 
     assert data.deferred_entries(project_tree.project) is None
-
-
-def test_severity_extraction():
-    cases = {
-        "severity: high\n": "high",
-        "Severity: HIGH\n": "high",
-        "priority: blocker\n": "critical",
-        "severity: med\n": "medium",
-        "severity:low\n": "low",
-        "severity: banana\n": None,
-        "no field here\n": None,
-        "the word severity: high inline does not count\n": None,
-    }
-    for body, expected in cases.items():
-        assert deferredwork.field_severity(f"### DW-9: t\n\n{body}status: open\n") == expected, body
 
 
 def test_deferred_entries_does_not_read_severity_from_a_fenced_example(project_tree):

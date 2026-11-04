@@ -39,6 +39,12 @@ ZERO_TOKEN_TIMEOUT_EVIDENCE = (  # nosec B105 - diagnostic prose, not a credenti
     "the CLI never got a usable response from the provider"
 )
 
+# `SessionResult.usage_limit_class` values (DW-591): which profile list a live
+# usage-limit sighting matched — `usage_limit_patterns` (blocked: an operator
+# must act) or `usage_wait_patterns` (waiting on a reset the CLI continues from).
+USAGE_LIMIT_BLOCKED = "blocked"
+USAGE_LIMIT_WAIT = "wait"
+
 
 class AdapterTaskDirectoryError(ValueError):
     """A built-in adapter refused an unsafe or redirected task directory."""
@@ -255,6 +261,15 @@ class SessionSpec:
     # APPENDED with defaults.
     resume_session_id: str | None = None
     resume_transcript_path: str | None = None
+    # Usage relaunch (#959, `limits.usage_limit_action = "relaunch"`), set by the
+    # engine on primary story sessions (dev, fix, review) only; False on every
+    # other session and on constructions outside the engine.
+    # `usage_relaunch_mode`: a usage limit or account StopFailure relaunches this
+    # session. `usage_relaunch_left`: relaunch mode with relaunch budget left, so
+    # the session should end at once on a limit rather than wait it out.
+    # Appended after `quota_wait_max_s` so positional constructions stay valid.
+    usage_relaunch_mode: bool = False
+    usage_relaunch_left: bool = False
 
 
 @dataclass(frozen=True)
@@ -338,8 +353,10 @@ class SessionResult:
     # wait loop WITHHELD the stall wake nudge (its Enter could answer the prompt,
     # #727) and ended the session `stalled`. Set only on that `stalled` exit,
     # from a latched parked hook event or a `parked_prompt_patterns` match on the
-    # visible pane; never on a `crashed` (window death outranks it) or completed
-    # result. Every engine/sweep site PAUSEs on it like `env_fault` (which
+    # visible pane; never on a completed result, and never on a `crashed` one
+    # (window death outranks it) except a result-less window death after a
+    # latched account StopFailure, which `wait_for_completion` labels parked
+    # with the same evidence the live exit carries (#959). Every engine/sweep site PAUSEs on it like `env_fault` (which
     # outranks it), so re-arm restores the attempt instead of a retry relaunching
     # into the same prompt. `parked_evidence` names what matched. APPENDED.
     parked: bool = False
@@ -361,11 +378,19 @@ class SessionResult:
     # in `session_failure_reason`. Diagnostic only: never read by routing.
     # APPENDED.
     env_fault_overruled: str | None = None
-    # Usage-limit evidence (#610): the visible-pane line a `usage_limit_patterns`
-    # / `usage_wait_patterns` match found LIVE — at stall-grace expiry (ending
-    # the session stalled + parked) or the instant the session timeout fired.
-    # Set only from a live pane sighting, never from the post-mortem log tail and
-    # never on a `crashed` or completed result. A set value makes
+    # Usage-limit evidence (#610): the line a `usage_limit_patterns` /
+    # `usage_wait_patterns` match found LIVE. Two sources: the tmux adapters'
+    # visible pane — at stall-grace expiry (ending the session stalled + parked)
+    # or the instant the session timeout fired, never on a `crashed` result
+    # except a result-less window death after a latched blocked or wait usage
+    # StopFailure or during an open quota wait, which `wait_for_completion`
+    # labels with that latched evidence (#959) — and
+    # opencode-http's provider-error line, formatted from a typed SSE frame for
+    # this session while it ran (DW-592), carried onto a `timeout`, `stalled` or
+    # `crashed` result its wait returns (ENV_FAULT_STATUSES, the verdicts
+    # `_classify_env_fault` reads). Never from the post-mortem log tail, never on
+    # a completed, aborted or over_budget result.
+    # A set value makes
     # `_classify_env_fault` stamp `env_fault` WITHOUT the #764 token veto (the
     # limit is on screen now, not a stale match), and both pause reasons name it
     # as a usage limit. APPENDED.
@@ -398,6 +423,27 @@ class SessionResult:
     # open-runtime fork (F6): the CLI session id this session resumed, None for a
     # fresh one. Journaled on `session-end`. APPENDED.
     resumed_from: str | None = None
+    # Which usage-limit list the live sighting in `usage_limited` matched
+    # (DW-591): USAGE_LIMIT_BLOCKED for `usage_limit_patterns` (the CLI will not
+    # continue by itself, e.g. credit exhaustion), USAGE_LIMIT_WAIT for
+    # `usage_wait_patterns` (it continues after the reset). None exactly when
+    # `usage_limited` is None. Journaled present-only. APPENDED.
+    usage_limit_class: str | None = None
+    # The `error` value of the latest Claude Code `StopFailure` hook event (#865)
+    # this session saw and no later `Stop` cleared: the API error that ended the
+    # turn (`server_error`, `billing_error`, `rate_limit`, ...). None = no
+    # uncleared StopFailure. Diagnostic only: routing never reads it, except that
+    # `_classify_env_fault` skips the log-tail scan for a parked result carrying
+    # it, so the parked pause reason names the error. Stamped on every result
+    # `wait_for_completion` returns; journaled on `session-end` present-only.
+    # APPENDED.
+    stop_failure: str | None = None
+    # The `[hooks.stop_failure_types]` action the profile maps `stop_failure`'s
+    # error to (`account`, `rate_limit`, `transient`, `ignore`), None when the
+    # error is unmapped or there is no uncleared StopFailure. Stamped with
+    # `stop_failure` on every result `wait_for_completion` returns. Diagnostic,
+    # plus #959 usage-relaunch routing. APPENDED.
+    stop_failure_action: str | None = None
 
 
 class CodingCLIAdapter(ABC):

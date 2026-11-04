@@ -57,7 +57,6 @@ Separate adversarial review session toggle.
 | `enabled` | boolean | `true` |  | ON: adversarial review runs in a dedicated 2nd session · OFF: the dev pass runs its own review layers inline, story straight to done |
 | `trigger` | string | `"recommended"` | `always` / `recommended` | recommended: run the 2nd-opinion review only when the dev pass flags it · always: run it every story (both bounded by limits.max_review_cycles) |
 | `on_timeout` | string | `"retry"` | `defer` / `retry` / `salvage-if-done` | retry: burn a review cycle per timeout (default) · salvage-if-done: commit the verified dev product and refile the follow-up · defer: give up on the first timeout |
-| `on_status_contradiction` | string | `"escalate"` | `escalate` / `retry` | escalate: pause naming both sides when a review writes sprint-status back off done (default) · retry: legacy — burn review cycles, then defer + roll back |
 
 ### `[stories]`
 
@@ -105,6 +104,8 @@ Cycle/attempt caps, timeout & token budget.
 | `session_budget_mode` | string | `"warn"` | `enforce` / `off` / `warn` | mid-session guard on the weighted per-session spend, sampled every ~30s · off: no sampling · warn: one ATTENTION + breadcrumb · enforce: wrap-up nudge then over_budget termination (retry→defer) |
 | `max_tokens_per_session` | integer | `4000000` | ≥ 1 | weighted (cache-discounted) token cap a single session may spend before the budget guard trips; healthy sessions run ~1-2.5M weighted, so the default trips only true runaways |
 | `session_budget_grace_s` | integer | `240` | ≥ 0 | enforce mode: seconds a tripped session gets to wrap up after the nudge before it is terminated over_budget · 0 = terminate at trip, no nudge |
+| `usage_limit_action` | string | `"pause"` | `pause` / `relaunch` | what a session that ends on a usage limit or an account StopFailure does · pause: the uncharged usage-limit pause `resolve` clears · relaunch: relaunch it at once as an uncharged retry (BMAD_LOOP_USAGE_RELAUNCH=&lt;n&gt; in the session env, for account rotation), capped by max_usage_relaunches |
+| `max_usage_relaunches` | integer | `3` | ≥ 0 | relaunch mode: uncharged usage relaunches per story (dev, fix and review together) · at the cap the session takes the usage-limit pause instead · 0 = always pause |
 | `harvest_summary_chars` | integer | `200` | ≥ 1 | characters a harvested deferred finding's summary keeps in the deferred-work ledger |
 | `harvest_evidence_chars` | integer | `1000` | ≥ 1 | characters a harvested deferred finding's evidence keeps in the deferred-work ledger |
 
@@ -146,7 +147,7 @@ CLI client, model & permission flags (base for all stages).
 | `name` | string | unset — CLI profile — default: claude |  |  |
 | `model` | string | unset — CLI default model |  |  |
 | `effort` | string | unset — provider default |  | reasoning effort, free-form (provider/model-specific, e.g. high, max); sent by opencode-http as the model variant (on 2.x it must be one of the model's variants), ignored by the tmux CLIs |
-| `extra_args` | array of strings | unset |  | when set, replaces the CLI profile's permission-bypass flags (its bypass_args), so repeat them (e.g. claude: --permission-mode bypassPermissions) or unattended sessions may stall on permission prompts |
+| `extra_args` | array of strings | unset |  | when set, replaces the CLI profile's permission-bypass flags (its bypass_args), so repeat them (e.g. claude: --permission-mode bypassPermissions) or unattended sessions may stall on permission prompts · under a sandboxed permission_mode it also drops the mode's linked-worktree gitdir grant, so a sandboxed codex session under worktree isolation cannot commit |
 | `permission_mode` | string | `"bypass"` | `bypass` / `sandboxed` | bypass (default): launch the CLI profile's permission-bypass flags (its bypass_args) · sandboxed: launch the profile's non-blocking sandboxed flags instead — a denied action returns to the agent as an error rather than a prompt (claude and codex on linux/macOS; other profiles refuse it) · extra_args, when set, still replaces either · stages inherit it even when they switch client |
 | `cleanup_session_on_finish` | boolean | `true` |  |  |
 | `usage_grace_s` | float | unset — inherit from CLI profile (copilot ships 8s) | ≥ 0 | seconds to poll the transcript for token usage after a session ends; CLIs that flush totals on shutdown (copilot) need a grace |
