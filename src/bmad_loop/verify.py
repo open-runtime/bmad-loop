@@ -20,7 +20,8 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Collection, Iterable
+from collections.abc import Callable, Collection, Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from stat import S_ISLNK, S_ISREG
@@ -5318,6 +5319,14 @@ def _entry_at_revision(
     return fields[0], fields[1], fields[2]
 
 
+def path_absent_at_revision(repo: Path, revision: str, rel: str) -> bool:
+    """True when ``revision``'s tree has NO entry at literal path ``rel`` — of any
+    type: a blob, symlink, gitlink or tree there all read as present. Absence is
+    the empty successful `ls-tree` answer :func:`_entry_at_revision` gives; a git
+    failure raises GitError, never quietly "absent"."""
+    return _entry_at_revision(repo, revision, rel) is None
+
+
 def file_bytes_at_revision(repo: Path, revision: str, rel: str) -> bytes | None:
     """Read one blob byte-exactly from ``revision``.
 
@@ -6115,6 +6124,42 @@ def commits_above(repo: Path, baseline: str, revision: str = "HEAD") -> list[str
     if rc != 0:
         raise GitError(f"git rev-list {baseline}..{revision} failed in {repo}: {detail}")
     return [line for line in out.splitlines() if line]
+
+
+def bookkeeping_only_commits(repo: Path, shas: Iterable[str], rel: str) -> set[str]:
+    """The subset of ``shas`` whose own change set names ``rel`` and nothing else —
+    `diff-tree --no-commit-id --name-only -r` against the first parent (`--root`
+    for a parentless commit).
+
+    A recorded sha is not proof on its own: the record says the engine minted the
+    commit, this re-reads what the commit actually touches, so a misrecorded sha
+    whose commit carries more than the ledger is never filtered out of a preserve
+    range. A commit that names no path at all — a merge, whose plain
+    diff-tree prints nothing, or an empty commit — is NOT bookkeeping-only.
+
+    `-z` output read verbatim (`_git_raw_out`): `--name-only` quotes a non-ASCII
+    path under the default `core.quotePath`, and a stripped value would eat a
+    path's own edge whitespace. Raises GitError on a git failure, like
+    :func:`commits_above` — a failed probe is never quietly "not bookkeeping"."""
+    found: set[str] = set()
+    for sha in shas:
+        rc, out, detail = _git_raw_out(
+            repo,
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "--no-renames",
+            "-r",
+            "-z",
+            "--root",
+            sha,
+        )
+        if rc != 0:
+            raise GitError(f"git diff-tree {sha} failed in {repo}: {detail}")
+        names = {name for name in out.split("\0") if name}
+        if names == {rel}:
+            found.add(sha)
+    return found
 
 
 def preserve_commits(
@@ -8277,6 +8322,7 @@ def set_frontmatter_field(
     *,
     confine_root: Path,
     root_identity: os.stat_result | None = None,
+    keep_bom: bool = False,
 ) -> bool:
     """Rewrite (or insert) a scalar ``<key>:`` line in a spec's `---`…`---`
     frontmatter block.
@@ -8319,18 +8365,24 @@ def set_frontmatter_field(
     Use the BYTES helper and not the text one:
     `atomic_write_text` keeps ``Path.write_text``'s translating newline default,
     which would relay ``\\n``→``\\r\\n`` on Windows and undo the paragraph above.
+
+    ``keep_bom`` reads a file the way the BMAD v7 scripts do (``utf-8-sig``): a
+    leading UTF-8 byte-order mark is set aside before the split and written back
+    ahead of the edit. Off, a BOM hides the block (``False``, nothing to change),
+    which matches what `read_frontmatter` sees in a spec.
     """
     if not path.is_file():
         return False
     text = path.read_bytes().decode("utf-8")
-    split = _split_frontmatter(text)
+    bom = "\ufeff" if keep_bom and text.startswith("\ufeff") else ""
+    split = _split_frontmatter(text[len(bom) :])
     if split is None:
         return False
     before, block, after = split
     edited = _edit_frontmatter_block(block, key, value, insert=True)
     if edited is None:
         return False
-    payload = (before + edited + after).encode("utf-8")
+    payload = (bom + before + edited + after).encode("utf-8")
     if path.is_relative_to(confine_root):
         atomic_write_bytes_confined(
             path,
@@ -10334,10 +10386,9 @@ def verify_review(
     this gate accepts below). A board now sitting *earlier* than ``done``
     is therefore not a stage the story never reached — it is a review session
     deliberately revoking the sign-off. Nothing in the review loop re-advances
-    the board, so retrying only replays the same failure until the budget runs
-    out and the work is rolled back; under
-    ``review.on_status_contradiction = "escalate"`` (the default) the gate
-    escalates instead, naming both sides. See #334.
+    the board, so retrying would only replay the same failure until the budget
+    ran out and the work was rolled back; the gate escalates instead, naming
+    both sides. See #334.
 
     ``(awaiting-operator, awaiting-operator)`` is the second accepted pair, on
     the same observed-spec-status selection ``verify_dev`` uses: this is the gate
@@ -10380,7 +10431,7 @@ def verify_review(
 
     sprint = story_status(paths.sprint_status, task.story_key)
     if sprint != expected:
-        if expected == "done" and _is_signoff_regression(sprint, sprint_reached_done, policy):
+        if expected == "done" and _is_signoff_regression(sprint, sprint_reached_done):
             return VerifyOutcome.escalate(
                 f"review revoked the sprint sign-off for {task.story_key}: the "
                 f"orchestrator advanced the board to 'done' after dev verified, "
@@ -10390,10 +10441,10 @@ def verify_review(
                 f"reconcile them — the review loop never re-advances the board, so "
                 f"the remaining cycles would burn down onto a defer that rolls the "
                 f"work back. Resolve by either completing the outstanding work and "
-                f"re-arming the escalation (the attempt budget resets on re-arm), "
-                f"or accepting the story and advancing the board yourself; set "
-                f'review.on_status_contradiction = "retry" to restore the legacy '
-                f"retry-until-budget behavior.",
+                f"re-arming with bmad-loop resolve (the attempt budget resets on "
+                f"re-arm), or, under worktree isolation, accepting the kept branch "
+                f"with bmad-loop resolve --adopt-branch; see "
+                f"docs/escalations-guide.md#a-review-revoked-the-sign-off.",
                 contradiction=True,
             )
         return VerifyOutcome.retry(
@@ -10403,16 +10454,16 @@ def verify_review(
     return _verify_review_commands(policy, paths, on_results=on_results, on_probes=on_probes)
 
 
-def _is_signoff_regression(sprint: str | None, sprint_reached_done: bool, policy: Policy) -> bool:
+def _is_signoff_regression(sprint: str | None, sprint_reached_done: bool) -> bool:
     """Whether a non-``done`` sprint status is a review deliberately walking the
     board backward, as opposed to a stage the story simply never reached.
 
-    Conservative on every uncertainty: without the launch-time guarantee, with
-    the knob set to ``retry``, or when the fresh read yields no status at all
-    (missing story entry) or a token outside the known lifecycle (a hand-edited
-    or future board), the caller falls through to the ordinary retry — a wrong
-    escalation halts an otherwise healthy run."""
-    if not sprint_reached_done or policy.review.on_status_contradiction != "escalate":
+    Conservative on every uncertainty: without the launch-time guarantee, or
+    when the fresh read yields no status at all (missing story entry) or a token
+    outside the known lifecycle (a hand-edited or future board), the caller
+    falls through to the ordinary retry — a wrong escalation halts an otherwise
+    healthy run."""
+    if not sprint_reached_done:
         return False
     if sprint is None or sprint not in STATUS_ORDER:
         return False
@@ -10470,10 +10521,12 @@ def verify_review_tickets(
     The plan is the only artifact, so the board's sign-off-regression arm becomes
     a monotonic read-back of the plan itself: a status that sits EARLIER in
     ``statemachine.PLAN_STATUS_ORDER`` than the one the review entered at is the
-    review walking the ticket backward. Under ``review.on_status_contradiction =
-    "escalate"`` (the default) that escalates as a contradiction, since no
-    further review cycle re-advances it; under ``"retry"`` it retries. Any other
-    mismatch retries. A ``dropped`` plan always escalates as a contradiction.
+    review walking the ticket backward, and it escalates as a contradiction: the
+    review's converged result disagrees with the plan it left. The gate runs only
+    on a converged pass (the plan at ``built`` or ``done``), so in practice that is
+    a ``done`` plan the review finalized at ``built``; a pass that leaves the plan
+    before ``built`` is non-terminal and the review loop runs another cycle. Any
+    other mismatch retries. A ``dropped`` plan always escalates as a contradiction.
 
     ``on_results`` / ``on_probes`` go straight to ``_verify_review_commands``,
     as for every review gate."""
@@ -10497,28 +10550,29 @@ def verify_review_tickets(
         return _verify_review_commands(policy, paths, on_results=on_results, on_probes=on_probes)
     expected = PLAN_DONE if entered_status == PLAN_DONE else PLAN_BUILT
     if status != expected:
-        if _is_plan_regression(status, entered_status, policy):
+        if _is_plan_regression(status, entered_status):
             return VerifyOutcome.escalate(
                 f"review walked ticket plan {plan} back from {entered_status!r} to "
-                f"{status!r}. The orchestrator verified it at {entered_status!r} before "
-                f"the review, and no further review cycle moves it forward again. "
-                f"Resolve by finishing the outstanding work and re-arming the "
-                f"escalation, or by accepting the ticket yourself; set "
-                f'review.on_status_contradiction = "retry" to retry instead.',
+                f"{status!r}. The plan entered the review at {entered_status!r}, so the "
+                f"review's converged result disagrees with the plan it left, and no "
+                f"further review cycle moves it forward again. Resolve by finishing the "
+                f"outstanding work and re-arming with bmad-loop resolve, or, under "
+                f"worktree isolation, accepting the kept branch with bmad-loop resolve "
+                f"--adopt-branch; see docs/escalations-guide.md#a-review-revoked-the-sign-off.",
                 contradiction=True,
             )
         return VerifyOutcome.retry(f"plan status is {status!r}, expected {expected!r}: {plan}")
     return _verify_review_commands(policy, paths, on_results=on_results, on_probes=on_probes)
 
 
-def _is_plan_regression(status: str, entered_status: str, policy: Policy) -> bool:
+def _is_plan_regression(status: str, entered_status: str) -> bool:
     """Whether ``status`` sits strictly earlier in the plan lifecycle than the
     status the review entered at. Conservative like :func:`_is_signoff_regression`:
     a token outside ``PLAN_STATUS_ORDER`` (``blocked``, an unknown value), a
     blank one (``""``: no plan status read, the shape an unreadable or torn plan
-    leaves), an unknown entry status, or the ``retry`` knob all fall through to
-    the ordinary retry."""
-    if policy.review.on_status_contradiction != "escalate" or not status:
+    leaves) or an unknown entry status all fall through to the ordinary
+    retry."""
+    if not status:
         return False
     if status not in PLAN_STATUS_ORDER or entered_status not in PLAN_STATUS_ORDER:
         return False
@@ -11017,7 +11071,34 @@ def unpublishable_target(target: Path, family: Literal["ledger", "store"]) -> (
     assert_never(family)
 
 
-def commit_paths(repo: Path, message: str, paths: list[Path]) -> str | None:
+@contextmanager
+def _hookless_git_config() -> Iterator[tuple[str, ...]]:
+    """Yield the `-c` arguments that run one git command with NO repository hooks
+    and NO commit signing: `core.hooksPath` at a fresh empty directory, and
+    `commit.gpgsign=false`.
+
+    `core.hooksPath`, not `--no-verify`: the flag skips only `pre-commit` and
+    `commit-msg`, leaving `prepare-commit-msg`, `post-commit` and
+    `post-index-change` to run — and it does not exist on `git add`, whose index
+    write fires `post-index-change`. An empty directory pointed at by the config
+    silences every hook, including one a repo-configured `core.hooksPath`
+    names, since the command-line `-c` wins over every config file. Signing is
+    off so a pinentry prompt cannot hang an unattended commit.
+
+    The directory lives for the `with` block alone; a failed mkdir raises
+    `GitError` rather than running the command with hooks live."""
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        hooks_dir = Path(td) / "no-hooks"
+        try:
+            hooks_dir.mkdir()
+        except OSError as exc:
+            raise GitError(f"hook isolation directory could not be prepared: {exc}") from exc
+        yield ("-c", f"core.hooksPath={hooks_dir}", "-c", "commit.gpgsign=false")
+
+
+def commit_paths(
+    repo: Path, message: str, paths: list[Path], *, run_hooks: bool = True
+) -> str | None:
     """Commit exactly `paths` (and nothing else), leaving any unrelated working
     or staged changes untouched. Unlike commit_story's `add -A`, this is safe to
     call out of band (e.g. `bmad-loop decisions`) when the tree may hold the
@@ -11066,7 +11147,24 @@ def commit_paths(repo: Path, message: str, paths: list[Path]) -> str | None:
     True — and `lstat` succeeds on it because it does not follow the last component.
     `unpublishable_target`'s RESOLVED-argument paragraph makes the same distinction
     for the same reason. The guard still handles what a probe raises, not what it
-    suppresses; there is simply nothing left here that suppresses."""
+    suppresses; there is simply nothing left here that suppresses.
+
+    ``run_hooks=False`` runs the `add`, `status` and `commit` under
+    :func:`_hookless_git_config` — no repository hook of any kind and no commit
+    signing — for an orchestrator bookkeeping commit that records bytes the engine
+    already wrote and must neither run project code nor block on a pinentry. The
+    default keeps every existing caller's hooks live."""
+    if not run_hooks:
+        with _hookless_git_config() as hookless:
+            return _commit_paths(repo, message, paths, hookless)
+    return _commit_paths(repo, message, paths, ())
+
+
+def _commit_paths(
+    repo: Path, message: str, paths: list[Path], git_config: tuple[str, ...]
+) -> str | None:
+    """:func:`commit_paths`'s body; ``git_config`` prefixes the `-c` arguments
+    onto its `add`, `status` and `commit` (empty for the hooks-live default)."""
     rels: list[str] = []
     # The single per-candidate uncertainty slot, shared by BOTH sources (a failed
     # `resolve()` and a failed presence probe) because they have one contract: omit
@@ -11162,7 +11260,7 @@ def commit_paths(repo: Path, message: str, paths: list[Path]) -> str | None:
     # this comparison is gone: `.as_posix()` above fixes the separator at the source,
     # and a dead normalizer beside a glob operand reads as protection that isn't there.
     specs = _literal_specs(rels)
-    rc, out = _git(repo, "add", "--", *specs)
+    rc, out = _git(repo, *git_config, "add", "--", *specs)
     if rc != 0:
         raise GitError(f"git add failed: {out}")
     # Stdout ALONE (`_git_out`, #442): this is an EMPTINESS test, and `status` exits 0
@@ -11170,13 +11268,13 @@ def commit_paths(repo: Path, message: str, paths: list[Path]) -> str | None:
     # non-empty, the early-out below is skipped, and `git commit` runs with nothing
     # staged and raises where the contract says return None. The `add` above and the
     # `commit` below stay on `_git`: both are rc-only, and stderr is their diagnostic.
-    rc, out, detail = _git_out(repo, "status", "--porcelain", "--", *specs)
+    rc, out, detail = _git_out(repo, *git_config, "status", "--porcelain", "--", *specs)
     if rc != 0:
         raise GitError(f"git status failed: {detail}")
     if not out:
         return None  # nothing changed in these paths
     # pathspec form commits only `rels`, ignoring any other staged changes
-    rc, out = _git(repo, "commit", "-m", message, "--", *specs)
+    rc, out = _git(repo, *git_config, "commit", "-m", message, "--", *specs)
     if rc != 0:
         raise GitError(f"git commit failed: {out}")
     return rev_parse_head(repo)

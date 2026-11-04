@@ -218,7 +218,7 @@ personal copy:
 [workflow]
 persistent_facts = [
   "Session logs for bmad-loop-driven stories are the run directories .bmad-loop/runs/<run-id>/ under {project-root}. Find this epic's runs by grepping their journal.jsonl files for its story keys.",
-  "journal.jsonl holds one JSON event per line: a session-start (task_id, role, story_key, adapter, model) and a session-end (task_id, tokens, and a status of completed, stalled, timeout, crashed, over_budget or aborted) per coding-CLI session, joined on task_id since session-end carries no story_key, plus review results, retries, rollbacks, pauses and escalations.",
+  "journal.jsonl holds one JSON event per line: a session-start (task_id, role, story_key, adapter, model) and a session-end (task_id, tokens, models: the model ids the session actually ran on, and a status of completed, stalled, timeout, crashed, over_budget or aborted) per coding-CLI session, where session-start's model is the configured one (empty for the CLI default), joined on task_id since session-end carries no story_key, plus review results, retries, rollbacks, pauses and escalations.",
   "logs/<task-id>.log is that session's raw terminal capture (escape sequences and repaints included; a readable transcript for the hookless opencode profile). The journal's log_task / log_pos fields name the log file and byte offset each event lines up with. state.json records the run's stories and their outcome.",
   "Runs archived by bmad-loop archive or bmad-loop clean are .bmad-loop/archive/<run-id>.tar.gz and still hold journal.jsonl, state.json and logs/: search inside them too. Record a session-log gap only for runs that were deleted.",
 ]
@@ -433,7 +433,9 @@ What differs on 2.x:
 - **Logs:** a provider failure (rate limit, quota, refused connection) never reaches the
   server's stdout on 2.x, so the adapter records each one in
   `<task-id>.provider-errors.log`, which the environment-fault classifier scans beside
-  `<task-id>.server.out`.
+  `<task-id>.server.out`. A quota failure there pauses the run as a usage limit, never
+  charged; rate limits, refused connections, provider 5xx errors, rejected credentials
+  and unroutable models are environment faults.
 - **Going back to 1.x:** both majors keep their state in the same
   `~/.local/share/opencode/opencode.db`. A 1.x server refuses to start on a database a 2.x
   server created ("Database is not empty and has no session table"), so move that file

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import threading
 import time
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -60,6 +61,33 @@ from ..widgets import (
 )
 from .factory import FactoryScreen
 from .modals import DeferredEntryModal
+
+# `warnings.catch_warnings` swaps the process-wide filters and `showwarning`, so
+# two overlapping captures (the replan worker thread beside a UI-thread load) can
+# restore each other's state out of order; one capture at a time.
+_POLICY_LOAD_LOCK = threading.Lock()
+
+
+def load_policy_noting_deprecations(path: Path) -> tuple[policy_mod.Policy, tuple[str, ...]]:
+    """``policy.load(path)`` plus the text of each ``PolicyDeprecationWarning`` it
+    raised, for the app to toast: Textual captures stderr, so the warning's own
+    print never reaches a dashboard user (DW-603). Records as ``cmd_validate``
+    does — every emission, not once per location — and passes any other warning
+    through ``warnings.showwarning``, also when the load raises."""
+    deprecations: list[str] = []
+    caught: list[warnings.WarningMessage] = []
+    try:
+        with _POLICY_LOAD_LOCK, warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", policy_mod.PolicyDeprecationWarning)
+            pol = policy_mod.load(path)
+    finally:
+        for w in caught:
+            if issubclass(w.category, policy_mod.PolicyDeprecationWarning):
+                deprecations.append(str(w.message))
+            else:
+                warnings.showwarning(w.message, w.category, w.filename, w.lineno, w.file, w.line)
+    return pol, tuple(deprecations)
+
 
 # Resizable-pane geometry, in terminal cells. The MIN_* floors keep a pane from
 # collapsing to nothing when a boundary is dragged or the terminal shrinks; they
@@ -216,9 +244,14 @@ class DashboardScreen(Screen[None]):
         # policy file degrades to defaults rather than blocking the dashboard. That
         # now covers a file whose BYTES are unreadable too — `policy.load` converts
         # the `UnicodeDecodeError` rather than letting a ValueError past a handler
-        # that runs before the app can draw anything.
+        # that runs before the app can draw anything. Its deprecation notices wait
+        # here for the app to toast once mounted.
+        self.policy_deprecations: tuple[str, ...] = ()
         try:
-            self._tui_policy = policy_mod.load(project / policy_mod.POLICY_FILE).tui
+            pol, self.policy_deprecations = load_policy_noting_deprecations(
+                project / policy_mod.POLICY_FILE
+            )
+            self._tui_policy = pol.tui
         except (policy_mod.PolicyError, OSError):
             self._tui_policy = policy_mod.TuiPolicy()
         self._seeded = False
@@ -1199,7 +1232,9 @@ class DashboardScreen(Screen[None]):
         driving THIS task, else the last session that stamped an adapter identity
         (#153 phase 1), else "-" (no live agent and no stamped history)."""
         if agent is not None and agent.story_key == key:
-            return agent_label(agent.name, agent.model)
+            # The CLI-reported model (#859) when the hook sent one.
+            model = agent.reported_model if agent.reported_model is not None else agent.model
+            return agent_label(agent.name, model)
         for record in reversed(task.sessions):
             if record.adapter:
                 return agent_label(record.adapter, record.model)

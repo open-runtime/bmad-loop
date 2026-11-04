@@ -27,7 +27,6 @@ from bmad_loop.policy import (
     POLICY_TEMPLATE,
     RELOAD_POLICY_MODES,
     RETRO_MODES,
-    REVIEW_ON_STATUS_CONTRADICTION_MODES,
     REVIEW_TRIGGER_MODES,
     SESSION_BUDGET_MODES,
     STAGES,
@@ -101,7 +100,6 @@ OPTIONS_ENUM = {
     ("gates", "mode"): GATE_MODES,
     ("gates", "retrospective"): RETRO_MODES,
     ("review", "trigger"): REVIEW_TRIGGER_MODES,
-    ("review", "on_status_contradiction"): REVIEW_ON_STATUS_CONTRADICTION_MODES,
     ("operator", "on_review_demotion"): OPERATOR_ON_REVIEW_DEMOTION_MODES,
     ("stories", "source"): STORIES_SOURCES,
     ("tickets", "mark_done"): TICKETS_MARK_DONE_MODES,
@@ -119,6 +117,7 @@ OPTIONS_ENUM = {
 # section (the adapter stage sub-tables) or is intentionally hidden.
 HIDDEN = {
     ("gates", "on_escalation"),  # CRITICAL escalations always pause; field reserved
+    ("review", "on_status_contradiction"),  # a revoked sign-off always escalates; one value
     ("sweep", "max_migration_attempts"),  # rare legacy-ledger path; no UI knob
     ("scm", "max_parallel"),  # inert until the parallel scheduler lands
     ("adapter", "dev"),  # rendered as the adapter.dev section
@@ -421,16 +420,3 @@ def test_unity_plugin_is_trust_gated_and_renders_settings():
     assert editor_mode.kind == "select"
     assert editor_mode.options == ("shared", "per_worktree")
     assert editor_mode.widget_id == "plugins-unity-editor_5fmode"  # plugin_field_wid-encoded
-
-
-def test_deprecated_engine_block_folds_into_unity_plugin():
-    """A legacy [engine] block loads (with a deprecation warning) by folding onto
-    [plugins] enabled + [plugins.unity]; explicit [plugins.unity] values win."""
-    with pytest.warns(DeprecationWarning):
-        pol = policy_mod.loads(
-            '[engine]\nname = "unity"\neditor_mode = "per_worktree"\nmcp = "coplaydev"\n'
-            '[scm]\nisolation = "worktree"\n'
-        )
-    assert "unity" in pol.plugins.enabled
-    assert pol.plugin_setting("unity", "editor_mode") == "per_worktree"
-    assert pol.plugin_setting("unity", "mcp") == "coplaydev"

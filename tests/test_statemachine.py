@@ -7,11 +7,14 @@ from bmad_loop.statemachine import (
     PLAN_AWAITING_OPERATOR,
     PLAN_STATUS_ORDER,
     PLAN_TRANSITIONS,
+    TICKET_CLOSED_STATES,
     TRANSITIONS,
     IllegalTransition,
+    InitiativeCloseRefused,
     PlanTransitionRefused,
     advance,
     check_board_regression,
+    check_initiative_close,
     check_plan_transition,
 )
 from bmad_loop.ticketmodel import PLAN_STATUSES
@@ -253,14 +256,6 @@ def test_plan_status_order_is_the_lifecycle_and_ticketmodel_reads_it():
     assert set(PLAN_TRANSITIONS) == set(EXPECTED)
 
 
-def test_plan_transition_forward_allowed():
-    """The accept path is strictly forward: built -> done, nothing else."""
-    assert _decide("accept", "built", "done") == "write"
-    assert _decide("accept", "done", "done") == "noop"
-    for state in ("", "draft", "ready-for-dev", "in-progress", "in-review", *_BLOCKED):
-        assert _decide("accept", state, "done") == "refuse", state
-
-
 @pytest.mark.parametrize(
     ("current", "target"),
     [
@@ -283,36 +278,21 @@ def test_plan_regression_refused_without_reason(current, target):
         check_plan_transition("1.1", current, target, "accept", has_plan=True, blocked_reason="")
 
 
-@pytest.mark.parametrize("reason", sorted(EXPECTED))
-@pytest.mark.parametrize("sink", ["done", "dropped"])
-def test_done_and_dropped_are_sinks(reason, sink):
-    """Nothing leaves done or dropped, under any reason; the only answer from a
-    sink other than a refusal is the no-op of writing done onto done.
-
-    Two gates hold this, so one ablation alone stays green by design: delete the
-    final-state refusal in `check_plan_transition` AND add `done` to a reason's
-    sources (say `rearm`'s) and this reddens; either edit alone is caught by the
-    other gate."""
-    for target in PLAN_STATUSES:
-        got = _decide(reason, sink, target)
-        if (sink, target) == ("done", "done") and reason in ("accept", "confirm"):
-            assert got == "noop"
-        else:
-            assert got == "refuse", (reason, sink, target)
-
-
-def test_dropped_is_never_written():
-    for reason in EXPECTED:
-        for state in PLAN_STATES:
-            assert _decide(reason, state, "dropped") == "refuse"
-
-
 @pytest.mark.parametrize(
     ("reason", "state", "target"),
     [(r, c, t) for r in sorted(EXPECTED) for c in PLAN_STATES for t in PLAN_STATUSES],
 )
 def test_plan_transition_table(reason, state, target):
-    """Every (reason, current, target) against the hand-written R1 table."""
+    """Every (reason, current, target) against the hand-written R1 table.
+
+    Ablation: the done/dropped sinks are held by two gates, the final-state
+    refusal in `check_plan_transition` and the rule sources (no reason lists
+    `done` or `dropped`), so one ablation alone stays green by design. Delete the
+    refusal AND add `done` to `rearm`'s sources and the rearm/done/* cells redden;
+    either edit alone is caught by the other gate. Widen the salvage rule's
+    targets to `done` and salvage/{in-progress,in-review}/done redden; widen its
+    sources to every build status and salvage/{draft,ready-for-dev}/built redden;
+    remove the rule and its write cells redden."""
     assert _decide(reason, state, target) == EXPECTED[reason].get((state, target), "refuse")
 
 
@@ -397,23 +377,6 @@ def test_session_declared_park_converts_to_blocked():
             assert _decide(reason, "awaiting-operator", target) == "refuse", (reason, target)
 
 
-def test_salvage_writes_built_and_never_done():
-    """A timed-out review's salvage lands the plan at `built` from in-progress or
-    in-review; it never writes `done` and never starts from a plan the build has
-    not started.
-
-    Ablation: widen the salvage rule's targets to include `done` and the `done`
-    refusal reddens; widen its sources to every build status and the
-    draft/ready-for-dev refusals redden; remove the rule and the writes redden."""
-    assert _decide("salvage", "in-review", "built") == "write"
-    assert _decide("salvage", "in-progress", "built") == "write"
-    assert _decide("salvage", "built", "built") == "noop"
-    for state in ("in-progress", "in-review", "built"):
-        assert _decide("salvage", state, "done") == "refuse", state
-    for state in ("", "draft", "ready-for-dev", *_BLOCKED, "awaiting-operator"):
-        assert _decide("salvage", state, "built") == "refuse", state
-
-
 def test_plan_transition_refused_is_an_illegal_transition():
     with pytest.raises(IllegalTransition) as caught:
         check_plan_transition("2.3", "draft", "done", "accept", has_plan=True, blocked_reason="")
@@ -428,3 +391,70 @@ def test_unknown_reason_is_refused():
         check_plan_transition(
             "1.1", "built", "done", "promote", has_plan=True, blocked_reason=""  # type: ignore[arg-type]
         )
+
+
+# ---- child initiative close ---------------------------------------------------
+
+
+def _close(current: str, total: int, closed: int) -> str:
+    try:
+        return (
+            "write"
+            if check_initiative_close("auth", current, total=total, closed=closed)
+            else "noop"
+        )
+    except InitiativeCloseRefused:
+        return "refuse"
+
+
+@pytest.mark.parametrize(
+    ("current", "expected"),
+    [("", "write"), ("in-progress", "write"), ("done", "noop"), ("dropped", "refuse")],
+)
+def test_initiative_close_from_each_container_status(current, expected):
+    """A drained child closes from unset or in-progress, is a no-op when done, and
+    a dropped one is never reopened. Which rule refuses `dropped` is pinned by
+    the next row."""
+    assert _close(current, 4, 4) == expected
+
+
+def test_dropped_tickets_count_as_closed():
+    """A drain counts dropped tickets with done ones: the caller sums these."""
+    assert TICKET_CLOSED_STATES == {"done", "dropped"}
+
+
+def test_dropped_initiative_refused_as_final():
+    """Ablation: delete the dropped arm and the refusal comes from the open-status
+    check, so the `final` match reddens."""
+    with pytest.raises(InitiativeCloseRefused, match="a dropped initiative is final"):
+        check_initiative_close("auth", "dropped", total=4, closed=4)
+
+
+@pytest.mark.parametrize("current", ["", "in-progress"])
+@pytest.mark.parametrize(("total", "closed"), [(4, 3), (4, 0), (0, 0)])
+def test_initiative_close_refused_until_drained(current, total, closed):
+    """An open child with a ticket left open, or with no tickets at all, is not
+    drained. Ablation: delete the drained check and every row reddens."""
+    assert _close(current, total, closed) == "refuse"
+
+
+def test_initiative_close_done_is_a_noop_even_when_not_drained():
+    """`done` is answered before the drain: a closed child stays a no-op."""
+    assert _close("done", 4, 1) == "noop"
+
+
+@pytest.mark.parametrize("current", ["blocked", "built", "draft", "ready-for-dev", "none"])
+def test_initiative_close_refuses_any_other_status(current):
+    assert _close(current, 4, 4) == "refuse"
+
+
+def test_initiative_close_refused_is_an_illegal_transition():
+    with pytest.raises(IllegalTransition) as caught:
+        check_initiative_close("billing", "in-progress", total=3, closed=2)
+    err = caught.value
+    assert isinstance(err, InitiativeCloseRefused)
+    assert (err.slug, err.current) == ("billing", "in-progress")
+    assert str(err) == (
+        "billing: initiative in-progress -> done is not a legal close: "
+        "not drained: 2 of 3 tickets done or dropped"
+    )

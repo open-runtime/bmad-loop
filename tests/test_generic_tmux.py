@@ -24,12 +24,14 @@ from pathlib import Path
 
 import pytest
 import regex
-from conftest import REAL_MUX_HANG_CEILING_S, json_recursion_payload, real_mux_e2e
+from conftest import REAL_MUX_HANG_CEILING_S, git, json_recursion_payload, real_mux_e2e
 
 from bmad_loop import devcontract, runs
 from bmad_loop.adapters import base as adapter_base
 from bmad_loop.adapters import env_fault, generic, tmux_base
 from bmad_loop.adapters.base import (
+    USAGE_LIMIT_BLOCKED,
+    USAGE_LIMIT_WAIT,
     ZERO_TOKEN_TIMEOUT_EVIDENCE,
     AdapterTaskDirectoryError,
     SessionHandle,
@@ -39,12 +41,18 @@ from bmad_loop.adapters.base import (
 )
 from bmad_loop.adapters.generic import GenericDevAdapter, GenericTmuxAdapter
 from bmad_loop.adapters.multiplexer import MultiplexerError
-from bmad_loop.adapters.profile import PARKED_EVENTS, PermissionModeSpec, get_profile
+from bmad_loop.adapters.profile import (
+    PARKED_EVENTS,
+    PermissionModeSpec,
+    get_profile,
+    toml_basic_string,
+)
 from bmad_loop.bmadconfig import ProjectPaths
 from bmad_loop.journal import TASK_CYCLE_ARTIFACTS, Journal
 from bmad_loop.model import TokenUsage
 from bmad_loop.policy import LimitsPolicy, NotifyPolicy, Policy
 from bmad_loop.signals import HookEvent
+from bmad_loop.verify import GitTimeoutError
 
 # A bump the filesystem can actually record. NTFS stores ~100ns ticks (FAT, 2s),
 # so a 1ns increment rounds away on Windows and the rewritten marker never reads
@@ -465,6 +473,102 @@ def test_a_sandboxed_profile_launches_its_mode_args_in_the_bypass_slot(tmp_path)
     cmd = adapter.build_command(make_spec(tmp_path))
     assert shlex.quote(settings) in cmd
     assert shlex.split(cmd)[prompt_at + 2] == settings
+
+
+def _grant_adapter(tmp_path, profile_name="codex", mode="sandboxed", extra_args=None):
+    adapter = make_adapter(tmp_path, profile_name=profile_name, extra_args=extra_args)
+    adapter.profile = get_profile(profile_name).for_permission_mode(mode, platform="linux")
+    return adapter
+
+
+def _linked_worktree(project) -> Path:
+    wt = project.project.parent / "wt"
+    git(project.project, "worktree", "add", "-q", "--detach", str(wt), "HEAD")
+    (wt / "nested").mkdir()  # a nested project's sessions run below the worktree root
+    return wt
+
+
+def test_sandboxed_codex_in_a_linked_worktree_is_granted_its_gitdir_and_common_dir(
+    tmp_path, project
+):
+    """DW-599: Codex's sandbox keeps a linked worktree's gitdir and the shared
+    common dir read-only, so the sandboxed launch appends the mode's
+    `linked_worktree_args` with both exact paths, after the mode args (its later
+    `default_permissions` must win) and before the model flag.
+
+    ABLATION: return () from `_linked_worktree_grant` and this reddens."""
+    wt = _linked_worktree(project)
+    adapter = _grant_adapter(tmp_path)
+    mode_args = list(adapter.profile.bypass_args)
+    gitdir = toml_basic_string(str((project.project / ".git" / "worktrees" / "wt").resolve()))
+    common = toml_basic_string(str((project.project / ".git").resolve()))
+    grant = [
+        "-c",
+        'permissions.bmad_loop_worktree.extends="bmad_loop"',
+        "-c",
+        f'permissions.bmad_loop_worktree.filesystem={{{gitdir}="write",{common}="write"}}',
+        "-c",
+        'default_permissions="bmad_loop_worktree"',
+    ]
+    for cwd in (wt, wt / "nested"):
+        argv = adapter.interactive_argv(dataclasses.replace(make_spec(tmp_path), cwd=cwd))
+        start = argv.index(mode_args[0])
+        assert argv[start:] == [*mode_args, *grant, "--model", "sonnet"]
+
+
+def test_no_linked_worktree_grant_in_a_main_checkout(tmp_path, project):
+    adapter = _grant_adapter(tmp_path)
+    argv = adapter.interactive_argv(dataclasses.replace(make_spec(tmp_path), cwd=project.project))
+    assert argv[-4:-2] == ["--ask-for-approval", "never"]  # the mode args end the slot
+    assert not any("bmad_loop_worktree" in a for a in argv)
+
+
+@pytest.mark.parametrize(
+    ("profile_name", "mode", "extra_args"),
+    [
+        ("codex", "bypass", None),
+        ("claude", "sandboxed", None),  # a sandbox that needs no grant declares none
+        ("codex", "sandboxed", ("--custom",)),  # extra_args replaces the mode args, grant too
+    ],
+    ids=["bypass", "non-codex", "extra-args"],
+)
+def test_no_linked_worktree_grant_without_a_declaring_mode(
+    tmp_path, project, monkeypatch, profile_name, mode, extra_args
+):
+    """No grant, and git is not even asked: a broken git must not fail a launch
+    that owes no grant."""
+    wt = _linked_worktree(project)
+
+    def no_git(*_a, **_k):
+        raise AssertionError("git asked for a launch that owes no grant")
+
+    monkeypatch.setattr(generic, "git_bytes", no_git)
+    adapter = _grant_adapter(tmp_path, profile_name, mode, extra_args)
+    argv = adapter.interactive_argv(dataclasses.replace(make_spec(tmp_path), cwd=wt))
+    assert not any("bmad_loop_worktree" in a for a in argv)
+
+
+def test_a_linked_worktree_grant_fault_refuses_the_launch(tmp_path, monkeypatch):
+    """A git fault while resolving the paths raises rather than launching a
+    session that could not commit. Covers a cwd git disowns (rc != 0) and a git
+    that raises (timeout / spawn failure).
+
+    ABLATION: return None from `_linked_worktree_git_dirs` on a fault and both
+    cases launch."""
+    adapter = _grant_adapter(tmp_path)
+    plain = tmp_path / "not-a-repo"
+    plain.mkdir()
+    spec = dataclasses.replace(make_spec(tmp_path), cwd=plain)
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    with pytest.raises(generic.LinkedWorktreeGrantError, match="could not read the git dirs"):
+        adapter.build_command(spec)
+
+    def hung(*_a, **_k):
+        raise GitTimeoutError("git timed out")
+
+    monkeypatch.setattr(generic, "git_bytes", hung)
+    with pytest.raises(generic.LinkedWorktreeGrantError, match="git timed out"):
+        adapter.interactive_argv(spec)
 
 
 def test_read_result_variants(tmp_path):
@@ -1470,29 +1574,10 @@ def test_stories_readback_ambiguous_returns_none_without_waiting(tmp_path):
     assert time.monotonic() - start < generic.RESULT_GRACE_S / 2
 
 
-def test_stories_readback_pending_returns_none(tmp_path):
-    adapter, _ = make_dev_adapter(tmp_path)
-    # no story spec on disk yet -> not terminal
-    assert adapter._result_json(_dev_handle(), _stories_spec(tmp_path), wait=False) is None
-
-
 def test_stories_readback_non_terminal_returns_none(tmp_path):
     adapter, _ = make_dev_adapter(tmp_path)
     # a died-mid-flight ready-for-dev (no plan-halt) is not a terminal result
     _write_story_spec(tmp_path, "1", "foo", "---\nstatus: ready-for-dev\n---\n\nplanned only\n")
-    assert adapter._result_json(_dev_handle(), _stories_spec(tmp_path), wait=False) is None
-
-
-def test_stories_readback_non_utf8_spec_returns_none(tmp_path):
-    """synthesize_result re-reads the resolved spec as UTF-8; a binary/undecodable
-    spec (or a torn glimpse of one still being written) must degrade to a
-    result-less poll, never crash the read-back. resolve_story_spec classifies it
-    PRESENT with status "" — so without the guard the poll dies on the very state
-    the engine is designed to wedge-and-pause on at the next pick."""
-    adapter, _ = make_dev_adapter(tmp_path)
-    d = tmp_path / "epic" / "stories"
-    d.mkdir(parents=True, exist_ok=True)
-    (d / "1-slug.md").write_bytes(_BAD_UTF8)
     assert adapter._result_json(_dev_handle(), _stories_spec(tmp_path), wait=False) is None
 
 
@@ -1543,15 +1628,6 @@ def _breadcrumbs(adapter, task_id="3-1-dev-1"):
     if not path.is_file():
         return []
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
-
-
-def test_resultless_stop_breadcrumb_scan_no_artifact(tmp_path, monkeypatch):
-    adapter, impl = make_dev_adapter(tmp_path)
-    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
-    assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True) is None
-    (crumb,) = _breadcrumbs(adapter)
-    assert crumb["verdict"] == "no-artifact"
-    assert str(impl) in crumb["detail"]  # names the searched dirs
 
 
 def test_resultless_stop_breadcrumb_explains_non_recursive_artifact_scan(tmp_path, monkeypatch):
@@ -1756,6 +1832,12 @@ def test_stories_readback_undecodable_spec_is_not_not_terminal(tmp_path, monkeyp
     keeps `not-terminal` (`test_resultless_stop_breadcrumb_stories_not_terminal`)
     and writes no lifecycle crumb (the healthy row below).
 
+    synthesize_result re-reads the resolved spec as UTF-8, and resolve_story_spec
+    classifies an undecodable spec (or a torn glimpse of one still being written)
+    PRESENT with status "", so the read-back must degrade to a result-less poll and
+    never crash on the very state the engine is designed to wedge-and-pause on at
+    the next pick.
+
     Ablation: drop the `_spec_read_fault` re-read or the `_note_spec_read_fault`
     call and the fault rows fail."""
     adapter, _ = make_dev_adapter(tmp_path)
@@ -1926,6 +2008,269 @@ def test_wait_for_completion_skips_transcriptless_subagent_stop(tmp_path):
     assert result.status == "completed"
     assert result.transcript_path == "/run/events.jsonl"  # main's path, not empty
     assert result.session_id == "main-sess"  # the subagent's toolu_ id is never recorded
+
+
+def _agy_stop(session_id, transcript_path, fully_idle):
+    return HookEvent(
+        ts=1,
+        event="Stop",
+        task_id="3-1-dev-1",
+        session_id=session_id,
+        transcript_path=transcript_path,
+        path=Path("x"),
+        fully_idle=fully_idle,
+    )
+
+
+def test_wait_for_completion_skips_a_fully_idle_false_yield_stop(tmp_path):
+    """DW-548 (pinned on agy 1.4.9): a parent that spawns a foreground subagent
+    fires Stop with `fullyIdle: false` while it yields, then Stop with
+    `fullyIdle: true` when it really finishes. The yield is no turn end. The
+    terminal spec is already on disk here, so a yield read as a turn end would
+    complete on the first event; the session must complete on the FINAL Stop,
+    and the yield is journaled once with its count.
+
+    Ablation, performed: delete the `fully_idle is False` branch in the wait
+    loop and this fails — the result completes on the yield, with its transcript."""
+    adapter, impl = make_dev_adapter(tmp_path, profile_name="antigravity")
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+    )
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _agy_stop("agy-parent", "/yield.jsonl", False),
+            _agy_stop("agy-parent", "/yield.jsonl", False),
+            _agy_stop("agy-parent", "/final.jsonl", True),
+        ]
+    )
+
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert result.session_id == "agy-parent"
+    assert result.transcript_path == "/final.jsonl"
+    assert adapter.watcher.calls == 3  # completion waited for the final Stop
+    yields = [e for e in _lifecycle_lines(adapter) if e["event"] == "hook-stop-yield-ignored"]
+    assert yields == [
+        {
+            "ts": yields[0]["ts"],
+            "event": "hook-stop-yield-ignored",
+            "session_id": "agy-parent",
+            "ignored_so_far": 1,
+        }
+    ]
+
+
+def test_a_lone_fully_idle_false_stop_never_completes(tmp_path, monkeypatch):
+    """DW-548: a yield Stop with no final Stop after it leaves the session
+    running, so it takes the timeout path with no stop seen, and the yield count
+    is on the `timeout-fired` crumb where an operator looks.
+
+    Ablation, performed: delete the `fully_idle is False` branch and this fails
+    — the yield sets stop_seen, and the result-less Stop ends the dev session as
+    stalled instead of timing out."""
+    adapter, clock = _timeout_clock_adapter(tmp_path, monkeypatch)
+    adapter._stall_grace_s = 0.0
+
+    def advance(call_n):
+        if call_n > 1:
+            clock["mono"] += 1000.0
+
+    adapter.watcher = _ScriptedWatcher(
+        [_agy_stop("agy-parent", None, False)],
+        on_call=advance,
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _short_spec(tmp_path, timeout_s=100.0))
+
+    assert result.status == "timeout"
+    assert result.stop_seen is False
+    assert result.session_id == "agy-parent"  # the session's own event: tracked
+    (fired,) = _lifecycle_events(adapter, "timeout-fired")
+    assert fired["stop_yields_ignored"] == 1
+
+
+_AGY_MARKER = ".system_generated/subagents/{session_id}.json"
+
+
+def _agy_brain(tmp_path, parent="agy-parent", child="agy-child"):
+    """A brain store as agy 1.4.9 lays it out: one folder per conversation, the
+    parent's holding the spawn marker it wrote for the child. Returns the two
+    transcript paths (strings, as a hook reports them)."""
+    brain = tmp_path / "brain"
+    transcripts = []
+    for conv in (parent, child):
+        logs = brain / conv / ".system_generated" / "logs"
+        logs.mkdir(parents=True)
+        (logs / "transcript_full.jsonl").write_text("")
+        transcripts.append(str(logs / "transcript_full.jsonl"))
+    marker = brain / parent / _AGY_MARKER.format(session_id=child)
+    marker.parent.mkdir(parents=True)
+    marker.write_text("{}")
+    return transcripts[0], transcripts[1]
+
+
+def test_spawn_marker_verdict_reads_a_sibling_marker_as_a_child(tmp_path):
+    parent_t, child_t = _agy_brain(tmp_path)
+    assert generic._spawn_marker_verdict(_AGY_MARKER, "agy-child", child_t) == "child"
+    assert generic._spawn_marker_verdict(_AGY_MARKER, "agy-parent", parent_t) == "own"
+
+
+def test_spawn_marker_verdict_ignores_a_marker_in_the_conversations_own_folder(tmp_path):
+    """Only a SIBLING folder's marker names a child: a conversation never spawns
+    itself, so its own folder is skipped."""
+    parent_t, _ = _agy_brain(tmp_path)
+    own = tmp_path / "brain" / "agy-parent" / _AGY_MARKER.format(session_id="agy-parent")
+    own.write_text("{}")
+    assert generic._spawn_marker_verdict(_AGY_MARKER, "agy-parent", parent_t) == "own"
+
+
+@pytest.mark.parametrize(
+    ("session_id", "transcript"),
+    [
+        (None, "brain/agy-child/t.jsonl"),
+        ("", "brain/agy-child/t.jsonl"),
+        ("agy-child", None),
+        ("agy-child", ""),
+        ("agy-child", "brain/elsewhere/t.jsonl"),  # no ancestor named by the id
+        ("..", "brain/../t.jsonl"),
+        ("agy-child", "brain/agy-child/t\0.jsonl"),
+    ],
+)
+def test_spawn_marker_verdict_is_unjudged_without_a_conversation_folder(
+    tmp_path, session_id, transcript
+):
+    _agy_brain(tmp_path)
+    if transcript:
+        transcript = str(tmp_path / transcript)
+    assert generic._spawn_marker_verdict(_AGY_MARKER, session_id, transcript) == "unjudged"
+
+
+def test_spawn_marker_verdict_propagates_a_store_read_fault(tmp_path, monkeypatch):
+    """A fault listing the store or statting a marker propagates for the caller
+    to crumb; only an absent marker reads as absent."""
+    parent_t, _ = _agy_brain(tmp_path)
+
+    def denied(path):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(generic.os, "scandir", denied)
+    with pytest.raises(PermissionError):
+        generic._spawn_marker_verdict(_AGY_MARKER, "agy-parent", parent_t)
+    monkeypatch.undo()
+    monkeypatch.setattr(generic.os, "stat", denied)
+    with pytest.raises(PermissionError):
+        generic._spawn_marker_verdict(_AGY_MARKER, "agy-parent", parent_t)
+
+
+def _agy_child_run(tmp_path, adapter, impl):
+    """parent yield -> child yield -> child final -> parent final, with the
+    terminal spec already on disk: whichever Stop is first read as a turn end
+    completes the session."""
+    parent_t, child_t = _agy_brain(tmp_path)
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+    )
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _agy_stop("agy-parent", parent_t, False),
+            _agy_stop("agy-child", child_t, False),
+            _agy_stop("agy-child", child_t, True),
+            _agy_stop("agy-parent", parent_t, True),
+        ]
+    )
+    return parent_t, child_t
+
+
+def test_wait_for_completion_drops_a_spawned_child_conversations_stop(tmp_path):
+    """DW-548 (pinned on agy 1.4.9): a subagent is a sibling conversation whose
+    Stops reach the parent's stream unannounced. Its final `fully_idle: true`
+    Stop must not complete the parent: the session completes on the PARENT's
+    final Stop, with the parent's id and transcript, and the child is journaled
+    once however many of its Stops arrive.
+
+    Ablation, performed: delete the spawn-marker branch in the wait loop and
+    this fails — the result completes on the child's final Stop, with its id."""
+    adapter, impl = make_dev_adapter(tmp_path, profile_name="antigravity")
+    assert adapter.profile.subagent_spawn_marker == _AGY_MARKER
+    parent_t, _ = _agy_child_run(tmp_path, adapter, impl)
+
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert result.session_id == "agy-parent"
+    assert result.transcript_path == parent_t
+    assert adapter.watcher.calls == 4
+    ignored = _lifecycle_events(adapter, "subagent-stop-ignored")
+    assert ignored == [
+        {
+            "ts": ignored[0]["ts"],
+            "event": "subagent-stop-ignored",
+            "child_session_id": "agy-child",
+            "fully_idle": False,
+        }
+    ]
+    assert _lifecycle_events(adapter, "subagent-marker-unjudged") == []
+    assert _lifecycle_events(adapter, "subagent-marker-unreadable") == []
+
+
+def test_wait_for_completion_without_a_spawn_marker_is_unchanged(tmp_path):
+    """Gating: a profile without the key reads the child's final Stop as the
+    turn end, exactly as before — the rule must not leak to other CLIs."""
+    adapter, impl = make_dev_adapter(tmp_path, profile_name="antigravity")
+    adapter.profile = dataclasses.replace(adapter.profile, subagent_spawn_marker=None)
+    _, child_t = _agy_child_run(tmp_path, adapter, impl)
+
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert result.session_id == "agy-child"
+    assert result.transcript_path == child_t
+    assert adapter.watcher.calls == 3
+    assert _lifecycle_events(adapter, "subagent-stop-ignored") == []
+
+
+def test_an_unjudged_stop_is_admitted_and_crumbed_once(tmp_path):
+    """A Stop the rule cannot judge (no folder named by its id) is admitted as
+    before, never silently read as own: the crumb fires once per attempt."""
+    adapter, impl = make_dev_adapter(tmp_path, profile_name="antigravity")
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+    )
+    adapter.watcher = _ScriptedWatcher(
+        [_agy_stop("agy-parent", "/yield.jsonl", False), _agy_stop("agy-parent", None, True)]
+    )
+
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert adapter.watcher.calls == 2
+    (crumb,) = _lifecycle_events(adapter, "subagent-marker-unjudged")
+    assert crumb["session_id"] == "agy-parent"
+    assert crumb["transcript_path"] == "/yield.jsonl"
+
+
+def test_an_unreadable_marker_store_admits_the_stop_and_crumbs_once(tmp_path, monkeypatch):
+    """A store read fault admits the Stop as before (failing toward acceptance)
+    and is journaled once with the error — never folded into "not a child"."""
+    adapter, impl = make_dev_adapter(tmp_path, profile_name="antigravity")
+    _, child_t = _agy_child_run(tmp_path, adapter, impl)
+    real_scandir = os.scandir
+
+    def denied(path):
+        if Path(path).name == "brain":
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_scandir(path)
+
+    monkeypatch.setattr(generic.os, "scandir", denied)
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert result.session_id == "agy-child"  # admitted: the fault judged nothing
+    assert result.transcript_path == child_t
+    (crumb,) = _lifecycle_events(adapter, "subagent-marker-unreadable")
+    assert crumb["session_id"] == "agy-parent"
+    assert crumb["error"].startswith("PermissionError")
+    assert _lifecycle_events(adapter, "subagent-stop-ignored") == []
 
 
 def test_wait_for_completion_ignores_foreign_identified_lifecycle_events(tmp_path):
@@ -2346,7 +2691,9 @@ def test_wait_for_completion_copilot_bound_subagent_stop_not_crumbed(tmp_path):
 
 def test_wait_for_completion_keeps_identified_stop_for_stop_only_profile(tmp_path):
     """A Stop-only profile (no SessionStart) never binds, so attribution admits
-    every event and its established identified-Stop completion stays intact."""
+    every event and its established identified-Stop completion stays intact. The
+    transcript sits under no folder named by the id, so the spawn-marker rule
+    (DW-548) cannot judge it: admitted, with that one crumb."""
     adapter, impl = make_dev_adapter(tmp_path, profile_name="antigravity")
     (impl / "spec-3-1-foo.md").write_text(
         "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
@@ -2360,7 +2707,7 @@ def test_wait_for_completion_keeps_identified_stop_for_stop_only_profile(tmp_pat
     assert result.status == "completed"
     assert result.session_id == "stop-only-session"
     assert result.transcript_path == "/legacy.jsonl"
-    assert _lifecycle_lines(adapter) == []
+    assert [e["event"] for e in _lifecycle_lines(adapter)] == ["subagent-marker-unjudged"]
 
 
 CODEX_SESSION = "019a2b3c-4d5e-7f60-8a9b-0c1d2e3f4a5b"
@@ -3995,6 +4342,7 @@ def test_heartbeat_written_and_throttled(tmp_path, monkeypatch):
         "probe_failures": 0,
         "usage_sample_failures": 0,
         "foreign_hook_events": 0,  # no nested CLI's events were dropped (#767)
+        "stop_yields_ignored": 0,  # no Stop was a subagent yield (DW-548)
     }
     assert [w["remaining_s"] for w in writes] == [100.0, 59.0]  # tick 2 was throttled
     hb = json.loads((adapter.tasks_dir / "3-1-dev-1" / "heartbeat.json").read_text())
@@ -5547,11 +5895,16 @@ def test_usage_limited_env_fault_is_not_overruled_by_tokens(tmp_path, status):
     evidence = _usage_evidence(adapter)
     handle = SessionHandle(task_id=_ENV_FAULT_TASK, native_id="@1")
     live = SessionResult(
-        status=status, parked=True, parked_evidence=evidence, usage_limited=evidence
+        status=status,
+        parked=True,
+        parked_evidence=evidence,
+        usage_limited=evidence,
+        usage_limit_class=USAGE_LIMIT_BLOCKED,
     )
     spec = make_spec(adapter.run_dir, task_id=_ENV_FAULT_TASK)
     result = adapter._classify_env_fault(handle, spec, live)
     assert result.env_fault is True
+    assert result.usage_limit_class == USAGE_LIMIT_BLOCKED  # the live class survives
     assert result.env_fault_evidence == evidence
     assert result.env_fault_overruled is None
     assert reads == []
@@ -5588,6 +5941,7 @@ def test_tail_only_usage_match_is_still_overruled(tmp_path):
     assert kept.env_fault is True
     assert "Run /usage-credits" in kept.env_fault_evidence
     assert kept.usage_limited is None  # the tail never sets the live field
+    assert kept.usage_limit_class is None  # ...nor its class (DW-591)
 
 
 def test_run_overruled_timeout_is_plain_timeout(tmp_path):
@@ -7308,26 +7662,6 @@ def test_frontmatter_fallback_refuses_unmodified_snapshot_dead_window(tmp_path):
     assert _breadcrumbs(adapter) == []
 
 
-def test_frontmatter_fallback_hash_mismatch_still_two_obs(tmp_path, monkeypatch):
-    """Content edited since the snapshot (the review actually wrote): the hash gate
-    is inert and today's fingerprint behavior stands — pending on the first stable
-    Stop, harvested on the second."""
-    adapter, impl = make_dev_adapter(tmp_path)
-    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
-    spec_file = impl / "spec-3-1-foo.md"
-    spec_file.write_text(
-        "---\nstatus: done\nbaseline_revision: abc123\n---\n\n# Story\n\nLaunch.\n"
-    )
-    spec = _snapshotted_spec(tmp_path, spec_file)
-    # the review rewrote the spec's body: bytes differ from the launch snapshot.
-    spec_file.write_text(_MARKERLESS_DONE)
-    assert adapter._result_json(_dev_handle(), spec, wait=True) is None
-    (crumb,) = _breadcrumbs(adapter)
-    assert crumb["verdict"] == "terminal-frontmatter-pending"
-    rj = adapter._result_json(_dev_handle(), spec, wait=True)
-    assert rj["synthesized_from_frontmatter"] is True
-
-
 def test_frontmatter_fallback_snapshot_other_path_inert(tmp_path, monkeypatch):
     """The gate only fires when the candidate IS the snapshotted spec. A snapshot
     for a different path leaves the fallback on its normal fingerprint path even
@@ -7511,7 +7845,8 @@ def test_frontmatter_fallback_missed_transition_stays_conservative(tmp_path, mon
     """Snapshot present, bytes differ, but NO transition was recorded (the flip
     happened between ticks): the fallback keeps the conservative 2-observation
     fingerprint — pending on the first stable Stop, harvested on the second with
-    transition=False."""
+    transition=False. Content edited since the snapshot (the review actually wrote)
+    leaves the M1 hash gate inert, so this is also the hash-mismatch row."""
     adapter, impl = make_dev_adapter(tmp_path)
     monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
     spec_file = impl / "spec-3-1-foo.md"
@@ -11207,6 +11542,212 @@ def test_subagent_activity_in_the_final_interval_closes_the_stretch(tmp_path, mo
     assert [e["kind"] for e in adapter.journal.entries] == ["session-idle", "session-active"]
 
 
+# DW-548: agy runs a foreground subagent as a SIBLING conversation and writes
+# nothing to the parent's folder meanwhile; the children the parent lists
+# through its spawn marker are walked like the subagent tree.
+
+
+def _agy_idle_run(tmp_path, monkeypatch, *, session_ids=("agy-parent",), on_call=None):
+    """An antigravity idle adapter over `_agy_brain`'s store, named by the
+    parent's `fullyIdle: false` yield Stops, one per tick from tick 1 with the
+    ids in `session_ids` (agy's only id-bearing event), with the pane
+    repainting from tick 2. The child's transcript grows
+    from tick 2 unless `on_call` replaces that; the loop ends on tick 7.
+    Returns (adapter, heartbeats, brain)."""
+    adapter, _, log, _t, clock, heartbeats = _idle_adapter(
+        tmp_path, monkeypatch, profile_name="antigravity"
+    )
+    assert adapter.profile.subagent_transcript_root == ""  # children only
+    parent_t, child_t = _agy_brain(tmp_path)
+
+    def script(call_n):
+        if call_n >= 2:
+            clock["t"] += generic.HEARTBEAT_INTERVAL_S
+            _grow(log, "\r⠋".encode())
+            if on_call is None:
+                _grow(Path(child_t), b'{"step_index":1}\n')
+        if on_call is not None:
+            on_call(call_n)
+        if call_n == 7:
+            clock["t"] += 10_000.0
+
+    stops = [_agy_stop(sid, parent_t, False) for sid in session_ids]
+    adapter.watcher = _ScriptedWatcher(stops, on_call=script)
+    return adapter, heartbeats, tmp_path / "brain"
+
+
+def test_spawned_child_activity_keeps_a_silent_agy_parent_active(tmp_path, monkeypatch):
+    """The parent's transcript sits still while the child it listed through the
+    spawn marker keeps writing: the idle clock reads the child's writes, so no
+    stretch opens.
+
+    ABLATION, performed: drop the `_spawned_children` roots from
+    `_sample_subagent_tree` and a `session-idle` opens."""
+    adapter, heartbeats, _ = _agy_idle_run(tmp_path, monkeypatch)
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert result.status == "timeout"
+    assert adapter.journal.entries == []
+    assert all(hb["transcript_idle_s"] == 0.0 for hb in heartbeats[1:])
+    crumbs = [ln["event"] for ln in _lifecycle_lines(adapter, "3-1-dev-1")]
+    assert not [c for c in crumbs if c.startswith("subagent-scan-")]
+
+
+@pytest.mark.parametrize("case", ["no-marker-key", "no-marker-file", "unjudged"])
+def test_spawned_child_is_not_watched_without_a_listing(tmp_path, monkeypatch, case):
+    """The same growing child is no activity when the parent does not list it:
+    a profile without `subagent_spawn_marker` (unchanged behaviour), a parent
+    folder holding no marker, or a Stop whose id names no ancestor folder of its
+    transcript (the parent's folder cannot be judged, so no child is guessed).
+    The silent parent opens its stretch at the grace crossing."""
+    adapter, _, brain = _agy_idle_run(
+        tmp_path, monkeypatch, session_ids=("elsewhere" if case == "unjudged" else "agy-parent",)
+    )
+    if case == "no-marker-key":
+        adapter.profile = dataclasses.replace(adapter.profile, subagent_spawn_marker=None)
+    elif case == "no-marker-file":
+        (brain / "agy-parent" / _AGY_MARKER.format(session_id="agy-child")).unlink()
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    adapter.wait_for_completion(_dev_handle(), spec)
+    entries = adapter.journal.entries
+    assert [e["kind"] for e in entries] == ["session-idle"]
+    assert entries[0]["since_ts"] == 5000.0
+    crumbs = [ln["event"] for ln in _lifecycle_lines(adapter, "3-1-dev-1")]
+    assert not [c for c in crumbs if c.startswith("subagent-scan-")]
+
+
+def test_spawned_child_appearing_mid_run_closes_the_stretch(tmp_path, monkeypatch):
+    """No child is listed when the parent goes quiet, so the stretch opens at
+    the grace crossing; the spawn then writes the marker and the child's
+    transcript, which reads as movement from the empty children's (0, 0, 0):
+    one `session-active` carrying the stretch's full length.
+
+    ABLATION: drop `or sub_moved` and the `session-active` is missing."""
+    marker = tmp_path / "brain" / "agy-parent" / _AGY_MARKER.format(session_id="agy-child")
+    child_dir = tmp_path / "brain" / "agy-child"
+    stash = tmp_path / "stash"
+
+    def script(call_n):
+        if call_n == 1:  # the store before the spawn: the parent alone
+            stash.mkdir()
+            marker.rename(stash / "marker.json")
+            child_dir.rename(stash / "agy-child")
+        if call_n == 5:  # heartbeat 5: 120 s
+            (stash / "marker.json").rename(marker)
+            (stash / "agy-child").rename(child_dir)
+        if call_n > 5:
+            _grow(child_dir / ".system_generated/logs/transcript_full.jsonl", b"{}\n")
+
+    adapter, _, _ = _agy_idle_run(tmp_path, monkeypatch, on_call=script)
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    adapter.wait_for_completion(_dev_handle(), spec)
+    entries = adapter.journal.entries
+    assert [e["kind"] for e in entries] == ["session-idle", "session-active"]
+    assert entries[0]["since_ts"] == 5000.0
+    assert entries[1]["idle_s"] == 120.0
+
+
+def test_children_coming_into_view_rebaseline_the_subagent_key(tmp_path, monkeypatch):
+    """A profile declaring both a tree and a spawn marker, named first by an
+    id-less Stop (the parent's folder cannot be judged: the tree alone is
+    watched) and then by the parent's id: the static children now in view
+    change what the key covers, which is a baseline, not movement, so the
+    stretch still opens from the naming.
+
+    ABLATION: drop the `sub_children_judged` rebaseline and the newly watched
+    children read as movement on tick 2, moving `since_ts`."""
+    adapter, _, _ = _agy_idle_run(
+        tmp_path, monkeypatch, session_ids=(None, "agy-parent"), on_call=lambda n: None
+    )
+    adapter.profile = dataclasses.replace(
+        adapter.profile, subagent_transcript_dir="{stem}/subagents"
+    )
+    parent_t = tmp_path / "brain/agy-parent/.system_generated/logs/transcript_full.jsonl"
+    _subagent_file(parent_t, "agent-a.jsonl")
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    adapter.wait_for_completion(_dev_handle(), spec)
+    entries = adapter.journal.entries
+    assert [e["kind"] for e in entries] == ["session-idle"]
+    assert entries[0]["since_ts"] == 5000.0
+
+
+def test_spawn_marker_listing_fault_is_crumbed_and_degrades_to_the_parent(tmp_path, monkeypatch):
+    """A marker listing that raises is never "no children": it joins the
+    `subagent-scan-failed` streak (`path` = the parent's conversation folder),
+    and the tick degrades to the parent alone, so the silent parent still opens
+    its stretch on time although the child writes.
+
+    ABLATION: swallow the fault into `[]` and the crumb is never written."""
+    calls: list[Path] = []
+
+    def denied(template, conversation):
+        calls.append(conversation)
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(generic, "_spawned_children", denied)
+    adapter, _, brain = _agy_idle_run(tmp_path, monkeypatch)
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    adapter.wait_for_completion(_dev_handle(), spec)
+    assert len(calls) > 3
+    entries = adapter.journal.entries
+    assert [e["kind"] for e in entries] == ["session-idle"]
+    assert entries[0]["since_ts"] == 5000.0
+    (failed,) = _lifecycle_events(adapter, "subagent-scan-failed")
+    assert failed["path"] == str(brain / "agy-parent")
+    assert failed["error"] == "PermissionError: [Errno 13] Permission denied"
+    assert _lifecycle_events(adapter, "subagent-scan-recovered") == []
+
+
+# `_spawned_children` directly: the marker listing's match/skip/raise rules.
+
+
+def test_spawned_children_lists_each_marked_sibling(tmp_path):
+    """A listed child's folder is named whether or not it exists yet; the
+    parent's own id, names the template does not match, and an empty listing
+    directory's absence are not children."""
+    _agy_brain(tmp_path)
+    brain = tmp_path / "brain"
+    parent = brain / "agy-parent"
+    subagents = parent / ".system_generated" / "subagents"
+    (subagents / "agy-late.json").write_text("{}")  # spawned, folder not yet written
+    (subagents / "agy-parent.json").write_text("{}")  # its own id never counts
+    (subagents / "notes.txt").write_text("x")
+    assert generic._spawned_children(_AGY_MARKER, parent) == [
+        brain / "agy-child",
+        brain / "agy-late",
+    ]
+    assert generic._spawned_children(_AGY_MARKER, brain / "agy-child") == []
+
+
+def test_spawned_children_matches_the_id_in_a_middle_component(tmp_path):
+    """The id may sit in a directory component: a candidate counts only when
+    the whole filled-in marker stats, and literal braces stay literal."""
+    template = "kids/{session_id}/{{spawned}}.json"
+    conversation = tmp_path / "store" / "p"
+    (conversation / "kids" / "c1").mkdir(parents=True)
+    (conversation / "kids" / "c1" / "{spawned}.json").write_text("{}")
+    (conversation / "kids" / "c2").mkdir()  # no marker inside: not a child
+    assert generic._spawned_children(template, conversation) == [tmp_path / "store" / "c1"]
+
+
+def test_spawned_children_propagates_a_listing_or_stat_fault(tmp_path, monkeypatch):
+    """Only an absent listing directory or marker reads as absent; every other
+    fault propagates for the caller to crumb."""
+    _agy_brain(tmp_path)
+    parent = tmp_path / "brain" / "agy-parent"
+
+    def denied(path):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(generic.os, "scandir", denied)
+    with pytest.raises(PermissionError):
+        generic._spawned_children(_AGY_MARKER, parent)
+    monkeypatch.undo()
+    monkeypatch.setattr(generic.os, "stat", denied)
+    with pytest.raises(PermissionError):
+        generic._spawned_children(_AGY_MARKER, parent)
+
+
 # `_subagent_tree_key` directly: the stat-only walk's skip/raise rules.
 
 
@@ -11676,6 +12217,7 @@ def _hook_event(
     transcript_path=None,
     source=None,
     lineage=None,
+    model=None,
 ):
     return HookEvent(
         ts=1,
@@ -11687,6 +12229,7 @@ def _hook_event(
         notification_type=notification_type,
         source=source,
         lineage=lineage,
+        model=model,
     )
 
 
@@ -12175,25 +12718,25 @@ def test_profile_without_parked_patterns_never_captures(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("line", "field"),
+    ("line", "field", "usage_class"),
     [
-        (USAGE_CREDITS_LINE, "usage_limit_patterns"),
-        (USAGE_SESSION_LINE, "usage_wait_patterns"),
+        (USAGE_CREDITS_LINE, "usage_limit_patterns", USAGE_LIMIT_BLOCKED),
+        (USAGE_SESSION_LINE, "usage_wait_patterns", USAGE_LIMIT_WAIT),
     ],
 )
 @pytest.mark.parametrize("nudges", [0, 2])
 def test_stall_expiry_on_usage_limit_line_is_parked_and_usage_limited(
-    tmp_path, monkeypatch, line, field, nudges
+    tmp_path, monkeypatch, line, field, usage_class, nudges
 ):
     """No hook latch, a usage-limit line on the visible pane: the stall-grace
     expiry ends the session `stalled` + `parked`, with `usage_limited` naming
     the matched pattern and quoting the line — whether a nudge was due (2) or
-    none is configured (0). Either list counts; one capture serves both the
-    parked and the usage patterns.
+    none is configured (0). Either list counts, and `usage_limit_class` names
+    which one (DW-591); one capture serves the parked and both usage sets.
 
-    Ablation: drop `self._usage_pane_patterns` from the stall gate's
-    `_pane_evidence` call (usage_now stays None) and this fails on an unparked
-    stall with `usage_limited` None."""
+    Ablation: drop the usage sets from the stall gate's `_pane_evidence` call
+    (usage_now stays None) and this fails on an unparked stall with
+    `usage_limited` None."""
     screen = f"\x1b[2m{line}\x1b[0m\r\n\r\n❯ \r\n"
     adapter, mux = _parked_adapter(tmp_path, monkeypatch, [], screen=screen, nudges=nudges)
     result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
@@ -12201,9 +12744,47 @@ def test_stall_expiry_on_usage_limit_line_is_parked_and_usage_limited(
     assert result.usage_limited is not None
     pattern = getattr(adapter.profile, field)[0]
     assert result.usage_limited == f"pane matched {pattern!r}: {line.strip()}"
+    assert result.usage_limit_class == usage_class
     assert result.parked_evidence == result.usage_limited  # no latch: the limit IS the park
     assert mux.sent == []
     assert mux.captures == ["@1"]
+
+
+def test_blocked_line_outranks_a_wait_line_on_one_screen(tmp_path, monkeypatch):
+    """The two lists are disjoint by contract, but a screen showing both a
+    session-window wait line and, BELOW it, a credit-exhaustion line is
+    `blocked` (DW-591): an operator must act. The wait line comes first in row
+    order, so a merged search would have picked it. Same at the stall-expiry
+    gate and the timeout-fired look, each still one capture.
+
+    Ablation: swap `_usage_hit`'s order (wait checked first) and this fails
+    on `wait`."""
+    both = f"{USAGE_SESSION_LINE}\n{USAGE_CREDITS_LINE}\n❯ \n"
+    stall_dir = tmp_path / "stall"
+    stall_dir.mkdir()
+    adapter, mux = _parked_adapter(stall_dir, monkeypatch, [], screen=both, nudges=0)
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(stall_dir))
+    assert (result.status, result.parked) == ("stalled", True)
+    assert result.usage_limit_class == USAGE_LIMIT_BLOCKED
+    assert result.usage_limited == _usage_evidence(adapter)
+    assert result.usage_limit_resets is None  # the credits line names no reset
+    assert mux.captures == ["@1"]
+
+    timeout_dir = tmp_path / "timeout"
+    timeout_dir.mkdir()
+    timed, clock = _timeout_clock_adapter(timeout_dir, monkeypatch)
+    timed_mux = _UnitMux(screen=both)
+    timed.mux = timed_mux
+
+    def advance(call_n):
+        clock["mono"] += 11.0
+
+    timed.watcher = _ScriptedWatcher([], on_call=advance)
+    late = timed.wait_for_completion(_dev_handle(), _short_spec(timeout_dir))
+    assert late.status == "timeout"
+    assert late.usage_limit_class == USAGE_LIMIT_BLOCKED
+    assert late.usage_limited == _usage_evidence(timed)
+    assert timed_mux.captures == ["@1"]
 
 
 @pytest.mark.parametrize(
@@ -12218,8 +12799,8 @@ def test_usage_line_withholds_the_stall_nudge(tmp_path, monkeypatch, events):
     `idle_prompt` latch already supplying the parked evidence, the usage look
     still runs and is still recorded.
 
-    Ablation: drop `self._usage_pane_patterns` from the stall gate's
-    `_pane_evidence` call and the no-latch case sends two STALL_NUDGE_TEXTs; the
+    Ablation: drop the usage sets from the stall gate's `_pane_evidence` call
+    and the no-latch case sends two STALL_NUDGE_TEXTs; the
     latched case loses `usage_limited` from the crumb and the result."""
     adapter, mux = _parked_adapter(
         tmp_path, monkeypatch, events, screen=f"{USAGE_CREDITS_LINE}\n", nudges=2
@@ -12229,6 +12810,7 @@ def test_usage_line_withholds_the_stall_nudge(tmp_path, monkeypatch, events):
     assert _stall_nudges(mux) == []
     assert (result.status, result.parked) == ("stalled", True)
     assert result.usage_limited == evidence
+    assert result.usage_limit_class == USAGE_LIMIT_BLOCKED
     (withheld,) = _lifecycle_events(adapter, "stall-nudge-withheld")
     assert withheld["usage_limited"] == evidence
     assert withheld["nudge_due"] is True
@@ -12256,6 +12838,7 @@ def test_timeout_with_usage_line_visible_is_usage_limited(tmp_path, monkeypatch)
     assert result.status == "timeout"
     pattern = adapter.profile.usage_wait_patterns[0]
     assert result.usage_limited == f"pane matched {pattern!r}: {USAGE_SESSION_LINE.strip()}"
+    assert result.usage_limit_class == USAGE_LIMIT_WAIT
     assert mux.captures == ["@1"]
 
     mux.screen = "working…\n❯ \n"
@@ -12264,6 +12847,7 @@ def test_timeout_with_usage_line_visible_is_usage_limited(tmp_path, monkeypatch)
     clean = adapter.wait_for_completion(_dev_handle(), _short_spec(tmp_path))
     assert clean.status == "timeout"
     assert clean.usage_limited is None
+    assert clean.usage_limit_class is None
 
 
 def test_timeout_with_wrapped_usage_line_is_usage_limited(tmp_path, monkeypatch):
@@ -12304,6 +12888,7 @@ def test_dead_window_is_never_usage_limited(tmp_path, monkeypatch):
     assert result.status == "crashed"
     assert result.parked is False
     assert result.usage_limited is None
+    assert result.usage_limit_class is None
     assert _stall_nudges(mux) == []
     assert mux.captures == ["@1"]  # the line WAS seen: the probe is what declined it
 
@@ -12321,6 +12906,7 @@ def test_dead_window_is_never_usage_limited(tmp_path, monkeypatch):
     late = timed.wait_for_completion(_dev_handle(), _short_spec(timeout_dir))
     assert late.status == "timeout"
     assert late.usage_limited is None
+    assert late.usage_limit_class is None
     assert timed_mux.captures == ["@1"]
 
 
@@ -12691,10 +13277,11 @@ def test_idle_prompt_latch_journals_no_parked_notice(tmp_path, monkeypatch):
     assert mux.captures == ["@1"]  # the timeout's own look only
 
 
-def test_activity_unpark_leaves_the_parked_latch_to_the_stall_gate(tmp_path, monkeypatch):
-    """The notice observes only: after it closes on transcript activity, the
-    latch it rode on is untouched, so the stall gate still withholds the nudge
-    and ends the session `stalled` + `parked` on it."""
+def _approved_latch_run(tmp_path, monkeypatch, *, approved):
+    """A PermissionPrompt latch naming a transcript, then silence past the 40 s
+    stall grace (11 s per idle tick, a heartbeat every 30 s). `approved` writes
+    to the transcript on the second watcher call, after the latch: the prompt
+    was answered and the CLI is working again."""
     monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
     monkeypatch.setattr(generic, "RESULT_POLL_S", 0.0)
     mux = _UnitMux()
@@ -12713,7 +13300,7 @@ def test_activity_unpark_leaves_the_parked_latch_to_the_stall_gate(tmp_path, mon
 
         def wait_for(self, task_id, kinds, timeout_s, since_ns=0):
             self.calls += 1
-            if self.calls == 2:
+            if approved and self.calls == 2:
                 _grow(transcript, b'{"type":"assistant"}\n')
             if script:
                 return script.pop(0)
@@ -12721,10 +13308,77 @@ def test_activity_unpark_leaves_the_parked_latch_to_the_stall_gate(tmp_path, mon
             return None
 
     adapter.watcher = _Watcher()
-    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    return adapter, mux, adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+
+def test_activity_unpark_clears_a_permission_latch_the_transcript_moved_past(tmp_path, monkeypatch):
+    """An approved prompt (a transcript write after the latch) followed by a
+    silent stretch is a working session gone quiet, not a parked one: the
+    notice closes on the activity and takes the latch with it, so the stall
+    gate sends its wake nudges and the session ends an ordinary stall (DW-594).
+
+    ABLATION: drop the latch clearing beside `_note_session_unparked(...,
+    "activity")` and this ends `stalled` + `parked` with no nudge sent."""
+    adapter, mux, result = _approved_latch_run(tmp_path, monkeypatch, approved=True)
     assert [e["how"] for e in _journaled(adapter, "session-unparked")] == ["activity"]
+    assert (result.status, result.parked) == ("stalled", False)
+    assert result.parked_evidence is None
+    assert _stall_nudges(mux) == [generic.STALL_NUDGE_TEXT] * 2
+
+
+def test_an_unmoved_permission_latch_still_parks_the_stall(tmp_path, monkeypatch):
+    """No transcript write after the latch: the prompt is still unanswered, so
+    the heartbeat samples leave the notice open and the latch set, and the stall
+    gate withholds the nudge and ends the session `stalled` + `parked`."""
+    adapter, mux, result = _approved_latch_run(tmp_path, monkeypatch, approved=False)
+    assert [e["how"] for e in _journaled(adapter, "session-unparked")] == ["ended"]
     assert (result.status, result.parked) == ("stalled", True)
     assert result.parked_evidence == "Notification(permission_prompt) -> PermissionPrompt"
+    assert _stall_nudges(mux) == []
+
+
+def test_a_failed_transcript_stat_leaves_the_permission_latch(tmp_path, monkeypatch):
+    """The transcript grows between its first sample and the latch, then cannot
+    be stat'ed: `idle.last_key` is still the pre-latch sample, which differs
+    from the latch's key though the prompt still waits. A failed stat is no
+    sample, so the notice stays open, the latch stays set, and the stall gate
+    withholds the nudge and ends the session `stalled` + `parked`.
+
+    ABLATION: compare `idle.last_key` without the `sampled` gate and the notice
+    closes on `activity`, the latch goes with it and both nudges are sent."""
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    monkeypatch.setattr(generic, "RESULT_POLL_S", 0.0)
+    mux = _UnitMux()
+    adapter, _ = make_dev_adapter(tmp_path, mux=mux)
+    adapter._stall_grace_s = 40.0
+    adapter._stall_nudges = 2
+    adapter._window_alive = lambda handle: True
+    adapter.journal = _FakeJournal()
+    clock = _frozen_stall_clock(monkeypatch)
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_bytes(b'{"type":"user"}\n')
+
+    class _Watcher:
+        calls = 0
+
+        def wait_for(self, task_id, kinds, timeout_s, since_ns=0):
+            self.calls += 1
+            if self.calls == 1:  # names the transcript: its first sample
+                return _hook_event("SessionStart", transcript_path=str(transcript))
+            if self.calls == 2:
+                _grow(transcript, b'{"type":"assistant"}\n')
+                return _hook_event(
+                    "Notification", "permission_prompt", transcript_path=str(transcript)
+                )
+            if self.calls == 3:
+                transcript.unlink()
+            clock["t"] += 11.0
+            return None
+
+    adapter.watcher = _Watcher()
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert [e["how"] for e in _journaled(adapter, "session-unparked")] == ["ended"]
+    assert (result.status, result.parked) == ("stalled", True)
     assert _stall_nudges(mux) == []
 
 
@@ -13772,6 +14426,7 @@ def test_reset_beyond_cap_skips_the_wait(tmp_path, monkeypatch):
     assert (result.status, result.parked) == ("stalled", True)
     assert result.parked_evidence == result.usage_limited == q.wait_evidence()
     assert result.usage_limit_resets == QUOTA_RESETS
+    assert result.usage_limit_class == USAGE_LIMIT_WAIT
     assert result.result_json is None
     assert result.quota_wait_s == 0.0
     assert q.quota_kinds() == []
@@ -13811,6 +14466,7 @@ def test_reset_within_cap_waits(tmp_path, monkeypatch):
     )
     assert result.status == "completed"
     assert result.usage_limit_resets is None  # it continued: no usage verdict
+    assert result.usage_limit_class is None
     assert _lifecycle_events(q.adapter, "quota-wait-skipped") == []
     assert q.quota_kinds() == ["quota-wait-started", "quota-wait-ended"]
     started = next(e for e in q.adapter.journal.entries if e["kind"] == "quota-wait-started")
@@ -13828,7 +14484,7 @@ def test_reset_within_cap_waits(tmp_path, monkeypatch):
 def test_usage_limited_result_carries_the_parsed_reset(tmp_path, monkeypatch):
     """Every usage-limited exit carries the reset parsed from the matched line:
     the stall-expiry gate (quota wait off, silent pane), the timeout-fired look,
-    and the quota-wait cap."""
+    and the quota-wait cap; each also names the wait list it matched (DW-591)."""
     for sub in ("stall", "timeout", "cap"):
         (tmp_path / sub).mkdir()
     stall = _quota_adapter(tmp_path / "stall", monkeypatch, grace=120.0)
@@ -13836,18 +14492,21 @@ def test_usage_limited_result_carries_the_parsed_reset(tmp_path, monkeypatch):
     assert (result.status, result.parked) == ("stalled", True)
     assert result.usage_limited == stall.wait_evidence()
     assert result.usage_limit_resets == QUOTA_RESETS
+    assert result.usage_limit_class == USAGE_LIMIT_WAIT  # the session-window line
 
     timeout = _quota_adapter(tmp_path / "timeout", monkeypatch)
     result = _drive_quota(timeout, _quota_spec(tmp_path, cap_s=0.0))
     assert result.status == "timeout"
     assert result.usage_limited == timeout.wait_evidence()
     assert result.usage_limit_resets == QUOTA_RESETS
+    assert result.usage_limit_class == USAGE_LIMIT_WAIT  # the session-window line
 
     cap = _quota_adapter(tmp_path / "cap", monkeypatch)
     result = _drive_quota(cap, _quota_spec(tmp_path, cap_s=600.0))
     assert (result.status, result.parked) == ("stalled", True)
     assert _lifecycle_events(cap.adapter, "quota-wait-cap")
     assert result.usage_limit_resets == QUOTA_RESETS
+    assert result.usage_limit_class == USAGE_LIMIT_WAIT  # the session-window line
     for q in (stall, timeout, cap):
         assert _lifecycle_events(q.adapter, "usage-reset-unparsed") == []
 
@@ -14061,3 +14720,1037 @@ def test_session_start_missing_journal_write_failure_is_swallowed(tmp_path, monk
     assert result.status == "timeout"
     assert attempts == ["session-start-missing", "session-start-missing"]
     assert [e["waited_s"] for e in _start_missing_entries(adapter)] == [150]
+
+
+# ------------------------------------------------ session-model notice (#859)
+#
+# Observation only. The first admitted SessionStart whose hook carries a `model`
+# gets one `session-model` row (the CLI's launch model); later SessionStarts —
+# a /clear or compact rebind, or a Codex subagent reusing the parent's id — never
+# re-journal it.
+
+
+def _session_model_entries(adapter):
+    return [e for e in adapter.journal.entries if e["kind"] == "session-model"]
+
+
+def _model_start(transcript, model, **kw):
+    return _hook_event(
+        "SessionStart", task_id="b-1", transcript_path=str(transcript), model=model, **kw
+    )
+
+
+def test_session_model_journaled_once_from_first_session_start(tmp_path, monkeypatch):
+    """A SessionStart carrying `model` journals one `session-model` row naming it,
+    the task and the CLI profile; a later rebind SessionStart does not add another.
+
+    ABLATION: drop the `session_model_noted` latch and the rebind appends a second
+    row."""
+    adapter, clock, sent = _start_missing_adapter(tmp_path, monkeypatch)
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_bytes(b"{}\n")
+    events = [
+        _model_start(transcript, "claude-opus-4-6[1m]"),
+        _model_start(transcript, "claude-opus-4-6[1m]", source="clear", session_id="sess2"),
+    ]
+    result = _run_start_missing(adapter, clock, tmp_path, events=events)
+    assert result.status == "timeout"
+    assert sent == []
+    assert _session_model_entries(adapter) == [
+        {
+            "kind": "session-model",
+            "task_id": "b-1",
+            "model": "claude-opus-4-6[1m]",
+            "cli": "claude",
+        }
+    ]
+
+
+def test_session_model_not_journaled_without_hook_model(tmp_path, monkeypatch):
+    """A SessionStart without a hook `model` (Claude may omit it; Gemini, Copilot
+    and agy never send one) journals nothing — and does not latch, so a later one
+    that carries it still journals.
+
+    ABLATION: drop the `event.model` test and the first SessionStart journals a
+    row with `model=None`."""
+    adapter, clock, _ = _start_missing_adapter(tmp_path, monkeypatch)
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_bytes(b"{}\n")
+    result = _run_start_missing(adapter, clock, tmp_path, events=[_model_start(transcript, None)])
+    assert result.status == "timeout"
+    assert _session_model_entries(adapter) == []
+
+    second = tmp_path / "second"
+    second.mkdir()
+    adapter, clock, _ = _start_missing_adapter(second, monkeypatch)
+    events = [_model_start(transcript, None), _model_start(transcript, "claude-sonnet-4-6")]
+    _run_start_missing(adapter, clock, second, events=events)
+    assert [e["model"] for e in _session_model_entries(adapter)] == ["claude-sonnet-4-6"]
+
+
+def test_later_same_sid_session_start_does_not_rejournal_model(tmp_path, monkeypatch):
+    """Codex subagent hooks reuse the parent's session id, so a later same-sid
+    SessionStart is admitted and may carry the child's model: only the first
+    (launch) model is journaled.
+
+    ABLATION: drop the `session_model_noted` latch and the child's model lands
+    as a second row."""
+    adapter, clock, _ = _start_missing_adapter(tmp_path, monkeypatch, hooks_from="codex")
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_bytes(b"{}\n")
+    events = [_model_start(transcript, "gpt-5.5-codex"), _model_start(transcript, "gpt-5.5-mini")]
+    result = _run_start_missing(adapter, clock, tmp_path, events=events)
+    assert result.status == "timeout"
+    assert _session_model_entries(adapter) == [
+        {"kind": "session-model", "task_id": "b-1", "model": "gpt-5.5-codex", "cli": "codex"}
+    ]
+
+
+def test_codex_model_less_first_start_latches_against_child_model(tmp_path, monkeypatch):
+    """On Codex the first admitted SessionStart latches even with no `model`: a
+    later same-sid start may be a subagent's, and its model must not label the
+    launch. (Claude stays open — see the test above.)
+
+    ABLATION: drop the codex-dialect arm of the latch and the child's model is
+    journaled as the session's."""
+    adapter, clock, _ = _start_missing_adapter(tmp_path, monkeypatch, hooks_from="codex")
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_bytes(b"{}\n")
+    events = [_model_start(transcript, None), _model_start(transcript, "gpt-5.5-mini")]
+    result = _run_start_missing(adapter, clock, tmp_path, events=events)
+    assert result.status == "timeout"
+    assert _session_model_entries(adapter) == []
+
+
+def test_session_model_journal_failure_is_crumbed(tmp_path, monkeypatch):
+    """An unwritable journal loses the `session-model` row but leaves a
+    `session-model-unjournaled` lifecycle crumb naming the model and the fault,
+    and the session runs to its own end.
+
+    ABLATION: drop the crumb in the `except OSError` and no line is written."""
+    adapter, clock, _ = _start_missing_adapter(tmp_path, monkeypatch)
+
+    class _Failing(_FakeJournal):
+        def append(self, kind, **fields):
+            if kind == "session-model":
+                raise OSError("disk full")
+            super().append(kind, **fields)
+
+    adapter.journal = _Failing()
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_bytes(b"{}\n")
+    events = [_model_start(transcript, "claude-opus-5-5")]
+    result = _run_start_missing(adapter, clock, tmp_path, events=events)
+    assert result.status == "timeout"
+    (crumb,) = _lifecycle_events(adapter, "session-model-unjournaled", task_id="b-1")
+    assert (crumb["model"], crumb["error"]) == ("claude-opus-5-5", "OSError: disk full")
+
+
+# --------------------------------------------- Claude Code StopFailure (#865)
+#
+# Claude Code fires `StopFailure` INSTEAD of `Stop` when an API error ends a
+# turn. claude's `[hooks.stop_failure_types]` maps the hook's `error` to an
+# action the wait loop takes at the event: a transient error gets the stop
+# nudge, an account error ends the session parked, and `rate_limit` is split by
+# its message against the usage-limit lists. It never completes a session.
+
+
+def _stop_failure_event(error, message=None, *, details=None, transcript_path=None):
+    return dataclasses.replace(
+        _hook_event("StopFailure", transcript_path=transcript_path),
+        stop_error=error,
+        stop_error_details=details,
+        stop_message=message,
+    )
+
+
+def _stop_nudges(mux):
+    return [text for _, text in mux.sent if text == generic.NUDGE_TEXT]
+
+
+@pytest.mark.parametrize("error", ["server_error", "overloaded", "unknown"])
+def test_transient_stop_failure_types_the_stop_nudge(tmp_path, monkeypatch, error):
+    """A transient API error ends the turn with no Stop: the result-less Stop's
+    nudge goes out at the event, from the same budget. It completes nothing and
+    latches no `stop_seen`; unanswered, the grace expiry stalls the session as
+    before and the error rides out on the result."""
+    adapter, mux = _parked_adapter(
+        tmp_path, monkeypatch, [_stop_failure_event(error, "Connection lost")], nudges=0
+    )
+    adapter._stop_nudges = 1
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert mux.sent == [("@1", generic.NUDGE_TEXT)]
+    assert result.status == "stalled"
+    assert result.stop_seen is False
+    assert result.parked is False
+    assert result.stop_failure == error
+    (crumb,) = _lifecycle_events(adapter, "stop-failure")
+    assert (crumb["error"], crumb["action"], crumb["message"]) == (
+        error,
+        "transient",
+        "Connection lost",
+    )
+
+
+def test_transient_stop_failure_nudge_send_failure_is_crumbed(tmp_path, monkeypatch):
+    adapter, mux = _parked_adapter(
+        tmp_path, monkeypatch, [_stop_failure_event("server_error")], nudges=0
+    )
+    adapter._stop_nudges = 1
+
+    def fail_send(window_id, text):
+        raise MultiplexerError("window gone")
+
+    mux.send_text = fail_send
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert result.status == "stalled"
+    (failed,) = _lifecycle_events(adapter, "nudge-send-failed")
+    assert failed["nudge"] == "stop-failure"
+
+
+def test_transient_stop_failure_withholds_the_nudge_during_a_quota_wait(tmp_path, monkeypatch):
+    """A quota wait is open (the CLI waits out a usage-window reset): typing the
+    nudge into it can only reproduce the limit line, so it is withheld, crumbed
+    like the result-less Stop's, and the wait runs on to its cap."""
+    q = _quota_adapter(tmp_path, monkeypatch)
+    q.adapter._stop_nudges = 1
+    result = _drive_quota(
+        q,
+        _quota_spec(tmp_path, timeout_s=120.0, cap_s=200.0),
+        events={7: _stop_failure_event("overloaded")},
+    )
+    assert q.mux.sent == []
+    (withheld,) = _lifecycle_events(q.adapter, "stop-nudge-withheld")
+    assert withheld["reason"] == "quota-wait"
+    assert withheld["hook_event"] == "StopFailure"
+    assert withheld["nudge_due"] is True
+    assert (result.status, result.parked) == ("stalled", True)
+    assert result.stop_failure == "overloaded"
+
+
+def test_transient_stop_failure_in_a_dev_session_types_the_wake_nudge(tmp_path, monkeypatch):
+    """The dev adapter's real knobs: no result-file nudge (the skill writes no
+    result.json), a wake-nudge budget. The transient error gets the wake nudge at
+    the event, from the stall budget, instead of after the grace runs out in
+    silence; unanswered, the next expiry spends the rest and the session stalls.
+
+    ABLATION: drop the `stall_nudge_due` branch and the first `send_text` comes
+    one grace later, after a `stop-failure-nudge-exhausted` crumb."""
+    sends: list[int] = []
+    adapter, mux = _parked_adapter(tmp_path, monkeypatch, [_stop_failure_event("overloaded")])
+    assert adapter._stop_nudges == 0
+    send = mux.send_text
+
+    def counting_send(window_id, text):
+        sends.append(len(_lifecycle_events(adapter, "stop-failure")))
+        return send(window_id, text)
+
+    mux.send_text = counting_send
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert _stop_nudges(mux) == []
+    assert _stall_nudges(mux) == [generic.STALL_NUDGE_TEXT] * 2
+    # the first wake nudge went out on the StopFailure tick, not a grace later
+    assert sends[0] == 1
+    assert _lifecycle_events(adapter, "stop-failure-nudge-exhausted") == []
+    assert (result.status, result.parked, result.stop_failure) == ("stalled", False, "overloaded")
+
+
+def test_transient_stop_failure_wake_nudge_honors_the_cap(tmp_path, monkeypatch):
+    """The wake nudge at the event is bounded by the session's attempt cap like one
+    at grace expiry: a grace expiry spends the cap of 1 first, so the later
+    StopFailure types nothing.
+
+    ABLATION: drop the cap clause from `stall_nudge_due` and a second wake nudge
+    goes out at the event."""
+    adapter, mux = _parked_adapter(
+        tmp_path, monkeypatch, [None, _stop_failure_event("server_error")]
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), stall_nudges_cap=1)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert _stall_nudges(mux) == [generic.STALL_NUDGE_TEXT]
+    assert result.status == "stalled"
+
+
+def test_transient_stop_failure_never_types_into_a_parked_cli(tmp_path, monkeypatch):
+    """A parked latch (a CLI waiting on a human) withholds the wake nudge at the
+    event too, and the stall expiry ends the session parked (#727)."""
+    adapter, mux = _parked_adapter(
+        tmp_path,
+        monkeypatch,
+        [_hook_event("Notification", "permission_prompt"), _stop_failure_event("server_error")],
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert _stall_nudges(mux) == []
+    (withheld,) = _lifecycle_events(adapter, "stop-nudge-withheld")
+    assert (withheld["reason"], withheld["hook_event"]) == ("parked", "StopFailure")
+    assert (result.status, result.parked) == ("stalled", True)
+
+
+def test_transient_stop_failure_never_types_the_stop_nudge_into_a_parked_cli(tmp_path, monkeypatch):
+    """A result-file session with stop-nudge budget left: a StopFailure after a
+    permission prompt does not prove the prompt was answered, so the result-file
+    nudge (and its Enter) is withheld like the wake nudge, and the stall expiry
+    ends the session parked (#727).
+
+    ABLATION: check the parked latch only before the wake nudge and NUDGE_TEXT is
+    typed into the permission dialog."""
+    adapter, mux = _parked_adapter(
+        tmp_path,
+        monkeypatch,
+        [_hook_event("Notification", "permission_prompt"), _stop_failure_event("overloaded")],
+        nudges=0,
+    )
+    adapter._stop_nudges = 1
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert mux.sent == []
+    (withheld,) = _lifecycle_events(adapter, "stop-nudge-withheld")
+    assert (withheld["reason"], withheld["hook_event"]) == ("parked", "StopFailure")
+    assert (result.status, result.parked) == ("stalled", True)
+
+
+def test_transient_stop_failure_after_the_nudges_run_out_falls_to_the_stall(tmp_path, monkeypatch):
+    """No stop nudge and no wake nudge left: crumbed, and the session keeps today's
+    stall path, a charged `stalled` (#764: an unrecovered transient error is not a
+    pause)."""
+    adapter, mux = _parked_adapter(
+        tmp_path, monkeypatch, [_stop_failure_event("server_error")], nudges=0
+    )
+    adapter._stop_nudges = 0
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert _stop_nudges(mux) == []
+    assert _stall_nudges(mux) == []
+    assert (result.status, result.parked, result.usage_limited) == ("stalled", False, None)
+    (exhausted,) = _lifecycle_events(adapter, "stop-failure-nudge-exhausted")
+    assert exhausted["error"] == "server_error"
+    from bmad_loop.escalation import Action, decide_dev
+    from bmad_loop.model import StoryTask
+
+    decision = decide_dev(
+        StoryTask(story_key="3-1", epic=3, attempt=1), result, None, Policy(limits=LimitsPolicy())
+    )
+    assert decision.action == Action.RETRY
+
+
+def test_account_stop_failure_exits_parked(tmp_path, monkeypatch):
+    """An account error only an operator can fix ends the session at once,
+    `stalled` + `parked` with the error as evidence, and nothing typed into it.
+    The engine's dev decider pauses it uncharged, naming the error."""
+    adapter, mux = _parked_adapter(
+        tmp_path,
+        monkeypatch,
+        [_stop_failure_event("billing_error", "Credit balance is too low")],
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert (result.status, result.parked) == ("stalled", True)
+    assert result.parked_evidence == "StopFailure(billing_error): Credit balance is too low"
+    assert result.usage_limited is None
+    assert result.stop_failure == "billing_error"
+    assert result.stop_seen is False
+    assert mux.sent == []
+    from bmad_loop.escalation import Action, decide_dev
+    from bmad_loop.model import StoryTask
+
+    decision = decide_dev(
+        StoryTask(story_key="3-1", epic=3, attempt=1), result, None, Policy(limits=LimitsPolicy())
+    )
+    assert decision.action == Action.PAUSE
+    assert decision.reason.startswith("parked: dev session stalled (StopFailure(billing_error)")
+
+
+@pytest.mark.parametrize(
+    ("message", "details", "said"),
+    [(None, "402 Payment Required", "402 Payment Required"), (None, None, "no message")],
+)
+def test_account_stop_failure_evidence_falls_back_to_details(
+    tmp_path, monkeypatch, message, details, said
+):
+    adapter, _ = _parked_adapter(
+        tmp_path,
+        monkeypatch,
+        [_stop_failure_event("authentication_failed", message, details=details)],
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert result.parked_evidence == f"StopFailure(authentication_failed): {said}"
+
+
+def test_rate_limit_stop_failure_matching_a_blocked_pattern_is_usage_limited(tmp_path, monkeypatch):
+    """A `rate_limit` whose message is the credit-exhaustion line: the CLI will
+    not continue by itself, so the session ends usage-limited (BLOCKED) at once,
+    the evidence naming the hook message rather than a pane look."""
+    adapter, mux = _parked_adapter(
+        tmp_path, monkeypatch, [_stop_failure_event("rate_limit", USAGE_CREDITS_LINE)]
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    pattern = adapter.profile.usage_limit_patterns[0]
+    evidence = f"StopFailure(rate_limit) message matched {pattern!r}: {USAGE_CREDITS_LINE.strip()}"
+    assert (result.status, result.parked) == ("stalled", True)
+    assert result.usage_limited == evidence
+    assert result.parked_evidence == evidence
+    assert result.usage_limit_class == USAGE_LIMIT_BLOCKED
+    assert result.usage_limit_resets is None
+    assert result.stop_failure == "rate_limit"
+    assert mux.sent == []
+
+
+def test_rate_limit_stop_failure_matching_a_wait_pattern_admits_the_quota_wait_without_a_pane_hit(
+    tmp_path, monkeypatch
+):
+    """A `rate_limit` whose message is the session-limit line, on a pane that
+    shows nothing (herdr cannot capture one): the quota wait admits on the hook's
+    line at the usual idle gate, parses its reset, and runs to its cap.
+
+    Ablation: drop the admission's StopFailure fallback and no wait opens; the
+    session times out instead."""
+    q = _quota_adapter(tmp_path, monkeypatch, screen="")
+    result = _drive_quota(
+        q,
+        _quota_spec(tmp_path, timeout_s=120.0, cap_s=200.0),
+        events={2: _stop_failure_event("rate_limit", USAGE_SESSION_LINE)},
+    )
+    pattern = q.adapter.profile.usage_wait_patterns[0]
+    evidence = f"StopFailure(rate_limit) message matched {pattern!r}: {USAGE_SESSION_LINE.strip()}"
+    (pending,) = _lifecycle_events(q.adapter, "stop-failure-quota-wait-pending")
+    assert pending["evidence"] == evidence
+    (started,) = _lifecycle_events(q.adapter, "quota-wait-started")
+    assert started["evidence"] == evidence
+    assert _lifecycle_events(q.adapter, "timeout-fired") == []
+    assert (result.status, result.parked) == ("stalled", True)
+    assert result.usage_limited == evidence
+    assert result.usage_limit_class == USAGE_LIMIT_WAIT
+    assert result.usage_limit_resets == QUOTA_RESETS
+    assert result.stop_failure == "rate_limit"
+    # The heartbeat carries the latched error only once it is latched.
+    assert "stop_failure" not in q.heartbeats[0]
+    assert q.heartbeats[-1]["stop_failure"] == "rate_limit"
+
+
+def test_unmatched_rate_limit_stop_failure_keeps_the_stall_timing(tmp_path, monkeypatch):
+    """A `rate_limit` whose message matches neither usage list (an ordinary 429):
+    crumbed, and the grace expiry decides as it does today."""
+    adapter, mux = _parked_adapter(
+        tmp_path,
+        monkeypatch,
+        [_stop_failure_event("rate_limit", "API Error: 429 Too Many Requests")],
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    (crumb,) = _lifecycle_events(adapter, "stop-failure-rate-limit-unmatched")
+    assert crumb["error"] == "rate_limit"
+    assert _stop_nudges(mux) == []
+    assert _stall_nudges(mux) == [generic.STALL_NUDGE_TEXT] * 2
+    assert (result.status, result.parked, result.usage_limited) == ("stalled", False, None)
+    assert result.stop_failure == "rate_limit"
+
+
+def _decide_dev(result, attempt=1):
+    from bmad_loop.escalation import decide_dev
+    from bmad_loop.model import StoryTask
+
+    return decide_dev(
+        StoryTask(story_key="3-1", epic=3, attempt=attempt),
+        result,
+        None,
+        Policy(limits=LimitsPolicy()),
+    )
+
+
+def _dies_at(q, call):
+    """Kill `q`'s window from wait call `call` on (a `_drive_quota` script)."""
+    alive = {"v": True}
+    q.adapter._window_alive = lambda handle: alive["v"]
+
+    def script(call_n):
+        if call_n >= call:
+            alive["v"] = False
+
+    return script
+
+
+def test_account_stop_failure_then_window_death_is_parked_not_charged(tmp_path, monkeypatch):
+    """#959: the user's own StopFailure hook kills the window, so the stall
+    re-probe finds it dead. The latched account error still labels the crash
+    parked, with the live exit's evidence, and the dev decider pauses it
+    uncharged instead of retrying.
+
+    Ablation: drop the account arm of `_relabel_dead_window` and this fails on
+    `parked is False` (and a RETRY)."""
+    adapter, mux = _parked_adapter(
+        tmp_path,
+        monkeypatch,
+        [_stop_failure_event("billing_error", "Credit balance is too low")],
+        alive=lambda handle: False,
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert (result.status, result.parked) == ("crashed", True)
+    assert result.parked_evidence == "StopFailure(billing_error): Credit balance is too low"
+    assert result.usage_limited is None
+    assert result.stop_failure == "billing_error"
+    assert result.stop_failure_action == "account"
+    assert result.stop_seen is False
+    assert mux.sent == []
+    (crumb,) = _lifecycle_events(adapter, "crash-relabeled")
+    assert (crumb["kind"], crumb["error"]) == ("account", "billing_error")
+    from bmad_loop.escalation import Action
+
+    decision = _decide_dev(result)
+    assert decision.action == Action.PAUSE
+    assert decision.reason.startswith("parked: dev session crashed (StopFailure(billing_error)")
+
+
+def test_blocked_rate_limit_stop_failure_then_window_death_is_usage_limited(tmp_path, monkeypatch):
+    """#959: a blocked usage StopFailure, then a dead window at the stall
+    re-probe: the crash carries the usage-limit labels, so the env-fault
+    classifier's usage shortcut stamps it and the decider pauses uncharged.
+
+    Ablation: drop the blocked/wait arm of `_relabel_dead_window` and this fails
+    on `usage_limited is None` (and a RETRY)."""
+    adapter, _ = _parked_adapter(
+        tmp_path,
+        monkeypatch,
+        [_stop_failure_event("rate_limit", USAGE_CREDITS_LINE)],
+        alive=lambda handle: False,
+    )
+    spec = _dev_spec(tmp_path)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    pattern = adapter.profile.usage_limit_patterns[0]
+    evidence = f"StopFailure(rate_limit) message matched {pattern!r}: {USAGE_CREDITS_LINE.strip()}"
+    assert (result.status, result.parked) == ("crashed", False)
+    assert result.usage_limited == evidence
+    assert result.usage_limit_class == USAGE_LIMIT_BLOCKED
+    assert result.usage_limit_resets is None
+    assert result.stop_failure_action == "rate_limit"
+    result = adapter._classify_env_fault(_dev_handle(), spec, result)
+    assert result.env_fault is True
+    from bmad_loop.escalation import Action
+
+    decision = _decide_dev(result)
+    assert decision.action == Action.PAUSE
+    assert decision.usage_limit is not None
+    assert decision.usage_limit.limit_class == USAGE_LIMIT_BLOCKED
+
+
+def test_wait_rate_limit_stop_failure_then_window_death_is_usage_limited(tmp_path, monkeypatch):
+    """#959: a wait-class usage StopFailure latches its reset; the window dies
+    before any quota wait admits. The crash is usage-limited WAIT with the
+    reset carried.
+
+    Ablation: drop the blocked/wait arm of `_relabel_dead_window` and this fails
+    on `usage_limited is None`."""
+    q = _quota_adapter(tmp_path, monkeypatch, screen="")
+    result = _drive_quota(
+        q,
+        _quota_spec(tmp_path),
+        events={2: _stop_failure_event("rate_limit", USAGE_SESSION_LINE)},
+        script=_dies_at(q, 3),
+    )
+    pattern = q.adapter.profile.usage_wait_patterns[0]
+    evidence = f"StopFailure(rate_limit) message matched {pattern!r}: {USAGE_SESSION_LINE.strip()}"
+    assert _lifecycle_events(q.adapter, "quota-wait-started") == []
+    assert (result.status, result.parked) == ("crashed", False)
+    assert result.usage_limited == evidence
+    assert result.usage_limit_class == USAGE_LIMIT_WAIT
+    assert result.usage_limit_resets == QUOTA_RESETS
+    (crumb,) = _lifecycle_events(q.adapter, "crash-relabeled")
+    assert (crumb["kind"], crumb["error"]) == ("wait", "rate_limit")
+    result = q.adapter._classify_env_fault(_dev_handle(), _quota_spec(tmp_path), result)
+    from bmad_loop.escalation import Action
+
+    decision = _decide_dev(result)
+    assert decision.action == Action.PAUSE
+    assert decision.usage_limit is not None
+
+
+def test_pane_quota_wait_then_window_death_is_usage_limited(tmp_path, monkeypatch):
+    """#959: no StopFailure (a pre-2.1.78 claude, or another CLI); the pane's
+    wait line opened a quota wait and the window died inside it. The crash
+    carries the wait's evidence and reset as a WAIT usage limit.
+
+    Ablation: drop the quota-wait arm of `_relabel_dead_window` and this fails
+    on `usage_limited is None`."""
+    q = _quota_adapter(tmp_path, monkeypatch)
+    result = _drive_quota(q, _quota_spec(tmp_path), script=_dies_at(q, 8))
+    assert len(_lifecycle_events(q.adapter, "quota-wait-started")) == 1
+    assert result.status == "crashed"
+    assert result.usage_limited == q.wait_evidence()
+    assert result.usage_limit_class == USAGE_LIMIT_WAIT
+    assert result.usage_limit_resets == QUOTA_RESETS
+    assert result.stop_failure is None
+    assert result.stop_failure_action is None
+    (crumb,) = _lifecycle_events(q.adapter, "crash-relabeled")
+    assert (crumb["kind"], crumb["error"]) == ("quota-wait", None)
+    # The open wait is still closed for the journal on the way out.
+    assert q.quota_kinds() == ["quota-wait-started", "quota-wait-ended"]
+
+
+def test_unmatched_rate_limit_then_window_death_stays_charged(tmp_path, monkeypatch):
+    """An ordinary 429 (`rate_limit` matching neither usage list) leaves no
+    classification: the dead window is a plain crash, charged as today."""
+    q = _quota_adapter(tmp_path, monkeypatch, screen="")
+    result = _drive_quota(
+        q,
+        _quota_spec(tmp_path),
+        events={2: _stop_failure_event("rate_limit", "API Error: 429 Too Many Requests")},
+        script=_dies_at(q, 3),
+    )
+    assert result.status == "crashed"
+    assert (result.usage_limited, result.parked) == (None, False)
+    assert result.stop_failure == "rate_limit"
+    assert result.stop_failure_action == "rate_limit"
+    assert _lifecycle_events(q.adapter, "crash-relabeled") == []
+    from bmad_loop.escalation import Action
+
+    assert _decide_dev(result).action == Action.RETRY
+
+
+def test_a_stop_clears_the_stop_failure_kind(tmp_path, monkeypatch):
+    """A Stop after a wait-class StopFailure proves the turn recovered: the
+    window dying afterwards is a plain crash. (An account StopFailure exits at
+    once, so no Stop can follow it.)"""
+    q = _quota_adapter(tmp_path, monkeypatch, screen="")
+    result = _drive_quota(
+        q,
+        _quota_spec(tmp_path),
+        events={
+            2: _stop_failure_event("rate_limit", USAGE_SESSION_LINE),
+            3: _stop_event("3-1-dev-1", "sess", str(q.transcript)),
+        },
+        script=_dies_at(q, 4),
+    )
+    assert result.status == "crashed"
+    assert (result.usage_limited, result.parked) == (None, False)
+    assert (result.stop_failure, result.stop_failure_action) == (None, None)
+    assert _lifecycle_events(q.adapter, "crash-relabeled") == []
+
+
+def test_transcript_activity_clears_a_wait_kind(tmp_path, monkeypatch):
+    """A transcript write after a wait-class StopFailure is a CLI that went on
+    by itself: the classification clears (crumbed), and a later window death is
+    a plain crash. The error itself stays latched.
+
+    Ablation: drop the `stop-failure-kind-cleared` clear and this fails on a
+    usage-limited result."""
+    q = _quota_adapter(tmp_path, monkeypatch, screen="")
+    dies = _dies_at(q, 5)
+
+    def script(call_n):
+        if call_n == 3:
+            _grow(q.transcript, _assistant_line())
+        dies(call_n)
+
+    result = _drive_quota(
+        q,
+        _quota_spec(tmp_path),
+        events={2: _stop_failure_event("rate_limit", USAGE_SESSION_LINE)},
+        script=script,
+    )
+    (cleared,) = _lifecycle_events(q.adapter, "stop-failure-kind-cleared")
+    assert (cleared["error"], cleared["stop_failure_kind"]) == ("rate_limit", "wait")
+    assert result.status == "crashed"
+    assert (result.usage_limited, result.parked) == (None, False)
+    assert result.stop_failure == "rate_limit"
+    assert _lifecycle_events(q.adapter, "crash-relabeled") == []
+
+
+def test_crash_with_a_result_json_is_not_relabeled(tmp_path, monkeypatch):
+    """The crash-path read-back still wins: a window that dies after a latched
+    wait-class StopFailure but with the terminal spec on disk completes, with
+    no usage-limit or parked label."""
+    q = _quota_adapter(tmp_path, monkeypatch, screen="")
+    dies = _dies_at(q, 3)
+
+    def script(call_n):
+        if call_n == 3:
+            _grow(q.log, b"worked on the story\n" * 200)  # the #261 proof of work
+            q.finish_spec()
+        dies(call_n)
+
+    result = _drive_quota(
+        q,
+        _quota_spec(tmp_path),
+        events={2: _stop_failure_event("rate_limit", USAGE_SESSION_LINE)},
+        script=script,
+    )
+    assert result.status == "completed"
+    assert result.result_json is not None
+    assert (result.usage_limited, result.parked, result.usage_limit_class) == (None, False, None)
+    assert _lifecycle_events(q.adapter, "crash-relabeled") == []
+
+
+@pytest.mark.parametrize("alive", [True, False])
+def test_stop_failure_action_is_stamped_on_every_exit(tmp_path, monkeypatch, alive):
+    """The mapped action rides out with the error on the live (stalled) exit
+    and the dead-window (crashed) one alike."""
+    adapter, _ = _parked_adapter(
+        tmp_path,
+        monkeypatch,
+        [_stop_failure_event("authentication_failed", "Invalid API key")],
+        alive=lambda handle: alive,
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert result.status == ("stalled" if alive else "crashed")
+    assert result.parked is True
+    assert (result.stop_failure, result.stop_failure_action) == ("authentication_failed", "account")
+
+
+# --- usage-relaunch mode (#959): the adapter ends a usage-limited session at
+# once so the engine can relaunch it uncharged ---
+
+HTTP_429 = "API Error: 429 Too Many Requests"
+
+
+def _relaunch_spec(spec: SessionSpec, *, left: bool = True) -> SessionSpec:
+    return dataclasses.replace(spec, usage_relaunch_mode=True, usage_relaunch_left=left)
+
+
+def _decide_dev_relaunch(result, *, usage_relaunches=0):
+    from bmad_loop.escalation import decide_dev
+    from bmad_loop.model import StoryTask
+
+    task = StoryTask(story_key="3-1", epic=3, attempt=1 + usage_relaunches)
+    task.dev_usage_relaunches = usage_relaunches
+    return decide_dev(
+        task, result, None, Policy(limits=LimitsPolicy(usage_limit_action="relaunch"))
+    )
+
+
+def test_relaunch_mode_wait_stop_failure_exits_at_once(tmp_path, monkeypatch):
+    """Relaunch budget left: a wait-class usage StopFailure ends the session at
+    the event, stalled + usage-limited WAIT with the reset carried, instead of
+    waiting for the quota wait to admit. The decider relaunches it uncharged.
+
+    Ablation: drop the WAIT arm's `usage_relaunch_left` exit and the quota wait
+    admits on the hook's line instead (`quota-wait-started`)."""
+    q = _quota_adapter(tmp_path, monkeypatch, screen="")
+    result = _drive_quota(
+        q,
+        _relaunch_spec(_quota_spec(tmp_path, timeout_s=120.0, cap_s=200.0)),
+        events={2: _stop_failure_event("rate_limit", USAGE_SESSION_LINE)},
+    )
+    pattern = q.adapter.profile.usage_wait_patterns[0]
+    evidence = f"StopFailure(rate_limit) message matched {pattern!r}: {USAGE_SESSION_LINE.strip()}"
+    assert q.adapter.watcher.calls == 2  # the StopFailure's own tick
+    assert _lifecycle_events(q.adapter, "quota-wait-started") == []
+    (skipped,) = _lifecycle_events(q.adapter, "quota-wait-skipped")
+    assert (skipped["reason"], skipped["evidence"]) == ("usage-relaunch", evidence)
+    assert (result.status, result.parked) == ("stalled", True)
+    assert result.usage_limited == evidence
+    assert result.usage_limit_class == USAGE_LIMIT_WAIT
+    assert result.usage_limit_resets == QUOTA_RESETS
+    assert result.stop_seen is False
+    from bmad_loop.escalation import Action
+
+    decision = _decide_dev_relaunch(result)
+    assert (decision.action, decision.uncharged) == (Action.RETRY, True)
+
+
+@pytest.mark.parametrize("left", [True, False])
+def test_relaunch_mode_unmatched_rate_limit_exits_usage_limited(tmp_path, monkeypatch, left):
+    """Relaunch mode reads a `rate_limit` matching neither usage list as a
+    wait-class usage limit and ends the session at the event, both with budget
+    left (the engine relaunches) and at the cap (the engine pauses uncharged at
+    once instead of after a stall grace).
+
+    Ablation: drop the unmatched arm's relaunch-mode exit and the session
+    stalls unlabeled after the wake nudges, as outside the mode."""
+    adapter, mux = _parked_adapter(
+        tmp_path, monkeypatch, [_stop_failure_event("rate_limit", HTTP_429)]
+    )
+    result = adapter.wait_for_completion(
+        _dev_handle(), _relaunch_spec(_dev_spec(tmp_path), left=left)
+    )
+    evidence = f"StopFailure(rate_limit): {HTTP_429}"
+    (crumb,) = _lifecycle_events(adapter, "stop-failure-rate-limit-unmatched")
+    assert (crumb["error"], crumb["relaunch_mode"]) == ("rate_limit", True)
+    assert mux.sent == []
+    assert (result.status, result.parked) == ("stalled", True)
+    assert result.usage_limited == evidence
+    assert result.parked_evidence == evidence
+    assert result.usage_limit_class == USAGE_LIMIT_WAIT
+    assert result.usage_limit_resets is None
+    from bmad_loop.escalation import Action
+
+    if left:
+        decision = _decide_dev_relaunch(result)
+        assert (decision.action, decision.uncharged) == (Action.RETRY, True)
+    else:
+        decision = _decide_dev_relaunch(result, usage_relaunches=3)
+        assert decision.action == Action.PAUSE
+        assert decision.usage_limit is not None
+
+
+def test_unmatched_rate_limit_without_relaunch_mode_keeps_the_stall_timing(tmp_path, monkeypatch):
+    """Outside relaunch mode an unmatched `rate_limit` stays an unclassified
+    error: crumbed without `relaunch_mode`, no early exit, and the grace expiry
+    stalls it unlabeled after the wake nudges."""
+    adapter, mux = _parked_adapter(
+        tmp_path, monkeypatch, [_stop_failure_event("rate_limit", HTTP_429)]
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    (crumb,) = _lifecycle_events(adapter, "stop-failure-rate-limit-unmatched")
+    assert "relaunch_mode" not in crumb
+    assert _stall_nudges(mux) == [generic.STALL_NUDGE_TEXT] * 2
+    assert (result.status, result.parked, result.usage_limited) == ("stalled", False, None)
+    assert _lifecycle_events(adapter, "quota-wait-skipped") == []
+
+
+def test_relaunch_mode_at_the_cap_keeps_the_quota_wait(tmp_path, monkeypatch):
+    """At the relaunch cap (`left` False) the pane's wait line admits the quota
+    wait as in pause mode: the engine would only pause, so the session may as
+    well wait out the reset."""
+    q = _quota_adapter(tmp_path, monkeypatch)
+    result = _drive_quota(
+        q, _relaunch_spec(_quota_spec(tmp_path, timeout_s=120.0, cap_s=200.0), left=False)
+    )
+    assert len(_lifecycle_events(q.adapter, "quota-wait-started")) == 1
+    assert _lifecycle_events(q.adapter, "quota-wait-skipped") == []
+    assert (result.status, result.parked) == ("stalled", True)
+    assert result.usage_limited == q.wait_evidence()
+    assert result.quota_wait_s is not None and result.quota_wait_s > 0
+
+
+def test_relaunch_left_skips_the_quota_wait_admission(tmp_path, monkeypatch):
+    """Relaunch budget left: where the pane's wait line would admit the quota
+    wait, the session ends stalled + usage-limited WAIT instead, crumbed
+    `quota-wait-skipped` with `reason="usage-relaunch"`.
+
+    Ablation: drop the admission's `usage_relaunch_left` exit and the wait opens
+    (`quota-wait-started`)."""
+    q = _quota_adapter(tmp_path, monkeypatch)
+    result = _drive_quota(q, _relaunch_spec(_quota_spec(tmp_path)))
+    assert _lifecycle_events(q.adapter, "quota-wait-started") == []
+    (skipped,) = _lifecycle_events(q.adapter, "quota-wait-skipped")
+    assert skipped["reason"] == "usage-relaunch"
+    assert skipped["evidence"] == q.wait_evidence()
+    assert skipped["resets_at"] == QUOTA_RESETS
+    assert q.clock["mono"] == 1090.0  # the admission tick, not a later one
+    assert (result.status, result.parked) == ("stalled", True)
+    assert result.usage_limited == q.wait_evidence()
+    assert result.usage_limit_class == USAGE_LIMIT_WAIT
+    assert result.usage_limit_resets == QUOTA_RESETS
+    assert not result.quota_wait_s  # no wait ever opened
+
+
+def test_relaunch_skip_then_window_death_at_the_reprobe_keeps_the_pane_evidence(
+    tmp_path, monkeypatch
+):
+    """Relaunch budget left, a pane-only wait line (no StopFailure latch, no
+    quota wait opened), and a window that dies between the admission's pane
+    look and the stall exit's liveness re-probe: the crash keeps the evidence
+    read while it was alive, so the decider relaunches it uncharged.
+
+    Ablation: drop the `usage_now` labels on `stall_exit`'s dead branch and this
+    fails on `usage_limited is None`."""
+    q = _quota_adapter(tmp_path, monkeypatch)
+    probe = q.adapter._probe_liveness
+    q.adapter._probe_liveness = lambda handle, site: (
+        False if site == "stall" else probe(handle, site)
+    )
+    result = _drive_quota(q, _relaunch_spec(_quota_spec(tmp_path)))
+    assert _lifecycle_events(q.adapter, "quota-wait-started") == []
+    (skipped,) = _lifecycle_events(q.adapter, "quota-wait-skipped")
+    assert skipped["reason"] == "usage-relaunch"
+    assert (result.status, result.parked) == ("crashed", False)
+    assert result.usage_limited == q.wait_evidence()
+    assert result.usage_limit_class == USAGE_LIMIT_WAIT
+    assert result.usage_limit_resets == QUOTA_RESETS
+    (crumb,) = _lifecycle_events(q.adapter, "crash-relabeled")
+    assert (crumb["kind"], crumb["error"]) == ("stall-exit", None)
+    from bmad_loop.escalation import Action
+
+    decision = _decide_dev_relaunch(result)
+    assert (decision.action, decision.uncharged) == (Action.RETRY, True)
+
+
+def test_relaunch_mode_unmatched_then_window_death_is_usage_limited(tmp_path, monkeypatch):
+    """Relaunch mode, an unmatched `rate_limit`, and a window already dead at
+    the exit's liveness re-probe: the funnel labels the crash a WAIT usage
+    limit, so the decider relaunches it uncharged instead of charging a crash.
+
+    Ablation: drop the unmatched arm of `_relabel_dead_window` and this fails on
+    `usage_limited is None`."""
+    adapter, _ = _parked_adapter(
+        tmp_path,
+        monkeypatch,
+        [_stop_failure_event("rate_limit", HTTP_429)],
+        alive=lambda handle: False,
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _relaunch_spec(_dev_spec(tmp_path)))
+    assert (result.status, result.parked) == ("crashed", False)
+    assert result.usage_limited == f"StopFailure(rate_limit): {HTTP_429}"
+    assert result.usage_limit_class == USAGE_LIMIT_WAIT
+    assert result.usage_limit_resets is None
+    (crumb,) = _lifecycle_events(adapter, "crash-relabeled")
+    assert (crumb["kind"], crumb["error"]) == ("unmatched", "rate_limit")
+    from bmad_loop.escalation import Action
+
+    decision = _decide_dev_relaunch(result)
+    assert (decision.action, decision.uncharged) == (Action.RETRY, True)
+
+
+def test_rate_limit_stop_failure_match_timeout_is_crumbed(tmp_path, monkeypatch):
+    adapter, _ = _parked_adapter(
+        tmp_path, monkeypatch, [_stop_failure_event("rate_limit", USAGE_CREDITS_LINE)]
+    )
+    monkeypatch.setattr(
+        generic, "match_rows", lambda rows, pats, **kw: generic.MatchTimeout("p", "TimeoutError: x")
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    failed = _lifecycle_events(adapter, "stop-failure-probe-failed")
+    assert [f["reason"] for f in failed] == ["match-timeout", "match-timeout"]
+    assert result.usage_limited is None
+    assert _lifecycle_events(adapter, "stop-failure-rate-limit-unmatched")
+
+
+def test_unmapped_stop_failure_error_is_crumbed(tmp_path, monkeypatch):
+    """An `error` value the profile does not map (a newer CLI's): a visible
+    degrade, and today's stall timing."""
+    adapter, mux = _parked_adapter(tmp_path, monkeypatch, [_stop_failure_event("brand_new_error")])
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    (crumb,) = _lifecycle_events(adapter, "stop-failure-unmapped")
+    assert crumb["error"] == "brand_new_error"
+    (seen,) = _lifecycle_events(adapter, "stop-failure")
+    assert seen["action"] is None
+    assert _stop_nudges(mux) == []
+    assert _stall_nudges(mux) == [generic.STALL_NUDGE_TEXT] * 2
+    assert result.stop_failure == "brand_new_error"
+
+
+def test_stop_failure_without_an_error_reads_as_unknown(tmp_path, monkeypatch):
+    adapter, mux = _parked_adapter(tmp_path, monkeypatch, [_stop_failure_event(None)], nudges=0)
+    adapter._stop_nudges = 1
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert _stop_nudges(mux) == [generic.NUDGE_TEXT]  # claude maps unknown as transient
+    assert result.stop_failure == "unknown"
+
+
+def test_a_later_stop_clears_the_stop_failure_latch(tmp_path, monkeypatch):
+    """The nudge recovered the turn: the next Stop completes the session as
+    usual, and the cleared latch leaves `stop_failure` unset.
+
+    Ablation: drop the Stop branch's latch clear and `stop_failure` survives."""
+    adapter, mux = _parked_adapter(
+        tmp_path,
+        monkeypatch,
+        [_stop_failure_event("server_error"), _stop_event("3-1-dev-1", "sess", None)],
+    )
+    adapter._stop_nudges = 1
+    (tmp_path / "impl" / "spec-3-1-foo.md").write_text(_DONE_SPEC, encoding="utf-8")
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert mux.sent == [("@1", generic.NUDGE_TEXT)]
+    assert result.status == "completed"
+    assert result.stop_seen is True
+    assert result.stop_failure is None
+
+
+def test_the_wait_loop_asks_the_watcher_for_stop_failure(tmp_path, monkeypatch):
+    """The production kind filter handed to `watcher.wait_for` must admit
+    `StopFailure`; the scripted watchers above ignore `kinds`.
+
+    Ablation: drop "StopFailure" from `generic.EVENT_KINDS` and this fails."""
+    adapter, _ = _parked_adapter(tmp_path, monkeypatch, [], nudges=0)
+    seen: list[set] = []
+    inner = adapter.watcher
+
+    class _Recording:
+        def wait_for(self, task_id, kinds, timeout_s, since_ns=0):
+            seen.append(set(kinds))
+            return inner.wait_for(task_id, kinds, timeout_s, since_ns)
+
+    adapter.watcher = _Recording()
+    adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert seen
+    assert "StopFailure" in seen[0]
+
+
+@pytest.mark.parametrize("error", ["server_error", "billing_error", "rate_limit"])
+def test_stop_failure_never_completes(tmp_path, monkeypatch, error):
+    """A finished spec on disk does not let a StopFailure complete the session:
+    only a Stop or window death vouches for a result."""
+    adapter, _ = _parked_adapter(
+        tmp_path, monkeypatch, [_stop_failure_event(error, USAGE_CREDITS_LINE)], nudges=0
+    )
+    adapter._stop_nudges = 1
+    (tmp_path / "impl" / "spec-3-1-foo.md").write_text(_DONE_SPEC, encoding="utf-8")
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert result.status == "stalled"
+    assert result.result_json is None
+    assert result.stop_seen is False
+    assert result.stop_failure == error
+
+
+def test_profiles_without_a_stop_failure_map_only_crumb_it(tmp_path, monkeypatch):
+    """A profile that maps no StopFailure error (every built-in but claude) reads
+    any it is sent as unmapped: nothing typed, today's timing."""
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    monkeypatch.setattr(generic, "RESULT_POLL_S", 0.0)
+    mux = _UnitMux()
+    adapter, _ = make_dev_adapter(tmp_path, profile_name="codex", mux=mux)
+    assert adapter._stop_failure_types == {}
+    adapter._stall_grace_s = 10.0
+    adapter._stall_nudges = 0
+    adapter._window_alive = lambda handle: True
+    clock = _frozen_stall_clock(monkeypatch)
+
+    def on_call(n):
+        if n > 1:
+            clock["t"] += 11.0
+
+    adapter.watcher = _ScriptedWatcher([_stop_failure_event("server_error")], on_call=on_call)
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert mux.sent == []
+    assert _lifecycle_events(adapter, "stop-failure-unmapped")
+    assert result.status == "stalled"
+
+
+# The classifier half (#865): a parked StopFailure result keeps its own evidence.
+
+
+def test_classify_env_fault_skips_the_tail_scan_for_a_parked_stop_failure(tmp_path):
+    """A session parked on an account StopFailure whose pane log ALSO holds an
+    env-fault line: the tail is not scanned, so the result stays parked and the
+    pause reason names `StopFailure(<error>)`, not the transport line.
+
+    Ablation: drop the `stop_failure` skip and env_fault comes back True."""
+    adapter = make_adapter(tmp_path)
+    _write_task_log(adapter, b"API Error: Unable to connect to API (ConnectionRefused)\n")
+    handle = SessionHandle(task_id=_ENV_FAULT_TASK, native_id="@1")
+    parked = SessionResult(
+        status="stalled",
+        parked=True,
+        parked_evidence="StopFailure(billing_error): Credit balance is too low",
+        stop_failure="billing_error",
+    )
+    spec = make_spec(adapter.run_dir, task_id=_ENV_FAULT_TASK)
+    result = adapter._classify_env_fault(handle, spec, parked)
+    assert result == parked
+    events = _lifecycle_lines(adapter, _ENV_FAULT_TASK)
+    assert [e["event"] for e in events] == ["env-fault-classified"]
+    assert events[0]["skipped"] == "stop-failure"
+    assert events[0]["stop_failure"] == "billing_error"
+    # The control: the same log without the StopFailure is an env fault.
+    plain = adapter._classify_env_fault(
+        handle, spec, dataclasses.replace(parked, stop_failure=None)
+    )
+    assert plain.env_fault is True
+
+
+def test_classify_env_fault_usage_shortcut_still_wins_over_a_stop_failure(tmp_path):
+    """A BLOCKED rate_limit StopFailure is usage-limited: the veto-exempt usage
+    shortcut stamps env_fault ahead of the StopFailure skip."""
+    adapter = make_adapter(tmp_path)
+    evidence = "StopFailure(rate_limit) message matched 'x': y"
+    handle = SessionHandle(task_id=_ENV_FAULT_TASK, native_id="@1")
+    live = SessionResult(
+        status="stalled",
+        parked=True,
+        parked_evidence=evidence,
+        usage_limited=evidence,
+        usage_limit_class=USAGE_LIMIT_BLOCKED,
+        stop_failure="rate_limit",
+    )
+    spec = make_spec(adapter.run_dir, task_id=_ENV_FAULT_TASK)
+    result = adapter._classify_env_fault(handle, spec, live)
+    assert result.env_fault is True
+    assert result.env_fault_evidence == evidence
+    (crumb,) = _lifecycle_lines(adapter, _ENV_FAULT_TASK)
+    assert crumb["usage_limited"] is True
+    assert "skipped" not in crumb

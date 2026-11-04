@@ -54,6 +54,8 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         # BMAD v7 resolved under tickets mode past leftover v6 artifact keys
         "bmad-config.v6-keys-ignored",
         "policy",
+        # a deprecated policy.toml key still loads (#835)
+        "policy.deprecated",
         "policy.model-qualified",
         "policy.effort-unsupported",
         "policy.bypass-dropped",
@@ -81,6 +83,9 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         # each role's permission posture (bypass/sandboxed, scm.isolation); a
         # warning where a mapping is known not to work under worktree isolation
         "adapter.permission-mode",
+        # `--probes`: one launch per distinct role launch, its first screen
+        # matched against the profile's parked-prompt patterns (#727)
+        "adapter.launch-probe",
         "adapter.external",
         "adapter.external-profile",
         "queue.sprint-status",
@@ -95,6 +100,9 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         "git.version",
         "hooks.config-parse",
         "hooks.registered",
+        # the Stop relay is registered but another mapped native event is not
+        # (a config written before the profile mapped it, e.g. claude StopFailure)
+        "hooks.events-incomplete",
         "hooks.trust",
         "hooks.relay-present",
         "hooks.relay-stale",

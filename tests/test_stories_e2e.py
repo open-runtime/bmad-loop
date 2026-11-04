@@ -248,12 +248,21 @@ LEGACY_EVENTS_FAKE_CLI = FAKE_CLI.replace('ed="$BMAD_LOOP_EVENTS_DIR"', 'ed="$rd
 # Stop and SessionEnd land in the parent's stream, before the parent has written a
 # result. Fresh timestamps (and a pause so they reach the watcher as their own ticks)
 # order every child event ahead of the parent's Stop, which is re-stamped too, so the
-# parent's completion cannot overtake them in one poll.
+# parent's completion cannot overtake them in one poll. Each event is published by a
+# rename, as the real relay does: SignalWatcher consumes a `.json` name on first
+# sight, so a poll landing mid-`printf` would drop a truncated child SessionStart for
+# good and no foreign crumb would follow. The parent's own SessionStart is renamed
+# into place too: dropped the same way, it leaves the child's start as the first
+# one, which the attribution admits as the launched session's — again no crumb.
+_PARENT_START_PUBLISHED = """    "$ts" "$tid" > "$ed/$ts-$tid-SessionStart.json.tmp"
+mv "$ed/$ts-$tid-SessionStart.json.tmp" "$ed/$ts-$tid-SessionStart.json"
+"""
 _NESTED_CHILD_EVENTS = r"""
 for kind in SessionStart Stop SessionEnd; do
     cts=$(date +%s%N)
     printf '{"ts": %s, "event": "%s", "task_id": "%s", "session_id": "child-1"}' \
-        "$cts" "$kind" "$tid" > "$ed/$cts-$tid-$kind.json"
+        "$cts" "$kind" "$tid" > "$ed/$cts-$tid-$kind.json.tmp"
+    mv "$ed/$cts-$tid-$kind.json.tmp" "$ed/$cts-$tid-$kind.json"
 done
 sleep 2
 """
@@ -266,7 +275,7 @@ ts2=$(( ts + 1 ))
 """
 assert FAKE_CLI.count(_PARENT_START) == 1 and FAKE_CLI.count(_STORY_STOP_TS) == 1
 NESTED_CHILD_FAKE_CLI = FAKE_CLI.replace(
-    _PARENT_START, _PARENT_START + _NESTED_CHILD_EVENTS
+    _PARENT_START, _PARENT_START_PUBLISHED + _NESTED_CHILD_EVENTS
 ).replace(_STORY_STOP_TS, _STORY_STOP_TS.replace("$(( ts + 1 ))", "$(date +%s%N)"))
 
 PROFILE_TOML = """\
@@ -318,6 +327,58 @@ idfile="$rd/tasks/$tid/fake-child.pid"
     + RECORD_CHILD_IDENTITY_SH
     + r"""wait "$child"
 """
+)
+
+# Claude Code's API-error turn end (#865): SessionStart, then a `StopFailure` event
+# carrying the relay's `stop_error` / `stop_message` keys instead of any Stop — so
+# only the adapter's StopFailure branch can end the session before the timeout.
+# Derived from TIMEOUT_FAKE_CLI: the inserted block exits before its sleep-child
+# tail ever runs, so no child identity is recorded and there is nothing to reap.
+_STOP_FAILURE_EVENT = r"""ts2=$(( ts + 1 ))
+printf '{"ts": %s, "event": "StopFailure", "task_id": "%s", "session_id": "fake-1", "stop_error": "billing_error", "stop_message": "Credit balance is too low"}' \
+    "$ts2" "$tid" > "$ed/$ts2-$tid-StopFailure.json"
+sleep 30
+exit 0
+"""
+assert TIMEOUT_FAKE_CLI.count(_PARENT_START) == 1
+STOP_FAILURE_FAKE_CLI = TIMEOUT_FAKE_CLI.replace(_PARENT_START, _PARENT_START + _STOP_FAILURE_EVENT)
+# #959: the CLI's window dies right after the StopFailure (as when an operator's own
+# StopFailure hook kills it to rotate accounts). The watcher's 1 s poll reads the
+# event only after the window is gone, so the stall re-probe finds it dead.
+assert STOP_FAILURE_FAKE_CLI.count("sleep 30\nexit 0\n") == 1
+STOP_FAILURE_DIES_FAKE_CLI = STOP_FAILURE_FAKE_CLI.replace("sleep 30\nexit 0\n", "exit 0\n")
+
+# #959 usage-limit relaunch: FAKE_CLI with a launch counter in the run dir. Every
+# launch records the `BMAD_LOOP_USAGE_RELAUNCH` it got; launch 1 then ends its turn
+# on a `rate_limit` StopFailure whose message matches no usage pattern (the profile
+# declares none) and sleeps, so only relaunch mode's at-once exit ends it in time.
+# Launch 2 falls through to FAKE_CLI's sprint path and completes the story.
+_RELAUNCH_ONCE = r"""n=$(cat "$rd/fake-launches" 2>/dev/null || echo 0)
+n=$(( n + 1 ))
+printf '%s' "$n" > "$rd/fake-launches"
+printf '%s' "${BMAD_LOOP_USAGE_RELAUNCH-unset}" > "$rd/tasks/$tid/usage-relaunch.txt"
+if [ "$n" = 1 ]; then
+    ts2=$(( ts + 1 ))
+    printf '{"ts": %s, "event": "StopFailure", "task_id": "%s", "session_id": "fake-1", "stop_error": "rate_limit", "stop_message": "API Error: 429 Too Many Requests"}' \
+        "$ts2" "$tid" > "$ed/$ts2-$tid-StopFailure.json"
+    sleep 30
+    exit 0
+fi
+"""
+USAGE_RELAUNCH_FAKE_CLI = FAKE_CLI.replace(_PARENT_START, _PARENT_START + _RELAUNCH_ONCE)
+
+# PROFILE_TOML with the canonical StopFailure mapped and one account error, as
+# claude's own profile maps it.
+_PROFILE_EVENTS = 'events = {{ SessionStart = "SessionStart", Stop = "Stop" }}\n'
+assert PROFILE_TOML.count(_PROFILE_EVENTS) == 1
+STOP_FAILURE_PROFILE_TOML = PROFILE_TOML.replace(
+    _PROFILE_EVENTS,
+    'events = {{ SessionStart = "SessionStart", Stop = "Stop", StopFailure = "StopFailure" }}\n'
+    "\n[hooks.stop_failure_types]\n"
+    'billing_error = "account"\n',
+)
+USAGE_RELAUNCH_PROFILE_TOML = STOP_FAILURE_PROFILE_TOML.replace(
+    'billing_error = "account"\n', 'billing_error = "account"\nrate_limit = "rate_limit"\n'
 )
 
 # DW-159: publication must not precede the session transition. `$!` names the child
@@ -461,6 +522,42 @@ for _fake in (DETACHED_WRITER_FAKE_CLI, PUBLICATION_FAULT_FAKE_CLI):
     assert _fake.index(AWAIT_DETACHED_SESSION_SH) < _fake.index(RECORD_CHILD_IDENTITY_SH)
 del _fake
 
+# #772: the sprint branch as bmad-build-auto behaves with review ON. The dev leg leaves
+# its own work committed, as the real skill's finalization does. The review leg (routed
+# on the review prompt's ledger hands-off clause, ahead of the spec-status routing: a
+# review re-invokes the skill on the `done` spec) finalizes like step-04: it writes its
+# result, commits the files it owns (its spec and the reviewed code), then HALTs
+# `blocked` — "finalization left repository dirty" — if ANYTHING else is left over. The
+# engine's own uncommitted ledger bookkeeping is exactly that leftover.
+_SPRINT_STATUS_READ = """    [ -f "$spec" ] && status=$(sed -n 's/^status:[[:space:]]*//p' "$spec" | head -1 | tr -d "'\\" ")
+"""
+_REVIEW_FINALIZE = r"""    if printf '%s' "$prompt" | grep -qF "deferred-work ledger entries"; then
+        printf -- '---\ntitle: %s\nstatus: done\nbaseline_commit: %s\n---\n\n## Intent\n\nx\n\n## Auto Run Result\n\n- Status: done\n\nSummary: reviewed.\n' \
+            "$story" "$baseline" > "$spec"
+        git add -- "$spec" src.txt
+        git diff --cached --quiet || git commit -q -m "review: $story"
+        if [ -n "$(git status --porcelain)" ]; then
+            printf -- '---\ntitle: %s\nstatus: blocked\nbaseline_commit: %s\n---\n\n## Intent\n\nx\n\n## Auto Run Result\n\n- Status: blocked\n\nfinalization left repository dirty\n' \
+                "$story" "$baseline" > "$spec"
+        fi
+        ts2=$(( ts + 1 ))
+        printf '{"ts": %s, "event": "Stop", "task_id": "%s", "session_id": "fake-1"}' \
+            "$ts2" "$tid" > "$ed/$ts2-$tid-Stop.json"
+        sleep 30
+        exit 0
+    fi
+"""
+_SPRINT_DEV_DONE = r"""Summary: sprint.\n' \
+            "$story" "$baseline" > "$spec"
+"""
+assert FAKE_CLI.count(_SPRINT_STATUS_READ) == 1 and FAKE_CLI.count(_SPRINT_DEV_DONE) == 1
+REVIEW_FINALIZE_FAKE_CLI = FAKE_CLI.replace(
+    _SPRINT_STATUS_READ, _SPRINT_STATUS_READ + _REVIEW_FINALIZE
+).replace(
+    _SPRINT_DEV_DONE,
+    _SPRINT_DEV_DONE + '        git add -A\n        git commit -q -m "dev: $story"\n',
+)
+
 
 def _git(root: Path, *args: str) -> None:
     subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True, text=True)
@@ -561,7 +658,11 @@ def _scaffold_renderer(
 
 
 def _scaffold_sprint(
-    root: Path, story_key: str, fake_cli: str = FAKE_CLI, extra_policy: str = ""
+    root: Path,
+    story_key: str,
+    fake_cli: str = FAKE_CLI,
+    extra_policy: str = "",
+    profile_toml: str = PROFILE_TOML,
 ) -> None:
     """A committed, clean SPRINT-mode sandbox carrying the SAME new folder+id-
     capable bmad-dev-auto skill stub as `_scaffold` (with the folder+id dispatch
@@ -569,7 +670,7 @@ def _scaffold_sprint(
     the default sprint path. sprint-status.yaml holds one ready-for-dev story; the
     policy has NO [stories] section, so the run is plain sprint mode. ``fake_cli``
     swaps the CLI script (e.g. a never-Stop timeout fake); ``extra_policy`` appends
-    to policy.toml (e.g. a [limits] block)."""
+    to policy.toml (e.g. a [limits] block); ``profile_toml`` swaps the profile."""
     root.mkdir(parents=True, exist_ok=True)
     (root / "src.txt").write_text("original\n", encoding="utf-8")
     (root / ".gitignore").write_text(".bmad-loop/runs/\n", encoding="utf-8")
@@ -608,7 +709,7 @@ def _scaffold_sprint(
     profiles = root / ".bmad-loop" / "profiles"
     profiles.mkdir(parents=True)
     (profiles / "fakestories.toml").write_text(
-        PROFILE_TOML.format(binary=str(fake)), encoding="utf-8"
+        profile_toml.format(binary=str(fake)), encoding="utf-8"
     )
     (root / ".bmad-loop" / "policy.toml").write_text(
         '[adapter]\nname = "fakestories"\n\n'
@@ -1973,6 +2074,193 @@ def test_e2e_session_timeout_teardown(
         assert injected_exit == -signal.SIGKILL
 
 
+def test_e2e_stop_failure_account_error_pauses_uncharged(
+    tmp_path, monkeypatch, private_tmux_server
+):
+    """#865 end to end through the real binary + real tmux, zero tokens: a turn that
+    ends on an account API error fires `StopFailure(billing_error)` and never a Stop.
+    The adapter ends the session parked at the event — no stall grace, no nudge —
+    and the engine PAUSEs with a reason naming the error, without charging a retry:
+    two dev attempts are allowed and exactly one session ran. The session-end
+    journal carries `stop_failure`, and the agent window is torn down. The 120 s
+    session timeout is far beyond the run's bound, so only the StopFailure exit can
+    end the session in time."""
+    root = tmp_path / "sbx"
+    story = "1-1-stopfail"
+    _scaffold_sprint(
+        root,
+        story,
+        fake_cli=STOP_FAILURE_FAKE_CLI,
+        extra_policy="\n[limits]\nmax_dev_attempts = 2\nteardown_grace_s = 5\n",
+        profile_toml=STOP_FAILURE_PROFILE_TOML,
+    )
+    # inherited by the `bmad-loop run` subprocess (_run passes no env=)
+    monkeypatch.setenv("BMAD_LOOP_SESSION_TIMEOUT_S", "120")
+    run_id: str | None = None
+    try:
+        proc = _run(root, "run", timeout=90)
+        assert proc.returncode == 0, proc.stderr or proc.stdout
+        run_id = _run_id(root)
+        run_dir = root / ".bmad-loop" / "runs" / run_id
+
+        state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+        assert state.get("paused_stage") == "escalation", state
+        reason = str(state.get("paused_reason", ""))
+        assert reason.startswith("parked: dev session stalled (StopFailure(billing_error)"), reason
+        assert "Credit balance is too low" in reason, reason
+
+        journal = [
+            json.loads(ln)
+            for ln in (run_dir / "journal.jsonl").read_text(encoding="utf-8").splitlines()
+            if ln.strip()
+        ]
+        # uncharged: the pause did not spend the second attempt on a retry
+        ends = [j for j in journal if j["kind"] == "session-end"]
+        assert len(ends) == 1, [j["kind"] for j in journal]
+        [end] = ends
+        assert end["status"] == "stalled", end
+        assert end["parked"] is True, end
+        assert end["stop_failure"] == "billing_error", end
+        decisions = [j for j in journal if j["kind"] == "dev-decision"]
+        assert [d["action"] for d in decisions] == ["pause"], decisions
+        assert state["tasks"][story]["attempt"] == 1, state["tasks"][story]
+
+        # the agent window is gone; the paused run keeps only its root shell window
+        session_name = f"bmad-loop-{run_id}"
+        windows = _tmux_window_names(private_tmux_server, session_name)
+        assert end["task_id"][-40:] not in windows and len(windows) == 1, windows
+    finally:
+        # The paused run left its session for a resume that never comes.
+        if run_id is not None:
+            subprocess.run(
+                ["tmux", "-S", str(private_tmux_server), "kill-session"]
+                + ["-t", f"=bmad-loop-{run_id}"],
+                capture_output=True,
+            )
+
+
+def test_e2e_stop_failure_then_window_death_pauses_uncharged(
+    tmp_path, monkeypatch, private_tmux_server
+):
+    """#959 end to end through the real binary + real tmux, zero tokens: the CLI
+    fires `StopFailure(billing_error)` and its window dies at once. The session
+    ends `crashed`, but the latched account error labels it parked, so the engine
+    PAUSEs uncharged instead of retrying: two dev attempts are allowed and exactly
+    one session ran."""
+    root = tmp_path / "sbx"
+    story = "1-1-stopfail-dies"
+    _scaffold_sprint(
+        root,
+        story,
+        fake_cli=STOP_FAILURE_DIES_FAKE_CLI,
+        extra_policy="\n[limits]\nmax_dev_attempts = 2\nteardown_grace_s = 5\n",
+        profile_toml=STOP_FAILURE_PROFILE_TOML,
+    )
+    # inherited by the `bmad-loop run` subprocess (_run passes no env=)
+    monkeypatch.setenv("BMAD_LOOP_SESSION_TIMEOUT_S", "120")
+    run_id: str | None = None
+    try:
+        proc = _run(root, "run", timeout=90)
+        assert proc.returncode == 0, proc.stderr or proc.stdout
+        run_id = _run_id(root)
+        run_dir = root / ".bmad-loop" / "runs" / run_id
+
+        state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+        assert state.get("paused_stage") == "escalation", state
+        reason = str(state.get("paused_reason", ""))
+        assert reason.startswith("parked: dev session crashed (StopFailure(billing_error)"), reason
+
+        journal = [
+            json.loads(ln)
+            for ln in (run_dir / "journal.jsonl").read_text(encoding="utf-8").splitlines()
+            if ln.strip()
+        ]
+        ends = [j for j in journal if j["kind"] == "session-end"]
+        assert len(ends) == 1, [j["kind"] for j in journal]
+        [end] = ends
+        assert end["status"] == "crashed", end
+        assert end["parked"] is True, end
+        assert end["stop_failure"] == "billing_error", end
+        decisions = [j for j in journal if j["kind"] == "dev-decision"]
+        assert [d["action"] for d in decisions] == ["pause"], decisions
+        assert state["tasks"][story]["attempt"] == 1, state["tasks"][story]
+    finally:
+        # The paused run left its session for a resume that never comes.
+        if run_id is not None:
+            subprocess.run(
+                ["tmux", "-S", str(private_tmux_server), "kill-session"]
+                + ["-t", f"=bmad-loop-{run_id}"],
+                capture_output=True,
+            )
+
+
+def test_e2e_usage_limit_relaunch_is_uncharged(tmp_path, monkeypatch, private_tmux_server):
+    """#959 end to end through the real binary + real tmux, zero tokens: in
+    `usage_limit_action = "relaunch"` mode, a `rate_limit` StopFailure matching no
+    usage pattern ends dev session 1 at the event, usage-limited. The engine
+    relaunches the story without charging an attempt (one attempt allowed, two
+    sessions ran), session 2 gets `BMAD_LOOP_USAGE_RELAUNCH=1` and completes the
+    story. The 120 s session timeout is far beyond the run's bound, so only the
+    relaunch-mode exit can end session 1 in time."""
+    root = tmp_path / "sbx"
+    story = "1-1-relaunch"
+    _scaffold_sprint(
+        root,
+        story,
+        fake_cli=USAGE_RELAUNCH_FAKE_CLI,
+        extra_policy=(
+            "\n[limits]\nmax_dev_attempts = 1\nteardown_grace_s = 5\n"
+            'usage_limit_action = "relaunch"\n'
+        ),
+        profile_toml=USAGE_RELAUNCH_PROFILE_TOML,
+    )
+    # inherited by the `bmad-loop run` subprocess (_run passes no env=)
+    monkeypatch.setenv("BMAD_LOOP_SESSION_TIMEOUT_S", "120")
+    run_id: str | None = None
+    try:
+        proc = _run(root, "run", timeout=120)
+        assert proc.returncode == 0, proc.stderr or proc.stdout
+        run_id = _run_id(root)
+        run_dir = root / ".bmad-loop" / "runs" / run_id
+
+        state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+        assert state.get("paused_stage") is None, state
+        task = state["tasks"][story]
+        assert task["attempt"] == 2, task
+        assert task["dev_usage_relaunches"] == 1, task
+        assert task["phase"] == "done", task
+        assert _sprint_status(root, story) == "done"
+
+        journal = [
+            json.loads(ln)
+            for ln in (run_dir / "journal.jsonl").read_text(encoding="utf-8").splitlines()
+            if ln.strip()
+        ]
+        ends = [j for j in journal if j["kind"] == "session-end"]
+        assert [e["status"] for e in ends] == ["stalled", "completed"], ends
+        assert ends[0]["stop_failure"] == "rate_limit", ends[0]
+        decisions = [j for j in journal if j["kind"] == "dev-decision"]
+        assert decisions[0]["action"] == "retry", decisions
+        assert decisions[0]["uncharged"] is True, decisions
+        assert decisions[0]["usage_relaunches"] == 1, decisions
+        assert not any(j["kind"] == "story-deferred" for j in journal), journal
+
+        seen = {
+            e["task_id"]: (run_dir / "tasks" / e["task_id"] / "usage-relaunch.txt").read_text(
+                encoding="utf-8"
+            )
+            for e in ends
+        }
+        assert [seen[e["task_id"]] for e in ends] == ["unset", "1"], seen
+    finally:
+        if run_id is not None:
+            subprocess.run(
+                ["tmux", "-S", str(private_tmux_server), "kill-session"]
+                + ["-t", f"=bmad-loop-{run_id}"],
+                capture_output=True,
+            )
+
+
 @pytest.mark.parametrize(
     "force_live_reap_assertion", [False, True], ids=["reaped", "live-assertion"]
 )
@@ -2308,6 +2596,59 @@ def test_e2e_sweep_intent_gap_patch_restore(tmp_path):
     run_dir = root / ".bmad-loop" / "runs" / run_id
     prompts = [p.read_text(encoding="utf-8") for p in (run_dir / "tasks").glob("*/prompt.txt")]
     assert any(str(spec) in p for p in prompts)
+
+
+def test_e2e_sweep_review_finalizes_clean_over_engine_ledger_bookkeeping(tmp_path):
+    """#772 through the real CLI and real tmux, zero tokens. A sweep bundle with
+    review ON: the dev leg commits its own work, then the engine closes DW-1 in the
+    tracked ledger — uncommitted, for the squash. The review fake finalizes like
+    bmad-build-auto's step-04: it commits the files it owns and HALTs `blocked`
+    ("finalization left repository dirty") on anything left over. The engine now
+    commits its ledger bookkeeping right before the review launches, so the review
+    finishes `done`, the bundle lands, and no escalation is raised.
+
+    Ablation: drop `commit_engine_ledger=True` at the review launch (engine.py) and
+    the review HALTs on the dirty ledger — the run escalates and the bundle never
+    reaches done."""
+    assert REVIEW_FINALIZE_FAKE_CLI != FAKE_CLI, "the review splice did not take"
+    root = tmp_path / "sbx"
+    _scaffold_sweep(root)
+    (root / ".bmad-loop" / "fake-cli.sh").write_text(REVIEW_FINALIZE_FAKE_CLI, encoding="utf-8")
+    (root / ".bmad-loop" / "policy.toml").write_text(
+        '[adapter]\nname = "fakestories"\n\n'
+        '[review]\nenabled = true\ntrigger = "always"\n\n'
+        '[gates]\nmode = "none"\n',
+        encoding="utf-8",
+    )
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "review on, finalizing fake")
+    story = "dw-fix"  # triage names the bundle "fix" → task key dw-fix
+    spec = root / "_bmad-output" / "implementation-artifacts" / f"spec-{story}.md"
+
+    proc = _run(root, "sweep", "--no-prompt")
+    assert proc.returncode == 0, proc.stderr or proc.stdout
+
+    run_dir = root / ".bmad-loop" / "runs" / _run_id(root)
+    rows = [
+        json.loads(ln)
+        for ln in (run_dir / "journal.jsonl").read_text(encoding="utf-8").splitlines()
+        if ln.strip()
+    ]
+    kinds = [r["kind"] for r in rows]
+    # premise: a review session really ran on the finalizing fake
+    prompts = [p.read_text(encoding="utf-8") for p in (run_dir / "tasks").glob("*/fake-prompt.txt")]
+    assert any("deferred-work ledger entries" in p for p in prompts), prompts
+    assert "story-escalated" not in kinds, [r for r in rows if r["kind"] == "story-escalated"]
+    review_commits = [
+        r for r in rows if r["kind"] == "engine-ledger-commit" and r.get("site") == "review"
+    ]
+    assert review_commits, kinds
+    assert all(r["story_key"] == story for r in review_commits)
+    state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+    assert state["tasks"][story]["phase"] == "done", state["tasks"][story]
+    assert not state.get("paused_stage"), state
+    assert "status: done" in spec.read_text(encoding="utf-8")
+    assert _dw_status(root, "DW-1").startswith("done")
 
 
 def test_e2e_a_relay_that_only_knows_the_legacy_events_dir_still_completes(tmp_path):

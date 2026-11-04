@@ -30,6 +30,7 @@ from conftest import (
     refuse_to_resolve,
     render_probe_stub_skill_md,
     windows_relay_builder,
+    write_script_launcher,
 )
 
 import bmad_loop.install as install_mod
@@ -186,13 +187,22 @@ def test_merge_hooks_adds_all_events():
     assert set(profile.hooks.events) <= set(settings["hooks"])
 
 
-def test_merge_hooks_idempotent():
-    profile = get_profile("claude")
+@pytest.mark.parametrize(
+    "name",
+    [
+        "claude",
+        "copilot",  # the bare-handler shape must still dedupe on a re-run
+        "antigravity",  # keyed by hook NAME ("bmad-loop"), flat Stop handler
+    ],
+)
+def test_merge_hooks_idempotent(name):
+    profile = get_profile(name)
     settings, _ = merge_hooks({}, _registrations(profile), profile.hooks.dialect)
     again, changed = merge_hooks(settings, _registrations(profile), profile.hooks.dialect)
     assert not changed
+    container = install_mod.hook_event_container(again, profile.hooks.dialect)
     for event in profile.hooks.events:
-        assert len(again["hooks"][event]) == 1
+        assert len(container[event]) == 1
 
 
 def test_merge_hooks_preserves_existing():
@@ -423,6 +433,35 @@ def test_relay_registered_without_the_notification_relay(tmp_path):
     config = json.loads((tmp_path / profile.hooks.config_path).read_text())
     del config["hooks"]["Notification"]
     assert _registered(profile, config)
+
+
+@pytest.mark.parametrize("name", ["claude", "codex", "gemini", "copilot", "antigravity"])
+def test_missing_relay_events_is_empty_after_fresh_init(tmp_path, name):
+    profile = get_profile(name)
+    assert install_into(tmp_path, clis=(name,), skills=False) == 0
+    config = json.loads((tmp_path / profile.hooks.config_path).read_text(encoding="utf-8"))
+    events = profile.hooks.events
+    assert install_mod.missing_relay_events(config, profile.hooks.dialect, events) == []
+
+
+def test_missing_relay_events_names_unregistered_and_mislabelled_natives():
+    """A config written before claude mapped `StopFailure` lacks it; a relay under
+    a mapped native that reports a different canonical event does not count, and
+    neither does a non-executed (`prompt`) handler."""
+    profile = get_profile("claude")
+    events = profile.hooks.events
+    config = _hook_config(
+        profile,
+        {
+            "Stop": [_relay_handler(profile, f"{_RELAY_EXE} relay Stop")],
+            "SessionStart": [_relay_handler(profile, f"{_RELAY_EXE} relay SessionEnd")],
+            "PreCompact": [
+                _relay_handler(profile, f"{_RELAY_EXE} relay PreCompact", handler_type="prompt")
+            ],
+        },
+    )
+    missing = install_mod.missing_relay_events(config, profile.hooks.dialect, events)
+    assert missing == [native for native in events if native != "Stop"]
 
 
 @pytest.mark.parametrize("kind", ["Notification", "PermissionPrompt", "IdlePrompt", "QuotaPrompt"])
@@ -1051,16 +1090,6 @@ def test_merge_hooks_copilot_entry_shape():
     assert handler["command"].endswith("bmad_loop_hook.py Stop")
 
 
-def test_merge_hooks_copilot_idempotent():
-    # the bare-handler shape must still dedupe on a re-run
-    profile = get_profile("copilot")
-    settings, _ = merge_hooks({}, _registrations(profile), profile.hooks.dialect)
-    again, changed = merge_hooks(settings, _registrations(profile), profile.hooks.dialect)
-    assert not changed
-    for event in profile.hooks.events:
-        assert len(again["hooks"][event]) == 1
-
-
 def test_merge_hooks_antigravity_entry_shape():
     # agy keys hooks.json by hook NAME at the top level ("bmad-loop"), and its Stop
     # event is FLAT (handler dict directly, no matcher/hooks wrapper).
@@ -1071,15 +1100,6 @@ def test_merge_hooks_antigravity_entry_shape():
     assert handler["type"] == "command"
     assert handler["timeout"] == 60  # agy hook timeouts are seconds
     assert handler["command"].endswith("bmad_loop_hook.py Stop")
-
-
-def test_merge_hooks_antigravity_idempotent():
-    profile = get_profile("antigravity")
-    settings, _ = merge_hooks({}, _registrations(profile), profile.hooks.dialect)
-    again, changed = merge_hooks(settings, _registrations(profile), profile.hooks.dialect)
-    assert not changed
-    for event in profile.hooks.events:
-        assert len(again["bmad-loop"][event]) == 1
 
 
 def test_merge_hooks_antigravity_appends_beside_existing_stop():
@@ -1494,6 +1514,126 @@ def test_install_no_skills(tmp_path):
     # hooks still installed, but no skill tree created
     assert (tmp_path / ".claude" / "settings.json").is_file()
     assert not (tmp_path / ".claude" / "skills").exists()
+
+
+# The real `<binary> --version` probe, captured before conftest's autouse stub
+# replaces it for every test.
+_REAL_CLI_VERSION = install_mod.cli_version
+
+
+def _claude_hooks(project: Path) -> dict:
+    return json.loads((project / ".claude" / "settings.json").read_text(encoding="utf-8"))["hooks"]
+
+
+def test_init_registers_the_stop_failure_relay(tmp_path):
+    """#865: init writes `relay StopFailure` under claude's native `StopFailure`
+    (the conftest stub reports a Claude Code new enough to know the event)."""
+    assert install_into(tmp_path, skills=False) == 0
+    hooks = _claude_hooks(tmp_path)
+    assert _installed_relay_suffix("StopFailure") in hooks["StopFailure"][0]["hooks"][0]["command"]
+
+
+@pytest.mark.parametrize(
+    ("version", "found"), [((2, 1, 77), "found 2.1.77"), (None, "an unreadable version")]
+)
+def test_init_leaves_stop_failure_out_below_its_floor(
+    tmp_path, monkeypatch, capsys, version, found
+):
+    """#865: Claude Code before 2.1.78 skips the WHOLE settings file over the unknown
+    `StopFailure` key, Stop relay included — so below the floor, or when the
+    version cannot be read, init leaves that one event out and says so.
+
+    Ablation: drop the `del events[native]` in `gated_hook_events` and the
+    `"StopFailure" not in hooks` assertion fails."""
+    monkeypatch.setattr(install_mod, "cli_version", lambda profile: version)
+    assert install_into(tmp_path, skills=False) == 0
+    hooks = _claude_hooks(tmp_path)
+    assert "StopFailure" not in hooks
+    assert _installed_relay_suffix("Stop") in hooks["Stop"][0]["hooks"][0]["command"]
+    out = capsys.readouterr().out
+    assert "warning: StopFailure hook not registered (claude)" in out
+    assert found in out and "re-run `bmad-loop init --cli claude`" in out
+
+
+def test_init_registers_stop_failure_at_exactly_its_floor(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(install_mod, "cli_version", lambda profile: (2, 1, 78))
+    assert install_into(tmp_path, skills=False) == 0
+    assert "StopFailure" in _claude_hooks(tmp_path)
+    assert "StopFailure hook not registered" not in capsys.readouterr().out
+
+
+def test_init_strips_a_gated_relay_after_a_downgrade(tmp_path, monkeypatch):
+    """A config written while Claude Code was new enough keeps its StopFailure
+    relay after a downgrade, and that entry alone makes the older CLI skip the
+    file — so re-running init strips it. The operator's own StopFailure handler
+    stays.
+
+    Ablation: drop the `strip_event_relays` call in `_register_hooks` and the
+    relay survives."""
+    assert install_into(tmp_path, skills=False) == 0
+    config = tmp_path / ".claude" / "settings.json"
+    data = json.loads(config.read_text(encoding="utf-8"))
+    data["hooks"]["StopFailure"].append({"hooks": [{"type": "command", "command": "notify-me"}]})
+    config.write_text(json.dumps(data), encoding="utf-8")
+
+    monkeypatch.setattr(install_mod, "cli_version", lambda profile: (2, 1, 77))
+    assert install_into(tmp_path, skills=False) == 0
+    hooks = _claude_hooks(tmp_path)
+    commands = [h["command"] for group in hooks["StopFailure"] for h in group["hooks"]]
+    assert commands == ["notify-me"]
+    assert _installed_relay_suffix("Stop") in hooks["Stop"][0]["hooks"][0]["command"]
+
+
+def test_gated_hook_events_never_probes_a_profile_without_floors(monkeypatch):
+    """Only a profile declaring `hooks.event_min_versions` spawns `--version`: every
+    other built-in registers exactly as before, with no process launched."""
+
+    def boom(profile):
+        raise AssertionError(f"probed {profile.name}")
+
+    monkeypatch.setattr(install_mod, "cli_version", boom)
+    for name in ("codex", "gemini"):
+        profile = get_profile(name)
+        assert install_mod.gated_hook_events(profile) == (dict(profile.hooks.events), [])
+
+
+def test_cli_version_reads_the_binarys_version_output(monkeypatch):
+    """The real probe, against a binary every host has: `python --version` prints
+    `Python X.Y.Z`. A binary that is not on PATH reads None, never raises."""
+    monkeypatch.setattr(install_mod, "_cli_versions", {})
+    claude = get_profile("claude")
+    python = dataclasses.replace(claude, binary=sys.executable, env={})
+    assert _REAL_CLI_VERSION(python) == tuple(sys.version_info[:3])
+    missing = dataclasses.replace(claude, binary="bmad-loop-no-such-cli-865", env={})
+    assert _REAL_CLI_VERSION(missing) is None
+
+
+def test_cli_version_runs_the_binary_under_the_profile_env(tmp_path, monkeypatch):
+    """The probe runs the binary in the session's environment, not only resolves
+    it there: a launcher whose answer depends on the profile's `env` (a
+    version-manager shim, an `env node` launcher) reads the version the session
+    would run. The cache is keyed by that env, so a second profile over the same
+    binary is probed again.
+
+    ABLATION: drop `env=` from the `run_argv` call and the first read is None."""
+    monkeypatch.setattr(install_mod, "_cli_versions", {})
+    launcher = write_script_launcher(
+        tmp_path,
+        "envcli",
+        "import os\nv = os.environ.get('BMAD_LOOP_TEST_CLI_VERSION')\n"
+        "print(v if v else 'no version')\n",
+    )
+    monkeypatch.delenv("BMAD_LOOP_TEST_CLI_VERSION", raising=False)
+    claude = get_profile("claude")
+    old = dataclasses.replace(
+        claude, binary=str(launcher), env={"BMAD_LOOP_TEST_CLI_VERSION": "2.1.77"}
+    )
+    new = dataclasses.replace(
+        claude, binary=str(launcher), env={"BMAD_LOOP_TEST_CLI_VERSION": "2.1.80"}
+    )
+    assert _REAL_CLI_VERSION(old) == (2, 1, 77)
+    assert _REAL_CLI_VERSION(new) == (2, 1, 80)
+    assert _REAL_CLI_VERSION(dataclasses.replace(claude, binary=str(launcher), env={})) is None
 
 
 def test_install_unknown_cli(tmp_path):
@@ -2360,6 +2500,35 @@ def test_provision_worktree_merge_preserves_the_operators_own_settings(tmp_path)
     hooks = json.loads(config.read_text(encoding="utf-8"))["hooks"]
     assert set(claude.hooks.events) <= set(hooks)
     assert _installed_relay_suffix("Stop") in hooks["Stop"][0]["hooks"][0]["command"]
+
+
+def test_provision_worktree_gates_stop_failure_on_the_cli_version(tmp_path, monkeypatch):
+    """#865: provisioning applies init's version gate. A seeded config carrying a
+    StopFailure relay (written while the CLI was newer) loses it below the
+    floor, the Stop relay stays, and the omission reaches `on_hook_gated` — the
+    engine journals it as `worktree-hook-gated`.
+
+    Ablation: drop the `on_hook_gated` loop in `provision_worktree` and `notes`
+    stays empty."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    repo.mkdir()
+    claude = get_profile("claude")
+    config = wt / claude.hooks.config_path
+    config.parent.mkdir(parents=True)
+    seeded = json.loads(_OPERATOR_SETTINGS)
+    seeded.setdefault("hooks", {})["StopFailure"] = [
+        {"hooks": [{"type": "command", "command": "/opt/bin/bmad-loop relay StopFailure"}]}
+    ]
+    config.write_text(json.dumps(seeded), encoding="utf-8")
+    monkeypatch.setattr(install_mod, "cli_version", lambda profile: (2, 1, 77))
+    notes: list[str] = []
+
+    provision_worktree(wt, [claude], repo, on_hook_gated=notes.append)
+
+    hooks = json.loads(config.read_text(encoding="utf-8"))["hooks"]
+    assert "StopFailure" not in hooks
+    assert _installed_relay_suffix("Stop") in hooks["Stop"][0]["hooks"][0]["command"]
+    assert len(notes) == 1 and notes[0].startswith("StopFailure hook not registered (claude)")
 
 
 def test_provision_worktree_write_failure_raises_and_leaves_the_config_entire(
@@ -5672,16 +5841,6 @@ def test_new_dev_auto_skill_is_additive_for_sprint_mode(tmp_path, primitive):
     assert missing_stories_support(tmp_path, [tree]) == []
 
 
-def test_provision_worktree_seeds_gitignored_config(tmp_path):
-    """A gitignored config present in the main repo is copied into the worktree
-    (a `git worktree add` checkout would omit it)."""
-    wt, repo = tmp_path / "wt", tmp_path / "repo"
-    repo.mkdir()
-    (repo / ".mcp.json").write_text('{"mcpServers": {}}', encoding="utf-8")
-    provision_worktree(wt, [], repo, seed_files=[".mcp.json"])
-    assert (wt / ".mcp.json").read_text() == '{"mcpServers": {}}'
-
-
 def test_provision_worktree_seed_skips_missing_source(tmp_path):
     wt, repo = tmp_path / "wt", tmp_path / "repo"
     repo.mkdir()
@@ -5691,19 +5850,7 @@ def test_provision_worktree_seed_skips_missing_source(tmp_path):
 
 def test_provision_worktree_seed_does_not_clobber_existing(tmp_path):
     """A seed target already present in the worktree (tracked/committed) is left
-    untouched, so no diff is merged back."""
-    wt, repo = tmp_path / "wt", tmp_path / "repo"
-    repo.mkdir()
-    (repo / ".mcp.json").write_text("FROM_REPO", encoding="utf-8")
-    dst = wt / ".mcp.json"
-    dst.parent.mkdir(parents=True)
-    dst.write_text("IN_WORKTREE", encoding="utf-8")
-    provision_worktree(wt, [], repo, seed_files=[".mcp.json"])
-    assert dst.read_text() == "IN_WORKTREE"
-
-
-def test_provision_worktree_reports_seed_skipped_as_noop(tmp_path):
-    """A seed entry left untouched because the destination exists is REPORTED, so a
+    untouched, so no diff is merged back. The untouched entry is REPORTED, so a
     `worktree_seed` that copies nothing cannot look like applied configuration."""
     wt, repo = tmp_path / "wt", tmp_path / "repo"
     repo.mkdir()
@@ -5712,6 +5859,7 @@ def test_provision_worktree_reports_seed_skipped_as_noop(tmp_path):
     dst.parent.mkdir(parents=True)
     dst.write_text("IN_WORKTREE", encoding="utf-8")
     assert provision_worktree(wt, [], repo, seed_files=[".mcp.json"]) == [".mcp.json"]
+    assert dst.read_text() == "IN_WORKTREE"
 
 
 def test_provision_preserves_unrelated_bmad_noop_when_internal_sibling_lands(tmp_path):
@@ -5823,8 +5971,9 @@ def test_provision_worktree_seeds_absent_empty_child_dir(tmp_path):
 
 
 def test_provision_worktree_reports_nothing_when_seeding_succeeds(tmp_path):
-    """A seed that actually copies is not reported — the signal stays specific to
-    entries that silently did nothing. A missing source is also not a no-op report:
+    """A gitignored config present in the main repo is copied into the worktree (a
+    `git worktree add` checkout would omit it). A seed that actually copies is not
+    reported — the signal stays specific to entries that silently did nothing. A missing source is also not a no-op report:
     it is already covered as its own case."""
     wt, repo = tmp_path / "wt", tmp_path / "repo"
     repo.mkdir()
@@ -7722,53 +7871,14 @@ def test_shield_refuses_to_enable_extension_at_the_old_capability_floor(
     assert not _wt_private_exclude(wt).exists()
 
 
-def test_shield_degrade_leaves_no_permanent_repo_format_change(project, tmp_path, monkeypatch):
-    """`extensions.worktreeConfig` is a PERMANENT repo-format change bmad-loop never
-    reverses, so it must not be paid for a shield that then degrades away.
-    `_shield_enable_worktree_config` used to perform the enable itself, ahead of the
-    seed, the mkdir, the write and the activation — so every degrade below it left
-    the operator's repo marked forever for a shield that never applied. It now only
-    PROBES; the write happens one line above the activation.
-
-    Driven through the seed fault, because that is the degrade path this reordering exists
-    for — a fault the old code could not even reach, since it swallowed instead of
-    degrading.
-
-    Read as TEXT rather than via `git config --get`, for the reason the sibling
-    refusal tests give: conftest's git() is check=True and an unset key exits 1.
-
-    Ablation: move the enable back above the seed (into
-    `_shield_enable_worktree_config`, where it was) and this fails —
-    `worktreeConfig` is in the shared config after a degrade that shielded nothing."""
-    repo = project.project
-    wt = tmp_path / "wt"
-    verify.worktree_add(repo, wt, "feat", "main")
-    users = tmp_path / "my-global-ignores"
-    users.write_text("mine.log\n", encoding="utf-8")
-    git(repo, "config", "core.excludesFile", str(users))
-    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
-    real = install_mod.git_bytes
-
-    def unanswerable_excludes_read(worktree, *args):
-        if "core.excludesFile" in args and "--get" in args:
-            raise verify.GitError("git config did not answer")
-        return real(worktree, *args)
-
-    monkeypatch.setattr(install_mod, "git_bytes", unanswerable_excludes_read)
-
-    reason = _worktree_local_exclude(wt, ["/probe-384"])
-
-    assert reason is not None  # it really did degrade
-    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
-
-
 def test_shield_enables_the_extension_on_the_path_that_activates(project, tmp_path):
     """The other half of the deferral: moving the enable down must not lose it. A
     happy path still leaves the repo carrying the extension — that write is what
     `git config --worktree` needs to exist at all, so without it the activation
     fatals and the shield does nothing.
 
-    The sibling above proves the flag is absent after a degrade; this proves the
+    `test_shield_degrades_when_git_will_not_say_what_the_users_excludes_are` proves the
+    flag is absent after a degrade; this proves the
     reordering did not simply stop setting it. Neither alone distinguishes the fix
     from a deletion."""
     repo = project.project
@@ -10417,6 +10527,13 @@ def test_shield_degrades_when_git_will_not_say_what_the_users_excludes_are(
     and both cases fail — on assertion 1 (`reason` comes back None) and again on
     assertion 3 (`mine.log` shows up untracked, the shadow).
 
+    The degrade also costs no PERMANENT repo-format change: `extensions.worktreeConfig`
+    is written one line above the activation, never ahead of the seed. Read as TEXT,
+    not via `git config --get`: conftest's git() is check=True and an unset key exits 1.
+    Ablation: move the enable back above the seed (into `_shield_enable_worktree_config`,
+    where it was) and both cases fail on the flag assertion — `worktreeConfig` is in
+    the shared config after a degrade that shielded nothing.
+
     Asserts on "did not answer", NOT "timed out": the latter is a lie for
     `GitSpawnError`, and it is the substring the activation-fault test above already
     asserts, so it could not tell which call faulted."""
@@ -10426,6 +10543,7 @@ def test_shield_degrades_when_git_will_not_say_what_the_users_excludes_are(
     users = tmp_path / "my-global-ignores"
     users.write_text("mine.log\n", encoding="utf-8")
     git(repo, "config", "core.excludesFile", str(users))
+    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
     real = install_mod.git_bytes
 
     def unanswerable_excludes_read(worktree, *args):
@@ -10441,6 +10559,7 @@ def test_shield_degrades_when_git_will_not_say_what_the_users_excludes_are(
     reason = _worktree_local_exclude(wt, ["/probe-389"])
 
     assert reason is not None and "did not answer" in reason
+    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
     assert not _wt_private_exclude(wt).exists()  # nothing to point a shadowing key at
     (wt / "mine.log").write_text("noise\n", encoding="utf-8")
     (wt / "probe-389").write_text("noise\n", encoding="utf-8")
@@ -12018,14 +12137,15 @@ def _tickets_paths(layout):
     return bmadconfig.load_paths(layout.project, want_tickets=True)
 
 
-def _tickets_findings(layout, monkeypatch, *, probe=False, uv="/usr/bin/uv"):
+def _tickets_findings(layout, monkeypatch, *, probe=False, uv="/usr/bin/uv", **kwargs):
     """`tickets_preflight` on ``layout`` with uv pinned present (or absent with
-    ``uv=None``) — the host's PATH must not decide a project check."""
+    ``uv=None``) — the host's PATH must not decide a project check. ``kwargs`` go
+    to the preflight."""
     monkeypatch.setattr(
         install_mod.shutil, "which", lambda tool: uv if tool == "uv" else f"/usr/bin/{tool}"
     )
     return install_mod.tickets_preflight(
-        _tickets_paths(layout), [".claude/skills"], probe_capability=probe
+        _tickets_paths(layout), [".claude/skills"], probe_capability=probe, **kwargs
     )
 
 
@@ -12145,26 +12265,119 @@ def _make_parent(layout, *, flat: bool = False) -> Path:
     return path
 
 
+def _slice_children(layout, *slugs: str) -> None:
+    """Give each child initiative in ``slugs`` a committed folder beside the active
+    initiative's, a copy of its ticket tree (call before `_make_parent`)."""
+    for slug in slugs:
+        shutil.copytree(layout.initiative_folder, layout.initiative_folder.parent / slug)
+    git(layout.project, "add", "-A")
+    git(layout.project, "commit", "-q", "-m", "child initiatives")
+
+
 def test_tickets_preflight_refuses_a_parent_initiative(project_v7, monkeypatch):
     """A parent initiative has no tickets of its own (tickets.py `status`/`next`
-    print its children, every other verb refuses), so a run needs one child
-    active: a problem naming the children, read from its `tickets.toml` without a
-    spawn, and the store checks are skipped. Ablation (performed): drop the
-    parent check and this FAILS (the store checks pass instead)."""
+    print its children, every other verb refuses), and without worktree isolation
+    every session reads the parent from the user config: a problem naming the
+    children, read from its `tickets.toml` without a spawn, and the store checks
+    are skipped. Ablation (performed): drop the isolation check and this FAILS
+    (the parent is accepted instead)."""
     from bmad_loop.checks import VALIDATE_CHECKS
 
+    _slice_children(project_v7, "initiative-auth", "initiative-billing")
     _make_parent(project_v7)
-    findings = _tickets_findings(project_v7, monkeypatch)
+    findings = _tickets_findings(project_v7, monkeypatch, isolation="none")
     (problem,) = [f for f in findings if f.severity == "problem"]
     assert problem.check == "tickets.initiative-parent"
     assert problem.detail == {
         "initiative": project_v7.initiative,
         "children": ["initiative-auth", "initiative-billing"],
+        "isolation": "none",
+        "retrospective": None,
     }
     assert "(children: initiative-auth, initiative-billing)" in problem.message
+    assert '`isolation = "worktree"`' in problem.message
     assert "`[core] active_initiative`" in problem.message
     assert "tickets.store-topology" not in _ids(findings)
     assert set(_ids(findings)) <= VALIDATE_CHECKS
+
+
+def test_tickets_preflight_accepts_a_parent_under_worktree_isolation(project_v7, monkeypatch):
+    """Under worktree isolation, with no auto retrospective, a parent is an ok line
+    naming its children, and each child's store is classified on its own folder.
+    Ablation (performed): drop the per-child store loop and this FAILS."""
+    from bmad_loop.checks import VALIDATE_CHECKS
+
+    _slice_children(project_v7, "initiative-auth", "initiative-billing")
+    _make_parent(project_v7)
+    findings = _tickets_findings(
+        project_v7, monkeypatch, isolation="worktree", retrospective="notify"
+    )
+    assert [f for f in findings if f.severity == "problem"] == []
+    (parent,) = [f for f in findings if f.check == "tickets.initiative-parent"]
+    assert parent.severity == "ok"
+    assert parent.detail["children"] == ["initiative-auth", "initiative-billing"]
+    assert parent.detail["skipped"] == []
+    stores = [f for f in findings if f.check == "tickets.store-topology"]
+    assert [f.detail["initiative"] for f in stores] == ["initiative-auth", "initiative-billing"]
+    root = project_v7.initiative_folder.parent
+    assert [f.detail["path"] for f in stores] == [
+        str(root / "initiative-auth"),
+        str(root / "initiative-billing"),
+    ]
+    assert all(f.severity == "ok" and f.detail["topology"]["layout"] == "T1" for f in stores)
+    assert stores[0].message.startswith("child initiative 'initiative-auth': ")
+    assert set(_ids(findings)) <= VALIDATE_CHECKS
+
+
+def test_tickets_preflight_refuses_a_parent_under_auto_retrospective(project_v7, monkeypatch):
+    """The auto retrospective session runs in the main checkout and reads the
+    parent, so even worktree isolation refuses a parent while it is on.
+    Ablation (performed): drop the retrospective check and this FAILS."""
+    _slice_children(project_v7, "initiative-auth", "initiative-billing")
+    _make_parent(project_v7)
+    findings = _tickets_findings(
+        project_v7, monkeypatch, isolation="worktree", retrospective="auto"
+    )
+    (problem,) = [f for f in findings if f.severity == "problem"]
+    assert problem.check == "tickets.initiative-parent"
+    assert '`gates.retrospective = "auto"`' in problem.message
+    assert "`[scm] isolation" not in problem.message
+    assert "tickets.store-topology" not in _ids(findings)
+
+
+def test_tickets_preflight_skips_a_parents_unsliced_child(project_v7, monkeypatch):
+    """A child declared but not sliced yet has no folder: the ok line says it is
+    skipped, and only the sliced child's store is classified."""
+    _slice_children(project_v7, "initiative-auth")
+    _make_parent(project_v7)
+    findings = _tickets_findings(project_v7, monkeypatch, isolation="worktree")
+    assert [f for f in findings if f.severity == "problem"] == []
+    (parent,) = [f for f in findings if f.check == "tickets.initiative-parent"]
+    assert parent.severity == "ok"
+    assert parent.detail["skipped"] == ["initiative-billing"]
+    assert "initiative-billing has no folder yet (declared, not sliced)" in parent.message
+    stores = [f for f in findings if f.check == "tickets.store-topology"]
+    assert [f.detail["initiative"] for f in stores] == ["initiative-auth"]
+
+
+def test_tickets_preflight_refuses_a_parents_child_on_a_tracked_user_config(
+    project_v7, monkeypatch
+):
+    """A chained run rewrites the mount's `config.user.toml` on every layout, so a
+    tracked personal layer refuses each child even on T1, which needs no store
+    redirect (the same project as a plain initiative runs)."""
+    _slice_children(project_v7, "initiative-auth", "initiative-billing")
+    git(project_v7.project, "add", "-f", "_bmad/custom/config.user.toml")
+    git(project_v7.project, "commit", "-q", "-m", "track the personal layer")
+    plain = _tickets_findings(project_v7, monkeypatch, isolation="worktree")
+    assert [f for f in plain if f.severity == "problem"] == []
+    _make_parent(project_v7)
+    findings = _tickets_findings(project_v7, monkeypatch, isolation="worktree")
+    problems = [f for f in findings if f.severity == "problem"]
+    assert [f.check for f in problems] == ["tickets.own-repo-isolation"] * 2
+    assert [f.detail["initiative"] for f in problems] == ["initiative-auth", "initiative-billing"]
+    assert [f.detail["refusal"] for f in problems] == ["user-config-tracked"] * 2
+    assert "config.user.toml" in problems[0].message
 
 
 def test_tickets_preflight_reads_a_parent_in_the_flat_layout_too(project_v7, monkeypatch):

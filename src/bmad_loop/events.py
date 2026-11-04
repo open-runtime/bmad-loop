@@ -1,12 +1,15 @@
 """Importable twin of the hardened event write in ``data/bmad_loop_hook.py``.
 
-The hook script is COPIED into every target project and runs inside the coding
-CLI's process under whatever interpreter the host has, so it is stdlib-only by
+Older inits COPIED the hook script into every target project; ``init`` now
+registers ``<bmad-loop exe> relay <Event>`` instead and recognizes a copied-script
+registration only as legacy, but such copies still run inside the coding CLI's
+process under whatever interpreter the host has, so the script is stdlib-only by
 contract (its docstring says so) and cannot import ``bmad_loop`` to reach this
 module — and this module cannot import it back, since it ships as package DATA
 rather than as an importable module. Hence a twin rather than shared code:
 ``_LINK_REPARSE_TAGS``, ``_first_workspace``, ``_notification_type``,
-``_source``, the DW-507 lineage block (``_LAUNCH_SHIM_WINDOW_S``,
+``_source``, ``_fully_idle``, the StopFailure field block (``RELAY_TEXT_MAX``,
+``_bounded_text``, ``_STOP_FAILURE_FIELDS``), the DW-507 lineage block (``_LAUNCH_SHIM_WINDOW_S``,
 ``_proc_stat``, ``_cmdline``, ``_HOOK_SHELLS``, ``_runs_relay``,
 ``_is_hook_wrapper``, ``_lineage``), ``_is_link_like``,
 ``_write_all`` and ``_write_event`` below are byte-identical copies of the
@@ -132,6 +135,40 @@ def _hcom_fields(environ):
     if isinstance(room, str) and room:
         fields["hcom_dir"] = room
     return fields
+
+
+def _fully_idle(payload):
+    # An agy Stop payload's `fullyIdle` (DW-548): false when the parent only
+    # yielded to a foreground subagent, true at the real turn end. Only a JSON
+    # boolean is forwarded, and the key is written only then, so every other
+    # CLI's event stays unchanged.
+    value = payload.get("fullyIdle")
+    return value if isinstance(value, bool) else None
+
+
+# Longest string a relay forwards from a free-text payload field (#865): enough
+# for an API error's rendered text, small enough that a runaway value cannot
+# bloat every event file the orchestrator reads.
+RELAY_TEXT_MAX = 2000
+
+
+def _bounded_text(payload, key):
+    # A free-text payload field, forwarded only when it is a string and cut to
+    # RELAY_TEXT_MAX characters; anything else reads as absent (None), so the
+    # caller writes the key only when there is text to carry.
+    value = payload.get(key)
+    return value[:RELAY_TEXT_MAX] if isinstance(value, str) else None
+
+
+# A StopFailure payload's free-text fields (#865), as (event key, payload key):
+# Claude Code sends `error` (the failure class the profile maps onto an action),
+# optional `error_details` and `last_assistant_message` (the rendered API error).
+# Each is written only when present, so every other event stays unchanged.
+_STOP_FAILURE_FIELDS = (
+    ("stop_error", "error"),
+    ("stop_error_details", "error_details"),
+    ("stop_message", "last_assistant_message"),
+)
 
 
 # How long after the launched CLI the rest of its launch chain may start
@@ -435,7 +472,12 @@ def shape_event(
     :func:`_lineage`); :func:`relay` computes it, since it reads this process's
     own parent chain rather than anything in the payload. ``payload_error`` is
     :func:`_read_payload`'s tag, written only when set so a readable payload's
-    event is unchanged."""
+    event is unchanged; ``fully_idle`` (DW-548) likewise appears only when the
+    payload carries a boolean ``fullyIdle``, and ``stop_error`` /
+    ``stop_error_details`` / ``stop_message`` (#865) only when a StopFailure
+    payload carries ``error`` / ``error_details`` / ``last_assistant_message`` as
+    a string, each cut to ``RELAY_TEXT_MAX`` characters; ``model`` (#859) only
+    when the payload carries a non-empty string ``model``, cut the same way."""
     event = {
         "ts": ts,
         "event": event_name,
@@ -464,6 +506,21 @@ def shape_event(
         # a filter — the orchestrator decides what a "mismatch" means.
         "lineage": lineage,
     }
+    # Only when the payload carries a boolean `fullyIdle` (agy, DW-548): a Stop
+    # with false is a subagent yield, not a turn end. Absent for every other CLI.
+    fully_idle = _fully_idle(payload)
+    if fully_idle is not None:
+        event["fully_idle"] = fully_idle
+    for event_key, payload_key in _STOP_FAILURE_FIELDS:
+        text = _bounded_text(payload, payload_key)
+        if text is not None:
+            event[event_key] = text
+    # The model the CLI reports on its hook payload (#859): Claude's SessionStart,
+    # Codex on every hook. Only when it is a non-empty string, so every other
+    # event stays unchanged.
+    model = _bounded_text(payload, "model")
+    if model:
+        event["model"] = model
     if payload_error:
         event["payload_error"] = payload_error
     # open-runtime fork: present-only turn and hcom fields (see `_turn_fields`).

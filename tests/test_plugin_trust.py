@@ -28,7 +28,6 @@ from pathlib import Path
 import pytest
 from conftest import grant_plugin
 
-from bmad_loop import policy as policy_mod
 from bmad_loop import runs
 from bmad_loop.plugins import (
     GrantSet,
@@ -167,16 +166,19 @@ def test_enabled_helpers():
 # ----------------------------------------------- THE trust invariant
 
 
-def test_untrusted_python_module_is_never_imported(tmp_path):
+def test_untrusted_python_module_is_never_imported(tmp_path, monkeypatch):
     write_py_plugin(tmp_path, "spy")
+    calls = record_instantiate(monkeypatch)
     journal = FakeJournal()
     reg = PluginRegistry.build(tmp_path, policy=Policy(), journal=journal)  # no grant
     lp = reg.get("spy")
     assert lp is not None
     assert lp.instance is None and lp.trusted is False and not lp.active
     assert lp.verdict is not None and lp.verdict.state is TrustState.REFUSED
-    # the smoking gun: the module's import-time side effect never happened
+    # the smoking gun: the module's import-time side effect never happened, and
+    # `_instantiate` was never even entered
     assert not marker_for(tmp_path, "spy").exists()
+    assert "spy" not in calls
     refused = [e for e in journal.entries if e["kind"] == "plugin-refused"]
     assert [(e["plugin"], e["origin"], e["path"]) for e in refused] == [
         ("spy", "project", ".bmad-loop/plugins/spy")
@@ -198,14 +200,6 @@ def test_unenabled_builtin_python_is_untrusted_not_refused(tmp_path, monkeypatch
     assert "unity" in untrusted
     assert "plugin-refused" not in journal.kinds() and reg.refusals == ()
     assert "unity" not in calls
-
-
-def test_ungranted_project_python_never_imports(tmp_path, monkeypatch):
-    write_py_plugin(tmp_path, "spy")
-    calls = record_instantiate(monkeypatch)
-    reg = PluginRegistry.build(tmp_path, policy=Policy())
-    assert "spy" not in calls and reg.instances() == []
-    assert not marker_for(tmp_path, "spy").exists()
 
 
 def test_enabled_python_module_is_constructed(tmp_path):
@@ -520,26 +514,6 @@ def test_manifest_swapped_back_before_the_hash_is_fatal_and_never_runs(tmp_path,
     assert not marker.exists()
 
 
-def test_legacy_engine_fold_does_not_grant_a_project_unity_override(tmp_path):
-    # `[engine] name = "unity"` folds into [plugins] enabled — a name, which must
-    # not vouch for a project dir that happens to carry it.
-    pdir = tmp_path / USER_PLUGINS_REL / "unity"
-    pdir.mkdir(parents=True)
-    shutil.copy(BUILTIN_UNITY / "plugin.toml", pdir / "plugin.toml")
-    marker = marker_for(tmp_path, "unity")
-    (pdir / "unity_plugin.py").write_text(
-        PY_MODULE.format(cls="UnityPlugin", marker=str(marker), tag="yes")
-    )
-    policy_path = tmp_path / "policy.toml"
-    policy_path.write_text('[engine]\nname = "unity"\n')
-    with pytest.warns(DeprecationWarning, match=r"\[engine\]"):
-        pol = policy_mod.load(policy_path)
-    assert "unity" in pol.plugins.enabled
-    with pytest.raises(PluginTrustError, match="plugins enable unity"):
-        PluginRegistry.build(tmp_path, policy=pol)
-    assert not marker.exists()
-
-
 def test_build_refusal_raises_before_any_exec(tmp_path, monkeypatch):
     # one fatal verdict stops the build before ANY plugin executes — a granted
     # project module and an enabled builtin alike
@@ -559,12 +533,6 @@ def test_granted_plugin_without_a_snapshot_root_is_refused(tmp_path):
     with pytest.raises(PluginError, match="no snapshot root"):
         PluginRegistry.build(tmp_path, policy=Policy(), grants=grants)
     assert not marker_for(tmp_path, "spy").exists()
-
-
-def test_build_defaults_to_no_grants(tmp_path):
-    write_py_plugin(tmp_path, "spy")
-    reg = PluginRegistry.build(tmp_path, policy=Policy(), grants=GrantSet.empty())
-    assert [r.name for r in reg.refusals] == ["spy"]
 
 
 # ------------------------------------------ granted plugins run the snapshot

@@ -48,11 +48,13 @@ rationale that already excludes ``over_budget``. Untracked usage (``None``), a
 tracked zero, or a fault reading usage keep today's verdict: only a measurement
 can overrule.
 
-A usage-limit line the wait loop saw LIVE on the visible pane (#610,
-``SessionResult.usage_limited``) is the one verdict the veto does not touch: a
-session that billed tokens and then hit its subscription limit is exactly the
-case the limit pause exists for, and the sighting is of the screen as it stood,
-not a stale line from earlier in the log. The same usage patterns also scan the
+A usage-limit line the adapter saw LIVE (#610, ``SessionResult.usage_limited``)
+is the one verdict the veto does not touch: a session that billed tokens and then
+hit its subscription limit is exactly the case the limit pause exists for. Live
+means one of two sources: the tmux adapters' visible pane, a sighting of the
+screen as it stood rather than a stale line from earlier in the log; or
+opencode-http's provider-error line, formatted from a typed SSE frame for this
+session while it ran (DW-592). The same usage patterns also scan the
 log TAIL as ordinary families, and there the veto applies — a limit the session
 recovered from must not excuse a later real stall.
 """
@@ -244,7 +246,12 @@ class EnvFaultMixin:
         A LIVE usage-limit sighting (``result.usage_limited``, #610) short-cuts
         all of that: ``env_fault`` is stamped with that evidence and no veto and
         no tail scan, crumbed ``env-fault-classified`` with
-        ``usage_limited=True``."""
+        ``usage_limited=True``.
+
+        A parked result carrying ``stop_failure`` (#865) and no live usage
+        sighting skips the tail scan too and is returned unchanged, crumbed
+        ``env-fault-classified`` with ``skipped="stop-failure"``: the parked
+        pause reason then names the hook's ``StopFailure(<error>)``."""
         if result.status not in ENV_FAULT_STATUSES or result.result_json is not None:
             return result
         if result.transport_fault is not None:
@@ -270,8 +277,9 @@ class EnvFaultMixin:
                 )
             return dataclasses.replace(result, env_fault=True, env_fault_evidence=evidence)
         if result.usage_limited is not None:
-            # Veto-exempt by design: the line was on the visible pane at the
-            # verdict, so tokens spent BEFORE the limit cannot disprove it.
+            # Veto-exempt by design: the line was seen live (on the visible pane
+            # at the verdict, or as this session's provider-error frame), so
+            # tokens spent BEFORE the limit cannot disprove it.
             self._note_lifecycle(
                 handle.task_id,
                 "env-fault-classified",
@@ -282,6 +290,22 @@ class EnvFaultMixin:
             return dataclasses.replace(
                 result, env_fault=True, env_fault_evidence=result.usage_limited
             )
+        if result.parked and result.stop_failure is not None:
+            # A session the wait loop parked on a Claude Code `StopFailure`
+            # (#865): the hook named the API error that ended the turn, which
+            # is better evidence than a log-tail line. A tail match would take
+            # the env-fault arm ahead of the parked one and hide the error from
+            # the pause reason, so the scan is skipped and the parked arm's
+            # reason names `StopFailure(<error>)`. A usage-limited one took the
+            # shortcut above.
+            self._note_lifecycle(
+                handle.task_id,
+                "env-fault-classified",
+                status=result.status,
+                skipped="stop-failure",
+                stop_failure=result.stop_failure,
+            )
+            return result
         if not self._tail_scan_patterns:
             return result
         evidence = self._env_fault_evidence(handle.task_id)

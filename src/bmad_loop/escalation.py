@@ -22,6 +22,7 @@ from .model import (
     VerifyOutcome,
 )
 from .policy import Policy
+from .usagereset import resolved_reset
 from .worksource import SOURCE_STORIES, SOURCE_TICKETS
 
 SEVERITY_CRITICAL = "CRITICAL"
@@ -53,6 +54,16 @@ REVIEW_TIMEOUT_STATUSES = frozenset({"timeout", "stalled", "over_budget"})
 
 
 @dataclass(frozen=True)
+class UsageLimitPause:
+    """The structured facts of a pause on a usage limit (DW-591), recorded on
+    ``RunState.paused_reset_at`` / ``paused_limit_class`` so no reader parses
+    the pause reason. Built only by :func:`usage_limit_pause`."""
+
+    reset_at: str | None
+    limit_class: str | None
+
+
+@dataclass(frozen=True)
 class Decision:
     action: Action
     reason: str = ""
@@ -64,6 +75,13 @@ class Decision:
     # Set only by the engine's environment seam (DW-523), never by a decider: the
     # `StoryTask.env_fault_site` a PAUSE it produced must record on escalation.
     env_site: str | None = None
+    # Set by a decider whose PAUSE reason is the usage-limit reason (DW-591):
+    # the facts the engine records with the pause. None on every other decision.
+    usage_limit: UsageLimitPause | None = None
+    # A RETRY that charges no budget (#959): a usage relaunch from
+    # :func:`usage_relaunch`. The engine adds it to the story's refund counter
+    # before journaling, and the environment seam never re-probes for it.
+    uncharged: bool = False
 
 
 def _escalation_list(result_json: dict[str, Any] | None) -> list[Any]:
@@ -351,6 +369,20 @@ def parked_pause_reason(role: str, result: SessionResult) -> str:
     )
 
 
+def usage_limit_pause(result: SessionResult) -> UsageLimitPause | None:
+    """The facts a pause on ``result`` records, or None when ``result`` was not
+    seen behind a usage limit — exactly when ``env_fault_pause_reason`` and
+    ``parked_pause_reason`` give the usage-limit reason. ``reset_at`` is the
+    reset only when it resolved (:func:`usagereset.resolved_reset`): an
+    unresolved clause's raw text stays in the reason alone."""
+    if not result.usage_limited:
+        return None
+    return UsageLimitPause(
+        reset_at=resolved_reset(result.usage_limit_resets),
+        limit_class=result.usage_limit_class,
+    )
+
+
 def usage_limit_pause_reason(role: str, result: SessionResult) -> str:
     """The pause reason for a session seen LIVE behind a usage limit (#610):
     ``usage limit: <role> session <status> (<evidence>; ...)``.
@@ -450,6 +482,46 @@ def session_failure_reason(role: str, result: SessionResult) -> str:
     return reason
 
 
+USAGE_RELAUNCH_REASON_PREFIX = "usage relaunch "
+
+
+def usage_relaunch(task: StoryTask, result: SessionResult, policy: Policy) -> Decision | None:
+    """The uncharged RETRY for a session that ended on a usage limit (#959), or
+    None when it does not qualify.
+
+    Qualifies only in relaunch mode (``limits.usage_limit_action =
+    "relaunch"``), while the story's uncharged relaunches stay under
+    ``limits.max_usage_relaunches``, for a non-completed session the adapter saw
+    behind a usage limit (``usage_limited``, any adapter) or a StopFailure mapped
+    to the account action. At the cap it returns None, so the caller falls
+    through to the usage-limit pause the same result gets in pause mode: a
+    repeated or forged limit signal buys at most the cap, never a loop.
+
+    The reason never starts with ``"usage limit: "``: :func:`pause_title` keys on
+    that prefix, and this is a relaunch, not a pause."""
+    limits = policy.limits
+    if limits.usage_limit_action != "relaunch":
+        return None
+    if task.usage_relaunches >= limits.max_usage_relaunches:
+        return None
+    if result.status == "completed":
+        return None
+    if result.usage_limited is None and result.stop_failure_action != "account":
+        return None
+    evidence = (
+        result.usage_limited
+        or result.parked_evidence
+        or result.stop_failure
+        or f"session {result.status}"
+    )
+    return Decision(
+        Action.RETRY,
+        f"{USAGE_RELAUNCH_REASON_PREFIX}({task.usage_relaunches + 1}/"
+        f"{limits.max_usage_relaunches}): {evidence}",
+        uncharged=True,
+    )
+
+
 def decide_dev(
     task: StoryTask,
     result: SessionResult,
@@ -461,10 +533,16 @@ def decide_dev(
     if critical_reason is not None:
         return Decision(Action.PAUSE, critical_reason)
 
-    budget_left = task.attempt < policy.limits.max_dev_attempts
+    budget_left = task.charged_attempts < policy.limits.max_dev_attempts
     exhausted = _exhausted_action(task)
 
     if result.status != "completed":
+        relaunch = usage_relaunch(task, result, policy)
+        if relaunch is not None:
+            # relaunch mode (#959): an uncharged RETRY ahead of the env_fault and
+            # parked arms that would pause this same result, and ahead of the
+            # budget, so it relaunches even on the last attempt.
+            return relaunch
         if result.env_fault:
             # A transport/API failure (the CLI never reached the API, #194): the
             # attempt did no real work, so pause for a human instead of charging
@@ -476,6 +554,7 @@ def decide_dev(
             return Decision(
                 Action.PAUSE,
                 env_fault_pause_reason("dev", result),
+                usage_limit=usage_limit_pause(result),
             )
         if result.parked:
             # The CLI was parked on a prompt only a human should answer (DW-348/
@@ -486,7 +565,11 @@ def decide_dev(
             # `env_fault` (a transport failure outranks it), ahead of the #727
             # no-work arm: a named prompt explains the silence better than the
             # silence does.
-            return Decision(Action.PAUSE, parked_pause_reason("dev", result))
+            return Decision(
+                Action.PAUSE,
+                parked_pause_reason("dev", result),
+                usage_limit=usage_limit_pause(result),
+            )
         if not result.produced_work:
             # The session never did anything (#727): no turn ended and the pane
             # never changed after its first frame — a CLI parked on a permission
@@ -558,18 +641,28 @@ def decide_review_session(task: StoryTask, result: SessionResult, policy: Policy
         return Decision(Action.PAUSE, critical_reason)
 
     if result.status != "completed":
+        relaunch = usage_relaunch(task, result, policy)
+        if relaunch is not None:
+            # relaunch mode (#959): an uncharged RETRY ahead of the pause arms and
+            # the `review.on_timeout` routing (see decide_dev).
+            return relaunch
         if result.env_fault:
             # transport/API failure (#194): pause rather than charge a review
             # cycle for a session that never reached the API (see decide_dev).
             return Decision(
                 Action.PAUSE,
                 env_fault_pause_reason("review", result),
+                usage_limit=usage_limit_pause(result),
             )
         if result.parked:
             # parked on a human prompt (DW-348/DW-350): pause rather than charge a
             # review cycle for a session the adapter would not type into (see
             # decide_dev). After env_fault, which outranks it.
-            return Decision(Action.PAUSE, parked_pause_reason("review", result))
+            return Decision(
+                Action.PAUSE,
+                parked_pause_reason("review", result),
+                usage_limit=usage_limit_pause(result),
+            )
         if not result.produced_work:
             # never did anything (#727): pause rather than retry, defer or
             # salvage a review that would relaunch into the same wall (see
@@ -595,7 +688,7 @@ def review_retry_or_exhaust(task: StoryTask, policy: Policy, reason: str) -> Dec
     cycle budget lasts, then plateau-defer (or re-escalate mid re-drive). Module-
     level so the engine can fall back through it when a SALVAGE attempt turns out
     not to be applicable (#271)."""
-    if task.review_cycle < policy.limits.max_review_cycles:
+    if task.charged_review_cycles < policy.limits.max_review_cycles:
         return Decision(Action.RETRY, reason)
     return review_exhausted(task, reason)
 

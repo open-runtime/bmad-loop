@@ -1,6 +1,7 @@
 """Run-directory helper tests."""
 
 import contextlib
+import dataclasses
 import errno
 import json
 import os
@@ -845,11 +846,15 @@ def test_stop_run_already_finished(tmp_path, monkeypatch):
 
 
 def test_stop_run_no_pid_falls_back_to_mark(tmp_path, monkeypatch):
+    """On the mark-stopped fallback nothing is left alive to consume the request, so
+    stop_run discards what it lodged. A file outliving the run it asked to stop is a
+    trap: the next resume would find it and stop again at the first item."""
     killed = []
     monkeypatch.setattr(runs, "kill_session", lambda rid: killed.append(rid))
     run_dir = _make_state_run(tmp_path, "r1")  # no engine.pid -> legacy/dead
     assert runs.stop_run(run_dir) is True
     assert load_state(run_dir).stopped is True
+    assert runs.read_stop_request_mode(run_dir) is None
     assert killed == ["r1"]
     journal = (run_dir / "journal.jsonl").read_text()
     assert "run-stop" in journal and '"fallback": true' in journal
@@ -1150,18 +1155,6 @@ def test_stop_run_stops_sigterm_immune_child_via_stop_request_file(tmp_path, mon
             proc.wait(timeout=10)
 
 
-def test_stop_run_fallback_clears_hard_request(tmp_path, monkeypatch):
-    """On the mark-stopped fallback nothing is left alive to consume the request, so
-    stop_run discards what it lodged. A file outliving the run it asked to stop is a
-    trap: the next resume would find it and stop again at the first item."""
-    monkeypatch.setattr(runs, "kill_session", lambda _rid: None)
-    run_dir = _make_state_run(tmp_path, "r1")  # no engine.pid -> straight to fallback
-    assert runs.stop_run(run_dir) is True
-    assert load_state(run_dir).stopped is True
-    assert runs.read_stop_request_mode(run_dir) is None
-    assert '"fallback": true' in (run_dir / "journal.jsonl").read_text()
-
-
 def test_stop_run_takes_state_lock_only_after_signal_and_wait(tmp_path, monkeypatch):
     """Ablation: move stop_run's state_lock above terminate and this reddens on order;
     the engine would be unable to save its own stopped state while stop waits."""
@@ -1337,7 +1330,11 @@ def test_stop_run_refusal_leaves_hard_request_lodged(tmp_path, monkeypatch):
     force-kill a pid whose identity we can no longer verify — but if it *is* still
     our engine, the file is now the only channel that can stop it. Clearing it here
     would retract the operator's request while simultaneously declining to enforce
-    it, leaving a live run nobody asked to keep running."""
+    it, leaving a live run nobody asked to keep running.
+
+    The refusal itself: the pid is still alive but its identity changed during the
+    grace window (possible pid reuse), so stop_run raises StopRunError rather than
+    force-kill it."""
     monkeypatch.setattr(runs, "kill_session", lambda _rid: None)
     monkeypatch.setattr(runs, "_STOP_WAIT_S", 0.05)
     monkeypatch.setattr(runs, "_STOP_POLL_S", 0.01)
@@ -1564,25 +1561,6 @@ def test_stop_run_force_kills_wedged_legacy_engine(tmp_path, monkeypatch):
     assert runs.stop_run(run_dir) is True
     assert host.force_killed == [4242]
     assert load_state(run_dir).stopped is True
-
-
-def test_stop_run_refuses_force_kill_on_identity_mismatch(tmp_path, monkeypatch):
-    """If the pid is still 'alive' but its identity changed during the grace window
-    (possible pid reuse), refuse to force-kill and raise StopRunError instead."""
-    monkeypatch.setattr(runs, "kill_session", lambda _rid: None)
-    monkeypatch.setattr(runs, "_STOP_WAIT_S", 0.05)
-    monkeypatch.setattr(runs, "_STOP_POLL_S", 0.01)
-    run_dir = _make_state_run(tmp_path, "r1")
-    (run_dir / "engine.pid").write_text("4242 123.0")  # persisted identity at run start
-
-    # matches the persisted identity at stop entry, then changes before the
-    # post-grace force-kill check (pid reused mid-grace).
-    identities = iter([123.0, 999.0])
-    host = _FakeHost(alive=True, identity=lambda: next(identities))
-    monkeypatch.setattr(runs, "get_process_host", lambda: host)
-    with pytest.raises(runs.StopRunError):
-        runs.stop_run(run_dir)
-    assert host.force_killed == []
 
 
 def test_stop_run_refuses_force_kill_without_identity(tmp_path, monkeypatch):
@@ -2182,34 +2160,6 @@ def _fake_home(monkeypatch, home) -> None:
     monkeypatch.setenv("USERPROFILE", str(home))
 
 
-def test_state_root_precedence_override_then_xdg_then_home(tmp_path, monkeypatch):
-    """Three answers, ranked, and the ranking is what each assertion removes.
-
-    The override outranks a *set* XDG_STATE_HOME and not merely an unset one —
-    graded by leaving XDG set throughout — because it is the operator's stated
-    answer and the suite's own isolation depends on it winning against whatever a
-    host exports.
-
-    The asymmetry in the middle is deliberate and pinned here rather than left to
-    the reader: `XDG_STATE_HOME` is a *base* to build under, so `bmad-loop` is
-    appended to it, while `BMAD_LOOP_STATE_DIR` names our root itself and is used
-    as spelled. Appending to the override would silently move every path a
-    phase-3 hook computes from that same variable."""
-    monkeypatch.setattr(runs.sys, "platform", "linux")
-    home = tmp_path / "home"
-    _fake_home(monkeypatch, home)
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
-    monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path / "override"))
-
-    assert runs.state_root() == tmp_path / "override"  # verbatim: no "bmad-loop" tail
-
-    monkeypatch.delenv(envvars.STATE_DIR)
-    assert runs.state_root() == tmp_path / "xdg" / "bmad-loop"
-
-    monkeypatch.delenv("XDG_STATE_HOME")
-    assert runs.state_root() == home / ".local" / "state" / "bmad-loop"
-
-
 @pytest.mark.parametrize("value", ["state", "./state", "~/state"], ids=repr)
 def test_state_root_refuses_a_relative_override(tmp_path, monkeypatch, value):
     """`BMAD_LOOP_STATE_DIR` is honoured as spelled, but a relative spelling is
@@ -2229,8 +2179,9 @@ def test_state_root_refuses_a_relative_override(tmp_path, monkeypatch, value):
 
     `~/state` is here for the same reason it is in the XDG rows: nothing expands
     it, so it stays relative. The empty string is deliberately NOT a row — empty
-    reads as *unset* and falls through to the cascade, which
-    `test_state_root_precedence_override_then_xdg_then_home` already grades.
+    reads as *unset* and falls through to the cascade, which the
+    `posix-empty-override` row of
+    `test_resolve_state_root_matches_state_root_on_every_cascade_arm` grades.
 
     Ablation target: drop the `os.path.isabs` guard from the override arm and all
     three rows fail — each returning a cwd-relative root instead of raising."""
@@ -2401,7 +2352,15 @@ def test_resolve_state_root_matches_state_root_on_every_cascade_arm(
     `USERPROFILE` mirrors `HOME` on the POSIX rows, as `_fake_home` does, so a
     faked-POSIX row means the same thing on a Windows host. HOME stays set on
     every POSIX row, so the passwd lookup never runs and `passwd_home=None` is
-    the faithful argument."""
+    the faithful argument.
+
+    The override outranks a *set* `XDG_STATE_HOME` (`posix-override` keeps XDG
+    set): it is the operator's stated answer, and the suite's own isolation
+    depends on it winning against whatever a host exports. The asymmetry is
+    deliberate: `XDG_STATE_HOME` is a *base* to build under, so `bmad-loop` is
+    appended to it, while `BMAD_LOOP_STATE_DIR` names our root itself and is used
+    as spelled. Appending to the override would silently move every path a
+    phase-3 hook computes from that same variable."""
     monkeypatch.setattr(runs.sys, "platform", platform)
     for name in (envvars.STATE_DIR, "XDG_STATE_HOME", "LOCALAPPDATA", "USERPROFILE", "HOME"):
         monkeypatch.delenv(name, raising=False)
@@ -3404,12 +3363,6 @@ def _raising(exc: Exception):
     return _fail
 
 
-def test_delete_run(tmp_path):
-    run_dir = _make_state_run(tmp_path, "r1")
-    runs.delete_run(tmp_path, run_dir)
-    assert not run_dir.exists()
-
-
 def test_delete_run_refuses_a_live_engine_inside_the_lifecycle_hold(tmp_path, monkeypatch):
     """Resume-first ordering: the decisive probe runs after lock acquisition and
     leaves both the run and its control plane untouched.
@@ -3742,21 +3695,6 @@ def test_delete_run_refuses_a_session_tagged_as_ours(tmp_path, monkeypatch):
     assert run_dir.exists()
 
 
-def test_delete_run_proceeds_when_the_session_listing_raises(tmp_path, monkeypatch):
-    """The seam only promises `pipe_pane` and `kill_session` never raise, so an
-    out-of-tree backend answers a failed listing with MultiplexerError where the
-    bundled one answers `[]`. Both must reach the same place, or the guard would
-    turn a transient transport error into a failed `delete`/`archive`/`clean` —
-    and `clean` has no override. Degrading to "no session" matches what tmux
-    already does for a dead server. (A stronger contract — refuse on the raise —
-    was built on this branch and withdrawn: the guard's degrade is main's
-    documented decision, and the measured cost is filed for its owner.)"""
-    run_dir = _make_state_run(tmp_path, "r1")
-    monkeypatch.setattr(runs, "get_multiplexer", lambda: _LivenessMux([], unanswerable=True))
-    runs.delete_run(tmp_path, run_dir)
-    assert not run_dir.exists()
-
-
 @pytest.mark.parametrize("helper", ["delete_run", "archive_run"])
 def test_removal_routes_the_unasked_guard_warning_to_one_channel(
     tmp_path, monkeypatch, capsys, helper
@@ -3765,6 +3703,12 @@ def test_removal_routes_the_unasked_guard_warning_to_one_channel(
     or the caller's ``warn`` sink instead of stderr (the TUI, whose stderr
     Textual captures). The sink gets the operator-facing line without the
     ``warning:`` prefix; stderr stays empty when a sink is given.
+
+    The listing here raises (MultiplexerError, what an out-of-tree backend may
+    answer where the bundled ones answer `[]`), and removal still proceeds: the
+    guard degrades to "no session", as tmux does for a dead server, rather than
+    turn a transient transport error into a failed `delete`/`archive`/`clean` —
+    and `clean` has no override. That degrade is the guard's documented decision.
 
     Ablation: drop ``warn=warn`` from either helper's `_refuse_live_session`
     call and its sink row fails (the note goes to stderr instead)."""
@@ -4516,39 +4460,52 @@ def test_rearm_plain_mode_sets_ready_for_dev_and_clears_stale_latch(tmp_path):
     assert entry["restore"] is False
 
 
-def test_rearm_clears_a_stale_adopt_latch(tmp_path):
-    """DW-386: an adoption that re-escalated before its latch was spent (e.g. the
-    kept worktree vanished on resume) must not fire an adopt leg on the re-drive.
+@pytest.mark.parametrize(
+    "field,seeded,cleared",
+    [
+        ("adopt_pending", True, False),
+        ("env_fault_site", "probe:decision:dev", None),
+        ("reverify_from", "deferred", ""),
+        ("reverify_replayed", "deferred", ""),
+    ],
+    ids=["dw386-adopt-latch", "dw523-env-fault-site", "reverify-latch", "dw527-post-replay-marker"],
+)
+def test_rearm_clears_a_stale_task_latch(tmp_path, field, seeded, cleared):
+    """A plain re-arm re-implements from the baseline, so every per-attempt latch the
+    escalated attempt left on its task is spent; each row seeds one and pins its clear.
 
-    Ablation, performed: drop the `adopt_pending = False` in
-    `_rearm_escalation_locked` and this reddens."""
-    from bmad_loop.model import Phase
+    [dw386-adopt-latch] DW-386: an adoption that re-escalated before its latch was
+    spent (e.g. the kept worktree vanished on resume) must not fire an adopt leg on
+    the re-drive. Ablation, performed: drop the `adopt_pending = False` in
+    `_rearm_escalation_locked` and this row reddens.
 
+    [dw523-env-fault-site] DW-523: a re-armed story starts with no environment fault
+    on record. Ablation, performed: drop the `env_fault_site = None` in
+    `_rearm_escalation_locked` and this row reddens.
+
+    [reverify-latch] A verify replay that escalated before its decision (a refused
+    board write) leaves `reverify_from` on the escalated task; left set, the fresh
+    attempt's next DEV_VERIFY pause would resume through the verify-replay arm.
+    Ablation, performed: drop the clear in `_rearm_escalation_locked` and this row
+    reddens on the surviving latch.
+
+    [dw527-post-replay-marker] DW-527: a `--reverify` continuation that escalated in
+    review leaves `reverify_replayed` on the escalated task; left set, a mid-review
+    crash of the re-drive would re-latch a verify replay instead of taking
+    resume-restart. Ablation, performed: drop the clear in `_rearm_escalation_locked`
+    and this row reddens on the surviving marker."""
     run_dir, _spec = _escalated_run(tmp_path, _SPEC_WITH_ARR)
     state = load_state(run_dir)
-    state.tasks["1-1-a"].adopt_pending = True
+    setattr(state.tasks["1-1-a"], field, seeded)
     save_state(run_dir, state)
 
     runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
     task = load_state(run_dir).tasks["1-1-a"]
     assert task.phase == Phase.PENDING
-    assert task.adopt_pending is False
-
-
-def test_rearm_clears_env_fault_site(tmp_path):
-    """DW-523: a re-armed story starts with no environment fault on record.
-
-    Ablation, performed: drop the `env_fault_site = None` in
-    `_rearm_escalation_locked` and this reddens."""
-    run_dir, _spec = _escalated_run(tmp_path, _SPEC_WITH_ARR)
-    state = load_state(run_dir)
-    state.tasks["1-1-a"].env_fault_site = "probe:decision:dev"
-    save_state(run_dir, state)
-
-    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
-
-    assert load_state(run_dir).tasks["1-1-a"].env_fault_site is None
+    assert getattr(task, field) == cleared
+    if cleared is None or isinstance(cleared, bool):
+        assert getattr(task, field) is cleared
 
 
 def test_adopt_clears_env_fault_site(tmp_path):
@@ -5117,42 +5074,6 @@ def test_rearm_resets_followup_reviews_spent(tmp_path):
     task = load_state(run_dir).tasks["1-1-a"]
     assert task.followup_reviews_spent == 0
     assert task.review_cycle == 0  # reset in lockstep with the counter
-
-
-def test_rearm_clears_a_stale_reverify_latch(tmp_path):
-    """A verify replay that escalated before its decision (a refused board write)
-    leaves `reverify_from` on the escalated task. A plain re-arm re-implements from
-    the baseline, so it spends the latch; left set, the fresh attempt's next
-    DEV_VERIFY pause would resume through the verify-replay arm.
-
-    Ablation, performed: drop the clear in `_rearm_escalation_locked` and this
-    reddens on the surviving latch."""
-    run_dir, _ = _escalated_run(tmp_path, _SPEC_WITH_ARR)
-    state = load_state(run_dir)
-    state.tasks["1-1-a"].reverify_from = "deferred"
-    save_state(run_dir, state)
-
-    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
-
-    assert load_state(run_dir).tasks["1-1-a"].reverify_from == ""
-
-
-def test_rearm_clears_a_post_replay_marker(tmp_path):
-    """DW-527: a `--reverify` continuation that escalated in review leaves
-    `reverify_replayed` on the escalated task. A plain re-arm re-implements from the
-    baseline, so it clears the marker; left set, a mid-review crash of the re-drive
-    would re-latch a verify replay instead of taking resume-restart.
-
-    Ablation, performed: drop the clear in `_rearm_escalation_locked` and this
-    reddens on the surviving marker."""
-    run_dir, _ = _escalated_run(tmp_path, _SPEC_WITH_ARR)
-    state = load_state(run_dir)
-    state.tasks["1-1-a"].reverify_replayed = "deferred"
-    save_state(run_dir, state)
-
-    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
-
-    assert load_state(run_dir).tasks["1-1-a"].reverify_replayed == ""
 
 
 # --------------------------------------------- #90: abandoned restore-latch residue
@@ -6900,10 +6821,6 @@ def test_clear_sentinel_readable_row_is_unchanged(tmp_path):
 # split tests stay in test_tui_data.py.
 
 
-def test_discover_runs_missing_dir(tmp_path):
-    assert _discover(tmp_path) == []
-
-
 def test_discover_runs_classification(tmp_path):
     _make_state_run(tmp_path, "20260611-100000-aaaa", finished=True)
     _make_state_run(tmp_path, "20260611-110000-bbbb", paused_reason="escalation")
@@ -6998,7 +6915,8 @@ def test_discover_runs_marks_graceful_stop_pending_while_unknown(tmp_path, monke
 
 def test_stopping_ignored_on_a_non_running_run(tmp_path):
     # The engine consumes the control file at the stop boundary; a file lingering
-    # on an already-stopped or finished run must not read as still-stopping.
+    # on an already-stopped or finished run must not read as still-stopping. The
+    # stopped run leaves a dead pid and reads STOPPED, not INTERRUPTED.
     from bmad_loop.runs import STOP_REQUEST_FILE
 
     stopped = _make_state_run(tmp_path, "20260611-100000-aaaa", stopped=True)
@@ -7106,13 +7024,6 @@ def test_stat_sig_includes_inode_for_same_size_rewrite(tmp_path):
     assert before != after  # ...but the inode did
 
 
-def test_stopped_run_classifies_as_stopped_not_interrupted(tmp_path):
-    # a deliberate stop leaves a dead pid; it must read STOPPED, not INTERRUPTED
-    run_dir = _make_state_run(tmp_path, "20260611-100000-aaaa", stopped=True)
-    (run_dir / "engine.pid").write_text(str(_dead_pid()))
-    assert _discover(tmp_path)[0].status == runs.STOPPED
-
-
 def test_classify_crashed(tmp_path):
     # a recorded crash classifies as CRASHED (distinct from a generic INTERRUPTED),
     # checked before liveness so the dead pid does not override it.
@@ -7159,6 +7070,13 @@ def test_the_stop_request_refuses_a_symlinked_bmad_loop(tmp_path):
     assertion measures a write that had somewhere to land rather than one that
     failed for want of a parent.
 
+    The positive control for this refusal is
+    `test_write_stop_request_survives_an_interleaved_concurrent_writer`: the same
+    `_write_stop_request(run_dir, "hard")` on a clean `_make_state_run` dir,
+    published through the real rename and read back as `mode == "hard"`. Without
+    it this test passes for a `_write_stop_request` wired to refuse everything,
+    which is every reason a file could be absent from `outside/`.
+
     Ablation: revert `_write_stop_request` to
     `atomic_write_text(..., follow_symlinks=False)` and this fails
     `DID NOT RAISE`, with `stop-request.json` sitting in `outside/runs/r1/`."""
@@ -7173,19 +7091,6 @@ def test_the_stop_request_refuses_a_symlinked_bmad_loop(tmp_path):
         runs._write_stop_request(proj / ".bmad-loop" / "runs" / "r1", "hard")
 
     assert list(landing.iterdir()) == []  # nothing escaped the project
-
-
-def test_the_stop_request_lands_on_a_clean_tree(tmp_path):
-    """The positive control for the refusal above — without it that test passes
-    for a `_write_stop_request` wired to refuse everything, which is every reason
-    a file could be absent from `outside/`."""
-    run_dir = _make_state_run(tmp_path, "r1")
-
-    runs._write_stop_request(run_dir, "hard")
-
-    assert json.loads((run_dir / runs.STOP_REQUEST_FILE).read_text(encoding="utf-8"))["mode"] == (
-        "hard"
-    )
 
 
 def test_stop_run_still_signals_when_the_lodge_is_refused_as_unconfined(tmp_path, monkeypatch):
@@ -7700,10 +7605,12 @@ def test_export_psmux_registry_root_sets_the_derived_root(tmp_path, monkeypatch)
     assert os.environ[runs.PSMUX_DATA_DIR] == expected
 
 
-def test_export_psmux_registry_root_overrides_an_operators_own(tmp_path, monkeypatch):
+@pytest.mark.parametrize("ambient", ["", "relative/root", ".", "/an/absolute/one"])
+def test_export_psmux_registry_root_overrides_any_ambient_spelling(tmp_path, monkeypatch, ambient):
     """The rule, and the absence of an exception to it is the point: the root is
     derived from (project, state root), full stop, so two bmad-loop processes
-    given one project cannot land in different registries.
+    given one project cannot land in different registries — whatever the ambient
+    spelling, including the ones psmux would panic on.
 
     Honouring an ambient value was tried and is the thing that was cut. It makes
     the registry a function of the launch *shell* — a TUI from the Start menu
@@ -7712,21 +7619,13 @@ def test_export_psmux_registry_root_overrides_an_operators_own(tmp_path, monkeyp
     because the process that finds a root in its environment cannot tell one
     typed in this shell alone from one the profile exports into every shell.
 
-    Ablate the unconditional export (restore an if-unset guard) and this fails."""
-    theirs = str(tmp_path / "theirs")
-    derived = str(runs.mux_registry_root(tmp_path))
-    monkeypatch.setenv(runs.PSMUX_DATA_DIR, theirs)
+    An earlier rule left a relative or empty value untouched so as not to
+    countermand something the operator typed — which, now that nothing ambient is
+    honoured, only preserved a value that makes every verb fail. Replacing it is
+    strictly better: the derived root works.
 
-    assert runs.export_psmux_registry_root(tmp_path) == derived
-    assert os.environ[runs.PSMUX_DATA_DIR] == derived
-
-
-@pytest.mark.parametrize("ambient", ["", "relative/root", ".", "/an/absolute/one"])
-def test_export_psmux_registry_root_overrides_any_ambient_spelling(tmp_path, monkeypatch, ambient):
-    """Including the ones psmux would panic on. An earlier rule left a relative or
-    empty value untouched so as not to countermand something the operator typed —
-    which, now that nothing ambient is honoured, only preserved a value that makes
-    every verb fail. Replacing it is strictly better: the derived root works."""
+    Ablate the unconditional export (restore an if-unset guard) and the rows
+    fail."""
     derived = str(runs.mux_registry_root(tmp_path))
     monkeypatch.setenv(runs.PSMUX_DATA_DIR, ambient)
 
@@ -8979,15 +8878,6 @@ def test_registry_ownership_demands_a_tag_when_it_cannot_be_asked(tmp_path, monk
     assert runs._registry_proves_ownership(tmp_path) is False
 
 
-def test_legacy_registry_leftovers_names_an_untagged_session(tmp_path, monkeypatch):
-    """A sweep that silently declines to migrate something is the same silence
-    this change exists to remove: cleanup prints a removal count, and a count that
-    excludes what it chose not to claim reads as "everything is clean"."""
-    legacy = _RegistryMux(["bmad-loop-old-1"], {})
-    monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
-    assert _healthy_leftovers(tmp_path) == {runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-old-1"]}
-
-
 def test_legacy_registry_leftovers_keys_each_session_to_its_own_registry(tmp_path, monkeypatch):
     """The grouping is the whole point of the shape: the operator's next action is
     to open the registry and look, and there are two of them now — psmux's own
@@ -9016,6 +8906,10 @@ def test_legacy_registry_leftovers_keys_each_session_to_its_own_registry(tmp_pat
 def test_legacy_registry_leftovers_merges_two_registries_that_name_one_root(tmp_path, monkeypatch):
     """A displaced root that happens to spell psmux's own default is admitted
     twice, and the rows merge rather than the second overwriting the first.
+
+    Both sessions are untagged, which the legacy pass declines to migrate, so
+    both are named: cleanup prints a removal count, and a count that excludes
+    what it chose not to claim reads as "everything is clean".
 
     Ablate the `grouped.get(label, [])` merge and the first registry's sessions
     vanish from a message that claims to name what is standing."""
@@ -9981,7 +9875,11 @@ def test_mount_root_identity_refuses_a_nested_mount_swapped_for_a_link_holding_a
 
     Ablation: skip the record compare (open ``mount`` unpinned, the handle arm) and
     both rows redden with the outside ``app/``'s identity; the pre-DW-446
-    per-component `lstat` walk reddens the ``worktrees`` row."""
+    per-component `lstat` walk reddens the ``worktrees`` row.
+
+    Positive control: `test_mount_root_identity_pins_an_intact_nested_project` —
+    a recorded mount and a real ``<mount>/<offset>`` answer the offset's own
+    identity, so the intact writes land."""
     mount = _mount(tmp_path)
     (mount / "app").mkdir(parents=True)
     record = _rec(mount)
@@ -9994,29 +9892,6 @@ def test_mount_root_identity_refuses_a_nested_mount_swapped_for_a_link_holding_a
     assert (mount / "app").is_dir()  # the premise
 
     assert _never_matches(runs.mount_root_identity(mount / "app", mount=mount, recorded=record))
-
-
-def test_mount_root_identity_of_an_intact_nested_project_is_its_own_fstat(tmp_path):
-    """DW-486 positive control: a recorded mount and a real ``<mount>/<offset>``
-    answer ``<mount>/<offset>``'s own identity — what the writers compare the root
-    they open against — so the intact writes land."""
-    mount = _mount(tmp_path)
-    nested = mount / "app"
-    nested.mkdir(parents=True)
-
-    identity = runs.mount_root_identity(nested, mount=mount, recorded=_rec(mount))
-
-    if sys.platform == "win32":
-        # `os.open` cannot open a directory on Windows; `stat` reads the same
-        # volume serial and file index.
-        own = os.stat(nested)
-    else:
-        fd = os.open(nested, os.O_RDONLY)
-        try:
-            own = os.fstat(fd)
-        finally:
-            os.close(fd)
-    assert (identity.st_dev, identity.st_ino) == (own.st_dev, own.st_ino)
 
 
 @requires_symlinked_mount_swap
@@ -11382,15 +11257,20 @@ def test_stop_run_backstop_leaves_another_projects_session(tmp_path, monkeypatch
     assert "refused" in capsys.readouterr().err
 
 
-def test_session_liveness_does_not_read_another_projects_session_as_alive(tmp_path, monkeypatch):
+def test_session_liveness_does_not_read_another_projects_session_as_alive(
+    tmp_path, monkeypatch, capsys
+):
     """A same-named session in a shared registry proves nothing about this run:
     'unknown', not 'alive', which would refuse this run's resume and delete
-    and hide it from cleanup.
+    and hide it from cleanup. 'unknown' alone cannot tell a refused probe from an
+    absent session, so the refusal is warned about.
 
-    Ablate the gate in `_session_liveness` and the first assert reads 'alive'."""
+    Ablate the gate in `_session_liveness` and the first assert reads 'alive';
+    ablate the warning and stderr is empty."""
     monkeypatch.setattr(runs, "mux_usable", lambda _m: True)
     _shared(monkeypatch, tmp_path, _foreign_r1(tmp_path))
     assert runs._session_liveness("r1") == "unknown"
+    assert "reading bmad-loop-r1 as this run's refused" in capsys.readouterr().err
 
     _shared(monkeypatch, tmp_path, _own_r1(tmp_path))
     assert runs._session_liveness("r1") == "alive"
@@ -11459,18 +11339,6 @@ def test_prune_sessions_does_not_count_a_refused_kill_as_removed(tmp_path, monke
     monkeypatch.setattr(runs, "kill_session", lambda _run_id: False)
 
     assert runs.prune_sessions(tmp_path) == ([], [], set())
-
-
-def test_session_liveness_says_why_it_did_not_read_alive(tmp_path, monkeypatch, capsys):
-    """'unknown' alone cannot tell a refused probe from an absent session, so the
-    refusal is warned about.
-
-    Ablate the warning in `_session_liveness` and stderr is empty."""
-    monkeypatch.setattr(runs, "mux_usable", lambda _m: True)
-    _shared(monkeypatch, tmp_path, _foreign_r1(tmp_path))
-
-    assert runs._session_liveness("r1") == "unknown"
-    assert "reading bmad-loop-r1 as this run's refused" in capsys.readouterr().err
 
 
 # ------------------------------------------- session_scan_error (#864)
@@ -11905,6 +11773,86 @@ def test_delete_run_removes_a_sweep_run_that_holds_nothing(project_v7_store_repo
     assert not engine.run_dir.exists()
 
 
+@pytest.mark.parametrize("force", [False, True])
+def test_archive_run_refuses_a_run_holding_unlanded_sweep_closes(project_v7_store_repo, force):
+    """DW-572: `archive_run` refuses a held run as `delete_run` does, since nothing
+    restores an archive for `resume` to land or reopen the closes from. The error
+    names the run, DW-1, `archive` and `bmad-loop resume`. No archive dir or
+    tarball is created, and the run dir, its state and the ledger are untouched.
+    `force` waives only the session guard.
+
+    Ablation: delete the `refuse_held_sweep_closes` call in `archive_run` and
+    both rows fail (the run is archived)."""
+    ts = _seam()
+    engine, paths, *_ = ts._held_sweep_run(project_v7_store_repo)
+    state_before = (engine.run_dir / "state.json").read_bytes()
+    ledger_before = paths.deferred_work.read_bytes()
+
+    with pytest.raises(runs.HeldSweepClosesError) as info:
+        runs.archive_run(paths.project, engine.run_dir, force=force)
+
+    assert info.value.run_id == ts.HELD_RUN_ID and info.value.dw_ids == ["DW-1"]
+    message = str(info.value)
+    assert "refusing to archive it" in message and "DW-1" in message
+    assert f"bmad-loop resume {ts.HELD_RUN_ID}" in message
+    assert not (paths.project / runs.ARCHIVE_DIR).exists()
+    assert (engine.run_dir / "state.json").read_bytes() == state_before
+    assert paths.deferred_work.read_bytes() == ledger_before
+
+
+def test_archive_run_refuses_a_run_it_cannot_check_for_held_closes(project_v7_store_repo):
+    """Fail safe, as on delete: an unreadable `state.json` might hold closes, so
+    `archive_run` refuses it, names the fault and writes no tarball."""
+    ts = _seam()
+    engine, paths, *_ = ts._held_sweep_run(project_v7_store_repo)
+    (engine.run_dir / "state.json").write_text("{not json", encoding="utf-8")
+
+    with pytest.raises(runs.HeldSweepClosesError) as info:
+        runs.archive_run(paths.project, engine.run_dir)
+
+    assert info.value.dw_ids == [] and "could not be read" in (info.value.reason or "")
+    assert not (paths.project / runs.ARCHIVE_DIR).exists()
+    assert (engine.run_dir / "state.json").read_text(encoding="utf-8") == "{not json"
+
+
+def test_archive_run_checks_held_closes_under_the_lock_after_the_liveness_guard(
+    project_v7_store_repo, monkeypatch
+):
+    """The archive gate runs under the run's state lock, after the liveness guard."""
+    ts = _seam()
+    engine, paths, *_ = ts._held_sweep_run(project_v7_store_repo)
+    real = runs.held_sweep_closes
+    checked: list[Path] = []
+
+    def held(project, run_dir):
+        assert_run_state_lock_held(run_dir)
+        checked.append(run_dir)
+        return real(project, run_dir)
+
+    monkeypatch.setattr(runs, "held_sweep_closes", held)
+    with pytest.raises(runs.HeldSweepClosesError):
+        runs.archive_run(paths.project, engine.run_dir)
+    assert checked == [engine.run_dir]
+
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "alive")
+    with pytest.raises(runs.LiveEngineError):
+        runs.archive_run(paths.project, engine.run_dir)
+    assert checked == [engine.run_dir]  # the liveness guard refused first
+    assert engine.run_dir.is_dir()
+
+
+def test_archive_run_archives_a_sweep_run_that_holds_nothing(project_v7_store_repo):
+    """A sweep run whose bundle landed holds no close, so it is archived as before."""
+    ts = _seam()
+    engine, paths, *_, task = ts._held_sweep_run(project_v7_store_repo, phase=Phase.DONE)
+    task.isolated_ledger_carried = True  # the merge-back's latch
+    engine._save()
+
+    dest = runs.archive_run(paths.project, engine.run_dir, warn=lambda _note: None)
+
+    assert dest.is_file() and not engine.run_dir.exists()
+
+
 def test_delete_run_failed_launch_unwind_skips_the_held_closes_check(
     project_v7_store_repo, monkeypatch
 ):
@@ -11997,3 +11945,80 @@ def test_prior_sweep_closes_records_a_liveness_probe_fault_as_a_fault_row(tmp_pa
     [row] = runs.prior_sweep_closes(tmp_path, exclude="x")
     assert row.run_id == "20260101-000000-aaaa" and row.dw_ids == ()
     assert row.fault and "bogus" in row.fault
+
+
+# ---------------------------------------- a chained run's recorded paths and pin
+
+CHILD = "initiative-child"
+
+
+def _chained(parent: str | None, initiative: str = CHILD) -> RunState:
+    return RunState(
+        run_id="r-chained",
+        project="/p",
+        started_at="now",
+        source="tickets",
+        initiative=initiative,
+        parent_initiative=parent,
+    )
+
+
+def test_paths_for_state_keeps_an_unchained_runs_paths(project_v7):
+    """An ordinary run reopens on the loaded paths themselves."""
+    paths = bmadconfig.load_paths(project_v7.project, want_tickets=True)
+    assert runs.paths_for_state(paths, _chained(None, project_v7.initiative)) is paths
+
+
+def test_paths_for_state_reroots_a_chained_run_on_its_child(project_v7):
+    """A chained run reopens on its child initiative: the folder is the parent's
+    sibling named for the child, and the ledger, sprint path and both artifact
+    dirs move onto it. Ablation (performed): return `paths` unconditionally and
+    this FAILS."""
+    paths = bmadconfig.load_paths(project_v7.project, want_tickets=True)
+    child = runs.paths_for_state(paths, _chained(project_v7.initiative))
+    folder = project_v7.initiative_folder.parent / CHILD
+    assert child.active_initiative == CHILD and child.initiative_folder == folder
+    assert child.implementation_artifacts == child.planning_artifacts == folder
+    assert child.deferred_work == folder / "deferred-work.md"
+    assert child.sprint_status == folder / "sprint-status.yaml"
+
+
+def test_paths_for_state_refuses_a_chained_run_whose_parent_moved(project_v7):
+    """A live `active_initiative` that no longer names the run's parent refuses
+    with a config error naming the value to restore — never the loaded (other)
+    initiative's paths, nor a child located from them."""
+    paths = bmadconfig.load_paths(project_v7.project, want_tickets=True)
+    with pytest.raises(bmadconfig.BmadConfigError, match="set it back to 'initiative-platform'"):
+        runs.paths_for_state(paths, _chained("initiative-platform"))
+
+
+def test_paths_for_state_refuses_a_child_it_cannot_locate(project_v7):
+    """A child slug that is no folder name is a config error, not a ValueError
+    escaping past every `load_paths` caller's handler."""
+    paths = bmadconfig.load_paths(project_v7.project, want_tickets=True)
+    with pytest.raises(bmadconfig.BmadConfigError, match="cannot locate child initiative"):
+        runs.paths_for_state(paths, _chained(project_v7.initiative, initiative="a/b"))
+
+
+def test_tree_pin_refuses_parent_rooted_paths(project_v7):
+    """`tree_pin` on a chained run handed the parent's own paths (`load_paths`
+    output, not re-rooted) refuses instead of routing the tree through the
+    parent's folder as if it were the child's; so does a folder not named for the
+    child. Ablation (performed): delete the guard and this FAILS."""
+    parent = bmadconfig.load_paths(project_v7.project, want_tickets=True)
+    state = _chained(project_v7.initiative)
+    with pytest.raises(ValueError, match="re-root them with paths_for_state"):
+        runs.tree_pin(state, parent)
+    elsewhere = parent.with_initiative(CHILD)
+    misfiled = dataclasses.replace(elsewhere, initiative_folder=parent.initiative_folder)
+    with pytest.raises(ValueError, match="re-root them with paths_for_state"):
+        runs.tree_pin(state, misfiled)
+    assert runs.tree_pin(state, elsewhere) == (project_v7.initiative, elsewhere.initiative_folder)
+
+
+def test_recorded_tree_pin_pins_a_mount_to_the_child(tmp_path, monkeypatch):
+    """A tree built in a worktree mount pins the chained run's child with no
+    folder — the mount's config names it — and reads no config at all."""
+    monkeypatch.setattr(bmadconfig, "load_paths", lambda *a, **k: pytest.fail("read config"))
+    state = _chained("initiative-platform")
+    assert runs.recorded_tree_pin(state, tmp_path, tmp_path / "wt" / "u1") == (CHILD, None)

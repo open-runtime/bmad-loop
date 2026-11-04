@@ -43,6 +43,7 @@ from .escalation import (
     REVIEW_TIMEOUT_STATUSES,
     Action,
     Decision,
+    UsageLimitPause,
     critical_session_reason,
     decide_dev,
     decide_reverify,
@@ -59,6 +60,8 @@ from .escalation import (
     review_retry_or_exhaust,
     session_failure_reason,
     unresolved_escalation_keys,
+    usage_limit_pause,
+    usage_relaunch,
 )
 from .frontmatter import FrontmatterWriteError, auto_dev_baseline_of
 from .install import dev_primitive_or_default
@@ -292,6 +295,9 @@ class RunPaused(Exception):
         self.reason = reason
         self.stage = stage
         self.story_key = story_key
+        # The usage-limit facts of a pause whose reason is the usage-limit reason
+        # (DW-591), attached by `Engine._escalate_session`; None on every other.
+        self.usage_limit: UsageLimitPause | None = None
 
 
 SpecWriteReason = Literal["salvage", "reconcile", "adoption", "repair"]
@@ -1098,6 +1104,7 @@ class Engine:
             dev_attempt_dispatched=self._dev_attempt_dispatched,
             spec_confine_root=lambda task: self._spec_confine_root(task),
             owned_plan=self._owned_plan_writer(),
+            ledger_rel=lambda: self._ledger_rel(),
         )
 
     def _escalation_pause(
@@ -1280,14 +1287,26 @@ class Engine:
                 if self._owns_signals and self.policy.adapter.cleanup_session_on_finish:
                     self._kill_run_session()
             except RunPaused as pause:
-                self.state.paused_reason = pause.reason
-                self.state.paused_stage = pause.stage
-                self.state.paused_story_key = pause.story_key
+                usage = pause.usage_limit
+                self.state.record_pause(
+                    pause.reason,
+                    pause.stage,
+                    pause.story_key,
+                    reset_at=usage.reset_at if usage is not None else None,
+                    limit_class=usage.limit_class if usage is not None else None,
+                )
+                # Present-only, like `session-end`'s usage-limit fields.
+                pause_extras: dict = {}
+                if self.state.paused_reset_at:
+                    pause_extras["usage_limit_reset_at"] = self.state.paused_reset_at
+                if self.state.paused_limit_class:
+                    pause_extras["usage_limit_class"] = self.state.paused_limit_class
                 self.journal.append(
                     "run-paused",
                     reason=pause.reason,
                     stage=pause.stage,
                     story_key=pause.story_key,
+                    **pause_extras,
                 )
             except RunStopped as stop:
                 if stop.graceful:
@@ -2802,6 +2821,7 @@ class Engine:
                 task.reverify_replayed = ""
                 task.generation += 1
                 task.review_cycle = 0
+                task.review_usage_relaunches = 0  # refunds never exceed review_cycle (#959)
                 task.followup_reviews_spent = 0
                 task.salvage_refile_pending = False
                 self._save()
@@ -2868,9 +2888,16 @@ class Engine:
                         # instead of parking commits made while the run was down.
                         self._accept_current_baseline(task)
                         accepted_baseline = True
-                    self._rollback_or_pause(
-                        task, cause="resolved" if task.rearmed else "stopped", restart=True
-                    )
+                    # After the accept above, which moves the baseline onto the
+                    # bookkeeping commit and so invalidates its record (#772).
+                    added_ledger = self._bookkept_ledger_for_restart(task)
+                    try:
+                        self._rollback_or_pause(
+                            task, cause="resolved" if task.rearmed else "stopped", restart=True
+                        )
+                    finally:
+                        if added_ledger is not None:
+                            self._restore_restart_ledger(task, added_ledger)
                 task.rearmed = False  # past rollback (only reached when not paused)
                 task.phase = Phase.PENDING  # deliberate reset, not a normal transition
                 # F2 (open-runtime fork): `--accept-baseline` moved the recorded
@@ -3405,6 +3432,8 @@ class Engine:
                 wf_extras["usage_limited"] = result.usage_limited
             if result.usage_limit_resets:
                 wf_extras["usage_limit_resets"] = result.usage_limit_resets
+            if result.usage_limit_class:
+                wf_extras["usage_limit_class"] = result.usage_limit_class
             if result.quota_wait_s > 0:
                 wf_extras["quota_wait_s"] = round(result.quota_wait_s, 1)
             self.journal.append(
@@ -3422,19 +3451,21 @@ class Engine:
                     # deferring the story on a transport failure. Non-blocking
                     # workflows keep continuing (journaled only): the next story
                     # session will classify and pause if the outage persists.
-                    self._escalate(
+                    self._escalate_session(
                         task,
                         env_fault_pause_reason(
                             f"blocking workflow {wf.name!r} ({lp.name})", result
                         ),
+                        usage_limit_pause(result),
                     )
                 if result.parked:
                     # Parked on a human prompt (DW-348/DW-350): the adapter withheld
                     # the stall nudge, so the workflow never got a chance to run —
                     # escalate (re-arm restores the budget) instead of deferring.
-                    self._escalate(
+                    self._escalate_session(
                         task,
                         parked_pause_reason(f"blocking workflow {wf.name!r} ({lp.name})", result),
+                        usage_limit_pause(result),
                     )
                 if not result.produced_work:
                     # Never did anything (#727): a deferral would charge the story
@@ -3810,6 +3841,11 @@ class Engine:
         # F6 (open-runtime fork): a retry that resumes the previous conversation
         # keeps the attempt's tree, as a fixable repair does (`feedback`).
         kept_tree = False
+        # A non-fixable rollback below restores the persisted ledger into the tree
+        # the next attempt starts from. Loop-local on purpose: `task.attempt` survives
+        # resume and re-arm, so it cannot tell a retry after rollback from a resumed
+        # first pass.
+        rolled_back = False
         while True:
             replayed = resume_result is not None
             if resume_result is None:
@@ -3913,7 +3949,15 @@ class Engine:
                     seq=task.attempt,
                     preserve_dispatched_spec_snapshot=preserve_chain_snapshot,
                     resume=resume_record,
+                    # #772: a repair keeps the harvested ledger, and a retry after
+                    # rollback starts on the restored one — both dirty, both the
+                    # engine's. A first-pass launch has no engine ledger dirt.
+                    commit_engine_ledger=feedback is not None or rolled_back,
                 )
+                # Consume the rollback's bookkeeping before another attempt can
+                # keep this session's edits for an in-place resume. Those edits
+                # are session-authored, not the earlier rollback's restored ledger.
+                rolled_back = False
             advance(task, Phase.DEV_VERIFY)
             outcome = None
             verified = NO_VERIFY_COMMANDS
@@ -4043,6 +4087,10 @@ class Engine:
                 result_json=result.result_json,
                 already_env_fault=env_fault,
             )
+            if decision.uncharged:
+                # An uncharged usage relaunch (#959): refund this attempt before
+                # the journal and the save below, so both record the same count.
+                task.dev_usage_relaunches += 1
             self._journal_dev_decision(task, result, decision, env_fault=env_fault)
             if decision.action == Action.PROCEED:
                 # DEV_VERIFY + spec_file is not itself proof of acceptance: this
@@ -4074,10 +4122,17 @@ class Engine:
                 # `task.attempt` are known-good for this decision, and it is before
                 # `_rollback_or_pause` can raise `RunPaused` and skip the notice for
                 # exactly the attempt whose loss most needs announcing.
+                if decision.uncharged:
+                    title = (
+                        f"dev relaunch: {task.story_key} (usage limit, relaunch "
+                        f"{task.usage_relaunches}/{self.policy.limits.max_usage_relaunches})"
+                    )
+                else:
+                    title = f"dev retry: {task.story_key} (attempt {task.attempt})"
                 gates.notify(
                     self.policy,
                     self.run_dir,
-                    f"dev retry: {task.story_key} (attempt {task.attempt})",
+                    title,
                     decision.reason.strip() or "dev attempt rejected with no reason recorded",
                 )
                 if outcome is not None and outcome.fixable:
@@ -4105,6 +4160,7 @@ class Engine:
                 else:
                     feedback = None
                     kept_tree = False
+                    rolled_back = True
                     try:
                         self._rollback_or_pause(task)
                     finally:
@@ -4183,7 +4239,7 @@ class Engine:
             ):
                 self._escalate_env(task, decision.reason, site="verify:dev")
             else:
-                self._escalate(task, decision.reason)
+                self._escalate_session(task, decision.reason, decision.usage_limit)
 
     def _journal_dev_decision(
         self, task: StoryTask, result: SessionResult, decision: Decision, *, env_fault: bool
@@ -4212,6 +4268,10 @@ class Engine:
                 # non-completed result to the parked PAUSE.
                 parked=result.parked,
                 parked_evidence=result.parked_evidence,
+                # An uncharged usage relaunch (#959) and the story's running
+                # count of them (dev and review together).
+                uncharged=decision.uncharged,
+                usage_relaunches=task.usage_relaunches,
             )
         else:
             self.journal.append(
@@ -4226,6 +4286,8 @@ class Engine:
                 produced_work=result.produced_work,
                 parked=result.parked,
                 parked_evidence=result.parked_evidence,
+                uncharged=decision.uncharged,
+                usage_relaunches=task.usage_relaunches,
                 env_fault_site=decision.env_site,
             )
 
@@ -4342,7 +4404,12 @@ class Engine:
         # replay branch below skips the re-increment, so no extra budget is
         # burned. resume_result is nulled after it is consumed, so every later
         # iteration falls back to the normal budget guard.
-        while resume_result is not None or task.review_cycle < self.policy.limits.max_review_cycles:
+        # The budget counts charged cycles only: an uncharged usage relaunch
+        # (#959) bumps `review_cycle` for session identity and refunds it.
+        while (
+            resume_result is not None
+            or task.charged_review_cycles < self.policy.limits.max_review_cycles
+        ):
             if resume_result is None:
                 # DW-523: probe before the cycle is charged; a pause here resumes
                 # through the DEV_VERIFY or completed-pass replay arms.
@@ -4386,6 +4453,10 @@ class Engine:
                     seq=task.review_cycle,
                     spec_snapshot=snapshot,
                     resume=review_resume,
+                    # #772: a fresh review follows engine bookkeeping (dev
+                    # harvest, bundle close or reclose, post-fix harvest). A
+                    # resumed reviewer still owns its unfinished ledger edits.
+                    commit_engine_ledger=review_resume is None,
                 )
             advance(task, Phase.REVIEW_VERIFY)
             self._save()
@@ -4403,6 +4474,19 @@ class Engine:
                 result_json=result.result_json,
                 already_env_fault=result.env_fault,
             )
+            if decision.uncharged:
+                # An uncharged usage relaunch (#959): refund this cycle before the
+                # journal, and persist it, so the next pass's budget check and
+                # state.json agree.
+                task.review_usage_relaunches += 1
+                self._save()
+                gates.notify(
+                    self.policy,
+                    self.run_dir,
+                    f"review relaunch: {task.story_key} (usage limit, relaunch "
+                    f"{task.usage_relaunches}/{self.policy.limits.max_usage_relaunches})",
+                    decision.reason,
+                )
             if decision.action != Action.SALVAGE and task.salvage_refile_pending:
                 task.salvage_refile_pending = False
                 self._save()
@@ -4413,7 +4497,11 @@ class Engine:
                 return
             if decision.action == Action.RETRY:
                 self.journal.append(
-                    "review-retry", story_key=task.story_key, reason=decision.reason
+                    "review-retry",
+                    story_key=task.story_key,
+                    reason=decision.reason,
+                    uncharged=decision.uncharged,
+                    usage_relaunches=task.usage_relaunches,
                 )
                 continue
             if decision.action == Action.SALVAGE:
@@ -4440,7 +4528,11 @@ class Engine:
                     self._defer(task, fallback.reason)
                     return
                 self.journal.append(
-                    "review-retry", story_key=task.story_key, reason=fallback.reason
+                    "review-retry",
+                    story_key=task.story_key,
+                    reason=fallback.reason,
+                    uncharged=fallback.uncharged,
+                    usage_relaunches=task.usage_relaunches,
                 )
                 continue
 
@@ -4588,7 +4680,10 @@ class Engine:
                 )
                 if gated.action == Action.PAUSE:
                     self._escalate_decision(task, gated)
-                if outcome.fixable and task.review_cycle < self.policy.limits.max_review_cycles:
+                if (
+                    outcome.fixable
+                    and task.charged_review_cycles < self.policy.limits.max_review_cycles
+                ):
                     # failing verify commands are dev work, not review work: a
                     # re-review of the same tree cannot make them pass. Repair
                     # with the failing output as feedback, then re-review. This
@@ -7350,7 +7445,10 @@ class Engine:
             return self._env_gate_claim(task, decision, claim, role=role)
         if not self.policy.environment.probes:
             return decision
-        charges = decision.action in (Action.RETRY, Action.DEFER) or decision.budget_exhausted
+        # An uncharged usage relaunch (#959) charges nothing, so it never probes.
+        charges = (
+            decision.action in (Action.RETRY, Action.DEFER) and not decision.uncharged
+        ) or decision.budget_exhausted
         if not charges:
             return decision
         site = f"probe:decision:{role}"
@@ -8019,12 +8117,210 @@ class Engine:
             except ValueError:
                 return None, None
 
+    def _commit_engine_ledger(
+        self, task: StoryTask, *, site: str, message: str | None = None
+    ) -> None:
+        """Commit the engine's own uncommitted ledger bookkeeping — that one file,
+        hooks and signing off — so the next session starts on a tree whose only
+        dirt is not the orchestrator's (#772: the build skill's finalization
+        HALTs `blocked` on any leftover change, and the engine's harvests, closes
+        and restores leave the ledger dirty on purpose for `finalize_commit` to
+        squash). It WRITES NO CONTENT: it records bytes the engine already wrote,
+        so the squash still lands the same story commit.
+
+        Best-effort: a git or filesystem fault is journaled
+        (`engine-ledger-commit-failed`), never raised, and the session launches
+        exactly as it did before this existed. Only a run-state save failure
+        propagates, as it does from every `_save()` in the engine — and the one
+        ahead of the commit fails before anything is committed.
+
+        Silent no-op for every ledger git cannot see or that is not dirty: absent,
+        external to the workspace, under the shared ticket store, gitignored
+        (`path_clean` reads clean, and `commit_paths` would RAISE on an ignored
+        operand, so the clean gate is mandatory), or unchanged. A ledger the
+        publication guard refuses is journaled (`engine-ledger-commit-refused`)
+        and left alone.
+
+        `bookkeeping_ledger` is SAVED BEFORE the commit. A record without its
+        commit (a crash between the two) costs at most a stray untracked ledger a
+        later restore declines to unlink; a commit without its record lets a
+        rollback's `reset --hard` delete an added ledger that the restore then
+        never recreates. A stray file beats data loss. A commit that fails or
+        finds nothing to commit rolls the pending entry back."""
+        rel, fault = self._ledger_rel()
+        if fault is not None:
+            self.journal.append(
+                "engine-ledger-commit-failed",
+                story_key=task.story_key,
+                site=site,
+                error=f"ledger scope probe failed: {fault}",
+            )
+            return
+        if rel is None:
+            return
+        ledger = self.workspace.paths.deferred_work
+        if self.workspace.paths.in_shared_store(ledger):
+            return
+        refusal = _publication_refusal(ledger, "ledger")
+        if refusal is not None:
+            cause, detail = refusal
+            if cause == "target-absent":
+                # Nothing there to commit — not a fault, and not the guard's to report.
+                return
+            self.journal.append(
+                "engine-ledger-commit-refused",
+                story_key=task.story_key,
+                site=site,
+                refuse_cause=cause,
+                error=detail,
+            )
+            return
+        root = self.workspace.root
+        try:
+            if verify.path_clean(root, rel):
+                return
+            # The ledger path absent from the baseline's TREE — not membership in
+            # `baseline_untracked`, which misses a ledger a session created itself.
+            added = task.baseline_commit is not None and verify.path_absent_at_revision(
+                root, task.baseline_commit, rel
+            )
+        except (verify.GitError, OSError, RuntimeError) as e:
+            self.journal.append(
+                "engine-ledger-commit-failed",
+                story_key=task.story_key,
+                site=site,
+                error=str(e),
+            )
+            return
+        previous = task.bookkeeping_for_baseline()
+        prior_shas: list[str] = list(previous["shas"]) if previous is not None else []
+        if task.baseline_commit is not None:
+            task.bookkeeping_ledger = {
+                "baseline": task.baseline_commit,
+                # Once any commit in this baseline's record added the ledger, the
+                # ledger stays added relative to that baseline.
+                "added": added or (previous is not None and bool(previous["added"])),
+                "shas": prior_shas,
+            }
+            self._save()
+        error: str
+        try:
+            sha = verify.commit_paths(
+                root,
+                message
+                or f"chore(deferred-work): engine bookkeeping before {site} ({task.story_key})",
+                [ledger],
+                run_hooks=False,
+            )
+        except (verify.GitError, OSError) as e:
+            sha = None
+            error = str(e)
+        else:
+            error = "nothing to commit"
+        if sha is None:
+            if task.baseline_commit is not None:
+                task.bookkeeping_ledger = previous if prior_shas else None
+                self._save()
+            self.journal.append(
+                "engine-ledger-commit-failed",
+                story_key=task.story_key,
+                site=site,
+                error=error,
+            )
+            return
+        if task.bookkeeping_ledger is not None:
+            task.bookkeeping_ledger = {
+                **task.bookkeeping_ledger,
+                "shas": [*prior_shas, sha],
+            }
+            self._save()
+        self.journal.append(
+            "engine-ledger-commit",
+            story_key=task.story_key,
+            site=site,
+            commit=sha,
+            added=added,
+        )
+
+    def _bookkept_ledger_for_restart(self, task: StoryTask) -> str | None:
+        """The ledger text a restart rollback must put back, or None (#772).
+
+        Only for a ledger an engine bookkeeping commit ADDED relative to the live
+        baseline: the commit made a file that was untracked (or absent) at the
+        baseline tracked, so the restart's `reset --hard` deletes it, where before
+        the commit `baseline_untracked` and the artifact-dir shield kept it. A
+        ledger already tracked at baseline needs nothing — the reset republishes
+        its committed bytes, as it always did.
+
+        Read off the tree BEFORE the reset: the whole current text, which is what
+        the untracked file would have kept. Absent or unreadable there (a crash
+        after an earlier restart's reset, or a session that deleted it), the last
+        recorded bookkeeping commit's copy stands in — the record is persisted
+        before each commit, so that sha holds the engine's last known ledger. A
+        probe fault on that fallback is journaled (`ledger-restart-capture-failed`)
+        and answers None: nothing to restore beats restoring bytes nobody can vouch
+        for."""
+        record = task.bookkeeping_for_baseline()
+        if record is None or not record["added"]:
+            return None
+        observed = self._ledger_text(site="ledger-restart-capture", story_key=task.story_key)
+        if isinstance(observed, str):
+            return observed
+        shas: list[str] = list(record["shas"])
+        rel, fault = self._ledger_rel()
+        if not shas or rel is None:
+            if fault is not None:
+                self.journal.append(
+                    "ledger-restart-capture-failed",
+                    story_key=task.story_key,
+                    error=f"ledger scope probe failed: {fault}",
+                )
+            return None
+        try:
+            blob = verify.worktree_file_bytes_at_revision(self.workspace.root, shas[-1], rel)
+            if blob is None:
+                return None
+            return blob.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+        except (verify.GitError, OSError, RuntimeError, UnicodeDecodeError) as e:
+            self.journal.append(
+                "ledger-restart-capture-failed",
+                story_key=task.story_key,
+                error=str(e),
+            )
+            return None
+
+    def _restore_restart_ledger(self, task: StoryTask, text: str) -> None:
+        """Republish :meth:`_bookkept_ledger_for_restart`'s capture after the restart
+        rollback, through :meth:`_restore_ledger`'s compare-and-set: the reset's own
+        deletion is the BASELINE anchor (the record makes the file git's to
+        restore), a rollback that paused without resetting reads back the capture
+        and writes nothing, and anything else is a journaled skip.
+
+        Runs in the rollback's ``finally``, so a write or lock fault is journaled
+        (`ledger-restore-failed`) rather than raised — it must not replace an
+        in-flight ``RunPaused`` or reset fault."""
+        try:
+            self._restore_ledger(task, text)
+        except (OSError, StateRootError) as e:
+            self.journal.append(
+                "ledger-restore-failed",
+                story_key=task.story_key,
+                error=f"{type(e).__name__}: {e}",
+            )
+
     def _ledger_is_gits_to_restore(self, task: StoryTask) -> bool:
         """Whether git owns the active ledger and reset is responsible for it.
 
         Probe failures degrade toward keeping the file: uncertainty must never
         authorize deleting a tracked ledger that ``reset --hard`` restored.
         """
+        record = task.bookkeeping_for_baseline()
+        if record is not None and record["added"]:
+            # An engine bookkeeping commit (#772) put a ledger ABSENT from the
+            # baseline into HEAD. `reset --hard` to that baseline deletes it, so the
+            # post-reset `path_tracked` probe below would read False and the restore
+            # would skip — losing the snapshot. The reset owns this file.
+            return True
         rel, fault = self._ledger_rel()
         if fault is not None:
             self.journal.append(
@@ -8385,7 +8681,13 @@ class Engine:
         ``tests/test_stories_engine.py::test_accepted_plan_halt_observation_excludes_the_nested_ledger_under_the_monorepo_shape``,
         and ``tests/test_sweep.py::test_bundle_gate_excludes_the_nested_ledger_under_the_monorepo_shape``.
         """
-        if not task.harvest_wrote_ledger or task.ledger_changed_before_harvest:
+        record = task.bookkeeping_for_baseline()
+        # An engine bookkeeping commit (#772) that ADDED the ledger makes the whole
+        # file read as added since baseline — engine bytes, not session work, so a
+        # repair that wrote no code must not pass on them. A ledger already tracked
+        # at baseline needs nothing: its committed and dirty copies diff the same.
+        bookkept_add = record is not None and bool(record["added"])
+        if task.ledger_changed_before_harvest or not (task.harvest_wrote_ledger or bookkept_add):
             return ()
         paths = self.workspace.paths
         root = paths.repo_root
@@ -8813,15 +9115,25 @@ class Engine:
             extras["parked"] = True
             if result.parked_evidence:
                 extras["parked_evidence"] = result.parked_evidence
-        # usage-limit diagnosis (#610): same present-only convention — the
-        # visible-pane line the adapter saw live, which exempted the env-fault
-        # verdict from the token veto.
+        # usage-limit diagnosis (#610): same present-only convention — the line
+        # the adapter saw live (claude's visible pane, or opencode's provider-error
+        # frame for this session, DW-592), which exempted the env-fault verdict
+        # from the token veto.
         if result.usage_limited:
             extras["usage_limited"] = result.usage_limited
         # the limit's reset, parsed from the same line (#610): ISO-8601, or the
         # raw clause when it did not resolve.
         if result.usage_limit_resets:
             extras["usage_limit_resets"] = result.usage_limit_resets
+        # which usage-limit list matched (DW-591): `blocked` or `wait`,
+        # present-only like the reset.
+        if result.usage_limit_class:
+            extras["usage_limit_class"] = result.usage_limit_class
+        # the API error a Claude Code `StopFailure` hook reported (#865):
+        # present-only, so a grep finds exactly the sessions whose last turn
+        # ended on one that no later Stop cleared.
+        if result.stop_failure:
+            extras["stop_failure"] = result.stop_failure
         # usage-limit quota wait (DW-396): present-only — the seconds the session
         # sat behind a usage-window reset with its timeout frozen.
         if result.quota_wait_s > 0:
@@ -8846,6 +9158,17 @@ class Engine:
         # exactly the sessions whose `tokens` is a lower bound.
         if usage is not None and usage.unread:
             extras["usage_unread"] = list(usage.unread)
+        # observed models (#859): the distinct model ids the parser saw, main
+        # session first. Three states stay distinct: `models` = observed,
+        # `models_unresolved: true` = tracked but none found, both absent = this
+        # CLI's parser has no model source (or no usage was read). Only this
+        # normal session-end row carries them; the raise-path and aborted rows
+        # have no usage, so they carry neither, matching their `tokens=None`.
+        if usage is not None and usage.models is not None:
+            if usage.models:
+                extras["models"] = list(usage.models)
+            else:
+                extras["models_unresolved"] = True
         return extras
 
     @staticmethod
@@ -8873,6 +9196,8 @@ class Engine:
         preserve_dispatched_spec_snapshot: bool = False,
         prelaunch_validator: Callable[[], None] | None = None,
         resume: SessionRecord | None = None,
+        *,
+        commit_engine_ledger: bool = False,
     ) -> SessionResult:
         # A session may change the environment a probe pass vouched for, so no
         # pass survives a launch (DW-523).
@@ -8936,6 +9261,16 @@ class Engine:
             # them so the generic adapter can stamp them onto the synthesized
             # result.json, keeping verify_dev_bundle's dw_ids cross-check live.
             env["BMAD_LOOP_DW_IDS"] = ",".join(task.dw_ids)
+        # Usage relaunch (#959) applies to primary story sessions only — dev
+        # (including the fix phase) and review. Injected workflow, sweep-triage
+        # and retro sessions have no relaunch arm.
+        relaunch_session = label is None and role in ("dev", "review")
+        relaunch_mode = self.policy.limits.usage_limit_action == "relaunch"
+        if relaunch_session and task.usage_relaunches > 0:
+            # The story's uncharged usage relaunches so far: the rotation signal
+            # a wrapper `binary` or `pre_session` plugin keys an account switch on.
+            # Engine-injected, so not registered in `envvars.py`.
+            env["BMAD_LOOP_USAGE_RELAUNCH"] = str(task.usage_relaunches)
         if role == "dev" and not self.policy.review.enabled:
             # signals that the orchestrator will run no follow-up review session.
             # bmad-build-auto always self-reviews inline (step-03 → step-04) and
@@ -9047,6 +9382,14 @@ class Engine:
         # after every executable session hook and every prompt/snapshot repair,
         # but before either the session-start record or adapter launch.  The
         # default keeps all existing callers byte-for-byte inert.
+        if commit_engine_ledger:
+            # #772: the build skill's finalization HALTs `blocked` on any leftover
+            # change, and the engine's harvests, closes and restores leave the ledger
+            # dirty on purpose. Commit that one file (hooks and signing off) after
+            # every session hook, so plugin `pre_*_session` ledger writes ride along,
+            # and only here on the live launch path: the veto return above and the
+            # callers' replay arms launch nothing, so they commit nothing.
+            self._commit_engine_ledger(task, site=role)
         if prelaunch_validator is not None:
             prelaunch_validator()
         spec = SessionSpec(
@@ -9077,6 +9420,15 @@ class Engine:
             # usage-limit quota wait cap (DW-396): the timeout freezes while the
             # CLI waits out a usage-window reset, for at most this long in total.
             quota_wait_max_s=float(self.policy.limits.quota_wait_max_min * 60),
+            # usage relaunch mode (#959), primary story sessions only: whether a
+            # usage limit relaunches this session, and whether relaunch budget is
+            # left for it (the adapter exits at once rather than waiting).
+            usage_relaunch_mode=relaunch_session and relaunch_mode,
+            usage_relaunch_left=(
+                relaunch_session
+                and relaunch_mode
+                and task.usage_relaunches < self.policy.limits.max_usage_relaunches
+            ),
             # Launch-state snapshot of a review session's spec (#276 M1); None for
             # every other session and on a crash-resume (process-transient).
             spec_snapshot=spec_snapshot,
@@ -9874,7 +10226,9 @@ class Engine:
         # Empty whenever the last attempt completed: the verify failure `reason`
         # already describes that, and the callers' own wording is the honest one.
         session_failure = ""
-        while task.attempt < self.policy.limits.max_dev_attempts:
+        # Charged attempts only: an uncharged usage relaunch (#959) bumps
+        # `attempt` for session identity and refunds it.
+        while task.charged_attempts < self.policy.limits.max_dev_attempts:
             preserve_chain_snapshot = self._preserves_dispatched_spec_snapshot_for_repair(task)
             task.attempt += 1
             feedback = self._write_feedback(task, reason)
@@ -9894,6 +10248,8 @@ class Engine:
                 seq=task.attempt,
                 session_stage="pre_fix_session",
                 preserve_dispatched_spec_snapshot=preserve_chain_snapshot,
+                # #772: the repair inherits the review leg's harvested ledger.
+                commit_engine_ledger=True,
             )
             advance(task, Phase.DEV_VERIFY)
             outcome = None
@@ -9955,6 +10311,17 @@ class Engine:
                 verification_stage=verified.stage,
                 verification_sequence=verified.sequence,
             )
+            critical_reason = critical_session_reason("fix", result.result_json)
+            # relaunch mode (#959): a usage-limited repair is relaunched uncharged,
+            # ahead of the env_fault/parked escalates below that would pause this
+            # same result. Never over a CRITICAL, which outranks it as in
+            # `decide_dev`. Refunded before the journal so `fix-decision` and
+            # state.json record the same count.
+            relaunch = (
+                usage_relaunch(task, result, self.policy) if critical_reason is None else None
+            )
+            if relaunch is not None:
+                task.dev_usage_relaunches += 1
             self.journal.append(
                 "fix-decision",
                 story_key=task.story_key,
@@ -9971,6 +10338,9 @@ class Engine:
                 parked_evidence=result.parked_evidence,
                 # No work at all (#727): what routed it to the no-work escalate below.
                 produced_work=result.produced_work,
+                # An uncharged usage relaunch (#959) and the story's running count.
+                uncharged=relaunch is not None,
+                usage_relaunches=task.usage_relaunches,
             )
             # CRITICAL routing, deliberately AFTER the emit and the journal record
             # above, and deliberately AHEAD of the env-fault/retryable arms below.
@@ -9985,24 +10355,39 @@ class Engine:
             # session reporting the same thing fired one. The hook is named for
             # the verification, the verification ran, and a plugin correlating
             # verify passes cannot have half of them silently withheld.
-            critical_reason = critical_session_reason("fix", result.result_json)
             if critical_reason is not None:
                 self._escalate(task, critical_reason)
+            if relaunch is not None:
+                # Relaunch the repair the way a failed repair continues: the tree
+                # is kept and the next pass gets the same feedback. Uncharged, so
+                # no environment probe and no end-of-loop budget gate.
+                self._save()
+                gates.notify(
+                    self.policy,
+                    self.run_dir,
+                    f"fix relaunch: {task.story_key} (usage limit, relaunch "
+                    f"{task.usage_relaunches}/{self.policy.limits.max_usage_relaunches})",
+                    relaunch.reason,
+                )
+                continue
             if result.status != "completed" and result.env_fault:
                 # A fix session whose CLI lost its API connection (#194) did no
                 # repair work — another attempt cannot fix the run environment, so
                 # pause (re-arm restores the budget) instead of burning the dev
                 # budget. A completed-but-env-fault-grade verify failure is handled
                 # by the retryable check just below (its own escalate path).
-                self._escalate(
+                self._escalate_session(
                     task,
                     env_fault_pause_reason("fix", result),
+                    usage_limit_pause(result),
                 )
             if result.status != "completed" and result.parked:
                 # Parked on a human prompt (DW-348/DW-350): the adapter withheld the
                 # stall nudge, so the repair never ran — another attempt would
                 # relaunch into the same prompt. Pause (re-arm restores the budget).
-                self._escalate(task, parked_pause_reason("fix", result))
+                self._escalate_session(
+                    task, parked_pause_reason("fix", result), usage_limit_pause(result)
+                )
             if result.status != "completed" and not result.produced_work:
                 # Never did anything (#727): another attempt would launch into the
                 # same wall. Pause (re-arm restores the budget), after env_fault
@@ -10040,7 +10425,7 @@ class Engine:
                 return Decision(Action.PROCEED)
             # A failed repair is charged — the next attempt, or the budget-spent
             # DEFER below — so re-probe the environment first (DW-523).
-            budget_left = task.attempt < self.policy.limits.max_dev_attempts
+            budget_left = task.charged_attempts < self.policy.limits.max_dev_attempts
             gated = self._env_gate_decision(
                 task,
                 Decision(
@@ -10163,11 +10548,16 @@ class Engine:
 
         A bare reason leaves the operator to find the rolled-back work themselves
         (the reporter used `git log --all`). In-place, the auto-rollback parked the
-        attempt on `task.preserve_ref`, which fast-forwards straight back. Isolated,
+        attempt on `task.preserve_ref`, and one `git merge --no-edit <ref>` takes it
+        back. Not `--ff-only`: the reset target does not stay the tip — the defer's
+        own ledger restore commit (#772) lands on the baseline right after, and
+        later units commit on top — so the parked ref has diverged from the branch
+        by the time anyone reads the notice. A plain merge still fast-forwards
+        when nothing moved. Isolated,
         *this* defer rolls nothing back — a kept-failed unit's branch stays mounted —
         but an EARLIER attempt's in-worktree dev-retry rollback parks on the same
         shared refs, so `preserve_ref` can be set here too. Both are named; the
-        isolated arm deliberately prints no `merge --ff-only` line, because that ref
+        isolated arm deliberately prints no merge line, because that ref
         is not fast-forwardable from either tree (the unit branch has since moved on
         with the deferred attempt's commits, and fast-forwarding it into the
         operator's checkout would land a *discarded* attempt on their branch).
@@ -10185,7 +10575,7 @@ class Engine:
         Selects on the same pair as `_defer` — live isolation OR a recorded mount —
         not on live policy alone. A run flipped `"worktree" -> "none"` while paused
         reaches the defer with the workspace swapped onto its mount, so the in-place
-        arm would advertise `git -C <mount> merge --ff-only` against a directory
+        arm would advertise `git -C <mount> merge` against a directory
         `_integrate_unit` is about to delete (`keep_failed` off), and hide the kept
         branch when it is on."""
         if self._isolated or task.worktree_path:
@@ -10201,7 +10591,7 @@ class Engine:
         if not task.preserve_ref:
             return ""
         recover = (
-            f'; recover with `git -C "{self.workspace.root}" merge --ff-only {task.preserve_ref}`'
+            f'; recover with `git -C "{self.workspace.root}" merge --no-edit {task.preserve_ref}`'
         )
         if task.preserve_partial:
             return (
@@ -10350,6 +10740,21 @@ class Engine:
             # Last, so a stash fault after the reset cannot cost the ledger repair
             # above: the snapshot it restores from exists only in memory.
             self._finish_deferred_stash(task, staged)
+            if snapshot is not None:
+                # The restore above left the ledger dirty in the MAIN checkout, and
+                # nothing will squash it now that this unit is terminal: the next
+                # unit's sessions would start on the engine's dirt and the build
+                # skill's finalization HALTs on any leftover change (#772), as does
+                # the run-end sweep's clean-tree gate. Commit that one file, hooks
+                # off. It persists on the target branch like the other ledger chore
+                # commits; best-effort and journaled, never raised.
+                self._commit_engine_ledger(
+                    task,
+                    site="defer",
+                    message=(
+                        "chore(deferred-work): restore ledger after deferring " f"{task.story_key}"
+                    ),
+                )
         self._record_defer(task, reason)
 
     def _restore_defer_ledger(self, task: StoryTask, snapshot: str) -> None:
@@ -11639,11 +12044,27 @@ class Engine:
 
     def _escalate_decision(self, task: StoryTask, decision: Decision) -> None:
         """Escalate a PAUSE decision, recording its ``env_site`` when the
-        environment seam (:meth:`_env_gate_decision`) produced it."""
+        environment seam (:meth:`_env_gate_decision`) produced it, else its
+        usage-limit facts (:meth:`_escalate_session`)."""
         if decision.env_site is not None:
             self._escalate_env(task, decision.reason, site=decision.env_site)
         else:
-            self._escalate(task, decision.reason)
+            self._escalate_session(task, decision.reason, decision.usage_limit)
+
+    def _escalate_session(
+        self, task: StoryTask, reason: str, usage_limit: UsageLimitPause | None
+    ) -> None:
+        """Escalate a pause whose reason came from a session result, attaching
+        that result's usage-limit facts (``escalation.usage_limit_pause``, None
+        unless the reason is the usage-limit reason) to the ``RunPaused`` so
+        ``run()`` records them with the pause (DW-591). Attached on the way out
+        rather than threaded through ``_escalate``, so the sweep engine's
+        override keeps its signature."""
+        try:
+            self._escalate(task, reason)
+        except RunPaused as pause:
+            pause.usage_limit = usage_limit
+            raise
 
     def _record_sweep_refusal(self, trigger: str, reason: str) -> None:
         """Record, durably, that this trigger's auto-sweep did not deliver.

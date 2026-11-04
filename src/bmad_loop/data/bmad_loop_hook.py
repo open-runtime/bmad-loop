@@ -8,8 +8,13 @@ orchestrator only ever sees canonical events. Payload keys vary too: snake_case
 (claude/codex), conversation_id (cursor), or camelCase (copilot's sessionId/
 transcriptPath, agy's conversationId/transcriptPath — protojson encoding); the
 field extraction below tries each. agy alone carries no cwd, sending the
-workspacePaths list instead. Reads the hook payload
-from stdin and writes one event file
+workspacePaths list instead, and alone sends `fullyIdle`, forwarded as
+`fully_idle` only when it is a boolean. Claude Code's StopFailure payload
+carries the API error that ended the turn: its `error`, `error_details` and
+`last_assistant_message` are forwarded as `stop_error`, `stop_error_details` and
+`stop_message`, each only when it is a string and cut to RELAY_TEXT_MAX
+characters. A payload's `model` (Claude's SessionStart, Codex on every hook) is
+forwarded the same way, only when it is a non-empty string. Reads the hook payload from stdin and writes one event file
 into the orchestrator's events directory. No-ops (exit 0) unless the session was
 spawned by bmad-loop (detected via env vars set on the tmux window), so
 normal interactive sessions are unaffected.
@@ -17,10 +22,12 @@ normal interactive sessions are unaffected.
 Where that directory is: $BMAD_LOOP_EVENTS_DIR when the orchestrator names one,
 else the legacy $BMAD_LOOP_RUN_DIR/events. The channel moved out of the project
 tree in #494 so a branch switch or a worktree mount cannot take a live run's
-control plane away, and this script is COPIED into the target project at init
-time — so an upgraded orchestrator regularly drives sessions whose installed
-copy is this file's older self, which knows only the legacy path. That pairing
-is what the orchestrator's own dual poll (signals.SignalWatcher) covers.
+control plane away, and older inits COPIED this script into the target project
+(init now registers `bmad-loop relay <Event>` and recognizes a copied-script
+registration only as legacy) — so an upgraded orchestrator can still drive
+sessions whose installed copy is this file's older self, which knows only the
+legacy path. That pairing is what the orchestrator's own dual poll
+(signals.SignalWatcher) covers.
 
 $BMAD_LOOP_EVENTS_DIR is deliberately NOT part of the no-op detector above: the
 mirror-image skew — an older orchestrator that sets only RUN_DIR/TASK_ID driving
@@ -140,6 +147,40 @@ def _hcom_fields(environ):
     if isinstance(room, str) and room:
         fields["hcom_dir"] = room
     return fields
+
+
+def _fully_idle(payload):
+    # An agy Stop payload's `fullyIdle` (DW-548): false when the parent only
+    # yielded to a foreground subagent, true at the real turn end. Only a JSON
+    # boolean is forwarded, and the key is written only then, so every other
+    # CLI's event stays unchanged.
+    value = payload.get("fullyIdle")
+    return value if isinstance(value, bool) else None
+
+
+# Longest string a relay forwards from a free-text payload field (#865): enough
+# for an API error's rendered text, small enough that a runaway value cannot
+# bloat every event file the orchestrator reads.
+RELAY_TEXT_MAX = 2000
+
+
+def _bounded_text(payload, key):
+    # A free-text payload field, forwarded only when it is a string and cut to
+    # RELAY_TEXT_MAX characters; anything else reads as absent (None), so the
+    # caller writes the key only when there is text to carry.
+    value = payload.get(key)
+    return value[:RELAY_TEXT_MAX] if isinstance(value, str) else None
+
+
+# A StopFailure payload's free-text fields (#865), as (event key, payload key):
+# Claude Code sends `error` (the failure class the profile maps onto an action),
+# optional `error_details` and `last_assistant_message` (the rendered API error).
+# Each is written only when present, so every other event stays unchanged.
+_STOP_FAILURE_FIELDS = (
+    ("stop_error", "error"),
+    ("stop_error_details", "error_details"),
+    ("stop_message", "last_assistant_message"),
+)
 
 
 # How long after the launched CLI the rest of its launch chain may start
@@ -481,6 +522,21 @@ def main() -> int:
         # a filter — the orchestrator decides what a "mismatch" means.
         "lineage": _lineage(event_name, ("bmad_loop_hook.py",)),
     }
+    # Only when the payload carries a boolean `fullyIdle` (agy, DW-548): a Stop
+    # with false is a subagent yield, not a turn end. Absent for every other CLI.
+    fully_idle = _fully_idle(payload)
+    if fully_idle is not None:
+        event["fully_idle"] = fully_idle
+    for event_key, payload_key in _STOP_FAILURE_FIELDS:
+        text = _bounded_text(payload, payload_key)
+        if text is not None:
+            event[event_key] = text
+    # The model the CLI reports on its hook payload (#859): Claude's SessionStart,
+    # Codex on every hook. Only when it is a non-empty string, so every other
+    # event stays unchanged.
+    model = _bounded_text(payload, "model")
+    if model:
+        event["model"] = model
     # Only when set, so a readable payload's event is unchanged.
     if payload_error:
         event["payload_error"] = payload_error

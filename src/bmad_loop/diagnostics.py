@@ -304,6 +304,22 @@ _JOURNAL_KIND_ALIAS_FIELDS: dict[str, dict[str, str]] = {
     "ticket-refine-pause": {"ref": "ticket"},
     "ticket-pick-halt": {"ref": "ticket"},
     "ticket-story-approved": {"ref": "ticket"},
+    # A BMAD v7 initiative slug (the parent's and the closed child's folder names):
+    # the customer's initiative name, identifier-shaped, aliased in its own
+    # namespace so one initiative gets one alias. Kind-scoped: `parent` and `slug`
+    # are generic names.
+    "initiative-mark": {"parent": "initiative", "slug": "initiative"},
+    # `cli._drive_initiative_chain`: the parent and the children it switches
+    # between, in the same `initiative` namespace.
+    "initiative-chain-next": {
+        "parent": "initiative",
+        "from_child": "initiative",
+        "to_child": "initiative",
+    },
+    "initiative-chain-end": {"parent": "initiative"},
+    "initiative-chain": {"parent": "initiative", "previous_child": "initiative"},
+    # `cli._close_drained_children`: a drained child left open, and its parent.
+    "initiative-close-skipped": {"parent": "initiative", "slug": "initiative"},
 }
 # Namespaces whose journalled value arrives in more than one shape and must be
 # reduced to its basename before it is aliased. `spec` is one: engine.py's
@@ -492,6 +508,17 @@ _JOURNAL_KIND_KEYLIST_FIELDS: dict[str, dict[str, str]] = {
     # ship verbatim, `scrub_json` being the identity on a list of
     # identifier-shaped strings.
     "sweep-bundle-dwids-adopted": {"previous_dw_ids": "dw"},
+    # `cli._drive_initiative_chain`: child initiative slugs passed over, still
+    # waiting on a prerequisite (`waiting`, and per prerequisite `waiting_child`),
+    # or waited on (`waiting_on`), aliased in the `initiative` namespace the
+    # kind-scoped `parent`/`*_child` rows use.
+    "initiative-chain-next": {"passed_over": "initiative"},
+    "initiative-chain-end": {
+        "passed_over": "initiative",
+        "waiting": "initiative",
+        "waiting_child": "initiative",
+        "waiting_on": "initiative",
+    },
 }
 _JOURNAL_KIND_COUNTLIST_FIELDS: dict[str, frozenset[str]] = {
     "merge-preflight-refused": frozenset({"tolerated"}),
@@ -590,11 +617,37 @@ _JOURNAL_KIND_SCHEMAS: dict[str, frozenset[str]] = {
     # DW-246/250. `dw_ids` is a `_JOURNAL_KEYLIST_FIELDS` name and aliases before
     # this table is consulted; named for the same completeness as `commit` above.
     "sweep-ledger-commit-withheld": frozenset({"message", "file", "reason", "dw_ids"}),
+    # #772: the engine's hooks-off commit of its own ledger bookkeeping before a
+    # session. `story_key` and `commit` alias, `error` drops; `site` is the closed
+    # session role (or `defer`), `added` a bare boolean, `refuse_cause` the closed
+    # `verify.unpublishable_target` enum.
+    "engine-ledger-commit": frozenset({"story_key", "site", "commit", "added"}),
+    "engine-ledger-commit-failed": frozenset({"story_key", "site", "error"}),
+    "engine-ledger-commit-refused": frozenset({"story_key", "site", "refuse_cause", "error"}),
     "sweep-repeat-done": frozenset({"cycles", "reason", "stop_cause"}),
     # DW-337. Both producers (`_cycle`'s dispatch gate and `_loop`'s in-flight
     # recovery withhold) write `cycle` and `bundles_not_run`; `reason` is a DROP
     # field and `story_keys` a `_JOURNAL_KEYLIST_FIELDS` name, both reached first.
     "sweep-bundles-withheld": frozenset({"cycle", "bundles_not_run", "reason", "story_keys"}),
+    # `tickettree.TicketTree.mark_initiative_done`: `file` is the child initiative
+    # file's absolute host path, which the by-name benign `file` (a code-constant
+    # basename elsewhere) would ship through `scrub_json`; left off the schema, it
+    # collapses to `file_present`. `before`, `after` and `outcome` are closed
+    # status/outcome tokens; `parent`/`slug` are kind-aliased, which runs first.
+    "initiative-mark": frozenset({"before", "after", "outcome"}),
+    # `cli._drive_initiative_chain`: `passed_over_why` holds closed pass-over
+    # tokens (`no-folder`, `drained`), `end` a closed chain-end token,
+    # `waiting_on_status` closed prerequisite-status tokens (an initiative status,
+    # `open`, `no-folder`, `?`), and `previous_run` a run id; the slugs are
+    # kind-aliased or kind-keylisted, which runs first, and `error` is dropped by
+    # name. `initiative-close-skipped`'s `why` is a closed skip token (`run-live`,
+    # `run-unfinished`, `runs-unread`, `work-left`, `store-refused`,
+    # `uncommitted-edit`) and `blocking_run` a run id (or empty); `detail` is
+    # dropped by name.
+    "initiative-chain-next": frozenset({"passed_over_why"}),
+    "initiative-chain-end": frozenset({"end", "passed_over_why", "waiting_on_status"}),
+    "initiative-chain": frozenset({"previous_run"}),
+    "initiative-close-skipped": frozenset({"why", "blocking_run"}),
 }
 
 # Policy keys whose values can carry secrets/paths/free text. Dropped or reduced
@@ -1066,6 +1119,26 @@ def _reserved_output_names(
     return frozenset(generated)
 
 
+# A model id as the coding CLIs report it: `claude-opus-4-6[1m]`,
+# `anthropic/claude-sonnet-4-5`, `gpt-5.5-codex`, `models/gemini-3-pro@001`.
+# Starts alphanumeric, so an absolute path (`/home/…`) never matches.
+_MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/\[\]-]{0,127}$")
+_REDACTED_STR = "<redacted:str>"
+
+
+def _scrub_model_id(value: object) -> str:
+    """`value` verbatim while it is a model-id-shaped string that does not look
+    like a credential, else `<redacted:str>`. Shared by every journal field that
+    carries an observed model id."""
+    if (
+        isinstance(value, str)
+        and _MODEL_ID_RE.fullmatch(value)
+        and not sanitize.looks_like_secret(value)
+    ):
+        return value
+    return _REDACTED_STR
+
+
 def _scrub_entry(
     entry: dict,
     pseudo: sanitize.Pseudonymizer,
@@ -1155,6 +1228,15 @@ def _scrub_entry(
             # Kept only while identifier-shaped, so a label that somehow still
             # carries a path or prose never ships.
             out[k] = v if isinstance(v, str) and sanitize.looks_like_identifier(v) else None
+        elif kind == "session-end" and k == "models":
+            # #859: observed model ids. `scrub_json` would blank every
+            # `provider/model` (opencode) and `…[1m]` (claude) id, because `/`
+            # and brackets fail `looks_like_identifier`; keep each element that
+            # is model-id shaped, redact the rest one by one.
+            out[k] = [_scrub_model_id(each) for each in v] if isinstance(v, list) else _REDACTED_STR
+        elif kind == "session-model" and k == "model":
+            # #859: the hook-reported launch model, one id of the same shapes.
+            out[k] = _scrub_model_id(v)
         elif declared is not None and k not in declared and k not in SELF_MINTED_FIELDS:
             # A kind with a declared schema (`_JOURNAL_KIND_SCHEMAS`) replaces the
             # `scrub_json` fallback with a fail-closed one, because on such a kind an
@@ -1536,6 +1618,10 @@ def render_markdown(
                 # `file` names which file, `reason` collapses to presence.
                 "sweep-ledger-commit-withheld",
                 "sweep-repeat-done",
+                # #772: the engine's own pre-session ledger bookkeeping commits.
+                "engine-ledger-commit",
+                "engine-ledger-commit-failed",
+                "engine-ledger-commit-refused",
             }
         ]
         if sweep_entries:

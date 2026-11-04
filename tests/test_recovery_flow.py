@@ -305,12 +305,6 @@ def test_owned_spec_restore_validates_missing_target_spelling_before_write(
     refuse_to_resolve(monkeypatch, spec, error=resolve_fault)
     monkeypatch.setattr(
         recovery_flow,
-        "atomic_write_bytes_confined",
-        lambda path, *_args, **_kwargs: writes.append(path),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        recovery_flow,
         "atomic_write_bytes_at",
         lambda _fd, path, *_args, **_kwargs: writes.append(Path(path)),
     )
@@ -548,6 +542,38 @@ def test_owned_spec_restore_detects_parent_swap_after_first_callback_check(tmp_p
     assert probes == 2
     assert victim.read_bytes() == b"external victim"
     assert (moved / spec.name).read_bytes() == b"snapshot bytes"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="socket substitution is POSIX-only")
+@requires_descriptor_restoration
+def test_owned_spec_socket_swap_before_read(tmp_path, monkeypatch):
+    """A socket planted between stat and open is typed authority loss.
+
+    On Darwin, removing EOPNOTSUPP from read_target_at makes the raw OSError
+    escape instead of the recovery boundary's actionable authority error.
+    """
+    spec = tmp_path.resolve() / "owned.md"
+    spec.write_bytes(b"operator bytes")
+    real_open = recovery_flow.open_at
+    swapped = False
+
+    with socket.socket(socket.AF_UNIX) as listener:
+
+        def swap_before_open(parent_fd, name, flags, *args, **kwargs):
+            nonlocal swapped
+            if name == spec.name and not swapped:
+                swapped = True
+                spec.unlink()
+                listener.bind(str(spec))
+            return real_open(parent_fd, name, flags, *args, **kwargs)
+
+        monkeypatch.setattr(recovery_flow, "open_at", swap_before_open)
+
+        with pytest.raises(_OwnedSpecAuthorityError, match="became unsafe"):
+            RecoveryFlow._restore_attempt_owned_spec_bytes(spec, b"snapshot bytes")
+
+    assert swapped
+    assert stat.S_ISSOCK(spec.lstat().st_mode)
 
 
 @pytest.mark.skipif(
@@ -4049,7 +4075,7 @@ def test_dirty_preserve_ref_wins_and_subsumes_the_commits_branch(project):
     `attempt-preserve/*` branch and the still-dirty tree on a dirty snapshot. The
     dirty ref is the one `preserve_ref` keeps, because it is committed parented at
     the attempt's HEAD and therefore already contains the branch — so the single
-    `git merge --ff-only <preserve_ref>` the defer notice prints recovers the
+    `git merge --no-edit <preserve_ref>` the defer notice prints recovers the
     whole attempt, not half of it."""
     repo = project.project
     ws = Workspace.default(project)
@@ -4111,7 +4137,7 @@ def test_snapshot_failure_leaves_a_commits_only_ref_flagged_partial(project, mon
     re-drive the reset runs anyway. `preserve_ref` then names the commits branch
     alone, so the whole-attempt promise no longer holds — `preserve_partial` records
     that, and the defer notice downgrades its claim instead of telling the operator
-    a `merge --ff-only` restores work the reset just destroyed.
+    a `merge` restores work the reset just destroyed.
 
     Since #340 a *plain* rollback refuses this reset, so the re-drive
     (`cause="resolved"`, contractually pause-free) is the surviving path where the
@@ -4142,7 +4168,7 @@ def test_snapshot_failure_leaves_a_commits_only_ref_flagged_partial(project, mon
     # why it matters: the reset ran regardless, so the tree is back at baseline and
     # the ref the notice names carries the committed half ONLY — the uncommitted
     # edit survives nowhere, which is exactly what the un-downgraded notice's
-    # `merge --ff-only` would have implied it could restore
+    # `merge` would have implied it could restore
     assert "committed" not in (repo / "src.txt").read_text()
     assert git(repo, "show", f"{task.preserve_ref}:src.txt") == "committed"
 
@@ -4638,6 +4664,9 @@ def test_pause_stopped_wording_no_commits(project, tmp_path):
 
 
 def test_pause_committed_wording_names_at_risk_commits(project, tmp_path):
+    """Shape (c), committed work above the baseline, names the at-risk commits
+    and (DW-371) offers `resume --accept-baseline` for commits that are the
+    operator's own."""
     repo = project.project
     ws = Workspace.default(project)
     flow = _make_flow(workspace=ws, run_dir=tmp_path)
@@ -4652,6 +4681,7 @@ def test_pause_committed_wording_names_at_risk_commits(project, tmp_path):
     reason = excinfo.value.reason
     assert "committed work above its baseline" in reason
     assert "do NOT reset before checking" in reason
+    assert "bmad-loop resume run-1 --accept-baseline" in reason
 
 
 def test_pause_preserve_failed_wording(project, tmp_path):
@@ -4663,20 +4693,6 @@ def test_pause_preserve_failed_wording(project, tmp_path):
         flow.pause_for_manual_recovery(task, task.baseline_commit, preserve_failed=True)
 
     assert "could not be auto-preserved" in excinfo.value.reason
-
-
-def test_pause_committed_wording_offers_accept_baseline(project, tmp_path):
-    """DW-371: shape (c) names `resume --accept-baseline` for commits that are
-    the operator's own."""
-    repo = project.project
-    flow = _make_flow(workspace=Workspace.default(project), run_dir=tmp_path)
-    task = _task(repo)
-    _commit_something(repo)
-
-    with pytest.raises(_Pause) as excinfo:
-        flow.pause_for_manual_recovery(task, task.baseline_commit)
-
-    assert "bmad-loop resume run-1 --accept-baseline" in excinfo.value.reason
 
 
 @pytest.mark.parametrize("deferred", [True, False], ids=["deferred", "escalated"])
