@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import copy
 import functools
 import hashlib
 import json
@@ -114,6 +115,7 @@ from .runs import (
     owner_run_dir,
     pinned_state_env,
     read_stop_request_mode,
+    rebase_recorded_project_path,
     reset_owner_run_dir,
     set_owner_run_dir,
     task_spec_path,
@@ -3094,6 +3096,25 @@ class Engine:
         self.journal.append("resume-post-story", story_key=task.story_key, phase=str(task.phase))
         self._emit("post_story", task)
 
+    def _replay_result_json(self, result_json: dict | None) -> dict | None:
+        """Rebind a saved result to the live project without rewriting history.
+
+        The run retains its launch-time project and original session payloads.
+        Only an absolute, project-owned spec path moves with that project; the
+        shared lexical mapper leaves external and traversing paths untouched.
+        Strict artifact/plan validation still judges the copied claim. Use the
+        live project, not the current workspace: session recovery can read the
+        result before reopening its unit mount.
+        """
+        replay = copy.deepcopy(result_json)
+        spec_file = result_mapping(replay).get("spec_file")
+        if isinstance(spec_file, str) and Path(spec_file).is_absolute():
+            recorded = Path(spec_file)
+            live = rebase_recorded_project_path(recorded, self.state, self.paths.project)
+            if live != recorded:
+                result_mapping(replay)["spec_file"] = str(live)
+        return replay
+
     def _pending_salvage_session(self, task: StoryTask) -> tuple[str, SessionResult] | None:
         """Retry only a latched current review timeout, through normal salvage.
 
@@ -3114,7 +3135,7 @@ class Engine:
                 return None
             return "review", SessionResult(
                 status=record.status,
-                result_json=record.result_json,
+                result_json=self._replay_result_json(record.result_json),
                 session_id=record.session_id,
                 transcript_path=record.transcript_path,
             )
@@ -3150,7 +3171,7 @@ class Engine:
                 return None
             return role, SessionResult(
                 status="completed",
-                result_json=record.result_json,
+                result_json=self._replay_result_json(record.result_json),
                 session_id=record.session_id,
                 transcript_path=record.transcript_path,
             )
@@ -7796,7 +7817,7 @@ class Engine:
             task.reverify_replayed = ""
             self._escalate(task, "reverify: no completed dev result to re-verify")
             return
-        result_json = record.result_json
+        result_json = self._replay_result_json(record.result_json)
         self._disarm_ledger_snapshot(task)
         # The replay-safe board writer (never-regress, latest-wins); a refused row
         # escalates through `_escalate_board_refusal` as on the dev leg.
