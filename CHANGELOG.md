@@ -7,6 +7,8 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+## [0.13.7] — 2026-11-04
+
 ### Fixed
 
 - Verify and accept interrupted development work before resuming review when its spec was already bound.
@@ -6791,7 +6793,8 @@ enforced in CI.
   implementation phase, driven by a Python control loop with hook-based session transport and
   resumable on-disk run state.
 
-[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.13.6...HEAD
+[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.13.7...HEAD
+[0.13.7]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.7
 [0.13.6]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.6
 [0.13.5]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.5
 [0.13.4]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.4
