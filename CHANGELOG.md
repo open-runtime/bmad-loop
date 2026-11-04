@@ -169,6 +169,8 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Rebase project-owned spec paths in replayed session results after a project move without
+  changing recorded history or weakening ticket-plan verification.
 - Redact Windows drive paths reported as model IDs in diagnostic dumps.
 - Keep version-gated relay events disabled across profiles sharing a hook configuration.
 - Classify a socket substituted for an owned spec as authority loss on macOS during recovery.
