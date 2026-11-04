@@ -7521,7 +7521,26 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     story_key = args.story or runs.default_escalation_key(state)
     task = state.tasks.get(story_key) if story_key else None
     reverify = getattr(args, "reverify", False)
-    if story_key is not None and task is not None and task.phase == Phase.DEFERRED and not reverify:
+    plain_rearm = (
+        not reverify
+        and args.restore_patch is None
+        and not getattr(args, "adopt_branch", False)
+        and not getattr(args, "abandon", False)
+        and not getattr(args, "at_reset", False)
+    )
+    deferred_redrive = bool(
+        plain_rearm
+        and story_key is not None
+        and task is not None
+        and runs.deferred_timeout_rearmable(state, task, story_key)
+    )
+    if (
+        story_key is not None
+        and task is not None
+        and task.phase == Phase.DEFERRED
+        and not reverify
+        and not deferred_redrive
+    ):
         # DW-522: a deferred story has nothing to resolve, but its kept work may be
         # re-verifiable — point at the flag instead of a bare refusal.
         print(
@@ -7535,7 +7554,12 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     if (
         story_key is None
         or task is None
-        or task.phase not in ((Phase.ESCALATED, Phase.DEFERRED) if reverify else (Phase.ESCALATED,))
+        or task.phase
+        not in (
+            (Phase.ESCALATED, Phase.DEFERRED)
+            if reverify or deferred_redrive
+            else (Phase.ESCALATED,)
+        )
         or (not reverify_named and not runs.escalation_story_admitted(state, story_key))
     ):
         print(f"no escalated story to resolve in run {args.run_id}", file=sys.stderr)
@@ -7566,6 +7590,13 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         return _resolve_at_reset(args, project, run_dir, state)
 
     pol = policy_mod.load(_policy_path(project))
+    if deferred_redrive and pol.scm.isolation == "worktree":
+        print(
+            f"story {story_key}'s deferred timeout requires in-place isolation to "
+            "restart from its kept partial work",
+            file=sys.stderr,
+        )
+        return 1
 
     # intent-gap patch-restore latch (#2564), explicit-flag path: everything about
     # it (isolation mode, path containment) is knowable NOW — validate before the
@@ -7786,6 +7817,21 @@ def cmd_resolve(args: argparse.Namespace) -> int:
             print(err, file=sys.stderr)
             return 1
 
+    if deferred_redrive and (pol.scm.isolation == "worktree" or restore_patch is not None):
+        print(
+            f"story {story_key}'s deferred timeout requires an in-place re-drive "
+            "without a restore patch",
+            file=sys.stderr,
+        )
+        return 1
+    if deferred_redrive:
+        print(
+            f"re-arming deferred timeout {story_key} for a fresh dev session from HEAD. "
+            "Commit partial source edits before resolving: restart keeps committed work "
+            "and dirty BMAD artifacts, but rolls back other uncommitted tracked changes.",
+            file=sys.stderr,
+        )
+
     # confirm-then-resume (args.resume: None = ask, True = auto, False = re-arm only)
     if args.resume is None and not _confirm(f"re-arm {story_key} and resume run {args.run_id}?"):
         print("cancelled — run is still paused at the escalation")
@@ -7905,7 +7951,17 @@ def cmd_resolve(args: argparse.Namespace) -> int:
                 )
                 return 1
             fresh_task = fresh_state.tasks.get(story_key)
-            if fresh_task is None or fresh_task.phase != Phase.ESCALATED:
+            if (
+                fresh_task is None
+                or fresh_task.phase != task.phase
+                or (
+                    fresh_task.phase != Phase.ESCALATED
+                    and not (
+                        deferred_redrive
+                        and runs.deferred_timeout_rearmable(fresh_state, fresh_task, story_key)
+                    )
+                )
+            ):
                 print(f"no escalated story to resolve in run {args.run_id}", file=sys.stderr)
                 return 1
             if fresh_task.generation != task.generation:
@@ -7915,6 +7971,17 @@ def cmd_resolve(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
                 return 1
+            if deferred_redrive:
+                # A confirmation can outlive a policy edit. The deferred attempt's
+                # kept work is safe only if the re-drive still runs in place.
+                pol = policy_mod.load(_policy_path(project))
+                if pol.scm.isolation == "worktree":
+                    print(
+                        f"story {story_key}'s deferred timeout requires in-place isolation "
+                        "— policy changed while resolve was in progress; not re-arming",
+                        file=sys.stderr,
+                    )
+                    return 1
             if paths is not None:
                 if (moved := runs.restamp_code_root(run_dir, paths.repo_root)) is not None:
                     print(f"warning: {moved}", file=sys.stderr)

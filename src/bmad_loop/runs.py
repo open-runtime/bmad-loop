@@ -4701,6 +4701,37 @@ def escalation_story_admitted(state: RunState, story_key: str) -> bool:
     return story_key in unresolved_escalation_keys(state)
 
 
+def deferred_timeout_rearmable(state: RunState, task: StoryTask, story_key: str) -> bool:
+    """Whether a deferred partial attempt can use the in-place restart path.
+
+    A completed dev attempt still uses re-verification. A timeout needs a fresh
+    dev session instead, but only while this task still owns the paused tree.
+    Workflow sessions are not the story's attempt. SessionRecord does not persist
+    produced_work, so admission uses the latest primary dev status, not prose.
+    Live policy isolation and restore-mode checks remain with the re-arm caller.
+    """
+    if (
+        task.phase != Phase.DEFERRED
+        or state.finished
+        or state.run_type == "sweep"
+        or task.worktree_path
+        or state.paused_stage != PAUSE_ESCALATION
+        or state.paused_story_key != story_key
+        or not state.tasks
+        or next(reversed(state.tasks)) != story_key
+    ):
+        return False
+    latest = next(
+        (
+            session
+            for session in reversed(task.sessions)
+            if session.role == "dev" and not session.label
+        ),
+        None,
+    )
+    return latest is not None and latest.status == "timeout"
+
+
 def validate_restore_latch(
     state: RunState, task: StoryTask, story_key: str, *, worktree_isolation: bool = False
 ) -> str | None:
@@ -6615,7 +6646,11 @@ def _rearm_escalation_locked(
     resolution_recorded: bool,
     project_root: Path | None = None,
 ) -> RearmOutcome:
-    """Re-arm an escalated story so the next resume re-drives it.
+    """Re-arm an escalated story or deferred in-place timeout for a fresh dev attempt.
+
+    Deferred admission is limited by :func:`deferred_timeout_rearmable` and
+    requires an in-place re-drive without patch restore. Its baseline advance
+    must succeed: restarting from the old baseline could discard the kept work.
 
     Admission is `escalation_resolvable`: the run is paused at the escalation stage,
     or not paused while the story is still an unresolved escalation — a resume
@@ -6750,8 +6785,14 @@ def _rearm_escalation_locked(
     task = state.tasks.get(key)
     if task is None:
         raise RearmError(f"run {run_dir.name} has no task for story {key}")
-    if task.phase != Phase.ESCALATED:
+    deferred_redrive = deferred_timeout_rearmable(state, task, key)
+    if task.phase != Phase.ESCALATED and not deferred_redrive:
         raise RearmError(f"story {key} is not escalated (phase: {task.phase})")
+    if deferred_redrive and (isolated_redrive or restore_patch is not None):
+        raise RearmError(
+            f"story {key}'s deferred timeout requires an in-place re-drive without "
+            "a restore patch so its kept work remains the starting point"
+        )
     if not escalation_story_admitted(state, key):
         raise RearmError(not_escalation_pause_message(run_dir.name, state.paused_stage))
     # Patch-restore preconditions (T1 guard + spec-less wedge + worktree isolation),
@@ -7368,6 +7409,10 @@ def _rearm_escalation_locked(
                 baseline=old_baseline or "",
                 error=f"{e.__class__.__name__}: {e}",
             )
+            if deferred_redrive:
+                raise RearmError(
+                    f"cannot advance story {key}'s baseline to preserve its partial work: {e}"
+                ) from e
         else:
             task.baseline_commit = head
             task.baseline_untracked = untracked
