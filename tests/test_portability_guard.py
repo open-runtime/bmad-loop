@@ -1476,6 +1476,9 @@ JOURNAL_DYNAMIC_KIND_SPELLINGS = {
 # the scan's, not the tree's.
 JOURNAL_KINDS = frozenset(
     {
+        # Finalization's publication boundary; SHA/branch fields use existing
+        # diagnostic aliases. Native replay coverage: test_fork_finalize_target.
+        "baseline-adopted-from-target",
         # adapters/generic.py — the only adapter-side writer. The engine hands its
         # `Journal` to every adapter it owns (`CodingCLIAdapter.journal`, #680) so
         # the wait loop can record what only it sees: the live transcript's idle
