@@ -2544,6 +2544,98 @@ def test_resume_dev_verify_replays_recorded_dev_result_to_done(project):
     assert "rollback-manual-required" not in kinds
 
 
+@pytest.mark.parametrize("approval", [False, True])
+def test_resume_bound_spec_without_acceptance_verifies_before_review(project, approval):
+    """A bound spec may survive a crash before its dev PROCEED was accepted."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    if approval:
+        engine.policy = dataclasses.replace(
+            engine.policy, gates=GatesPolicy(mode="per-story-spec-approval")
+        )
+    baseline, sp = _dev_verify_crash_state(project, engine, "done")
+    task = engine.state.tasks["1-1-a"]
+    task.spec_file = str(sp)
+    engine._save()
+
+    resumed, adapter = resume_engine(project, engine, [])
+    summary = resumed.run()
+
+    assert not summary.crashed
+    saved = load_state(resumed.run_dir).tasks["1-1-a"]
+    assert saved.accepted_dev_session_index == 0
+    assert saved.attempt == 1 and len(saved.sessions) == 1
+    assert adapter.sessions == []
+    decisions = _rows(resumed, "dev-decision")
+    assert len(decisions) == 1 and decisions[0]["action"] == "proceed"
+    assert "change for 1-1-a" in (project.project / "src.txt").read_text()
+    if approval:
+        assert summary.paused and resumed.state.paused_stage == PAUSE_SPEC_APPROVAL
+        resumed, adapter = resume_engine(project, resumed, [])
+        assert resumed.run().done == 1
+        assert adapter.sessions == []
+        # An accepted spec-approval resume keeps the existing path: no second
+        # dev verification/decision or duplicate session is required.
+        assert len(_rows(resumed, "dev-decision")) == 1
+    else:
+        assert summary.done == 1 and rev_parse_head(project.project) != baseline
+
+
+def test_resume_bound_spec_failed_dev_gate_never_reviews_or_accepts(project):
+    """A completed record and bound spec cannot bypass a failing dev check.
+
+    Ablation: removing the unaccepted-dev replay gate launches a review on the
+    failing tree, and the no-review assertion below fails.
+    """
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    engine.policy = dataclasses.replace(
+        engine.policy,
+        limits=LimitsPolicy(max_dev_attempts=1),
+        verify=VerifyPolicy(commands=(_FAIL,)),
+    )
+    _baseline, sp = _dev_verify_crash_state(project, engine, "done")
+    task = engine.state.tasks["1-1-a"]
+    task.spec_file = str(sp)
+    task.followup_review_recommended = True
+    task.sessions[0].result_json["followup_review_recommended"] = True
+    engine._save()
+
+    resumed, adapter = resume_engine(project, engine, [review_effect(project, "1-1-a", clean=True)])
+    summary = resumed.run()
+
+    assert summary.done == 0 and not summary.crashed
+    assert resumed.state.tasks["1-1-a"].accepted_dev_session_index is None
+    assert adapter.sessions == []
+    assert not _rows(resumed, "resume-review")
+    assert _rows(resumed, "dev-decision")
+    assert all(row["action"] != "proceed" for row in _rows(resumed, "dev-decision"))
+
+
+def test_resume_bound_spec_without_completed_record_pauses_before_review(project):
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    _baseline, sp = _dev_verify_crash_state(project, engine, "done")
+    task = engine.state.tasks["1-1-a"]
+    task.spec_file = str(sp)
+    task.sessions[0].result_json = None
+    engine._save()
+
+    resumed, adapter = resume_engine(project, engine, [])
+    summary = resumed.run()
+
+    assert summary.paused and not summary.crashed
+    saved = load_state(resumed.run_dir)
+    assert saved.paused_stage == PAUSE_ESCALATION
+    assert "no completed current-attempt session result" in saved.paused_reason
+    assert saved.tasks["1-1-a"].phase == Phase.ESCALATED
+    assert saved.tasks["1-1-a"].accepted_dev_session_index is None
+    assert runs.escalation_resolvable(saved)
+    assert runs.default_escalation_key(saved) == "1-1-a"
+    assert adapter.sessions == []
+    assert not _rows(resumed, "resume-review")
+
+
 def test_resume_dev_verify_replay_verify_still_failing_retries_normally(project):
     """When the replayed record's verify failure reproduces (the spec is still
     short of done), the replay re-enters the normal retry path — commits parked
@@ -26826,11 +26918,17 @@ def test_reverify_honors_the_spec_approval_gate(project, tmp_path):
     assert summary.paused and engine2.state.paused_stage == PAUSE_SPEC_APPROVAL
     task = load_state(engine2.run_dir).tasks["1-1-a"]
     assert task.phase == Phase.DEV_VERIFY and task.reverify_from == ""
+    # Reverify does not invent acceptance for an old-generation dev record. Its
+    # persisted PROCEED receipt is sufficient for the spec-approval continuation.
+    assert task.accepted_dev_session_index is None
+    assert task.reverify_replayed == "deferred"
 
     engine3, adapter3 = resume_engine(project, engine2, [])
-    engine3.run()
+    result = engine3.run()
+    assert not result.paused and not result.crashed
     assert adapter3.sessions == []
     assert engine3.state.tasks["1-1-a"].phase == Phase.DONE
+    assert engine3.state.tasks["1-1-a"].accepted_dev_session_index is None
     kinds = [e["kind"] for e in Journal(engine3.run_dir).entries()]
     assert kinds.count("reverify-decision") == 1 and "resume-review" in kinds
 
