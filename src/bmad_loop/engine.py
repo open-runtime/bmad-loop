@@ -7833,9 +7833,10 @@ class Engine:
         Every fresh entry starts at ``review_cycle`` 0, except a restart-arm
         re-drive. That re-drive keeps its counters and so reviews once instead of
         skipping, which is the conservative direction."""
-        # A successful reverify is a durable PROCEED receipt without a matching
-        # current-generation dev session; its approval resume is already verified.
-        if task.accepted_dev_session_index is None and not task.reverify_replayed:
+        # Acceptance belongs to the current attempt's record, not merely any
+        # retained index. A successful reverify separately persists its PROCEED
+        # receipt without a current-generation dev session.
+        if not self._accepted_dev_session_matches(task) and not task.reverify_replayed:
             resumable = self._resumable_session(task)
             if resumable is None:
                 self._escalate(

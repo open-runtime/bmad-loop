@@ -7,6 +7,10 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Fixed
+
+- Require the current development session’s acceptance before resuming review after a rearm.
+
 ## [0.13.7] — 2026-11-04
 
 ### Fixed
