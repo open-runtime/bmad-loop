@@ -7,6 +7,8 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+## [0.13.10] — 2026-11-05
+
 ### Added
 
 - Recover an owed primary review with an explicit, source-bound implementation attestation for stopped tickets.
@@ -6809,7 +6811,8 @@ enforced in CI.
   implementation phase, driven by a Python control loop with hook-based session transport and
   resumable on-disk run state.
 
-[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.13.9...HEAD
+[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.13.10...HEAD
+[0.13.10]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.10
 [0.13.9]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.9
 [0.13.8]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.8
 [0.13.7]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.7
