@@ -9795,6 +9795,35 @@ def test_proof_of_work_gates_the_aborted_rescue(tmp_path, monkeypatch):
     assert rescued.result_json["post_kill_reconciled"] is True
 
 
+def test_post_kill_rescued_continuation_keeps_native_identity(tmp_path, monkeypatch):
+    """Losing Stop cannot strip the continuation identity from its real result."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    adapter._window_alive = lambda handle: False
+    (impl / "spec-3-1-foo.md").write_text(_DONE_SPEC)
+    _pane_log(adapter, "3-1-dev-1", generic.PROOF_OF_WORK_MIN_LOG_BYTES + 1)
+    binding = {"version": 1, "profile": "claude", "session_id": "same-native"}
+    interrupted = SessionResult(
+        status="timeout",
+        session_id="same-native",
+        transcript_path="/native.jsonl",
+        resumed_from="same-native",
+        native_binding=binding,
+    )
+    resumed = dataclasses.replace(
+        _dev_spec(tmp_path),
+        resume_session_id="same-native",
+        resume_transcript_path="/native.jsonl",
+        resume_binding=binding,
+    )
+    rescued = adapter._post_kill_reconcile(_dev_handle(), resumed, interrupted)
+    assert rescued.status == "completed"
+    assert rescued.result_json["post_kill_reconciled"] is True
+    assert rescued.session_id == rescued.resumed_from == "same-native"
+    assert rescued.transcript_path == "/native.jsonl"
+    assert rescued.native_binding == binding
+
+
 def test_proof_of_work_journals_the_refusal(tmp_path, monkeypatch):
     """The refusal is observable — a silent downgrade would be its own #261."""
     adapter, impl = make_dev_adapter(tmp_path)

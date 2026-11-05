@@ -5949,6 +5949,7 @@ class _DevSynthesisMixin(_ResultFileMixin):
             timeout_expired_clock=result.timeout_expired_clock,
             budget_weighted=result.budget_weighted,
             stop_seen=result.stop_seen,
+            resumed_from=result.resumed_from,
             native_binding=result.native_binding,
             quota_wait_s=result.quota_wait_s,
         )
