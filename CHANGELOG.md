@@ -7,6 +7,8 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+## [0.13.14] — 2026-11-05
+
 ### Added
 
 - Continue a stopped native development session through explicit, verified recovery while preserving its unfinished source and original artifacts.
@@ -6846,7 +6848,8 @@ enforced in CI.
   implementation phase, driven by a Python control loop with hook-based session transport and
   resumable on-disk run state.
 
-[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.13.13...HEAD
+[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.13.14...HEAD
+[0.13.14]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.14
 [0.13.13]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.13
 [0.13.12]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.12
 [0.13.11]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.11
