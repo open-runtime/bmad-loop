@@ -4267,6 +4267,29 @@ def unfolded_changes(repo: Path, baseline: str, source: str, revision: str) -> t
     return tuple(sorted(unfolded))
 
 
+def committed_changed_paths(repo: Path, baseline: str, revision: str) -> set[str]:
+    """Exact changed paths between commits, including both sides of renames.
+
+    Recovery uses this before accepting operator-supplied implementation evidence;
+    a failed probe must not be mistaken for an empty or a valid change set.
+    """
+    proc = git_bytes(
+        repo,
+        "diff-tree",
+        "--no-commit-id",
+        "--name-only",
+        "--no-renames",
+        "-z",
+        "-r",
+        baseline,
+        revision,
+        "--",
+    )
+    if proc.returncode != 0:
+        raise GitError("cannot read the implementation commit's changed paths")
+    return {os.fsdecode(item) for item in proc.stdout.split(b"\0") if item}
+
+
 def integration_cleanup_state_recoverable(
     repo: Path,
     run_dir: Path,

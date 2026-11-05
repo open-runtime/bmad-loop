@@ -7,6 +7,10 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Added
+
+- Recover an owed primary review with an explicit, source-bound implementation attestation for stopped tickets.
+
 ## [0.13.9] — 2026-11-05
 
 ### Fixed

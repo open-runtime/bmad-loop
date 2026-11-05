@@ -258,6 +258,7 @@ REARM_ESCALATION_CALLERS = {
 # outer hold. Exact inventories make a newly added writer fail loudly instead of
 # relying on a reviewer to find it by grep.
 SAVE_STATE_CALLERS = {
+    ("accepted_review.py", "rearm_for_implemented_review"),
     ("cli.py", "_prepare_resume_locked"),
     # a resume that failed before its engine started puts its cleared pause back
     ("cli.py", "_restore_aborted_resume"),
@@ -275,6 +276,7 @@ SAVE_STATE_CALLERS = {
     ("unitreplay.py", "abandon_replay_run"),
 }
 RUN_STATE_TRANSACTIONS = {
+    ("accepted_review.py", "rearm_for_implemented_review"),
     ("cli.py", "_resume_paused_run"),
     # the failed-resume restore: reload, re-check finished / a concurrent re-pause,
     # then put back the pause `_prepare_resume_locked` cleared
@@ -404,6 +406,7 @@ ISOLATION_CONFLICT_CALLERS = {
 # and `cmd_run` refuses through the wrapper ahead of that same preflight. A new
 # caller lands with a row and the test that it refuses.
 STORE_TOPOLOGY_CALLERS = {
+    ("accepted_review.py", "_evidence"): 2,  # admission, locked mutation and dispatch
     ("ticketstore.py", "store_conflict"): 1,  # the predicate's own text call
     ("install.py", "_tickets_store_findings"): 1,  # validate + run preflight findings
     ("cli.py", "_reject_store_topology"): 1,  # the wrapper's own predicate call
@@ -1614,6 +1617,9 @@ JOURNAL_KINDS = frozenset(
         # DW-522. A DEFERRED or environment-fault ESCALATED story re-armed for a
         # verify replay of its kept tree, from `runs._rearm_for_reverify_locked`.
         "story-reverify-armed",
+        # Explicit historical implementation attestation and its normal review.
+        "implemented-review-armed",
+        "implemented-review-resumed",
         # DW-522. The engine's `_finish_inflight` reverify arm entering the replay
         # (`resume-reverify`), and the replay's `decide_reverify` routing
         # (`reverify-decision`), from `Engine._resume_reverify`.

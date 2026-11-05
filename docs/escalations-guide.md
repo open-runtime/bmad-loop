@@ -79,7 +79,22 @@ The reason names both sides. The work is kept: uncommitted in the checkout, or o
 - `--no-resume` only re-arms and prints `resume when ready: bmad-loop resume <id>`.
 - `--force` proceeds when the engine's liveness cannot be verified. A running engine always blocks: run `bmad-loop stop <run-id>` first.
 
-`--restore-patch`, `--adopt-branch`, `--reverify` and `--abandon` are mutually exclusive.
+`--restore-patch`, `--adopt-branch`, `--reverify`, `--review-implemented` and `--abandon` are mutually exclusive.
+
+### Review implementation already in the baseline
+
+For a stopped in-place ticket whose accepted implementation was absorbed into a later baseline, use:
+
+```sh
+bmad-loop resolve <run-id> --story <key> --review-implemented <full-commit-sha> --no-resume
+bmad-loop resume <run-id>
+```
+
+This is an explicit operator attestation that the named commit implements the ticket. It requires the original completed, built dev result and its matching native-session `PROCEED` journal decision; the latest dev must also have a completed built result for the current plan and baseline. A stopped subsequent attempt without a recorded result is admitted only when no uncommitted source or ledger remains outside the bound plan. The task must still be at a dev boundary, not a terminal escalation or a planning checkpoint.
+
+The implementation commit must follow the original baseline and be an ancestor of the current baseline and HEAD. All implementation paths except the bound plan and ledger must retain their exact content and modes at both revisions. Unrelated committed main updates are allowed. The attestation pins current HEAD, both result identities, ticket-store topology and the plan's content. These are rechecked after confirmation and after session hooks, before native launch; changes refuse recovery. Commit the ledger and any partial source before using this mode.
+
+Resume moves the plan to `in-review` through the normal ticket writer and starts the required primary review, even with `review.trigger = "recommended"`. The review receives the original implementation range and current HEAD. Review must be enabled, with a nonzero review budget. Normal review verification and commit gates still apply; no new dev, repeated dev verification, synthetic acceptance or baseline rewrite occurs. Before removing the prior Auto Run Result, the controller records both exact plan forms. A crash around that removal can resume with either form; native launch requires the prepared form. Other pre-native evidence changes pause. Session-hook ledger edits are preserved without an automatic commit. A genuinely started primary retains its normal continuation and partial work.
 
 ### Re-arm with the resolve agent
 

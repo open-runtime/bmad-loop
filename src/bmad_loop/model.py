@@ -822,6 +822,11 @@ class StoryTask:
     # Survives the resume serialization round-trip; deliberately absent from
     # `documents.py`'s `--json` projection (schema 1).
     reverify_replayed: str = ""
+    # Explicit operator attestation for a historically accepted ticket whose
+    # implementation is already in the current baseline. This binds source and
+    # original acceptance; it never substitutes a new SessionRecord or acceptance.
+    # Kept through the mandatory primary review and its ordinary verification.
+    implemented_review: dict[str, Any] | None = None
     # sweep bundles only: the deferred-work ids this task closes and the
     # rendered intent file handed to dev sessions
     dw_ids: list[str] = field(default_factory=list)
@@ -1041,6 +1046,7 @@ class StoryTask:
             "adopt_pending": self.adopt_pending,
             "reverify_from": self.reverify_from,
             "reverify_replayed": self.reverify_replayed,
+            "implemented_review": deepcopy(self.implemented_review),
             "dw_ids": self.dw_ids,
             "bundle_file": self.bundle_file,
             "worktree_path": self.worktree_path,
@@ -1336,6 +1342,11 @@ class StoryTask:
             adopt_pending=bool(d.get("adopt_pending", False)),
             reverify_from=str(d.get("reverify_from", "") or ""),
             reverify_replayed=str(d.get("reverify_replayed", "") or ""),
+            implemented_review=(
+                deepcopy(dict(d["implemented_review"]))
+                if d.get("implemented_review") is not None
+                else None
+            ),
             dw_ids=[str(i) for i in d.get("dw_ids", [])],
             bundle_file=d.get("bundle_file"),
             worktree_path=str(d.get("worktree_path", "")),

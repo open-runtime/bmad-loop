@@ -1087,9 +1087,18 @@ def strip_auto_run_result(
     # `AUTO_RUN_HEADING_RE`'s MULTILINE `^` and no-ops — the same pinned
     # asymmetry `reset_spec_status` documents above.
     text = spec_path.read_bytes().decode("utf-8")
+    stripped = without_auto_run_result(text)
+    if stripped == text:
+        return False
+    _atomic_write_spec(spec_path, stripped, confine_root=confine_root, root_identity=root_identity)
+    return True
+
+
+def without_auto_run_result(text: str) -> str:
+    """Pure form of the controller's terminal-marker removal, preserving all else."""
     matches = _section_headings(text)
     if not matches:
-        return False
+        return text
     kept: list[str] = []
     pos = 0
     for m in matches:
@@ -1098,10 +1107,7 @@ def strip_auto_run_result(
         kept.append(text[pos : m.start()])
         pos = _next_heading_start(text, m.end())
     kept.append(text[pos:])
-    _atomic_write_spec(
-        spec_path, "".join(kept), confine_root=confine_root, root_identity=root_identity
-    )
-    return True
+    return "".join(kept)
 
 
 def reset_spec_for_replan(

@@ -208,6 +208,8 @@ PLAN_WRITE_REASONS: Mapping[tuple[SpecWriteReason, str], PlanWriteReason] = {
     ("adoption", verify.PLAN_DONE): "accept",
     # a repair leg re-opens the plan in place
     ("repair", "in-progress"): "repair",
+    # Explicit source/acceptance attestation reopens only the owed review.
+    ("implemented-review", "in-review"): "rearm",
     # a timed-out review's verified work lands at `built` ({in-progress, in-review}
     # → built); salvage never targets `done`, which stays the acceptance's
     ("salvage", verify.PLAN_BUILT): "salvage",
