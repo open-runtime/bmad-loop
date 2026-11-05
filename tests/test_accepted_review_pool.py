@@ -354,7 +354,12 @@ def test_pool_review_requires_recorded_adapter(pool_review):
 
 @pytest.mark.parametrize(
     "native,resumed",
-    [(None, None), ("different-native", "interrupted-primary"), ("interrupted-primary", None)],
+    [
+        (None, None),
+        ("different-native", "interrupted-primary"),
+        ("interrupted-primary", None),
+        ("interrupted-primary", "interrupted-primary"),
+    ],
 )
 def test_pool_retry_unproven_native_never_clears_obligation(pool_review, native, resumed):
     case, engine, adapter, task, _record = pool_review
@@ -366,6 +371,36 @@ def test_pool_retry_unproven_native_never_clears_obligation(pool_review, native,
     assert saved.implemented_review.get("pool_resume_required")
     assert saved.phase == Phase.ESCALATED
     assert len(adapter.sessions) == 1
+
+
+@pytest.mark.parametrize(
+    "status,result",
+    [
+        ("crashed", None),
+        ("stalled", None),
+        ("timeout", None),
+        ("completed", None),
+        ("crashed", {"status": "built"}),
+        ("stalled", {"status": "built"}),
+        ("timeout", {"status": "built"}),
+    ],
+)
+def test_incomplete_same_native_record_keeps_pool_obligation(pool_review, status, result):
+    _case, _engine, _adapter, task, _record = pool_review
+    task.review_cycle = 2
+    task.implemented_review["pool_resume_required"] = "interrupted-primary"
+    task.sessions.append(
+        SessionRecord(
+            task_id=f"{task.story_key}-review-2-g2",
+            role="review",
+            adapter="claude",
+            status=status,
+            session_id="interrupted-primary",
+            resumed_from="interrupted-primary",
+            result_json=result,
+        )
+    )
+    assert not accepted_review.pool_resume_recorded(task)
 
 
 @pytest.mark.parametrize("native", [None, "different-native"])
