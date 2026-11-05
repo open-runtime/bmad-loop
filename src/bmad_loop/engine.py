@@ -95,6 +95,9 @@ from .platform_util import (
     require_root_pinned,
     retrying_unlink,
     safe_segment,
+)
+from .platform_util import session_task_id as _session_task_id
+from .platform_util import (
     unlink_confined,
 )
 from .plugins import GrantSet, HookBus, HookContext, PluginRegistry, PluginTrustError, Refusal
@@ -579,37 +582,6 @@ def _session_ended(result: SessionResult) -> str:
     if not result.produced_work:
         return "no-work"
     return ""
-
-
-def _session_task_id(story_key: str, part: str, seq: int, generation: int) -> str:
-    """Single composition point for session task ids. Sanitize the whole
-    composition, not the parts: two individually capped parts can still compose
-    past a Windows filename segment limit, and ``safe_segment``'s digest suffix
-    differs between the two orders. ``_resumable_session``'s resume match must
-    be byte-identical to what ``_run_session`` stored, so both MUST call this.
-
-    ``generation`` is ``StoryTask.generation``, bumped whenever an escalated task
-    is reopened while resetting ``attempt`` to 0 (``runs.rearm_escalation`` and the
-    sweep engine's ESCALATED restart arms). The next dispatch bumps the attempt
-    back to 1, so without this the re-minted id is BYTE-EQUAL to a record the
-    abandoned attempt already appended to ``task.sessions``. For dev/review tasks,
-    ``_resumable_session`` would then replay that abandoned verdict (#705); sweep
-    task records would alias the same task-directory artifacts.
-
-    REQUIRED, with no default, for the reason ``verify_dev_exclude_relpaths``' ``root``
-    is: an implicit ``generation=0`` is correct in every run that never re-armed — which
-    is nearly every test — and wrong only on the re-armed one, so a fourth mint site that
-    omitted it would look right everywhere it was exercised and silently re-open #705.
-    Requiring it turns OMISSION into a type error; it does not police a wrong value.
-
-    The suffix is composed INSIDE the f-string, before ``safe_segment``, because
-    the whole-composition cap and digest contract above is what makes the id a
-    legal single segment; appending after sanitization could push it back over
-    ``MAX_SEGMENT``. It is emitted ONLY when ``generation > 0``, so every id an
-    existing run already wrote to disk stays byte-identical and a run resumed
-    across this upgrade still finds its ``tasks/`` directories."""
-    gen = f"-g{generation}" if generation > 0 else ""
-    return safe_segment(f"{story_key}-{part}-{seq}{gen}")
 
 
 def _at_or_past(landed: str | None, target: str) -> bool:

@@ -7,6 +7,10 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Fixed
+
+- Re-arm deferred timeouts when their linked retry crashed before binding a native session.
+
 ## [0.13.8] — 2026-11-04
 
 ### Fixed

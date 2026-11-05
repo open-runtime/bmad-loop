@@ -100,6 +100,11 @@ Use this path too when the dev CLI has no interactive mode.
 
 A deferred in-place story whose latest dev session timed out also needs a fresh dev attempt. Use `bmad-loop resolve <run-id> --story <key> --no-interactive --no-resume`, then resume when ready. The run must still be paused on that story, with no later story picked. The re-arm advances its baseline to HEAD, preserves the session history and starts a new session generation. Commit any partial source changes you want to keep before resolving: the existing restart preserves committed work, BMAD artifact edits and pre-existing untracked files, but rolls back other uncommitted tracked changes. Dirty bookkeeping stays available to the new attempt. A failed baseline read refuses the re-arm; worktree isolation and restore-patch mode are not supported for this deferred-timeout path.
 
+The same route covers a timeout with no result followed immediately by its linked retry crashing
+without a native session or result. Both records must belong to the current attempt chain, and the
+retry must name the timed-out native session. The history stays intact; recovery starts a fresh
+dev session rather than replaying an unfinished result or resuming the failed retry.
+
 ### Restore an intent-gap patch
 
 When an escalation names a saved patch (in the spec's `## Auto Run Result`), you can re-apply it instead of re-implementing:
