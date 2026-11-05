@@ -520,3 +520,130 @@ def test_ordinary_proof_accepts_verification_document_but_not_just_plan(
     assert outcome.ok is evidence_doc
     if not evidence_doc:
         assert outcome.reason == "no changes in worktree since baseline commit"
+
+
+@pytest.fixture(params=["T2", "T3"])
+def ignored_store_implementation(accepted_implementation, request):
+    from conftest import _store_repo
+
+    from bmad_loop import ticketstore
+
+    case = accepted_implementation
+    paths = bmadconfig.load_paths(case.root, want_tickets=True)
+    store = paths.output_folder
+    rel = store.relative_to(case.root).as_posix()
+    git(case.root, "rm", "-r", "-q", "--cached", rel)
+    with (case.root / ".gitignore").open("a") as f:
+        f.write(f"/{rel}/\n")
+    git(case.root, "add", ".gitignore")
+    git(case.root, "commit", "-q", "-m", "retain an ignored ticket store")
+    ledger = paths.deferred_work
+    ledger.write_text("Existing deferred work.\n")
+    if request.param == "T3":
+        _store_repo(store)
+    topology = ticketstore.assess_store(paths, "none")
+    assert isinstance(topology, ticketstore.StoreTopology)
+    assert topology.layout == request.param
+    assert case.refusal() is None
+    return case, ledger
+
+
+@pytest.mark.parametrize("boundary", ["confirmation", "dispatch"])
+def test_ignored_store_ledger_changes_refuse_recovery(ignored_store_implementation, boundary):
+    case, ledger = ignored_store_implementation
+    evidence = accepted_review._evidence(
+        case.state,
+        case.task,
+        KEY,
+        case.implementation,
+        run_dir=case.run_dir,
+        project_root=case.root,
+        require_stopped=True,
+    )
+    if boundary == "dispatch":
+        runs.rearm_for_implemented_review(
+            case.run_dir, KEY, case.implementation, project_root=case.root
+        )
+        state = load_state(case.run_dir)
+        task = state.tasks[KEY]
+        assert accepted_review.pending_review_refusal(state, task, case.run_dir, case.root) is None
+    before = (case.run_dir / "state.json").read_bytes()
+    head = verify.rev_parse_head(case.root)
+    ledger.write_text("Unfinished owner work must stay uncommitted.\n")
+    assert ledger.relative_to(case.root).as_posix() not in verify.dirty_paths(case.root)
+    if boundary == "confirmation":
+        with pytest.raises(runs.RearmError):
+            runs.rearm_for_implemented_review(
+                case.run_dir,
+                KEY,
+                case.implementation,
+                project_root=case.root,
+                expected_evidence=evidence,
+            )
+    else:
+        assert (
+            accepted_review.pending_review_refusal(state, task, case.run_dir, case.root) is not None
+        )
+    assert (case.run_dir / "state.json").read_bytes() == before
+    assert verify.rev_parse_head(case.root) == head
+    assert ledger.read_text() == "Unfinished owner work must stay uncommitted.\n"
+
+
+@pytest.mark.parametrize("mutation", ["created", "deleted", "replaced"])
+def test_ignored_ledger_presence_and_identity_are_pinned(ignored_store_implementation, mutation):
+    case, ledger = ignored_store_implementation
+    owner = verify.git_toplevel(ledger.parent)
+    if mutation == "created":
+        ledger.unlink()
+        if owner != case.root:
+            git(owner, "add", "-A")
+            git(owner, "commit", "-qm", "ledger absent at admission")
+    runs.rearm_for_implemented_review(
+        case.run_dir, KEY, case.implementation, project_root=case.root
+    )
+    state = load_state(case.run_dir)
+    assert (
+        accepted_review.pending_review_refusal(state, state.tasks[KEY], case.run_dir, case.root)
+        is None
+    )
+    if mutation == "created":
+        ledger.write_text("New unfinished work.\n")
+    elif mutation == "deleted":
+        ledger.unlink()
+    else:
+        replacement = ledger.with_suffix(".replacement")
+        replacement.write_bytes(ledger.read_bytes())
+        replacement.replace(ledger)
+    assert (
+        accepted_review.pending_review_refusal(state, state.tasks[KEY], case.run_dir, case.root)
+        is not None
+    )
+
+
+def test_nested_repository_dirty_ledger_is_refused_at_admission(ignored_store_implementation):
+    case, ledger = ignored_store_implementation
+    ledger.write_text("Uncommitted nested repository work.\n")
+    if verify.git_toplevel(ledger.parent) == case.root:
+        assert case.refusal() is None  # T2 explicitly attests unversioned bytes.
+    else:
+        assert case.refusal() is not None
+
+
+@pytest.mark.parametrize("evidence", ["start", "record", "unreadable"])
+def test_unlaunched_refund_requires_trustworthy_absence(accepted_implementation, evidence):
+    case = accepted_implementation
+    case.task.review_cycle = 1
+    task_id = f"{KEY}-review-1-g1"
+    assert accepted_review.review_reservation_unlaunched(case.state, case.task, case.run_dir)
+    if evidence == "record":
+        case.task.sessions.append(
+            SessionRecord(task_id=task_id, role="review", status="vetoed", adapter="claude")
+        )
+    elif evidence == "start":
+        Journal(case.run_dir, pin=case.state).append(
+            "session-start", task_id=task_id, role="review"
+        )
+    else:
+        with (case.run_dir / "journal.jsonl").open("a") as stream:
+            stream.write("unreadable journal row\n")
+    assert not accepted_review.review_reservation_unlaunched(case.state, case.task, case.run_dir)

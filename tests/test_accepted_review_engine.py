@@ -6,6 +6,9 @@ import dataclasses
 import pytest
 from conftest import _OK, review_effect, write_sprint
 from test_accepted_review_recovery import accepted_implementation as _accepted_implementation
+from test_accepted_review_recovery import (
+    ignored_store_implementation as _ignored_store_implementation,
+)
 from test_engine import _dev_verify_crash_state, make_engine
 
 from bmad_loop import bmadconfig, cli, runs, verify
@@ -18,6 +21,7 @@ from bmad_loop.policy import GatesPolicy, NotifyPolicy, Policy, ReviewPolicy, Ve
 from bmad_loop.tickets_engine import TicketsEngine
 
 accepted_implementation = _accepted_implementation
+ignored_store_implementation = _ignored_store_implementation
 
 
 def _armed_engine(case):
@@ -444,8 +448,9 @@ def test_first_primary_refuses_post_hook_drift(accepted_implementation, monkeypa
 
 
 @pytest.mark.parametrize("after_strip", [False, True])
+@pytest.mark.parametrize("crash_count", [1, 2])
 def test_recovery_replays_crash_after_real_marker_removal(
-    accepted_implementation, monkeypatch, after_strip
+    accepted_implementation, monkeypatch, after_strip, crash_count
 ):
     from bmad_loop.adapters.base import SessionResult
 
@@ -456,6 +461,9 @@ def test_recovery_replays_crash_after_real_marker_removal(
     )
     engine, adapter = _armed_engine(case)
     task = engine.state.tasks[case.task.story_key]
+    engine.policy = dataclasses.replace(
+        engine.policy, limits=dataclasses.replace(engine.policy.limits, max_review_cycles=1)
+    )
     reset = engine._reset_spec_for_review
 
     def crash_after_strip(task):
@@ -492,6 +500,28 @@ def test_recovery_replays_crash_after_real_marker_removal(
             },
         )
 
+    if crash_count == 2:
+        second_reset = recovered._reset_spec_for_review
+
+        def second_crash(task):
+            if after_strip:
+                second_reset(task)
+            raise RuntimeError("second host loss")
+
+        monkeypatch.setattr(recovered, "_reset_spec_for_review", second_crash)
+        with pytest.raises(RuntimeError, match="second host loss"):
+            recovered._finish_inflight()
+        assert state.tasks[case.task.story_key].review_unlaunched_cycles == 1
+        state = load_state(case.run_dir)
+        recovered = TicketsEngine(
+            paths=engine.paths,
+            policy=recovered.policy,
+            adapter=adapter,
+            run_dir=case.run_dir,
+            state=state,
+            journal=Journal(case.run_dir, pin=state),
+        )
+
     adapter.script.append(primary)
     recovered._finish_inflight()
     resumed_task = state.tasks[case.task.story_key]
@@ -499,3 +529,50 @@ def test_recovery_replays_crash_after_real_marker_removal(
     assert [spec.role for spec in adapter.sessions] == ["review"]
     assert resumed_task.accepted_dev_session_index == 0
     assert read_frontmatter(case.plan)["verify_unmet"] == 1
+    assert adapter.sessions[0].task_id == f"{case.task.story_key}-review-{crash_count + 1}-g2"
+    assert resumed_task.review_unlaunched_cycles == crash_count
+    assert resumed_task.usage_relaunches == 0
+
+
+def test_ignored_store_hook_ledger_edit_never_launches_or_commits(
+    ignored_store_implementation, monkeypatch
+):
+    case, ledger = ignored_store_implementation
+    engine, adapter = _armed_engine(case)
+    task = engine.state.tasks[case.task.story_key]
+    head = verify.rev_parse_head(case.root)
+    adapter.script.append(lambda _spec: pytest.fail("launched after ignored ledger mutation"))
+
+    def hook(_task, _role, prompt, env, _stage):
+        ledger.write_text("Hook-owned unfinished work.\n")
+        return prompt, env, None
+
+    monkeypatch.setattr(engine, "_emit_session_gate", hook)
+    with pytest.raises(RunPaused):
+        engine._resume_after_dev_verify(task)
+    assert not adapter.sessions
+    assert verify.rev_parse_head(case.root) == head
+    assert ledger.read_text() == "Hook-owned unfinished work.\n"
+
+
+def test_recovery_does_not_refund_same_reservation_twice(accepted_implementation, monkeypatch):
+    from bmad_loop.journal import save_state
+
+    case = accepted_implementation
+    engine, _adapter = _armed_engine(case)
+    task = engine.state.tasks[case.task.story_key]
+    task.phase = Phase.REVIEW_RUNNING
+    task.review_cycle = 1
+    monkeypatch.setattr(engine, "_review_and_commit", lambda *a, **kw: None)
+    engine._resume_implemented_review(task)
+    assert task.review_unlaunched_cycles == 1
+    assert task.phase == Phase.REVIEW_VERIFY
+    # This is the state durably saved before any new reservation. A repeated
+    # resume at this boundary must retain that single credit.
+    save_state(case.run_dir, engine.state)
+    engine.state = load_state(case.run_dir)
+    task = engine.state.tasks[case.task.story_key]
+    engine._resume_implemented_review(task)
+    assert task.review_unlaunched_cycles == 1
+    assert task.charged_review_cycles == 0
+    assert task.usage_relaunches == 0

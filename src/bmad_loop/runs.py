@@ -6880,6 +6880,7 @@ def _rearm_escalation_locked(
         task.escalations_resolved_upto = len(task.sessions)
     task.review_cycle = 0
     task.review_usage_relaunches = 0  # refunds never exceed review_cycle (#959)
+    task.review_unlaunched_cycles = 0
     task.followup_reviews_spent = 0  # human-resolved re-drive gets a fresh damping budget
     task.defer_reason = None
     task.env_fault_site = None  # the re-armed story starts with no fault on record (DW-523)
@@ -8023,6 +8024,7 @@ def latch_for_reverify(task: StoryTask, origin: str) -> None:
     task.generation += 1  # #705: no session id the earlier attempt minted is reused
     task.review_cycle = 0
     task.review_usage_relaunches = 0  # refunds never exceed review_cycle (#959)
+    task.review_unlaunched_cycles = 0
     task.followup_reviews_spent = 0
     task.salvage_refile_pending = False
     task.adopt_pending = False

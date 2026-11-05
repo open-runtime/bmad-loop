@@ -10,12 +10,14 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import stat
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import bmadconfig, devcontract, frontmatter, policy, ticketstore, verify
 from .journal import Journal, load_state, save_state, state_lock
 from .model import Phase, RunState, SessionRecord, StoryTask
+from .platform_util import session_task_id
 
 if TYPE_CHECKING:
     from .runs import RearmOutcome
@@ -42,6 +44,47 @@ def _plan_content_digest(raw: bytes) -> str:
     fields = frontmatter.parse_frontmatter(text)
     fields.pop("status", None)
     return _digest([fields, split[2]])
+
+
+def _ledger_evidence(path: Path) -> dict[str, Any]:
+    """Bind even ignored ledger bytes; check dirt in the actual owning repo."""
+    if path.is_symlink():
+        raise ValueError("the deferred-work ledger is a symlink")
+    resolved = path.resolve()
+    parent = resolved.parent
+    while not parent.exists() and parent != parent.parent:
+        parent = parent.parent
+    owner = verify.git_toplevel(parent)
+    if owner is not None and not verify.path_clean(owner, resolved.relative_to(owner).as_posix()):
+        raise ValueError("uncommitted ledger work must be preserved in its owning repository first")
+    parent_stat = parent.stat()
+    evidence: dict[str, Any] = {
+        "path": str(path),
+        "resolved": str(resolved),
+        "owner": str(owner) if owner else None,
+        "parent": [str(parent), parent_stat.st_dev, parent_stat.st_ino],
+    }
+    try:
+        before = path.lstat()
+    except FileNotFoundError:
+        evidence["exists"] = False
+        return evidence
+    if not stat.S_ISREG(before.st_mode):
+        raise ValueError("the deferred-work ledger is not a regular file")
+    data = path.read_bytes()
+    after = path.lstat()
+
+    def identity(value):
+        return (value.st_dev, value.st_ino, value.st_mode, value.st_size, value.st_mtime_ns)
+
+    if identity(before) != identity(after):
+        raise ValueError("the deferred-work ledger changed while being read")
+    evidence.update(
+        exists=True,
+        identity=[before.st_dev, before.st_ino, before.st_mode],
+        sha256=hashlib.sha256(data).hexdigest(),
+    )
+    return evidence
 
 
 def _accepted(task: StoryTask) -> SessionRecord | None:
@@ -303,6 +346,7 @@ def _evidence(
         "latest_task_id": latest.task_id,
         "latest_digest": _digest(latest.to_dict()),
         "plan_digest": _plan_digest(plan),
+        "ledger": _ledger_evidence(paths.deferred_work),
         "story_key": story_key,
     }
 
@@ -388,6 +432,7 @@ def rearm_for_implemented_review(
         task.phase = Phase.DEV_VERIFY
         task.generation += 1
         task.review_cycle = task.review_usage_relaunches = task.followup_reviews_spent = 0
+        task.review_unlaunched_cycles = 0
         task.reverify_from = task.reverify_replayed = ""
         task.rearmed = False
         task.defer_reason = task.env_fault_site = None
@@ -487,4 +532,20 @@ def primary_was_bound(state: RunState, task: StoryTask, run_dir: Path) -> bool:
         and e.get("session_id")
         and re.fullmatch(pattern, str(e.get("task_id", "")))
         for e in entries
+    )
+
+
+def review_reservation_unlaunched(state: RunState, task: StoryTask, run_dir: Path) -> bool:
+    """Refund only an exact reserved identity with no launch or result evidence."""
+    if task.review_cycle <= 0:
+        return False
+    task_id = session_task_id(task.story_key, "review", task.review_cycle, task.generation)
+    if any(record.task_id == task_id for record in task.sessions):
+        return False
+    entries = Journal(run_dir, pin=state).entries()
+    return not any(
+        not isinstance(entry, dict)
+        or entry.get("kind") == "journal-line-unreadable"
+        or entry.get("task_id") == task_id
+        for entry in entries
     )

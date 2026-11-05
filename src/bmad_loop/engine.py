@@ -2804,6 +2804,7 @@ class Engine:
                 task.generation += 1
                 task.review_cycle = 0
                 task.review_usage_relaunches = 0  # refunds never exceed review_cycle (#959)
+                task.review_unlaunched_cycles = 0
                 task.followup_reviews_spent = 0
                 task.salvage_refile_pending = False
                 self._save()
@@ -7861,14 +7862,26 @@ class Engine:
 
     def _resume_implemented_review(self, task: StoryTask) -> None:
         """Consume an explicit source attestation only through normal primary review."""
-        from .accepted_review import prepared_plan_evidence, primary_was_bound
+        from .accepted_review import (
+            prepared_plan_evidence,
+            primary_was_bound,
+            review_reservation_unlaunched,
+        )
 
+        unlaunched = task.phase == Phase.REVIEW_RUNNING and review_reservation_unlaunched(
+            self.state, task, self.run_dir
+        )
         if task.phase == Phase.REVIEW_RUNNING:
             # The native process is gone; inspect its retained state before
             # either re-entering review or escalating. This records no result.
             advance(task, Phase.REVIEW_VERIFY)
         if not primary_was_bound(self.state, task, self.run_dir):
             self._validate_implemented_review(task)
+            if unlaunched:
+                task.review_unlaunched_cycles += 1
+                # Save the refund with REVIEW_VERIFY: another crash cannot
+                # credit this reservation twice. Keep review_cycle for unique IDs.
+                self._save()
             assert task.spec_file is not None
             spec = verify.resolve_spec_path(task.spec_file, self.workspace.paths)
             self._spec_status_write(

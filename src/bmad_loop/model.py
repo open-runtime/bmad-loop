@@ -907,6 +907,9 @@ class StoryTask:
     # capped per story by `limits.max_usage_relaunches`.
     dev_usage_relaunches: int = 0
     review_usage_relaunches: int = 0
+    # Reserved review identities whose launch never began. Separate from usage
+    # relaunches: a host crash before dispatch spends no provider/budget slot.
+    review_unlaunched_cycles: int = 0
 
     @property
     def terminal(self) -> bool:
@@ -921,8 +924,8 @@ class StoryTask:
     @property
     def charged_review_cycles(self) -> int:
         """Review cycles charged against `limits.max_review_cycles`: every launch
-        minus the uncharged usage relaunches (#959)."""
-        return self.review_cycle - self.review_usage_relaunches
+        minus usage relaunches and proven unlaunched reservations."""
+        return self.review_cycle - self.review_usage_relaunches - self.review_unlaunched_cycles
 
     @property
     def usage_relaunches(self) -> int:
@@ -977,6 +980,7 @@ class StoryTask:
             "followup_reviews_spent": self.followup_reviews_spent,
             "dev_usage_relaunches": self.dev_usage_relaunches,
             "review_usage_relaunches": self.review_usage_relaunches,
+            "review_unlaunched_cycles": self.review_unlaunched_cycles,
             "generation": self.generation,
             "escalations_resolved_upto": self.escalations_resolved_upto,
             "followup_review_recommended": self.followup_review_recommended,
@@ -1242,6 +1246,7 @@ class StoryTask:
             followup_reviews_spent=int(d.get("followup_reviews_spent", 0)),
             dev_usage_relaunches=int(d.get("dev_usage_relaunches", 0)),
             review_usage_relaunches=int(d.get("review_usage_relaunches", 0)),
+            review_unlaunched_cycles=int(d.get("review_unlaunched_cycles", 0)),
             generation=int(d.get("generation", 0)),
             escalations_resolved_upto=int(d.get("escalations_resolved_upto", 0)),
             followup_review_recommended=bool(d.get("followup_review_recommended", False)),
