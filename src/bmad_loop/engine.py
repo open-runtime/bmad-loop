@@ -2596,36 +2596,62 @@ class Engine:
             except (OSError, ValueError) as exc:
                 refuse(str(exc))
 
+        def result_from_resumable_record() -> SessionResult:
+            last = task.sessions[-1]
+            return SessionResult(
+                status=last.status,
+                session_id=last.session_id,
+                transcript_path=last.transcript_path,
+                resumed_from=last.resumed_from or None,
+                result_json=last.result_json,
+                parked=last.ended == "parked",
+                produced_work=last.ended != "no-work",
+                transport_fault=(
+                    last.ended
+                    if last.ended in ("transport", "pool", "environment", "usage")
+                    else None
+                ),
+            )
+
+        result: SessionResult
         if not stopped_native.recorded(task):
             if task.stopped_native.get("reserved"):
-                refuse(
-                    "a native launch was reserved without a completed matching result; preserve its evidence"
+                # reserved is only for a crash with no SessionRecord. A matching
+                # timeout/stall/crash was a real adapter return — recover it so
+                # ordinary decide/retry can continue the native on the kept tree.
+                if not stopped_native.resumable_recorded(task):
+                    refuse(
+                        "a native launch was reserved without a completed matching result; preserve its evidence"
+                    )
+                result = result_from_resumable_record()
+            else:
+                validate()
+                if not getattr(getattr(self.adapters["dev"], "profile", None), "resumable", False):
+                    refuse("the selected adapter cannot resume this conversation")
+                self._gate_dispatch(task, "dev")
+                validate()
+                held = task.stopped_native
+                task.stopped_native["reserved"] = True
+                self._save()
+                resume = stopped_native.NativeResume(
+                    held["native_id"], held["transcript_path"], held["native_binding"]
                 )
-            validate()
-            if not getattr(getattr(self.adapters["dev"], "profile", None), "resumable", False):
-                refuse("the selected adapter cannot resume this conversation")
-            self._gate_dispatch(task, "dev")
-            validate()
-            held = task.stopped_native
-            task.stopped_native["reserved"] = True
-            self._save()
-            resume = stopped_native.NativeResume(
-                held["native_id"], held["transcript_path"], held["native_binding"]
-            )
-            result = self._run_session(
-                task,
-                "dev",
-                self._resume_prompt(task, "dev", resume),
-                task.attempt,
-                resume=resume,
-                continuation=int(held["resumes"]) + 1,
-                prelaunch_validator=validate,
-                commit_engine_ledger=False,
-            )
-            if not stopped_native.recorded(task):
-                refuse(
-                    "the continuation did not return a completed result from the original native"
+                result = self._run_session(
+                    task,
+                    "dev",
+                    self._resume_prompt(task, "dev", resume),
+                    task.attempt,
+                    resume=resume,
+                    continuation=int(held["resumes"]) + 1,
+                    prelaunch_validator=validate,
+                    commit_engine_ledger=False,
                 )
+                if not stopped_native.recorded(task) and not stopped_native.resumable_recorded(
+                    task
+                ):
+                    refuse(
+                        "the continuation did not return a completed result from the original native"
+                    )
         else:
             replay = self._resumable_session(task)
             if replay is None:
@@ -2638,7 +2664,9 @@ class Engine:
         )
         task.stopped_native = {}
         # Exactly the existing completed-result replay transition below. No
-        # attempt, generation, baseline, or source reset accompanies it.
+        # attempt, generation, baseline, or source reset accompanies it. A
+        # matching timeout/stall/crash also lands here so decide_dev can RETRY
+        # the same native on the unfinished tree instead of leaving the latch.
         task.phase = Phase.PENDING
         self._drive_story(task, dev_resume=result)
 

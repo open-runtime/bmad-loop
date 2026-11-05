@@ -22,7 +22,7 @@ from . import runs, signals, verify
 from .adapters.multiplexer import MultiplexerError, get_multiplexer, mux_usable
 from .adapters.profile import load_profiles
 from .journal import Journal
-from .model import Phase, RunState, StoryTask
+from .model import Phase, RunState, SessionRecord, StoryTask
 from .native_binding import resume_refusal
 from .platform_util import session_task_id
 from .policy import Policy
@@ -389,18 +389,40 @@ def validate(state: RunState, task: StoryTask, project: Path, policy: Policy) ->
     _require(refusal is None, f"the native binding changed: {refusal}")
 
 
-def recorded(task: StoryTask) -> bool:
+# Same vocabulary as Engine.RESUMABLE_SESSION_STATUSES: a real adapter return
+# that is not a completed result, so ordinary decide/retry may continue the
+# native. Kept here to avoid an engine import cycle.
+_RESUMABLE_STATUSES = frozenset({"stalled", "timeout", "crashed"})
+
+
+def _continuation_session(task: StoryTask) -> SessionRecord | None:
+    """Latest session when it is this continuation's return from the native."""
     held = task.stopped_native
     if not held or not task.sessions:
-        return False
+        return None
     last = task.sessions[-1]
-    return (
+    if (
         last.task_id == held.get("task_id")
         and last.artifact_task_id == held.get("artifact_id")
         and last.role == "dev"
         and not last.label
         and last.session_id == held.get("native_id")
         and last.resumed_from == held.get("native_id")
-        and last.status == "completed"
-        and last.result_json is not None
-    )
+    ):
+        return last
+    return None
+
+
+def recorded(task: StoryTask) -> bool:
+    last = _continuation_session(task)
+    return last is not None and last.status == "completed" and last.result_json is not None
+
+
+def resumable_recorded(task: StoryTask) -> bool:
+    """Matching continuation that timed out, stalled, or crashed.
+
+    Unlike a host loss with no SessionRecord, this is a real adapter return: the
+    reserved launch latch must not brick ordinary recovery of the same native.
+    """
+    last = _continuation_session(task)
+    return last is not None and last.status in _RESUMABLE_STATUSES

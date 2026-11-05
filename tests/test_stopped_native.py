@@ -500,6 +500,89 @@ def test_reserved_crash_never_relaunches_or_reuses_artifacts(stopped_native, mon
     assert case.engine.state.tasks[case.task.story_key].stopped_native
 
 
+def _complete_native(case):
+    def complete(spec):
+        assert spec.resume_session_id == NATIVE
+        write_spec(case.plan, "done", case.baseline)
+        return SessionResult(
+            status="completed",
+            session_id=NATIVE,
+            resumed_from=NATIVE,
+            result_json={
+                "workflow": "auto-dev",
+                "story_key": case.task.story_key,
+                "spec_file": str(case.plan),
+                "baseline_commit": case.baseline,
+                "escalations": [],
+                "followup_review_recommended": False,
+            },
+        )
+
+    return complete
+
+
+@pytest.mark.parametrize("status", ["timeout", "stalled", "crashed"])
+def test_continuation_timeout_does_not_brick_native_recovery(stopped_native, monkeypatch, status):
+    """A recorded non-completed continuation must clear the latch and keep the
+    unfinished tree so ordinary decide/retry can resume the same native.
+
+    Ablation: refuse after `_run_session` whenever `recorded()` is false and the
+    next resume hits the reserved arm forever while prepare also rejects a
+    second `--continue-native`."""
+    case = stopped_native
+    _arm(case)
+    before = (case.project.project / "unfinished.txt").read_text()
+    case.adapter.script.append(SessionResult(status=status, session_id=NATIVE, resumed_from=NATIVE))
+    case.adapter.script.append(_complete_native(case))
+    reviewed = []
+    monkeypatch.setattr(
+        case.engine, "_review_and_commit", lambda t, **kw: reviewed.append(t.story_key)
+    )
+    case.engine._finish_inflight()
+    assert len(case.adapter.sessions) == 2
+    assert case.adapter.sessions[0].resume_session_id == NATIVE
+    assert case.adapter.sessions[1].resume_session_id == NATIVE
+    assert (case.project.project / "unfinished.txt").read_text() == before
+    assert not case.engine.state.tasks[case.task.story_key].stopped_native
+    assert reviewed == [case.task.story_key]
+
+
+def test_reserved_timeout_record_recovers_on_next_resume(stopped_native, monkeypatch):
+    """A prior refuse that left reserved=True with a timeout SessionRecord must
+    still be recoverable without hand-editing state."""
+    from bmad_loop.model import SessionRecord
+
+    case = stopped_native
+    _arm(case)
+    held = case.task.stopped_native
+    held["reserved"] = True
+    case.task.sessions.append(
+        SessionRecord(
+            task_id=held["task_id"],
+            log_task_id=held["artifact_id"],
+            role="dev",
+            status="timeout",
+            session_id=NATIVE,
+            resumed_from=NATIVE,
+            adapter=case.engine.policy.adapter.resolved("dev").name,
+        )
+    )
+    case.task.session_resumes = 1
+    case.engine._save()
+    case.adapter.script.append(_complete_native(case))
+    reviewed = []
+    monkeypatch.setattr(
+        case.engine, "_review_and_commit", lambda t, **kw: reviewed.append(t.story_key)
+    )
+    case.engine._finish_inflight()
+    assert not case.engine.state.tasks[case.task.story_key].stopped_native
+    assert reviewed == [case.task.story_key]
+    assert case.adapter.sessions[-1].resume_session_id == NATIVE
+    assert (case.project.project / "unfinished.txt").read_text() == (
+        "Keep the unfinished source.\n"
+    )
+
+
 def test_completed_result_crash_replays_without_second_native(stopped_native, monkeypatch):
     case = stopped_native
     _arm(case)
