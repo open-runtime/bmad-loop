@@ -7,6 +7,8 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+## [0.13.12] — 2026-11-05
+
 ### Fixed
 
 - Keep a resumed primary bound to its original native review until it completes with a recorded result.
@@ -6821,7 +6823,8 @@ enforced in CI.
   implementation phase, driven by a Python control loop with hook-based session transport and
   resumable on-disk run state.
 
-[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.13.11...HEAD
+[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.13.12...HEAD
+[0.13.12]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.12
 [0.13.11]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.11
 [0.13.10]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.10
 [0.13.9]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.9
