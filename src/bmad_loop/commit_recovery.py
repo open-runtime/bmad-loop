@@ -126,7 +126,8 @@ def evidence(
     key = task.story_key
     _require(state.source == "tickets" and state.run_type == "story", "requires a ticket run")
     _require(not state.finished, "the run is finished")
-    _require(resuming or state.stopped, "the run must be stopped")
+    # A commit-window failure pauses via RunPaused; it does not stamp stopped.
+    # Engine death is enforced at arm(); admission here matches other resolve modes.
     _require(
         resuming
         or (runs.escalation_resolvable(state) and runs.escalation_story_admitted(state, key)),

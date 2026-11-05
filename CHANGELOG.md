@@ -7,6 +7,12 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+## [0.13.15] — 2026-11-05
+
+### Fixed
+
+- Retry verified finalization from a paused escalation without requiring an unrelated stopped flag.
+
 ## [0.13.14] — 2026-11-05
 
 ### Added
@@ -6851,7 +6857,8 @@ enforced in CI.
   implementation phase, driven by a Python control loop with hook-based session transport and
   resumable on-disk run state.
 
-[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.13.14...HEAD
+[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.13.15...HEAD
+[0.13.15]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.15
 [0.13.14]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.14
 [0.13.13]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.13
 [0.13.12]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.12
