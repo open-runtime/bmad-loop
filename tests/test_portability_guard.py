@@ -332,6 +332,9 @@ RUN_STATE_TRANSACTIONS = {
 # refusals, and deliberately adds no runtime abstraction (no RefusalError, no
 # registry): the inventory is the test file's, not the product's.
 REFUSAL_HELPER_DEFS = {
+    # #949: no keys into a pane in a mode, naming the mode; test_generic_tmux.py
+    # test_send_text_refuses_a_pane_in_mode, test_a_pane_mode_refusal_names_the_mode_*
+    ("adapters/tmux_base.py", "_refuse_in_mode"),
     # DW-444: publish into a zero-inode artifacts root; test_artifact_publication.py
     ("artifact_publication.py", "_refuse_zero_inode_root"),
     ("cli.py", "_reject_bad_run_id"),
@@ -410,6 +413,7 @@ ISOLATION_CONFLICT_CALLERS = {
 STORE_TOPOLOGY_CALLERS = {
     ("accepted_review.py", "_evidence"): 2,  # admission, locked mutation and dispatch
     ("commit_recovery.py", "evidence"): 1,  # admission, locked arm and commit entry
+    ("stopped_native.py", "snapshot"): 1,  # preserve the live ticket-store binding
     ("ticketstore.py", "store_conflict"): 1,  # the predicate's own text call
     ("install.py", "_tickets_store_findings"): 1,  # validate + run preflight findings
     ("cli.py", "_reject_store_topology"): 1,  # the wrapper's own predicate call
@@ -1112,6 +1116,10 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "threshold_s",
         "to",
         "tokens",
+        # `session-end` (DW-618): the session's usage split per observed model, a
+        # {model id: four int counts} map `diagnostics._scrub_tokens_by_model`
+        # keeps key-wise through `_scrub_model_id`, values cut to the counts.
+        "tokens_by_model",
         "tokens_weighted",
         "total",
         # `quota-wait-ended` (DW-396): the session's cumulative quota-wait
@@ -1233,10 +1241,9 @@ JOURNAL_SPLAT_ALLOW = {
     ("engine.py", "_review_and_commit"): 1,
     # TWO unresolved `**self._session_end_extras(result)` arguments, one on each of
     # two writes — the normal session-end path and the `finally` fallback that runs
-    # when the normal one did not reach. Both splat the SAME method's dict, which is
-    # why one field inventory covers the pair; the count is the only thing that can
-    # see a third arrive, whether as a third write or as a second `**` on one of
-    # these two.
+    # when the normal one did not reach. The fallback augments the SAME method's
+    # dict with the hard-stop exception class under the routed `error` name;
+    # one field inventory covers both. The count catches a third argument.
     ("engine.py", "_run_session"): 2,
     # One unresolved `**fields` forward: the forwarder's own hole.
     ("plugins/bus.py", "_log"): 1,
@@ -1334,6 +1341,10 @@ JOURNAL_SPLAT_FIELDS = {
             "usage_limit_class",
             "models",
             "models_unresolved",
+            "tokens_by_model",
+            # Returned hard-stop provenance, added to the fallback extras
+            # before journaling; diagnostics drops exception text by name.
+            "error",
         }
     ),
     # The plugin bus's `_log` forwards its OWN `**fields` parameter, so the keys
@@ -1493,6 +1504,12 @@ JOURNAL_KINDS = frozenset(
         "commit-retry-armed",
         "commit-retry-entered",
         "commit-retry-refused",
+        # Native recovery identifiers are routed by diagnostics; refusals drop
+        # their reason. Covered by stopped-native and native-binding tests.
+        "stopped-native-armed",
+        "stopped-native-completed",
+        "stopped-native-refused",
+        "native-resume-refused",
         # adapters/generic.py — the only adapter-side writer. The engine hands its
         # `Journal` to every adapter it owns (`CodingCLIAdapter.journal`, #680) so
         # the wait loop can record what only it sees: the live transcript's idle
@@ -1614,6 +1631,9 @@ JOURNAL_KINDS = frozenset(
         "deferred-close-skipped-out-of-tree",
         "deferred-close-unmatched",
         "dev-decision",
+        # DW-615. The tree choice of an uncharged dev usage relaunch, from
+        # `Engine._dev_phase`: `kept` and the `reason` it was kept or rolled back.
+        "dev-relaunch-tree",
         # DW-523. A failed `[environment]` probe pass, from
         # `Engine._observe_environment_probes` (dev/fix verify, and the review
         # gates through `_review_probe_sink`): `site` names the asking seam.

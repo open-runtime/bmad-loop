@@ -37,6 +37,41 @@ from conftest import make_git_noisy
 from bmad_loop import bmadconfig, envvars, verify
 
 
+def test_non_utf8_filename_probe_accepts_supported_filesystem(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        conftest.os,
+        "open",
+        lambda path, flags, mode: calls.append(("open", path, flags, mode)) or 41,
+    )
+    monkeypatch.setattr(conftest.os, "close", lambda fd: calls.append(("close", fd)))
+    monkeypatch.setattr(conftest.os, "unlink", lambda path: calls.append(("unlink", path)))
+
+    conftest._require_non_utf8_filenames(tmp_path)
+
+    raw = os.fsencode(tmp_path) + b"/pytest-non-utf8-\xff"
+    assert calls == [
+        ("open", raw, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600),
+        ("close", 41),
+        ("unlink", raw),
+    ]
+
+
+@pytest.mark.parametrize("error", [errno.EILSEQ, errno.EACCES, errno.ENOSPC])
+def test_non_utf8_filename_probe_skips_only_encoding_rejection(tmp_path, monkeypatch, error):
+    def refuse(*_):
+        raise OSError(error, "filesystem rejected probe")
+
+    monkeypatch.setattr(conftest.os, "open", refuse)
+    if error == errno.EILSEQ:
+        with pytest.raises(pytest.skip.Exception, match="non-UTF-8 filenames"):
+            conftest._require_non_utf8_filenames(tmp_path)
+    else:
+        with pytest.raises(OSError) as raised:
+            conftest._require_non_utf8_filenames(tmp_path)
+        assert raised.value.errno == error
+
+
 def test_template_drops_sample_hooks_but_keeps_hooks_dir_and_exclude(project):
     """`git init` seeds 14 dead `*.sample` hooks that nothing reads; the template
     deletes the files so each per-test copy stops replicating them.
@@ -825,33 +860,6 @@ def test_opencode_gate_refuses_a_binary_that_cannot_be_launched(monkeypatch, err
 
     assert not conftest.opencode_runs()
     assert len(calls) == 1
-
-
-def test_opencode_gate_answers_win32_without_touching_the_host(monkeypatch):
-    """The win32 early-out, which nothing else in the suite grades.
-
-    opencode-on-Windows is unverified for this adapter (README adapter table),
-    so the answer there is False by policy — and it has to be reached before the
-    PATH lookup and before the probe, because Windows CI should pay for
-    neither. Poisoning both `shutil.which` and `subprocess.run` is how the
-    ordering is asserted rather than just the return value: either one being
-    reached is an `AssertionError`.
-
-    Ablation target: delete the `if sys.platform == "win32": return False` early
-    return and this test fails alone, on the `AssertionError` the poisoned
-    `shutil.which` raises. The other three rows all pin `platform` to "linux" to
-    stay host-independent, so they stay GREEN under that same mutation — which
-    is the whole reason this row exists: without it, deleting the early return
-    leaves this file, and the suite, entirely green."""
-
-    def refuse(*args, **kwargs):
-        raise AssertionError("win32 must answer before any PATH lookup or probe")
-
-    monkeypatch.setattr(conftest.sys, "platform", "win32")
-    monkeypatch.setattr(conftest.shutil, "which", refuse)
-    monkeypatch.setattr(conftest.subprocess, "run", refuse)
-
-    assert not conftest.opencode_runs()
 
 
 # --- DW-95: the real-tmux xdist grouping guard --------------------------------

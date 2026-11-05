@@ -7,9 +7,26 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+## [0.13.14] — 2026-11-05
+
+### Added
+
+- Continue a stopped native development session through explicit, verified recovery while preserving its unfinished source and original artifacts.
+- Document fork capabilities, parallel epic runs and TeamRouter routing.
+
 ### Fixed
 
 - Ignore retained run archives when initializing or refreshing a project.
+- Validate native harness and launch-profile bindings before resuming a conversation.
+- Retain per-model usage and unread-transcript diagnostics when charging resumed sessions.
+- Install the open-runtime fork from its setup skill and installation examples.
+- Preserve continuation identity when recovering a completed session that lost its Stop event.
+- Redact nested wrapper home directories without refusing safe adapter probe reports.
+- Register recovery diagnostics and check filename-test support on the target filesystem.
+- Preserve retry decisions and escalation state before notifying or relaunching a session.
+- Keep unfinished source and ledger edits during usage-limit relaunches and recheck environment gates.
+- Improve per-model token accounting, descendant activity tracking and OpenCode budget enforcement.
+- Correct Windows trust matching, hook-payload capture and terminal view-mode diagnostics.
 
 ## [0.13.13] — 2026-11-05
 
@@ -6834,7 +6851,8 @@ enforced in CI.
   implementation phase, driven by a Python control loop with hook-based session transport and
   resumable on-disk run state.
 
-[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.13.13...HEAD
+[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.13.14...HEAD
+[0.13.14]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.14
 [0.13.13]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.13
 [0.13.12]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.12
 [0.13.11]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.11

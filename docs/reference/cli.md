@@ -203,12 +203,13 @@ bmad-loop sweep [--project PROJECT] [--no-prompt] [--decisions-only] [--max-bund
 Continues a paused or interrupted run or sweep.
 
 ```text
-bmad-loop resume [--project PROJECT] [--accept-baseline] run_id
+bmad-loop resume [--project PROJECT] [--accept-baseline | --continue-native SESSION_ID] run_id
 ```
 
-| Option              | Description                                                                                                                                          |
-| ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--accept-baseline` | For this resume only, adopt the current HEAD as the baseline of every restarted in-place story instead of preserving commits above the old baseline. |
+| Option                         | Description                                                                                                                                                                                                                                                                                         |
+| ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--accept-baseline`            | For this resume only, adopt the current HEAD as the baseline of every restarted in-place story instead of preserving commits above the old baseline.                                                                                                                                                |
+| `--continue-native SESSION_ID` | Explicitly continue a stopped unfinished in-place development session with matching native evidence, preserving its source and attempt. Requires remaining session-resume budget; see [stopped-session continuation](../loop-recovery-guide.md#continue-an-explicitly-stopped-development-session). |
 
 - Refused with exit 1 for a live engine, a finished run, a sweep whose ledger cannot be read, and the same git-floor, isolation, skill and plugin-trust gates as `run`. Does not require a clean worktree.
 - Refused with exit 1, before any side effect, for a story run whose work source this version does not know (the run was started by a newer bmad-loop) or cannot run yet. Do not downgrade bmad-loop while a run is in progress.
@@ -313,6 +314,7 @@ bmad-loop status [--project PROJECT] [--json] [run_id]
 ```
 
 - The status line (`status: …`) is `finished`, `PAUSED (<stage>) — <reason>`, `in progress — graceful stop pending (will stop after the current item)`, or `in progress (or interrupted)`.
+- A story row's `dev×N review×N` is followed by `↻M` when M of those sessions were uncharged usage-limit relaunches (dev and review together), which is why either count can exceed its cap. Not shown when M is 0.
 - For an unfinished story run with no pause stage, each story still escalated adds `escalated: story '<key>' awaiting resolve — bmad-loop resolve <id>` below the status line. Not in `--json`.
 - For a tickets run, the footer is the tickets board, read live through the project's `tickets.py status` and pinned to the run's initiative. It shows the run's selectors, the ticket counts by state, then one block per epic in build order: done count, epic status and any recorded closure, and each ticket's state, plan status, flags and this run's phase. A tree that cannot be read prints `tickets board unavailable: <reason>`, and `status` still exits 0. Marks or store commits still owed after landing are listed last.
 - Exits 1 with `no runs found`, or on a bad or ambiguous ref (stdout stays empty under `--json`).
@@ -560,7 +562,9 @@ Built from the run's `state.json`.
 | `tickets`                                           | object \| null | tickets runs only, below; null for every other source                  |
 | `tasks`                                             | array          | one entry per story                                                    |
 
-Each task: `story_key`, `epic`, `phase`, `attempt`, `review_cycle`, `tokens` (`input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_creation_tokens`, `raw`, `weighted`), `commit_sha`, `defer_reason`, `preserve_ref`, `followup_review_recommended` (bool: the build session recommended a follow-up review), `adapters_used` (`{role: {name, model}}`), `ticket` (object or null, below).
+Each task: `story_key`, `epic`, `phase`, `attempt`, `review_cycle`, `dev_usage_relaunches` and `review_usage_relaunches` (int: the uncharged usage-limit relaunches counted inside `attempt` and `review_cycle`, which is why either can exceed its cap), `tokens` (`input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_creation_tokens`, `raw`, `weighted`), `commit_sha`, `defer_reason`, `preserve_ref`, `followup_review_recommended` (bool: the build session recommended a follow-up review), `adapters_used` (`{role: {name, model}}`), `ticket` (object or null, below).
+
+`tokens_by_model` (object, present only when some session of the task recorded a per-model split) maps each model id, and `<unattributed>`, to `{input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens}` summed over the task's sessions (see the [run directory](run-state.md#run-directory)). It sums to `tokens` when every session was split; it never changes `tokens`.
 
 `adapters_used` reports each role's last session that stamped an adapter. Its `model` is the configured model (`""` for the CLI default). `models_used` lists the models that session was observed to run (see the [run directory](run-state.md#run-directory)) and is present only when some were observed, so a role whose latest session observed none shows no `models_used` even when an earlier one did.
 

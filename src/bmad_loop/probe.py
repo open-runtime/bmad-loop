@@ -90,9 +90,13 @@ TRANSCRIPT_GLOBS = {
     "codex-rollout": "~/.codex/sessions/*/*/*/rollout-*.jsonl",
     "gemini-chat": "~/.gemini/tmp/*/chats/session-*.jsonl",
     "copilot-events": "~/.copilot/session-state/*/events.jsonl",
+    "antigravity-transcript": (
+        "~/.gemini/antigravity-cli/brain/*/.system_generated/logs/transcript_full.jsonl"
+    ),
 }
 # Fallback family glob keyed by the `cli` name, so a CLI whose usage_parser is
-# still "none" (e.g. antigravity, freshly added) still gets transcript discovery.
+# "none" (a freshly added profile, or an override that turns the parser off)
+# still gets transcript discovery.
 FAMILY_GLOBS = {
     "claude": "~/.claude/projects/*/*.jsonl",
     "codex": "~/.codex/sessions/*/*/*/rollout-*.jsonl",
@@ -311,6 +315,11 @@ def _redact_location(path: Path, aliases: dict[str, str] | None = None) -> str:
     def comp(c: str) -> str:
         if aliases and c in aliases:
             return aliases[c]
+        # Wrapper runtimes can nest a home directory below the real home.
+        # Keep the display from resembling another absolute home path after
+        # the outer prefix has been shortened to `~`.
+        if c.casefold() in {"home", "users", "root"}:
+            return "<redacted>"
         # The username check closes a hole the identifier gate leaves open:
         # a component like `pytest-of-alice` (or a $TMPDIR under /var/folders
         # named after the user) is identifier-shaped yet names the user — and

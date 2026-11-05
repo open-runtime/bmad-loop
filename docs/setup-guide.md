@@ -69,7 +69,7 @@ BMAD v7 installs modules from `bmod.toml` records. bmad-loop ships one: the
 register the module:
 
 ```bash
-npx skills add bmad-code-org/bmad-loop          # or: --skill '*' -y to skip the picker
+npx skills add open-runtime/bmad-loop          # or: --skill '*' -y to skip the picker
 claude "/bmad setup bmad-loop"
 claude "/bmad-loop-setup accept all defaults"
 ```
@@ -93,7 +93,7 @@ The BMAD-method installer copies the three `bmad-loop-*` skill directories
 init` adds the `bmod-bmad-loop` record folder, which v6 ignores. It does **not** carry the orchestrator tool — the installer copies only skill
 directories, not their sibling files, so the tool can't ride along in the skill folder.
 It is installed separately from Git by the setup skill. The canonical source is
-<https://github.com/bmad-code-org/bmad-loop>. (Going the other way, the tool's wheel
+<https://github.com/open-runtime/bmad-loop>. (Going the other way, the tool's wheel
 bundles the skills, so `bmad-loop init` can install them without the BMAD installer —
 when the installer already placed them, `init` simply skips the existing copies.)
 
@@ -274,11 +274,11 @@ The `[tui]` extra pulls in the Textual dashboard (`textual` + `tomlkit` + `pyte`
 **Together (recommended):**
 
 ```bash
-uv tool install "bmad-loop[tui] @ git+https://github.com/bmad-code-org/bmad-loop.git"
+uv tool install "bmad-loop[tui] @ git+https://github.com/open-runtime/bmad-loop.git"
 ```
 
 **A pinned release tag** (reproducible; recommended for day-to-day use): append the tag to the URL,
-as in `...bmad-loop.git@v<version>` (see the [releases](https://github.com/bmad-code-org/bmad-loop/releases) for tags).
+as in `...bmad-loop.git@v<version>` (see the [releases](https://github.com/open-runtime/bmad-loop/releases) for tags).
 Without a tag the install tracks `main`.
 
 **Tool first, TUI later (separately):** install the core without the extra, then add the
@@ -286,10 +286,10 @@ dashboard whenever you want it by re-running the same command **with** `[tui]`:
 
 ```bash
 # core tool only
-uv tool install "bmad-loop @ git+https://github.com/bmad-code-org/bmad-loop.git"
+uv tool install "bmad-loop @ git+https://github.com/open-runtime/bmad-loop.git"
 
 # add the TUI later — re-run with the extra (uv upgrades the install in place)
-uv tool install --upgrade "bmad-loop[tui] @ git+https://github.com/bmad-code-org/bmad-loop.git"
+uv tool install --upgrade "bmad-loop[tui] @ git+https://github.com/open-runtime/bmad-loop.git"
 ```
 
 Until the extra is present, `bmad-loop tui` prints a clear error
@@ -317,7 +317,7 @@ By hand (non-Claude CLIs, CI, scripts):
 # 1. upgrade the tool; --reinstall is required for a git source, or uv reuses the cached commit
 uv tool upgrade bmad-loop --reinstall
 #    to move to a newer tag instead, re-install with the new ref:
-#    uv tool install --force "bmad-loop[tui] @ git+https://github.com/bmad-code-org/bmad-loop.git@v<version>"
+#    uv tool install --force "bmad-loop[tui] @ git+https://github.com/open-runtime/bmad-loop.git@v<version>"
 
 # 2. re-lay the refreshed skills into each project that uses bmad-loop; without --cli this
 #    refreshes only the CLIs the policy selects (claude by default), so name every CLI
@@ -329,7 +329,7 @@ bmad-loop init --project /path/to/project --force-skills --cli claude --cli code
 `init` gitignores policy.toml because it is per-machine; if yours is already committed, run
 `git rm --cached .bmad-loop/policy.toml` once to stop sharing it (your local copy is kept).
 Read the [CHANGELOG](../CHANGELOG.md) or the
-[releases](https://github.com/bmad-code-org/bmad-loop/releases) for what changed between tags.
+[releases](https://github.com/open-runtime/bmad-loop/releases) for what changed between tags.
 
 ## Initializing CLIs other than claude
 
@@ -366,13 +366,17 @@ them to whoever owns the machine:
   ≥ 0.46.
 - **copilot** — run `copilot` once in the project and authenticate (`gh` / a Copilot
   subscription). Requires the Copilot **CLI** GA (≥ 2026-02) — _not_ the VS Code extension.
-  **Pin a capable model**: the free default (GPT-5 mini) silently skips steps in the
-  multi-step dev/review skills; set `[adapter] model = "claude-sonnet-4-6"` (→ `--model`).
+  **Pin a capable model**: a small model (GPT-5 mini was the old free default) silently
+  skips steps in the multi-step dev/review skills, so set
+  `[adapter] model = "claude-sonnet-4.6"` (→ `--model`; Copilot model ids use dotted
+  versions). The Copilot Free plan ignores `--model`: Copilot 1.0.105 auto-routes every
+  session. The model that actually ran shows in session-end `models` once a turn has
+  finished; a session that ends before its first turn completes records no model.
 - **antigravity** — run `agy` once in the project, authenticate, and answer
   **"Yes, I trust this folder"** before `bmad-loop run`; spawned sessions can't answer that
   dialog, and a pending one reads as a session timeout. Requires Antigravity CLI
-  (`agy` ≥ 1.1.3). Two limitations to know, both verified against 1.1.3:
-  - **Trust is exact-path.** `settings.json` `trustedWorkspaces` matches whole paths —
+  (`agy` ≥ 1.1.3). Things to know:
+  - **Trust is exact-path** (verified against 1.1.3). `settings.json` `trustedWorkspaces` matches whole paths —
     trusting a parent does _not_ cover its subdirectories, and
     `--dangerously-skip-permissions` does not bypass the dialog (it covers tool
     permissions only). `isolation = "none"` (the default) works once the project root
@@ -386,10 +390,18 @@ them to whoever owns the machine:
     **Known limitation:** entries are never removed when a worktree is torn down, so
     `trustedWorkspaces` accumulates one entry per unit — prune stale
     `.bmad-loop/runs/` paths by hand if the list grows.
-  - **Token usage is not recorded** (`usage_parser = "none"`) — and this is permanent,
-    not a gap: agy's transcript carries no usage data at all (it counts tokens only in
-    an internal SQLite/protobuf store). Runs work; the token columns stay empty.
-- **opencode** — install the HTTP client extra (`uv tool install "bmad-loop[tui,opencode] @ git+https://github.com/bmad-code-org/bmad-loop.git"`) and
+  - **Trust is case-sensitive, even on Windows** (agy 1.5.0). agy records the cwd as
+    your shell spelled it, so answer the dialog from the project's canonical-case path
+    (`C:\Users\...`). `cmd` keeps a typed `c:` drive letter, and that entry trusts
+    neither bmad-loop's sessions nor its worktrees. A forward-slash spelling of the same
+    path (`C:/Users/...`) also counts.
+  - **Token usage is read from agy's transcript**
+    (`usage_parser = "antigravity-transcript"`, checked against agy 1.4.9 and 1.5.0): each
+    model step's input, cache-read and output counts are summed, and a subagent's usage is
+    folded into the parent session that spawned it. The transcript has no model id, so the
+    observed model is not recorded. agy 1.1.3 wrote no counts, so its sessions read as
+    untracked.
+- **opencode** — install the HTTP client extra (`uv tool install "bmad-loop[tui,opencode] @ git+https://github.com/open-runtime/bmad-loop.git"`) and
   authenticate once, **globally**, with `opencode auth login` (not per-project — there is no
   workspace-trust dialog to answer). Supports OpenCode 1.x ≥ 1.18 and 2.x ≥ 2.0.21; see
   [OpenCode versions](#opencode-versions). Set the model as

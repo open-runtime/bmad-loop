@@ -144,7 +144,7 @@ def test_ignored_failure_is_not_reclassified_from_its_transcript(tmp_path, monke
     """Profile ignore applies to the same error in hook and transcript paths."""
     transcript = _transcript(tmp_path, [API_ERROR])
     failure = dataclasses.replace(
-        _relay_failure("server_error", "API Error: Connection lost mid-response."),
+        _relay_failure("server_error", "API Error: " "Connection lost mid-response."),
         transcript_path=transcript,
     )
     adapter, mux = _parked_adapter(tmp_path, monkeypatch, [failure])
@@ -160,7 +160,7 @@ def test_ignored_failure_is_not_reclassified_from_its_transcript(tmp_path, monke
 
 def test_classified_transient_keeps_backoff_and_bounded_nudge(tmp_path, monkeypatch):
     """Canonical upstream fields still enter fork transport recovery exactly once."""
-    message = "API Error: Connection lost mid-response."
+    message = "API Error: " "Connection lost mid-response."
     adapter, mux, spec, _ = _fork_adapter(
         tmp_path,
         monkeypatch,

@@ -141,6 +141,7 @@ from .worktree_flow import WorktreeFlow
 if TYPE_CHECKING:
     # Type-only: the worktree-provisioning helpers speak in CLI profiles.
     from .adapters.profile import CLIProfile
+    from .stopped_native import NativeResume
 
 
 # `origin:` marker prefix for ledger entries harvested out of a spec's
@@ -292,6 +293,14 @@ class VerifyCommandRecords:
 
 
 NO_VERIFY_COMMANDS = VerifyCommandRecords()
+
+# The sentence a kept-tree usage relaunch (DW-615) adds after the spec or plan
+# pointer, ahead of the injected clauses. Bare and backtick-free, like them.
+USAGE_RELAUNCH_RESUME = (
+    "A usage limit cut off the previous session before it finished; its partial "
+    "work is still in the working tree, so continue that work rather than "
+    "starting over."
+)
 
 
 class RunPaused(Exception):
@@ -2572,9 +2581,75 @@ class Engine:
             self.state.accept_baseline = False
             self._save()
 
+    def _continue_stopped_native(self, task: StoryTask) -> None:
+        from . import stopped_native
+
+        def refuse(reason: str) -> NoReturn:
+            self.journal.append("stopped-native-refused", story_key=task.story_key, reason=reason)
+            raise RunPaused(
+                f"cannot continue stopped native: {reason}", PAUSE_ESCALATION, task.story_key
+            )
+
+        def validate() -> None:
+            try:
+                stopped_native.validate(self.state, task, self.paths.project, self.policy)
+            except (OSError, ValueError) as exc:
+                refuse(str(exc))
+
+        if not stopped_native.recorded(task):
+            if task.stopped_native.get("reserved"):
+                refuse(
+                    "a native launch was reserved without a completed matching result; preserve its evidence"
+                )
+            validate()
+            if not getattr(getattr(self.adapters["dev"], "profile", None), "resumable", False):
+                refuse("the selected adapter cannot resume this conversation")
+            self._gate_dispatch(task, "dev")
+            validate()
+            held = task.stopped_native
+            task.stopped_native["reserved"] = True
+            self._save()
+            resume = stopped_native.NativeResume(
+                held["native_id"], held["transcript_path"], held["native_binding"]
+            )
+            result = self._run_session(
+                task,
+                "dev",
+                self._resume_prompt(task, "dev", resume),
+                task.attempt,
+                resume=resume,
+                continuation=int(held["resumes"]) + 1,
+                prelaunch_validator=validate,
+                commit_engine_ledger=False,
+            )
+            if not stopped_native.recorded(task):
+                refuse(
+                    "the continuation did not return a completed result from the original native"
+                )
+        else:
+            replay = self._resumable_session(task)
+            if replay is None:
+                refuse("the completed native result cannot be replayed")
+            _role, result = replay
+        self.journal.append(
+            "stopped-native-completed",
+            story_key=task.story_key,
+            session_id=task.stopped_native["native_id"],
+        )
+        task.stopped_native = {}
+        # Exactly the existing completed-result replay transition below. No
+        # attempt, generation, baseline, or source reset accompanies it.
+        task.phase = Phase.PENDING
+        self._drive_story(task, dev_resume=result)
+
     def _finish_inflight(self) -> None:
         """Complete or roll back tasks interrupted by a pause or crash."""
         for task in list(self.state.tasks.values()):
+            if task.stopped_native:
+                self._continue_stopped_native(task)
+                self._post_story_after_replay(task)
+                self._after_story(task)
+                continue
             if task.phase == Phase.ESCALATED and task.implemented_review is not None:
                 from .accepted_review import pool_review_refusal
 
@@ -2654,10 +2729,17 @@ class Engine:
                 else:
                     self._release_orphaned_mount(task)
                     self._resume_reverify(task)
-            elif task.phase == Phase.DEV_VERIFY and task.spec_file:
+            elif (
+                task.phase == Phase.DEV_VERIFY
+                and task.spec_file
+                and not self._dev_retry_latched(task)
+            ):
                 # paused at the spec-approval gate (or, in stories mode, a
                 # plan-checkpoint awaiting implementation — _resume_after_dev_verify
-                # dispatches the right leg): dev verified on disk.
+                # dispatches the right leg): dev verified on disk. A latched dev
+                # RETRY (DW-617) shares this shape but rejected the attempt, so it
+                # falls through to the replay or restart arm below, as it would
+                # with no spec_file.
                 if mounted:
                     unit = self._reopen_unit(task)
                     prev = self.workspace
@@ -2749,13 +2831,17 @@ class Engine:
                     self._release_orphaned_mount(task)
                     self._finalize_commit_phase(task)
             elif env_role == "dev" and task.phase == Phase.PENDING:
-                # DW-523: the run paused at the dev dispatch gate, before the
-                # attempt, the baseline, or anything else moved — so NO rollback:
-                # the tree (and any commit the operator made while paused) is the
-                # one the story starts from. The story gate was asked above, before
-                # the site cleared. A review-dispatch pause at DEV_VERIFY + spec_file
-                # (first cycle) or at REVIEW_VERIFY with the completed pass on record
-                # resumes through the spec-approval or completed-pass replay arms;
+                # DW-523: the run paused at a dev dispatch gate with nothing owed
+                # a rollback — at the top of the phase before the attempt, the
+                # baseline, or anything else moved, or (DW-616 `_gate_relaunch`)
+                # before a usage relaunch, after the usage-limited session's
+                # rollback already landed and the phase was reset to PENDING. So
+                # NO rollback: the tree (and any commit the operator made while
+                # paused) is the one the story starts from. The story gate was
+                # asked above, before the site cleared. A review-dispatch pause at
+                # DEV_VERIFY + spec_file (first cycle) or at REVIEW_VERIFY with the
+                # completed pass on record resumes through the spec-approval or
+                # completed-pass replay arms;
                 # the remaining REVIEW_VERIFY shape has its own arm below (DW-529).
                 self.journal.append("resume-env-dispatch", story_key=task.story_key, role=env_role)
                 if mounted:
@@ -2860,6 +2946,14 @@ class Engine:
                 # task keeps its half-built worktree mounted until a resume gets
                 # past the gate — the same thing an escalation pause does, and the
                 # cheaper of the two mistakes.
+                # Validate any resumable native before a restart can discard its
+                # tree. An unknown or changed harness stays a visible hold across
+                # engine restarts as well as inside the ordinary retry loop.
+                native_role = (
+                    "review" if task.phase in (Phase.REVIEW_RUNNING, Phase.REVIEW_VERIFY) else "dev"
+                )
+                native_seq = task.review_cycle if native_role == "review" else task.attempt
+                self._resume_candidate(task, native_role, native_seq + 1)
                 self._refuse_gated_story(task.story_key)
                 task.salvage_refile_pending = False  # abandoning this product's retry
                 self.journal.append(
@@ -2947,8 +3041,6 @@ class Engine:
             return None
         adapter = self.adapters.get(role)
         profile = getattr(adapter, "profile", None)
-        if profile is None or not getattr(profile, "resumable", False):
-            return None
         record = next((r for r in reversed(task.sessions) if r.role == role and not r.label), None)
         if record is None or not record.session_id:
             return None
@@ -2958,13 +3050,34 @@ class Engine:
             return None
         if record.ended in UNRESUMABLE_SESSION_ENDS:
             return None
-        if record.adapter and record.adapter != self.policy.adapter.resolved(role).name:
-            return None
-        if record.transcript_path and not Path(record.transcript_path).is_file():
+        native_refusal = getattr(adapter, "native_resume_refusal", None)
+        if callable(native_refusal):
+            reason = native_refusal(record)
+            if reason is not None:
+                self.journal.append(
+                    "native-resume-refused",
+                    story_key=task.story_key,
+                    role=role,
+                    session_id=record.session_id,
+                    reason=reason,
+                )
+                raise RunPaused(
+                    f"cannot resume native session: {reason}",
+                    PAUSE_ESCALATION,
+                    task.story_key,
+                )
+        elif (
+            profile is None
+            or not getattr(profile, "resumable", False)
+            or (record.adapter and record.adapter != self.policy.adapter.resolved(role).name)
+            or (record.transcript_path and not Path(record.transcript_path).is_file())
+        ):
             return None
         return record
 
-    def _resume_prompt(self, task: StoryTask, role: str, record: SessionRecord) -> str:
+    def _resume_prompt(
+        self, task: StoryTask, role: str, record: SessionRecord | NativeResume
+    ) -> str:
         """F6: the plain-text continuation a resumed session gets instead of the
         skill command (which would restart the workflow's steps)."""
         why = {
@@ -3151,7 +3264,10 @@ class Engine:
 
         DEV_VERIFY also reaches this matcher through _resume_after_dev_verify
         when a spec was bound before the host died but no accepted dev decision
-        was persisted. A bound spec alone does not prove acceptance."""
+        was persisted. A bound spec alone does not prove acceptance. A latched
+        RETRY of the current attempt also replays here (DW-617), before the
+        spec-approval arm, so a rejected attempt never becomes accepted merely
+        because the host died before the next dispatch."""
         if task.phase in (Phase.DEV_RUNNING, Phase.DEV_VERIFY):
             role, seq = "dev", task.attempt
         elif task.phase in (Phase.REVIEW_RUNNING, Phase.REVIEW_VERIFY):
@@ -3171,6 +3287,13 @@ class Engine:
                 transcript_path=record.transcript_path,
             )
         return None
+
+    def _dev_retry_latched(self, task: StoryTask) -> bool:
+        """Whether a dev RETRY rejected the task's current attempt and the next
+        attempt has not started (DW-617, ``StoryTask.rejected_dev_task_id``)."""
+        return bool(task.rejected_dev_task_id) and task.rejected_dev_task_id == (
+            _session_task_id(task.story_key, "dev", task.attempt, task.generation)
+        )
 
     def _current_dev_session_index(self, task: StoryTask) -> int | None:
         """Index of the newest primary dev record for the current attempt."""
@@ -3342,22 +3465,25 @@ class Engine:
         if veto.action == "pause":
             task.phase = Phase.ESCALATED  # deliberate: veto stage may have no legal advance
             self.journal.append("story-escalated", story_key=task.story_key, reason=msg)
+            # Both notifying arms save before the notify, as `_escalate` does: a
+            # host loss inside a slow notify command must not leave the last save.
+            self._save()
             gates.notify(
                 self.policy,
                 self.run_dir,
                 f"CRITICAL escalation: {task.story_key}",
                 f"{msg} — resolve, then `bmad-loop resume {self.state.run_id}`",
             )
-            self._save()
             raise RunPaused(msg, PAUSE_ESCALATION, task.story_key)
         task.defer_reason = msg
         task.phase = Phase.DEFERRED  # deliberate set; the veto stage may have no legal advance
         if veto.action == "defer":
             self.journal.append("story-deferred", story_key=task.story_key, reason=msg)
+            self._save()
             gates.notify(self.policy, self.run_dir, f"story deferred: {task.story_key}", msg)
         else:  # skip: retire quietly, no human notification
             self.journal.append("story-skipped", story_key=task.story_key, reason=msg)
-        self._save()
+            self._save()
         return True
 
     def _emit_run_boundary(self, stage: str) -> None:
@@ -3854,16 +3980,23 @@ class Engine:
             # retry rebases it onto the tree that retry deliberately keeps.
             task.baseline_ledger_digest = self._ledger_digest(task)
         feedback: Path | None = None
-        # F6 (open-runtime fork): a retry that resumes the previous conversation
-        # keeps the attempt's tree, as a fixable repair does (`feedback`).
-        kept_tree = False
         # A non-fixable rollback below restores the persisted ledger into the tree
         # the next attempt starts from. Loop-local on purpose: `task.attempt` survives
         # resume and re-arm, so it cannot tell a retry after rollback from a resumed
         # first pass.
         rolled_back = False
+        # An uncharged usage relaunch that kept the cut-off attempt's tree
+        # (DW-615): the next attempt inherits that tree and the chain's
+        # harvest/ledger/snapshot state as a fixable retry does, and dispatches
+        # `relaunch_prompt` when no repair `feedback` is held. Loop-local for the
+        # same reason as `feedback`: a crash replay re-decides from its record.
+        kept_tree = False
+        relaunch_prompt: str | None = None
         while True:
             replayed = resume_result is not None
+            # This attempt starts on the previous attempt's tree, not a rolled-back
+            # one: a fixable repair, or an uncharged usage relaunch that kept it.
+            inherits_tree = feedback is not None or kept_tree
             if resume_result is None:
                 # a resumed result replays the attempt it was recorded under, so
                 # the counter (and the session task_id derived from it) must not
@@ -3871,10 +4004,11 @@ class Engine:
                 # re-enters this continuation instead of falling back to restart.
                 task.attempt += 1
                 # A genuinely new attempt starts from a rolled-back tree and owes
-                # nothing to the rejected attempt's harvest. A fixable retry keeps
-                # that tree and ledger intentionally, so preserve its payload for a
-                # later isolated carry. Crash replay never enters this branch.
-                if not kept_tree:
+                # nothing to the rejected attempt's harvest. A fixable retry (or a
+                # kept-tree relaunch) keeps that tree and ledger intentionally, so
+                # preserve its payload for a later isolated carry. Crash replay
+                # never enters this branch.
+                if not inherits_tree:
                     task.harvested_deferrals = []
                     # The artifact-only receipt's ownership baseline (DW-273) is
                     # re-stamped on the same rule: a rolled-back attempt's IGNORED
@@ -3886,16 +4020,21 @@ class Engine:
                 # A fresh-baseline dispatch replaces stale ownership. A fixable
                 # repair inherits the current working tree, but retains the chain's
                 # first bound snapshot because a later non-fixable retry resets all
-                # the way to the phase baseline. For a resolved re-drive those are
-                # the operator-corrected bytes.
+                # the way to the phase baseline; a kept-tree relaunch inherits it
+                # the same way. For a resolved re-drive those are the
+                # operator-corrected bytes.
                 # Recorded-result replay never enters this branch and therefore
                 # retains the persisted binding unchanged.
                 preserve_chain_snapshot = (
-                    kept_tree and self._preserves_dispatched_spec_snapshot_for_repair(task)
+                    inherits_tree and self._preserves_dispatched_spec_snapshot_for_repair(task)
                 )
                 if not preserve_chain_snapshot:
                     self._bind_dispatched_spec_for_attempt(task)
             advance(task, Phase.DEV_RUNNING)
+            # The retry window a RETRY latch guards ends here: a fresh attempt
+            # bumped `attempt` above, and a crash replay re-decides from the
+            # recorded result below (DW-617).
+            task.rejected_dev_task_id = ""
             self._save()
             if (
                 resume_result is None
@@ -3917,24 +4056,25 @@ class Engine:
             else:
                 # intent-gap patch-restore (#2564): re-lay the saved attempt onto
                 # the baseline before dispatch so the re-driven session resumes
-                # review on the restored diff. `feedback is None` ⇒ the tree is at
+                # review on the restored diff. `not inherits_tree` ⇒ the tree is at
                 # baseline (fresh attempt or a non-fixable rollback below), NOT a
-                # fixable-feedback retry that kept the attempt's tree — so this
-                # never double-applies. No-op unless a restore is latched; escalates
-                # (never dispatches) if the patch fails to apply.
-                if not kept_tree:
+                # fixable-feedback retry or kept-tree relaunch that kept the
+                # attempt's tree — so this never double-applies. No-op unless a
+                # restore is latched; escalates (never dispatches) if it fails.
+                if not inherits_tree:
                     self._restore_patch(task)
-                # F6 (open-runtime fork): continue the previous conversation when
-                # it ended on a stall, timeout, crash or turn error and its tree
-                # was kept; a repair with feedback is always a fresh session.
+                # F6 continues a bound native conversation before considering a
+                # usage relaunch's explicit-spec prompt. A repair with feedback
+                # always gets a fresh session.
                 resume_record = (
                     self._resume_candidate(task, "dev", task.attempt) if feedback is None else None
                 )
-                prompt = (
-                    self._resume_prompt(task, "dev", resume_record)
-                    if resume_record is not None
-                    else self._dev_prompt(task, feedback)
-                )
+                if resume_record is not None:
+                    prompt = self._resume_prompt(task, "dev", resume_record)
+                elif kept_tree and feedback is None and relaunch_prompt is not None:
+                    prompt = relaunch_prompt
+                else:
+                    prompt = self._dev_prompt(task, feedback)
                 # Capture the exact bytes a fresh-baseline child will inherit after
                 # orchestrator-owned pre-launch mutations. A fixable repair validates
                 # that same path but retains the chain's first snapshot, because a
@@ -3965,10 +4105,17 @@ class Engine:
                     seq=task.attempt,
                     preserve_dispatched_spec_snapshot=preserve_chain_snapshot,
                     resume=resume_record,
-                    # #772: a repair keeps the harvested ledger, and a retry after
-                    # rollback starts on the restored one — both dirty, both the
-                    # engine's. A first-pass launch has no engine ledger dirt.
-                    commit_engine_ledger=feedback is not None or rolled_back,
+                    # #772: a repair keeps the harvested ledger, and a retry
+                    # after rollback starts on the restored one — both dirty, both
+                    # the engine's. A first-pass launch has no engine ledger dirt.
+                    # Neither has a kept-tree relaunch (DW-615), of a primary
+                    # attempt or of a repair: its cut-off session never completed,
+                    # so no harvest ran, and a cut-off repair's own launch already
+                    # committed the harvest it inherited. Any ledger dirt is that
+                    # session's own work. It stays in the tree for the resumed
+                    # session, never committed as bookkeeping that a later
+                    # rollback's preserve step would drop.
+                    commit_engine_ledger=(inherits_tree or rolled_back) and not kept_tree,
                 )
                 # Consume the rollback's bookkeeping before another attempt can
                 # keep this session's edits for an in-place resume. Those edits
@@ -3986,7 +4133,7 @@ class Engine:
                 # session authorship from the persisted baseline digest. Once an
                 # engine write is latched, the current ledger includes that write
                 # and replay must preserve the attribution saved before harvest.
-                if not replayed and feedback is None:
+                if not replayed and not inherits_tree:
                     task.harvest_wrote_ledger = False
                 if (
                     replayed
@@ -4019,7 +4166,7 @@ class Engine:
                 # all the way to the phase baseline. An unarmed replay may safely
                 # arm from disk; an armed replay must retain the dead attempt's
                 # pre-harvest bytes.
-                if (not replayed and feedback is None) or not task.pre_harvest_ledger_captured:
+                if (not replayed and not inherits_tree) or not task.pre_harvest_ledger_captured:
                     snapshot = self._ledger_text(
                         site="pre-harvest-snapshot", story_key=task.story_key
                     )
@@ -4114,6 +4261,15 @@ class Engine:
                 # explicit transaction latch so recovery may replay accepted-only
                 # bookkeeping without closing work from a PAUSE/RETRY/DEFER.
                 self._accept_current_dev_session(task)
+            elif decision.action == Action.RETRY:
+                # DW-617: the same DEV_VERIFY save carries a spec_file whenever the
+                # artifact gate passed (this attempt, ahead of a failing verify
+                # command, or an earlier verified one), which is the spec-approval
+                # resume shape. Persist the rejection so a host loss before the
+                # next attempt's save re-decides or restarts instead of reviewing.
+                task.rejected_dev_task_id = _session_task_id(
+                    task.story_key, "dev", task.attempt, task.generation
+                )
             self._save()
             if decision.action == Action.PROCEED:
                 self._finish_post_dev_accepted_sync(task, result.result_json)
@@ -4155,7 +4311,6 @@ class Engine:
                     # work exists and the failure is concrete: keep the tree,
                     # hand the failing output to a repair session
                     feedback = self._write_feedback(task, decision.reason)
-                    kept_tree = True
                     # The repair session is judged against the kept chain. Move
                     # the ledger reference onto that tree so the retained harvest
                     # is accounted for, while a new session-authored ledger edit
@@ -4165,76 +4320,51 @@ class Engine:
                     # ledger edit is NOT credited, the trade-off
                     # `_ledger_changed_since_baseline` accepts.
                     task.baseline_ledger_digest = self._ledger_digest(task)
+                    kept_tree = False
+                    relaunch_prompt = None
                 elif self._resume_candidate(task, "dev", task.attempt + 1) is not None:
-                    # F6 (open-runtime fork): the session itself failed (a stall,
-                    # timeout, crash or turn error) and its conversation can be
-                    # resumed: keep the tree for it instead of rolling back, the
-                    # way the fixable leg keeps it for a repair session.
+                    # F6: continue the same native on its unchanged tree. Do not
+                    # turn its own ledger edits into engine bookkeeping.
                     feedback = None
                     kept_tree = True
+                    relaunch_prompt = None
                     task.baseline_ledger_digest = self._ledger_digest(task)
                 else:
-                    feedback = None
-                    kept_tree = False
-                    rolled_back = True
-                    try:
-                        self._rollback_or_pause(task)
-                    finally:
-                        # An exception from rollback means this attempt is leaving
-                        # the decision pipeline just as surely as a returned
-                        # rollback. Detect the active unwind without limiting it to
-                        # RunPaused: reset/preserve failures are the #420 gap.
-                        unwinding = sys.exc_info()[0] is not None
-                        restore_error: OSError | StateRootError | None = None
-                        # Recovery resets code/spec state but protects artifact
-                        # directories through `_safe_reset`'s
-                        # keep=(".bmad-loop", *self._protected_relpaths()) shield.
-                        # Consequently an ordinary untracked harvest-created ledger
-                        # survives unless restored explicitly; `git reset --hard`
-                        # performs the ledger revert only when the ledger is tracked.
-                        # Run this for stop-and-wait too: the operator's eventual
-                        # reset would not remove an untracked or ignored file either.
-                        try:
-                            self._restore_persisted_ledger(task, replayed=replayed)
-                        except (OSError, StateRootError) as e:
-                            # Preserve an exception already in flight; replacing a
-                            # RunPaused/reset fault would misclassify the run and
-                            # skip the stale-arm cleanup below. The journal keeps
-                            # this secondary repair failure visible.
-                            # `StateRootError` joins `OSError` because the restore
-                            # now serializes on `ledger_lock`, which raises it when
-                            # the environment names no state root to put the lock
-                            # sidecar under. A lock that could not be taken is the
-                            # same class of secondary repair failure as a write
-                            # that could not land, and must not be the exception a
-                            # paused run reports either.
-                            restore_error = e
-                            self.journal.append(
-                                "ledger-restore-failed",
-                                story_key=task.story_key,
-                                error=f"{type(e).__name__}: {e}",
-                            )
-                        # Rebase from the snapshot already in hand so a filesystem
-                        # fault cannot replace a RunPaused while unwinding.
-                        if task.pre_harvest_ledger_captured:
-                            task.baseline_ledger_digest = _digest_of(task.pre_harvest_ledger)
-                        # Leaving this attempt spends the chain snapshot even when
-                        # its repair failed: retaining stale bytes across a pause or
-                        # crash would let resume overwrite later operator work. A
-                        # fixable retry never enters this branch and keeps its arm.
-                        self._disarm_ledger_snapshot(task)
-                        if unwinding or restore_error is not None:
-                            # A pause or rollback failure skips the next loop/save;
-                            # persist before it can ride a human window or #420's
-                            # crash path. A restore failure must likewise persist
-                            # the disarm before it is raised. On a cleanly returned
-                            # rollback the next attempt's ordinary save supplies
-                            # durability.
-                            self._save()
-                        if restore_error is not None and not unwinding:
-                            # Repair writes fail loud when there is no earlier
-                            # exception whose identity must be preserved.
-                            raise restore_error
+                    # An uncharged usage relaunch keeps the cut-off attempt's tree
+                    # when it can name the spec it resumes (DW-615); every other
+                    # non-fixable decision rolls back as it always has. Decide
+                    # before clearing `feedback`: a cut-off repair keeps it.
+                    kept_tree, tree_reason, relaunch_prompt = (
+                        self._usage_relaunch_tree(task, repair=feedback is not None)
+                        if decision.uncharged
+                        else (False, "", None)
+                    )
+                    if decision.uncharged:
+                        self.journal.append(
+                            "dev-relaunch-tree",
+                            story_key=task.story_key,
+                            attempt=task.attempt,
+                            kept=kept_tree,
+                            reason=tree_reason,
+                        )
+                    if not kept_tree:
+                        feedback = None
+                        rolled_back = True
+                        self._roll_back_rejected_attempt(task, replayed=replayed)
+                if decision.uncharged:
+                    # DW-616: the relaunch dispatches below without passing the
+                    # top-of-phase gate, and `_env_gate_decision` skipped the
+                    # probes for this uncharged decision — probe now, after the
+                    # tree choice, so a dead environment pauses instead of
+                    # failing the relaunched session. A kept tree is rolled back
+                    # before that pause: resume re-enters the phase from the top
+                    # and re-captures the baseline, which would absorb it.
+                    def roll_back_kept_tree() -> None:
+                        nonlocal rolled_back
+                        rolled_back = True
+                        self._roll_back_rejected_attempt(task, replayed=replayed)
+
+                    self._gate_relaunch(task, rollback=roll_back_kept_tree if kept_tree else None)
                 continue
             # DEFER and escalation preserve their current tree/knowledge rather
             # than rejecting the attempt, so neither may later consume this arm.
@@ -4256,6 +4386,104 @@ class Engine:
                 self._escalate_env(task, decision.reason, site="verify:dev")
             else:
                 self._escalate_session(task, decision.reason, decision.usage_limit)
+
+    def _roll_back_rejected_attempt(self, task: StoryTask, *, replayed: bool) -> None:
+        """Roll a rejected dev attempt back to the phase baseline.
+
+        The non-fixable RETRY leg of :meth:`_dev_phase`: recover the tree, put the
+        persisted ledger back, rebase the ledger reference onto it and spend the
+        chain's pre-harvest snapshot. Also the rollback a kept-tree usage relaunch
+        runs before its failed relaunch probe pauses (DW-615). ``replayed`` names
+        a crash-replayed attempt: its ledger restore journals a missing snapshot
+        (``ledger-snapshot-missing``) instead of skipping it silently."""
+        try:
+            self._rollback_or_pause(task)
+        finally:
+            # An exception from rollback means this attempt is leaving
+            # the decision pipeline just as surely as a returned
+            # rollback. Detect the active unwind without limiting it to
+            # RunPaused: reset/preserve failures are the #420 gap.
+            unwinding = sys.exc_info()[0] is not None
+            restore_error: OSError | StateRootError | None = None
+            # Recovery resets code/spec state but protects artifact
+            # directories through `_safe_reset`'s
+            # keep=(".bmad-loop", *self._protected_relpaths()) shield.
+            # Consequently an ordinary untracked harvest-created ledger
+            # survives unless restored explicitly; `git reset --hard`
+            # performs the ledger revert only when the ledger is tracked.
+            # Run this for stop-and-wait too: the operator's eventual
+            # reset would not remove an untracked or ignored file either.
+            try:
+                self._restore_persisted_ledger(task, replayed=replayed)
+            except (OSError, StateRootError) as e:
+                # Preserve an exception already in flight; replacing a
+                # RunPaused/reset fault would misclassify the run and
+                # skip the stale-arm cleanup below. The journal keeps
+                # this secondary repair failure visible.
+                # `StateRootError` joins `OSError` because the restore
+                # now serializes on `ledger_lock`, which raises it when
+                # the environment names no state root to put the lock
+                # sidecar under. A lock that could not be taken is the
+                # same class of secondary repair failure as a write
+                # that could not land, and must not be the exception a
+                # paused run reports either.
+                restore_error = e
+                self.journal.append(
+                    "ledger-restore-failed",
+                    story_key=task.story_key,
+                    error=f"{type(e).__name__}: {e}",
+                )
+            # Rebase from the snapshot already in hand so a filesystem
+            # fault cannot replace a RunPaused while unwinding.
+            if task.pre_harvest_ledger_captured:
+                task.baseline_ledger_digest = _digest_of(task.pre_harvest_ledger)
+            # Leaving this attempt spends the chain snapshot even when
+            # its repair failed: retaining stale bytes across a pause or
+            # crash would let resume overwrite later operator work. A
+            # fixable retry or kept-tree relaunch never calls this and keeps
+            # its arm.
+            self._disarm_ledger_snapshot(task)
+            if unwinding or restore_error is not None:
+                # A pause or rollback failure skips the next loop/save;
+                # persist before it can ride a human window or #420's
+                # crash path. A restore failure must likewise persist
+                # the disarm before it is raised. On a cleanly returned
+                # rollback the next attempt's ordinary save supplies
+                # durability.
+                self._save()
+            if restore_error is not None and not unwinding:
+                # Repair writes fail loud when there is no earlier
+                # exception whose identity must be preserved.
+                raise restore_error
+
+    def _usage_relaunch_tree(
+        self, task: StoryTask, *, repair: bool
+    ) -> tuple[bool, str, str | None]:
+        """Whether an uncharged dev usage relaunch keeps the cut-off tree (DW-615).
+
+        Returns ``(kept, reason, prompt)``. A cut-off repair (``repair``: its
+        session ran with feedback) is kept on the snapshot gate alone and re-runs
+        its same repair prompt, so ``prompt`` is None. A primary attempt is kept
+        only when :meth:`_usage_relaunch_prompt` can name the spec it resumes.
+        Both also need the retry chain's dispatched-spec snapshot to validate
+        when the chain holds one, the same authority a fixable repair inherits.
+        A ``kept=False`` answer takes the ordinary rollback leg unchanged."""
+        snapshot_ok = not self._preserves_dispatched_spec_snapshot_for_repair(
+            task
+        ) or self._validate_dispatched_spec_snapshot(task)
+        if repair:
+            if not snapshot_ok:
+                return False, "snapshot-invalid", None
+            return True, "repair-feedback", None
+        # The snapshot verdict comes first: a seam may read the spec to build its
+        # prompt (tickets' plan-halt probe), and a spec that already failed the
+        # snapshot must take the journaled rollback, not that read's fault path.
+        if not snapshot_ok:
+            return False, "snapshot-invalid", None
+        prompt = self._usage_relaunch_prompt(task)
+        if prompt is None:
+            return False, "no-spec", None
+        return True, "spec-named", prompt
 
     def _journal_dev_decision(
         self, task: StoryTask, result: SessionResult, decision: Decision, *, env_fault: bool
@@ -7510,6 +7738,40 @@ class Engine:
         if not probe.ok:
             self._pause_environment(task, site=site, probe=probe)
 
+    def _gate_relaunch(
+        self, task: StoryTask, *, rollback: Callable[[], None] | None = None
+    ) -> None:
+        """Probe the environment before an uncharged dev usage relaunch (DW-616).
+
+        The relaunch is the next iteration of :meth:`_dev_phase`'s loop, so it
+        never reaches :meth:`_gate_dispatch` at the top of the phase, and
+        :meth:`_env_gate_decision` leaves uncharged decisions unprobed. Called
+        once the relaunch's tree choice has run (DW-615): the tree is either the
+        attempt baseline after the rollback, or the cut-off attempt's kept tree,
+        and the refund (``dev_usage_relaunches``) already stands. Skipped when no
+        probes are configured. Freshness is not consulted: the usage-limited
+        session's launch cleared it, and a rollback clears it again.
+
+        On a failed pass a kept tree is rolled back first through ``rollback``
+        (the rollback leg's own block): resume re-enters the phase from the top
+        and re-captures the baseline, which would otherwise absorb the kept
+        attempt's files as pre-existing. Then the phase is reset to ``PENDING``
+        (deliberately, as the resume arms do) and the run takes the ordinary
+        dispatch pause at ``probe:dispatch:dev``: a plain ``resume`` re-probes and
+        lands on the no-rollback dev-dispatch arm, which re-enters the phase from
+        the top and launches the relaunch from the baseline. Left at
+        ``DEV_VERIFY`` with a ``spec_file``, resume would take the spec-approval
+        arm and review unverified work."""
+        if not self.policy.environment.probes:
+            return
+        site = f"{ENV_FAULT_SITE_DISPATCH_PREFIX}dev"
+        probe = self._run_environment_probes(task, site=site)
+        if not probe.ok:
+            if rollback is not None:
+                rollback()
+            task.phase = Phase.PENDING  # deliberate reset, not a normal transition
+            self._pause_environment(task, site=site, probe=probe)
+
     def _pause_environment(
         self, task: StoryTask, *, site: str, probe: verify.ProbeOutcome
     ) -> NoReturn:
@@ -7517,11 +7779,12 @@ class Engine:
 
         Shaped like :meth:`_pause_for_ledger_repair`: notify, ``_save()``,
         ``RunPaused`` — and the task's phase, attempt and review cycle stay exactly
-        where they were. NOT :meth:`_escalate`: nothing ran, so there is nothing
-        for ``resolve`` to adjudicate. ``env_fault_site`` records the dispatch site
-        so a plain ``bmad-loop resume`` re-probes first
-        (:meth:`_take_env_dispatch_pause`) and then dispatches the same session
-        without a rollback."""
+        where the caller left them (:meth:`_gate_relaunch` resets the phase to
+        ``PENDING`` first; its usage-limited session already ran and was rolled
+        back, a kept tree included). NOT :meth:`_escalate`: nothing is pending for
+        ``resolve`` to adjudicate. ``env_fault_site`` records the dispatch site so a plain
+        ``bmad-loop resume`` re-probes first (:meth:`_take_env_dispatch_pause`) and
+        then dispatches the withheld session without a rollback — none is owed."""
         failed = probe.failed
         assert failed is not None  # only a failed pass pauses
         role = site.removeprefix(ENV_FAULT_SITE_DISPATCH_PREFIX)
@@ -7599,7 +7862,8 @@ class Engine:
             return self._env_gate_claim(task, decision, claim, role=role)
         if not self.policy.environment.probes:
             return decision
-        # An uncharged usage relaunch (#959) charges nothing, so it never probes.
+        # An uncharged usage relaunch (#959) charges nothing, so it never probes
+        # here; a dev relaunch is probed at dispatch instead (`_gate_relaunch`).
         charges = (
             decision.action in (Action.RETRY, Action.DEFER) and not decision.uncharged
         ) or decision.budget_exhausted
@@ -9465,6 +9729,13 @@ class Engine:
                 extras["models"] = list(usage.models)
             else:
                 extras["models_unresolved"] = True
+        # per-model split (DW-618): `tokens` re-cut by observed model, values
+        # summing field-wise to it (`<unattributed>` holds what the parser could
+        # not pin). Present-only: absent for an untracked-model CLI or no usage.
+        if usage is not None and usage.by_model:
+            extras["tokens_by_model"] = {
+                model: each.to_dict() for model, each in usage.by_model.items()
+            }
         return extras
 
     @staticmethod
@@ -9491,16 +9762,26 @@ class Engine:
         spec_snapshot: SpecSnapshot | None = None,
         preserve_dispatched_spec_snapshot: bool = False,
         prelaunch_validator: Callable[[], None] | None = None,
-        resume: SessionRecord | None = None,
+        resume: SessionRecord | NativeResume | None = None,
         *,
         commit_engine_ledger: bool = False,
+        continuation: int = 0,
     ) -> SessionResult:
         # A session may change the environment a probe pass vouched for, so no
         # pass survives a launch (DW-523).
         self._env_probes_fresh_root = None
         # ``label`` names a non-standard session (a plugin-provided workflow) so
         # its task_id stays distinct from the role's own dev/review attempts.
-        task_id = _session_task_id(task.story_key, label if label else role, seq, task.generation)
+        logical_task_id = _session_task_id(
+            task.story_key, label if label else role, seq, task.generation
+        )
+        task_id = _session_task_id(
+            task.story_key,
+            label if label else role,
+            seq,
+            task.generation,
+            continuation=continuation,
+        )
         adapter = self.adapters[role]
         if self.workspace.root != self.paths.repo_root:
             # DW-341: Codex silently skips hooks it has not trusted for this exact
@@ -9763,11 +10044,17 @@ class Engine:
             fallback_result_dirs=self._session_fallback_dirs(role, label),
             resume_session_id=resume.session_id if resume is not None else None,
             resume_transcript_path=resume.transcript_path if resume is not None else None,
+            resume_binding=resume.native_binding if resume is not None else None,
+            # Explicit stopped continuations have no prior accounting record;
+            # count the entire native transcript once when they finally return.
+            resume_usage_accounted=continuation == 0,
         )
         if label is None and role in ("dev", "review"):
             # F6 (open-runtime fork): the resume chain's bookkeeping, at launch.
             task.session_resumes = task.session_resumes + 1 if resume is not None else 0
             task.resume_blocked = False
+            if continuation:
+                self._save()  # charged before the adapter can launch
         self.journal.set_active_log(task_id)
         if resume is not None:
             self.journal.append(
@@ -9858,7 +10145,8 @@ class Engine:
                 raise RunStopped(via="stop-request")
             task.record_session(
                 SessionRecord(
-                    task_id=task_id,
+                    task_id=logical_task_id,
+                    log_task_id=task_id if continuation else "",
                     role=role,
                     status=result.status,
                     adapter=cfg.name,
@@ -9879,6 +10167,7 @@ class Engine:
                     label=label or "",
                     ended=_session_ended(result),
                     resumed_from=result.resumed_from or "",
+                    native_binding=result.native_binding,
                 )
             )
             # Make the completed session durable before the usage read, post-session
@@ -9888,7 +10177,7 @@ class Engine:
             # not a durability gate.
             self._save()
             usage = adapter.read_usage(result)
-            task.attach_session_usage(task_id, usage)
+            task.attach_session_usage(logical_task_id, usage)
             self.journal.append(
                 "session-end",
                 task_id=task_id,
@@ -9920,13 +10209,19 @@ class Engine:
                         # UNBOUND here (read_usage itself is a candidate raiser),
                         # so referencing it would raise NameError on a path that
                         # is already unwinding an exception.
+                        fallback_extras = self._session_end_extras(result)
+                        if result.status == "aborted" and sys.exc_info()[1] is not None:
+                            fallback_extras["error"] = type(sys.exc_info()[1]).__name__
                         self.journal.append(
                             "session-end",
                             task_id=task_id,
                             status=result.status,
                             tokens=None,
                             tokens_weighted=None,
-                            **self._session_end_extras(result),
+                            # A returned hard-stop verdict raises RunStopped
+                            # before recording a result. Preserve that explicit
+                            # provenance just like the exception-only stop path.
+                            **fallback_extras,
                         )
                     else:
                         exc = sys.exc_info()[1]
@@ -10144,6 +10439,37 @@ class Engine:
             f"changing the spec's frozen intent contract. Verification evidence is "
             f"in `{feedback}`."
         ) + after_sentence
+
+    def _usage_relaunch_prompt(self, task: StoryTask) -> str | None:
+        """The prompt for a kept-tree uncharged dev usage relaunch (DW-615), or
+        None when the relaunch cannot name its spec and must roll back instead.
+
+        Names the recorded spec explicitly only while it resolves as this
+        attempt's trusted regular file (:meth:`_dispatched_spec_for_attempt`), so
+        build-auto routes the existing spec by its status before step-01's
+        clean-tree check, which would HALT on the kept partial work. No status
+        write: a ``draft`` spec must still route to planning. Builds its own line
+        rather than decorating :meth:`_dev_prompt`, so the injected clauses keep
+        their order (board, environment claim, park last); a retry's parked-work
+        notice (#777) follows in its own paragraph, as on the fresh legs."""
+        if not task.spec_file or self._dispatched_spec_for_attempt(task) is None:
+            return None
+        clauses = [
+            c
+            for c in (
+                self._sprint_board_instruction(),
+                self._environment_claim_instruction(),
+                self._operator_park_instruction(),
+            )
+            if c
+        ]
+        tail = " ".join(clauses)
+        prompt = (
+            f"/{self._dev_skill()} Resume the autonomous dev session on the spec at "
+            f"`{task.spec_file}`. {USAGE_RELAUNCH_RESUME}"
+        ) + (f" {tail}" if tail else "")
+        preserved = self._retry_preserve_notice(task)
+        return prompt + (f"\n\n{preserved}" if preserved else "")
 
     def _sprint_board_instruction(self) -> str:
         """The board-ownership PROHIBITION — never write the board, never revert it
@@ -11049,7 +11375,7 @@ class Engine:
                     task,
                     site="defer",
                     message=(
-                        "chore(deferred-work): restore ledger after deferring " f"{task.story_key}"
+                        f"chore(deferred-work): restore ledger after deferring {task.story_key}"
                     ),
                 )
         self._record_defer(task, reason)
@@ -12315,13 +12641,17 @@ class Engine:
             if env_fault_site_reverifiable(task)
             else ""
         )
+        # Persist ESCALATED before the notify (DW-628): a notify command can be
+        # slow, and a host loss inside it would otherwise leave the last save,
+        # e.g. a dev decision at DEV_VERIFY with `spec_file` set, which resume's
+        # spec-approval arm carries into review and commit.
+        self._save()
         gates.notify(
             self.policy,
             self.run_dir,
             pause_title(reason, task.story_key, env_fault_site=task.env_fault_site),
             f"{displayed} — resolve, then `bmad-loop resume {self.state.run_id}`{reverify}",
         )
-        self._save()
         raise RunPaused(reason, PAUSE_ESCALATION, task.story_key)
 
     def _escalate_env(self, task: StoryTask, reason: str, *, site: str) -> None:

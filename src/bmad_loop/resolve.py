@@ -240,11 +240,11 @@ def _gather_escalations(
     answered: dict[str, dict[str, Any]] = {}
     last = len(task.sessions) - 1
     for offset, session in enumerate(reversed(task.sessions)):
-        if session.task_id in seen_ids:
+        if session.artifact_task_id in seen_ids:
             continue
-        seen_ids.add(session.task_id)
+        seen_ids.add(session.artifact_task_id)
         target = found if last - offset >= start else answered
-        task_dir = run_dir / "tasks" / session.task_id
+        task_dir = run_dir / "tasks" / session.artifact_task_id
         for fname in TASK_CYCLE_ARTIFACTS:
             fpath = task_dir / fname
             try:

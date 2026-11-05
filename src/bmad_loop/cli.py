@@ -6238,7 +6238,13 @@ def _sweep_dry_run(
     return 0
 
 
-def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: bool = False):
+def _prepare_resume_locked(
+    project: Path,
+    run_dir: Path,
+    *,
+    accept_baseline: bool = False,
+    continue_native: str | None = None,
+):
     """Publish resume state while the caller holds this run's state lock.
 
     ``accept_baseline`` is `resume --accept-baseline` (DW-371). It is written onto
@@ -6382,6 +6388,17 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
     # does — `_sweep_factory(..., new_digest)` — so the same reasoning applies.
     profiles = _launch_profiles(pol, project)
     new_digest = _trusted_config_digest(pol, project, profiles=profiles)
+    native_authority = None
+    if continue_native is not None:
+        from . import stopped_native
+
+        try:
+            if accept_baseline:
+                raise ValueError("--continue-native cannot be combined with --accept-baseline")
+            native_authority = stopped_native.prepare(state, run_dir, project, continue_native, pol)
+        except (OSError, ValueError) as exc:
+            print(f"cannot continue native session: {exc}", file=sys.stderr)
+            return 1
     # Discard any stop request left over from a prior stopped run — either mode — so
     # the re-armed engine does not consume it at the first item boundary and
     # immediately re-stop. A resume is fresh user intent, which is what makes a
@@ -6636,6 +6653,15 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
     # and only here — past every refusal above — on the write that persists this
     # resume, so a refused resume cannot arm it and a plain one always clears it.
     state.accept_baseline = accept_baseline
+    if native_authority is not None:
+        state.tasks[native_authority["story_key"]].stopped_native = native_authority
+        journal.append(
+            "stopped-native-armed",
+            story_key=native_authority["story_key"],
+            session_id=continue_native,
+            task_id=native_authority["task_id"],
+            artifact_task_id=native_authority["artifact_id"],
+        )
     # A tickets run paused for a refined ticket's story-file approval: this resume
     # is that approval, recorded while the pause still names the ticket and past
     # every refusal above, so a refused resume approves nothing.
@@ -6884,7 +6910,13 @@ def _unresumable_source(state: RunState) -> str | None:
     return None
 
 
-def _resume_paused_run(project: Path, run_dir: Path, *, accept_baseline: bool = False) -> int:
+def _resume_paused_run(
+    project: Path,
+    run_dir: Path,
+    *,
+    accept_baseline: bool = False,
+    continue_native: str | None = None,
+) -> int:
     """Resume a paused/interrupted run without holding its lock across execution.
 
     Also resolve's re-arm path, which never passes ``accept_baseline`` — its re-arm
@@ -6908,7 +6940,10 @@ def _resume_paused_run(project: Path, run_dir: Path, *, accept_baseline: bool = 
                 file=sys.stderr,
             )
             return 1
-        prepared = _prepare_resume_locked(project, run_dir, accept_baseline=accept_baseline)
+        native_options = {"continue_native": continue_native} if continue_native is not None else {}
+        prepared = _prepare_resume_locked(
+            project, run_dir, accept_baseline=accept_baseline, **native_options
+        )
         if isinstance(prepared, int):
             return prepared
         (
@@ -7093,7 +7128,14 @@ def cmd_resume(args: argparse.Namespace) -> int:
     # Anything else the operator changed while the run sat paused is theirs to
     # commit or stash first.
     return _resume_paused_run(
-        project, run_dir, accept_baseline=bool(getattr(args, "accept_baseline", False))
+        project,
+        run_dir,
+        accept_baseline=bool(getattr(args, "accept_baseline", False)),
+        **(
+            {"continue_native": args.continue_native}
+            if getattr(args, "continue_native", None) is not None
+            else {}
+        ),
     )
 
 
@@ -10077,12 +10119,17 @@ def cmd_status(args: argparse.Namespace) -> int:
         extra = task.defer_reason or task.commit_sha or ""
         if task.preserve_ref:
             extra = f"{extra} [{task.preserve_ref}]".lstrip()
+        # The story's uncharged usage-limit relaunches (#959), only when nonzero
+        # — why dev×N / review×N can exceed their caps. Same `↻N` glyph and
+        # nonzero gate as the TUI counter cell (tui/screens/dashboard.py
+        # _counter_cell, not importable here: the TUI is an optional extra).
+        relaunched = f" ↻{task.usage_relaunches}" if task.usage_relaunches > 0 else ""
         # 17 = len("awaiting-operator"), the longest Phase token; a narrower
         # field does not truncate, it shifts every following column on that one
         # row, which reads as corrupt output rather than as a long status.
         print(
-            f"  {key:40s} {task.phase:17s} dev×{task.attempt} review×{task.review_cycle} "
-            f"{tokens} {extra}"
+            f"  {key:40s} {task.phase:17s} dev×{task.attempt} review×{task.review_cycle}"
+            f"{relaunched} {tokens} {extra}"
         )
     _STATUS_PRINTERS[worksource.resumed_traits_for(state.source).name](state, project)
     try:
@@ -11668,6 +11715,11 @@ def main(argv: list[str] | None = None) -> int:
 
     resume_p = add("resume", cmd_resume, "resume a paused run")
     resume_p.add_argument("run_id")
+    resume_p.add_argument(
+        "--continue-native",
+        metavar="UUID",
+        help="continue this exact explicitly stopped dev native, preserving its attempt and unfinished work; refuse uncertain ownership instead of restarting",
+    )
     resume_p.add_argument(
         "--accept-baseline",
         action="store_true",
