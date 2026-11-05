@@ -358,6 +358,9 @@ def test_pool_review_requires_recorded_adapter(pool_review):
         (None, None),
         ("different-native", "interrupted-primary"),
         ("interrupted-primary", None),
+        # Same IDs without a completed payload must not discharge: otherwise a
+        # crash/stall falls through to an ordinary review retry and can launch a
+        # fresh primary once native resume is spent or unavailable.
         ("interrupted-primary", "interrupted-primary"),
     ],
 )
