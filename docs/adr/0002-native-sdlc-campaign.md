@@ -1,6 +1,6 @@
 # ADR 0002: A deterministic SDLC campaign with GitHub delivery
 
-- **Status:** Accepted scope; architecture review pending
+- **Status:** Architecture reviewed; implementation and activation qualification pending
 - **Date:** 2026-11-05
 - **Scope:** An opt-in campaign supervisor, isolated workers, planning, GitHub synchronization and native Paradev reflection
 
@@ -18,6 +18,12 @@ fetched main, and project tracking has been reconciled. An accepted merge reques
 queued merge, local commit or successful worker exit is insufficient.
 
 ## Decision
+
+The detailed [implementation contract](0002-campaign-implementation.md) resolves
+the command surface, persistence, worker/source isolation, publication, terminal
+retention and activation decisions below. Both documents form the plan for one
+implementation PR. Capability and repository-policy prerequisites remain
+explicit; a reviewed design is not evidence of a deployed feature.
 
 Add a deterministic Python campaign supervisor above the existing serial story
 engine. Planning, implementation, conflict repair and review run in coding-CLI
@@ -41,11 +47,12 @@ The publication boundary requires all of the following:
 1. A genuine product plan/spec has been committed and pushed, and a draft PR
    exists before implementation starts. No empty or artificial dispatch commit is
    created merely to manufacture a PR diff.
-2. The complete PR head includes the recorded current target head. Code and
-   artifact synchronization preserves published history.
+2. For direct publication, the complete PR head includes the recorded current
+   target head. Queue publication instead binds the combined merge-group
+   candidate and its target. Synchronization preserves published history.
 3. Local verification and independent final review identify the same full PR
-   head, target head and trusted policy fingerprint. A later change invalidates
-   the affected evidence.
+   head, target head and trusted policy fingerprint, or the exact combined queue
+   candidate when using a queue. A later change invalidates affected evidence.
 4. Required GitHub checks and reviews are satisfied; unresolved review requests,
    conflicting changes, human holds and unknown observations prevent merging.
 5. The merge uses the expected head identity and server-enforced up-to-date
@@ -79,6 +86,15 @@ crash, reconcile the remote marker/identity before retrying. Unknown outcomes
 remain visible. Pagination failure is not an empty result. Preserve unmanaged
 body sections and hold conflicting simultaneous edits.
 
+Intake selects unmapped issues explicitly or by configured labels. A durable,
+versioned inbox deduplicates remote edits and excludes the campaign's own
+comments. Bounded triage sessions propose reuse, repair, new work, duplicates,
+clarifications or holds; deterministic validation admits only authorized scope.
+Required review findings repair the same PR. New scope becomes a reviewed
+planning change before execution, without blocking unrelated units. Use ordinary
+issue references in PRs and close tracking explicitly after confirmed merge and
+source reconciliation; parent issues wait for all required children.
+
 ### Parallelism and recovery
 
 The scheduler admits only dependency-ready units, reserving worker and resource
@@ -93,6 +109,13 @@ each boundary so a restart resumes the existing PR and worker rather than
 creating replacements. The supervisor runs continuously; no scheduled Paradev
 automation is needed for its routine decisions.
 
+The queue serializes final merge decisions, not candidate preparation. Independent
+workers, verification and reviews run concurrently under separate resource
+limits. The coordinator must remain responsive while those operations run.
+Tracking debt after a confirmed merge blocks only that unit's dependents;
+unrelated work and merges continue. No implicit per-epic serial ceiling applies
+to the campaign's independent stories.
+
 ### Native Paradev reflection
 
 Include an optional reflection mode that uses Paradev's existing project sidebar,
@@ -102,10 +125,10 @@ its tests. The installed package must not depend on another repository checkout.
 BMAD retains scheduling and delivery authority; Paradev supplies registered
 workspaces, worker PTYs and their native presentation.
 
-The proposed entry point is a campaign option, `--paradev-reflect`, with an
+The entry point is a campaign run option, `--paradev-reflect`, with an
 explicit Paradev project selector and equivalent policy settings. It selects
 the Paradev workspace provider, native `paradev` mux and projection together.
-Exact command syntax remains subject to architecture review. A separate
+The command contract is specified in the implementation document. A separate
 reflection-only command must not suggest it can adopt an arbitrary live tmux
 worker as a native Paradev agent.
 
@@ -205,11 +228,10 @@ Keep failures and recent completed output inspectable with bounded retention.
 Durable logs and session accounting survive view removal. Removing a view must
 use the keep-terminal operation; disposing an owned worker follows the declared
 stop/retirement protocol. A closed tab never means the work was delivered.
-Current adapter finalization always tears down its window. Architecture review
-must settle how to retain the latest completed/failed phase output without
-retaining a live coding process: either verified parked terminal history or
-the existing file/output views. Keep this distinction explicit in the transport
-contract rather than silently skipping teardown to preserve a tab.
+Keep current adapter finalization, which always tears down its window. Retain
+the latest completed/failed phase log and transcript and expose the existing
+Paradev file/output view. Active session tabs remain real worker PTYs. Parked
+terminal-history retention is deferred; never skip teardown to preserve a tab.
 
 #### Packaging and portability
 
@@ -326,7 +348,7 @@ independence.
 | ----- | --------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 1     | Versioned campaign specifications, state, transitions and store | Invalid/cyclic inputs refuse before effects; persistence is atomic; duplicate coordinators refuse.                                                  |
 | 2     | GitHub gateway, outbox and publication controller               | Early drafts, pagination, exact-head/base gates, unknown-write reconciliation and merge read-back work through fake transport.                      |
-| 3     | Issue hierarchy, managed content and discussion inbox           | Stable IDs, native subissues, milestone progress and linked comments survive retry without duplicates or lost human edits.                          |
+| 3     | Issue hierarchy, managed content, intake and triage             | Stable IDs, native subissues, bounded new work and linked dispositions survive retry without duplicates, lost human edits or premature closure.     |
 | 4     | Planning sessions and source import                             | A brief yields validated product plans and ready units through existing session completion authority.                                               |
 | 5     | Isolated workers, workspace providers and dependency scheduler  | Multiple units execute concurrently without shared engine state; provider allocation precedes launch; dependencies release only after delivery.     |
 | 6     | CLI and complete delivery/recovery loop                         | One command plans, dispatches, reviews, publishes, waits, merges, reconciles and continues; stop/resume preserves identities.                       |
@@ -367,15 +389,15 @@ without Stop, stale generations/name reuse, parent identity/room leakage,
 database reset, stop/recovery and operator takeover. Existing mocked nudge tests
 do not establish compatibility with automatic peer delivery.
 
-### Architecture review checkpoints
+### Architecture review decisions
 
-Before implementation, fact-check the core GitHub and planning contracts plus
-the pinned external source and installed capability observations. Resolve the
-terminal history/teardown contract, full native-session attribution, optional
-task-free reflection and external-backend migration. Determine whether an hcom
-completion fence can be implemented entirely within bmad-loop with the deployed
-launchers; otherwise explicitly defer automatic inbound coordination. The final
-reviewed scope must not require an unplanned Paradev or hcom release.
+The implementation contract specifies native attribution read-back, task-free
+reflection, bundled-backend migration and output history after teardown.
+Optional hcom observation is included; new automatic peer wakeups remain deferred
+until their closing behavior qualifies. GitHub's asynchronous merge API and queue
+candidate semantics are explicit. REM activation must resolve its non-strict
+required checks and administrative merge route before claiming strict unattended
+delivery. No implicit Paradev/hcom release or GitHub ruleset change is authorized.
 
 ## Alternatives
 
