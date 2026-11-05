@@ -134,6 +134,15 @@ legacy execution defaults remain intact. Validate effective model/effort rather
 than inheriting this chat's selection or selecting an unapproved model. Publication
 review retains project-required provider-family independence.
 
+Conflict repair specifically uses Astra. Commit and push substantive checkpoints
+throughout planning, implementation and repair so draft PRs expose ongoing work.
+The worker owns commits; the supervisor publishes exact immutable heads without
+touching a live worker's index. Before publication, merge current main with both
+pre-merge heads preserved, resolve conflicts against both sides' intended behavior,
+and repeat affected verification plus independent final review. Main movement
+invalidates stale acceptance; no force-push or blanket conflict-side selection
+substitutes for reconciliation.
+
 Before requesting owner input, a bounded evidence review searches authorized
 owner notes, instructions, GitHub discussions and available bound conversations.
 Apply a still-valid prior decision, exercise explicitly delegated routine judgment,

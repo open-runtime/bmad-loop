@@ -94,6 +94,15 @@ pool = "reasoning"
 [roles.decision_review]
 pool = "reasoning"
 
+[roles.conflict_repair]
+profile = "codex"
+model = "gpt-6-astra"
+effort = "high"
+
+[checkpoints]
+push = true
+target_interval_s = 600
+
 [decisions]
 mode = "evidence-first"
 
@@ -126,8 +135,8 @@ configuration trust/digest machinery; do not invent document-hash ceremonies.
 
 ### Campaign model roles
 
-Campaign roles are planning, planning_review, triage, escalation, decision_review
-and publication_review, with independently resolved profiles and session budgets.
+Campaign roles are planning, planning_review, triage, escalation, decision_review,
+conflict_repair and publication_review, with independently resolved profiles and budgets.
 Execution retains the existing dev/review stage settings. Generic defaults
 inherit project settings; the rollout preset permits Astra through Codex or Fable
 through Claude for planning, planning review, semantic triage, escalation diagnosis
@@ -152,6 +161,10 @@ Missing or mismatching required attribution does not satisfy the role contract.
 Keep a launched attempt on its selected model. A provider change after failure
 starts a fresh session with saved artifacts/context and the same lifetime budget;
 do not pass a Codex conversation ID to Claude or pretend it is the same session.
+
+Conflict repair is explicitly pinned to Astra for this rollout. If Astra is
+unavailable, retain that candidate's repair wait and continue unrelated work;
+the planning pool's Fable alternative does not override this exact-model role.
 
 The current generic mux adapter ignores SessionSpec.effort; setting that field
 alone would not configure Codex. Qualify additive native CLI/profile arguments
@@ -623,6 +636,43 @@ real acceptance/implementation details in that unit's branch; do not manufacture
 an empty commit. Workers update that same PR. All PRs target the configured main
 branch in version 1; stacked PR planning and retargeting are outside this change.
 
+## Frequent checkpoint commits and pushes
+
+Publish useful progress throughout planning and implementation, not only when a
+unit completes. Require substantive checkpoint commits after planning stages,
+coherent implementation/test milestones, completed repairs and before planned
+handoff or pause. The rollout targets ten minutes of active editing between
+checkpoints where a coherent snapshot is available. This is a soft progress
+target, not permission to create empty commits or interrupt an atomic edit.
+An intermediate checkpoint may be incomplete or have failing tests if clearly
+recorded; its PR remains draft and no acceptance gate is satisfied by the push.
+
+The worker is the sole owner of staging/committing its work. Its session contract
+requires checkpoints and a versioned receipt naming unit/attempt/generation,
+branch/head and progress. Reconcile receipts against Git, including reachability
+from the prior owned head and scoped tracked changes. Never git add, commit or
+merge in a live worker's tree from the supervisor. Dirty work that has not reached
+a checkpoint is explicitly unbacked-up progress, not a falsely healthy receipt.
+Report checkpoint age and outstanding push debt; do not inject unsupported
+mid-turn instructions or bypass the Stop/hcom closing contract for a timer.
+
+The coordinator persists a push intent, then pushes the exact committed SHA to
+the already-bound draft PR branch through the Git chokepoint. It can publish that
+immutable commit while its worker continues editing; it never pushes the worker's
+index or uncommitted files. Serialize pushes per branch, coalesce superseded
+pending checkpoints to the newest descendant, and verify the remote ref afterward.
+Use fast-forward updates only. Unexpected remote movement or a rejected push
+becomes a reconciliation hold, never an automatic force-push over another writer.
+An uncertain response is read back before retry; retries are bounded and retain
+all local commits. Failed remote backup remains visible and blocks transitions
+that depend on the published head. Cross-unit pushes need no global execution lock.
+
+Keep source manifests, plans and progress changes in their existing ownership
+paths; exclude run logs, credentials and private conversation evidence. Respect
+signing/hooks and avoid blanket staging of unrelated files. Draft CI may observe
+checkpoint heads, but only evidence for the final accepted candidate can authorize
+merge. Batch progress comments and superseded CI work where project policy permits.
+
 ## GitHub transport and synchronization
 
 Use an injectable gateway and the installed authenticated gh CLI as the initial
@@ -679,11 +729,30 @@ classic branch protection. Local evidence never masquerades as a GitHub check.
 
 ## Sync, final review and merge
 
-Freeze the unit's writer, confirm teardown and require a clean tracked tree
-before publication. Fetch canonical target B; merge B into unit head H without
-rewriting published history. If conflicted, run a bounded repair session in the
-same workspace and invalidate old evidence. Every candidate-changing action,
+For final integration, freeze the unit's writer, confirm teardown and require a
+clean tracked tree. Fetch canonical target B; merge B into unit head H without
+rewriting published history. If conflicted, run a bounded Astra conflict-repair
+session in the same workspace and invalidate old evidence. Every candidate-changing action,
 including spec/status synchronization, precedes final verification and review.
+
+Before attempting that merge, persist preservation refs for the pre-merge unit
+head and fetched target, along with their merge base and source identities. There
+must be no uncommitted worker edits to discard. The repair context includes both
+branches' changes, acceptance intent, relevant tests and the conflicted index.
+Require a resolution report for each conflict explaining how both sides' intended
+behavior survives, or citing a valid superseding decision. Blanket ours/theirs
+selection and deleting conflicting tests are not acceptable evidence of repair.
+Semantic disagreement goes through decision evidence review before any owner ask.
+
+Verify that the merge result retains the recorded histories, has no unmerged
+index entries, and passes tests covering affected behavior from both sides.
+Preserved commits make recovery possible, but ancestry alone cannot prove semantic
+preservation. Independent publication review inspects the conflict resolutions
+and the full final diff. Push the repaired head and rerun affected verification,
+CI and review. A fresh main read immediately before submission must still match
+the evidence; further target movement requires another sync/acceptance cycle.
+The server current-base gate or qualified merge queue remains mandatory. Do not
+hold the global publication slot while waiting for Astra, tests or repair review.
 
 Evidence binds repository, unit, full PR head H, base B, source/graph revision,
 effective trusted policy and actual dev/reviewer model families. Final review
@@ -898,6 +967,7 @@ spends LLM tokens. Each negative gate gets its required ablation check.
 | Discovery          | Active/abandoned/merged PR overlap, squash history, branch-only partial work, external ownership, stale heads, partial coverage and no duplicate admission.                |
 | Model/resolution   | Astra/Fable availability and attribution, exact-model refusal, fresh cross-provider attempts, effort propagation, verified repairs and persistent retry budgets.           |
 | Decision evidence  | Prior/delegated decisions, authenticated sources, spoofed summaries, scope/head drift, revocation, conditional holds, actual GitHub approvals and deduplicated owner asks. |
+| Checkpoints/repair | Push exact heads during live editing, coalesce retries, refuse foreign head movement, preserve both merge histories/behaviors, Astra-only repair and repeat acceptance.    |
 | Publication        | Moving H/B, late review changes, draft/ready transitions, required app/status identity, strict-rule absence, queue candidate changes, squash/rebase, merged tracking debt. |
 | Planning/source    | Brief to planning PR to graph, malformed artifacts, existing-plan import, private shared stores, three-way unit updates, multiple initiatives and closure units.           |
 | Paradev            | Real PTY identity, same-terminal pane attach, title and native-agent read-back, missing/duplicate panes, user focus, output history after teardown, absent optional extra. |
