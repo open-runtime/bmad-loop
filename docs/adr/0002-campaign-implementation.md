@@ -331,6 +331,88 @@ but retains verification and applicable local plugin behavior. Detect conflictin
 push-merge/sync-with-main ownership during preflight; do not merely rely on a
 post_story hook being advisory. Disable automatic cleanup of unresolved runs.
 
+### Frozen worker configuration
+
+Persist the complete resolved worker policy, profiles, role selection, plugin
+grants and campaign execution options outside the editing tree, identified by
+the campaign configuration revision. Construct the engine, flows and adapters
+from those same values. Force recovery.reload_policy=off in the effective child
+policy and make Engine.\_maybe_reload_policy return before reading project files
+when the trusted campaign-worker option is present. This applies before the first
+dispatch, every internal retry boundary and resumed worker execution; max_stories=1
+does not avoid the initial reload site. No worker may replace its model, budgets,
+gates, review policy or campaign recovery rules from its editable checkout.
+
+The existing config_digest pins the host-execution surface, not the entire
+operational configuration: model, limits, gates and review edits can deliberately
+pass that check. Preserve its legacy semantics and retain its trust checks;
+do not use a matching digest as proof of frozen campaign settings. The trusted
+campaign binding and persisted full snapshot supply that separate guarantee.
+Journal the effective configuration revision and suppressed reload mode.
+
+Every restart, resume and re-arm reconstructs this campaign context before any
+engine recovery or dispatch. Direct legacy resume/resolve of a campaign child
+must route through the campaign or refuse with the supported campaign command;
+it must not silently reload/bless the checkout and lose its execution options.
+Missing or mismatched snapshots hold recovery. Checkout configuration drift is
+reported to the coordinator, never adopted by a child. An intentional policy
+revision requires coordinator validation at a quiescent boundary, persisted new
+bindings and invalidation of affected acceptance evidence. Ordinary non-campaign
+runs keep their existing story-boundary reload and explicit resume behavior.
+
+### Recovery without rewriting checkpoint history
+
+Campaign branches are append-only from creation, including commits not yet
+pushed. Internal child retries, defers, stops and startup/resume recovery must
+not reset their branch to an earlier attempt baseline or discard/recreate the
+worktree. This rule overrides inherited scm.rollback_on_failure for campaign
+execution. Merely setting that flag false is insufficient: resolved re-drives,
+mounted worktrees and some normalization paths select automatic rollback anyway.
+Preservation refs keep objects but do not make a reset branch fast-forwardable.
+
+Intercept recovery before destructive effects in RecoveryFlow.rollback_or_pause
+and the related engine paths, including \_roll_back_rejected_attempt and
+\_finish_inflight. Return a typed campaign recovery request and park the child
+instead of following the legacy reset and immediate retry. Prevent the rejected
+attempt's finally-block ledger restoration/cleanup from mutating source artifacts
+after that handoff; include the required restoration in the recovery transaction.
+Keep a defensive campaign guard at the destructive-reset seam so an overlooked
+caller refuses instead of rewinding the branch. Legacy recovery stays unchanged.
+
+The coordinator records a per-unit recovery fence and suspends new dispatch and
+checkpoint push submissions for that unit. Confirm the child and coding sessions
+are quiescent, then reconcile its final head, source bindings and checkpoint
+receipts. Settle already-issued pushes or retain their unknown status explicitly;
+never infer that an unacknowledged push did not reach GitHub. Capture prepared,
+in-flight and confirmed checkpoint heads with the recovery request. Remote or
+pending heads that are not ancestors of the owned current head require a hold.
+No repository-wide lock is held while waiting; unrelated workers and pushes run.
+
+Before recovery effects, persist the recovery action ID, expected parent/head,
+source preimages and intended correction. Bind any recovery commit to that action;
+after a crash, verify its parent and resulting tree before adopting it or retrying.
+An exclusively owned recovery worker preserves the current committed head and
+tracked/untracked attempt residue, then creates a compensating/revert commit on
+top of that head where recovery needs a clean retry. Compute changes from the
+recorded attempt baseline and owned-path/source preimages, preserving authorized
+spec corrections, earlier accepted work and pre-existing files. Use source
+sole-writer APIs for lifecycle/ledger restoration. Do not restore the whole old
+repository tree over later work or delete unknown files. Ambiguous ownership or
+an invalid preimage holds; a conflicting repair uses the Astra conflict contract.
+If no content correction is needed, verify that fact without an empty commit.
+
+The recovered head must descend from the pre-recovery head and every checkpoint
+that was published or could still be published. Persist its recovery receipt and
+source changes before lifting the fence. Unsent old push intents may be explicitly
+superseded by that descendant; in-flight/unknown intents retain reconciliation
+history. Only this transaction's authorized recovery push may pass the fence.
+Confirm the recovered remote head and source state, then lift the fence before
+admitting the next attempt.
+Re-arm against that head with a new attempt/session generation and the same frozen
+configuration, preserving prior baselines and lifetime budgets in history. A crash
+at any point resumes this transaction; it cannot repeat a revert or run the legacy
+rollback. Recovery failure retains the branch/PR and unresolved evidence intact.
+
 Each worker gets a private source view. In-tree tracked plans stay on its branch.
 Shared/ignored/external ticket stores are copied into an isolated store with
 explicit configuration redirection; setting mark_done=never alone is insufficient
@@ -656,6 +738,11 @@ a checkpoint is explicitly unbacked-up progress, not a falsely healthy receipt.
 Report checkpoint age and outstanding push debt; do not inject unsupported
 mid-turn instructions or bypass the Stop/hcom closing contract for a timer.
 
+Every child recovery path follows the append-only recovery contract above,
+including automatic retries inside a running Engine. Checkpoint publication and
+recovery share the per-unit fence and durable push history; an internal rollback
+cannot race a pending push and silently invalidate branch ancestry.
+
 The coordinator persists a push intent, then pushes the exact committed SHA to
 the already-bound draft PR branch through the Git chokepoint. It can publish that
 immutable commit while its worker continues editing; it never pushes the worker's
@@ -980,6 +1067,25 @@ Assert restart continues the same PR/claim or reports unknown; never duplicate
 an executor. Run only affected checks during iteration, then the required full
 CI/platform matrix once the final implementation stabilizes. Report unavailable
 live-host qualification explicitly instead of equating mocked tests with it.
+
+Recovery qualification must run a real child retry with rollback_on_failure=true
+after a checkpoint reaches a fixture remote, then prove its recovery and next
+checkpoint remain descendants and push without force. Repeat with a push prepared,
+in flight and remotely accepted but its reply lost; crash at fence, preservation,
+compensating commit, receipt and re-arm boundaries. Cover normalization, resolved
+re-drive, startup/resume and rejected-attempt ledger-finally paths. Verify accepted
+earlier work, owned source corrections and pre-existing untracked files survive.
+Restoring the legacy reset path must fail the ancestry regression; exercise the
+defensive reset guard directly as a separate refusal/ablation test.
+
+Configuration qualification must use inherited story-boundary reload plus a
+checkout whose model, limits, gates and review values differ while config_digest
+still matches. Prove first dispatch and resumed/re-armed workers use the frozen
+snapshot and that their engine, flows and adapters agree. Test the effective
+reload-off policy and the early campaign guard independently, so one cannot hide
+removal of the other. A guard test supplies story-boundary mode with a trusted
+campaign binding and must fail when the early guard is removed. Separately prove
+legacy reloads still apply and direct child-resume cannot bypass the snapshot.
 
 Throughput regression tests must demonstrate overlap, not just eventual success:
 park one fake review/CI response and prove another independent unit starts and

@@ -124,6 +124,14 @@ Tracking debt after a confirmed merge blocks only that unit's dependents;
 unrelated work and merges continue. No implicit per-epic serial ceiling applies
 to the campaign's independent stories.
 
+Campaign workers retain their complete resolved configuration on first dispatch,
+retry and resume; inherited story-boundary policy reload is disabled for these
+workers. Ordinary runs retain their existing reload behavior. All campaign retry
+and recovery paths preserve append-only branch history, including internal engine
+rollbacks: a per-unit fence reconciles pending pushes, then a compensating commit
+restores any required attempt state without resetting behind a published head.
+Recovery and re-arm are durable stages with preserved work and lifetime budgets.
+
 ### Model roles and escalation resolution
 
 The rollout configuration permits Astra or Fable, whichever has eligible capacity,
