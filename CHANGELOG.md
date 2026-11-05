@@ -7,6 +7,10 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Fixed
+
+- Resume a pool-interrupted attested primary in its existing native review without restarting development.
+
 ## [0.13.10] — 2026-11-05
 
 ### Added

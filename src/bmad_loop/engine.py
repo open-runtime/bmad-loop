@@ -2575,6 +2575,22 @@ class Engine:
     def _finish_inflight(self) -> None:
         """Complete or roll back tasks interrupted by a pause or crash."""
         for task in list(self.state.tasks.values()):
+            if task.phase == Phase.ESCALATED and task.implemented_review is not None:
+                from .accepted_review import pool_review_refusal
+
+                if pool_review_refusal(self.state, task, self.run_dir, self.paths.project) is None:
+                    # A pool interruption is not a rejected implementation or
+                    # review verdict. Resume only the already-bound primary.
+                    if self._resume_candidate(task, "review", task.review_cycle + 1) is None:
+                        raise RunPaused(
+                            "the pool-paused primary cannot resume its native conversation; "
+                            "restore its adapter, transcript and session-resume budget",
+                            PAUSE_ESCALATION,
+                            task.story_key,
+                        )
+                    task.implemented_review["pool_resume_required"] = task.sessions[-1].session_id
+                    task.phase = Phase.REVIEW_VERIFY
+                    self._save()
             if task.terminal:
                 continue
             if task.worktree_path:
@@ -4329,6 +4345,27 @@ class Engine:
         *,
         resumed_loop: bool = False,
     ) -> None:
+        from .accepted_review import pool_review_record
+
+        pool_record = pool_review_record(task) if resume_result is None else None
+        if task.implemented_review and task.implemented_review.get("pool_resume_required"):
+            if resume_result is None and pool_record is None:
+                if task.phase == Phase.REVIEW_RUNNING:
+                    advance(task, Phase.REVIEW_VERIFY)
+                self._escalate(
+                    task,
+                    "the reserved pool-review continuation has no completed result or "
+                    "exact resumable record; preserve its native session for operator recovery",
+                )
+            if resume_result is not None:
+                self._finish_pool_resume(task)
+        pool_plan = None
+        if pool_record is not None:
+            self._validate_pool_review(task)
+            assert task.implemented_review is not None
+            task.implemented_review["pool_resume_required"] = pool_record.session_id
+            self._save()
+            pool_plan = task_spec_path(task, self.state).read_bytes()
         if task.implemented_review is not None and not self.policy.review.enabled:
             self._escalate(task, "implemented recovery still owes an enabled primary review")
             return
@@ -4437,6 +4474,8 @@ class Engine:
             else:
                 from .accepted_review import primary_was_bound
 
+                if pool_record is not None:
+                    self._validate_pool_review(task, launching=True, expected_plan=pool_plan)
                 first_attested_primary = (
                     task.implemented_review is not None
                     and not primary_was_bound(self.state, task, self.run_dir)
@@ -4457,10 +4496,20 @@ class Engine:
                     prelaunch_validator = functools.partial(
                         self._validate_implemented_review, task, require_prepared=True
                     )
+                if pool_record is not None:
+                    prelaunch_validator = functools.partial(
+                        self._validate_pool_review,
+                        task,
+                        launching=True,
+                        expected_plan=task_spec_path(task, self.state).read_bytes(),
+                    )
                 # F6 (open-runtime fork): a review retry after a stalled, timed
                 # out or crashed review session continues that conversation; the
                 # tree is kept between review cycles.
                 review_resume = self._resume_candidate(task, "review", task.review_cycle)
+                if pool_record is not None and review_resume is not pool_record:
+                    advance(task, Phase.REVIEW_VERIFY)
+                    self._escalate(task, "the pool-paused primary's native resume is unavailable")
                 result = self._run_session(
                     task,
                     role="review",
@@ -4481,6 +4530,9 @@ class Engine:
                     commit_engine_ledger=review_resume is None and not first_attested_primary,
                     prelaunch_validator=prelaunch_validator,
                 )
+                if pool_record is not None:
+                    self._finish_pool_resume(task)
+                pool_record = None
             advance(task, Phase.REVIEW_VERIFY)
             self._save()
             self._emit(
@@ -7919,6 +7971,33 @@ class Engine:
             if task.phase == Phase.REVIEW_RUNNING:
                 advance(task, Phase.REVIEW_VERIFY)
             self._escalate(task, f"cannot resume implemented review: {refusal}")
+
+    def _finish_pool_resume(self, task: StoryTask) -> None:
+        """Require the same durable native result on normal return and crash replay."""
+        from .accepted_review import pool_resume_recorded
+
+        if not pool_resume_recorded(task):
+            if task.phase == Phase.REVIEW_RUNNING:
+                advance(task, Phase.REVIEW_VERIFY)
+            self._escalate(task, "the pool retry did not record its original native review result")
+        assert task.implemented_review is not None
+        task.implemented_review.pop("pool_resume_required")
+
+    def _validate_pool_review(
+        self, task: StoryTask, *, launching: bool = False, expected_plan: bytes | None = None
+    ) -> None:
+        from .accepted_review import pool_review_refusal
+
+        refusal = pool_review_refusal(
+            self.state, task, self.run_dir, self.paths.project, launching=launching
+        )
+        if refusal is None and expected_plan is not None:
+            if task_spec_path(task, self.state).read_bytes() != expected_plan:
+                refusal = "the partial review plan changed before native dispatch"
+        if refusal is not None:
+            if task.phase == Phase.REVIEW_RUNNING:
+                advance(task, Phase.REVIEW_VERIFY)
+            self._escalate(task, f"cannot resume pool-paused review: {refusal}")
 
     def _implemented_review_context(self, task: StoryTask) -> str:
         """Give the normal primary its actual retained implementation range."""

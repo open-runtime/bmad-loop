@@ -7067,7 +7067,14 @@ def cmd_resume(args: argparse.Namespace) -> int:
     # gates above give: resolve's re-arm reaches that helper with the story already
     # re-armed. An unreadable state skips the warning; the resume below reports it.
     try:
-        skipped = resume_skipped_escalation_keys(load_state(run_dir))
+        from .accepted_review import pool_review_refusal
+
+        state = load_state(run_dir)
+        skipped = [
+            key
+            for key in resume_skipped_escalation_keys(state)
+            if pool_review_refusal(state, state.tasks[key], run_dir, project) is not None
+        ]
     except (OSError, KeyError, ValueError):
         skipped = []
     for key in skipped:
