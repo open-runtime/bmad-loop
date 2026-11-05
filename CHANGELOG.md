@@ -7,6 +7,10 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Fixed
+
+- Ignore retained run archives when initializing or refreshing a project.
+
 ## [0.13.13] — 2026-11-05
 
 ### Fixed

@@ -4044,11 +4044,10 @@ def _archive_run_locked(project: Path, run_dir: Path) -> Path:
     archive_dir.mkdir(parents=True, exist_ok=True)
     dest = archive_dir / f"{run_dir.name}.tar.gz"
     # #363: the guard, not a helper — the path is handed to `tarfile.open`, so there
-    # is no payload for `atomic_write_*` to take. Nothing gitignores this directory:
-    # init writes `.bmad-loop/runs/`, `.bmad-loop/cache/`, `.bmad-loop/policy.toml`
-    # and `_bmad/render/`, and `archive/` matches none of them. So a stranded temp
-    # here is an untracked file holding `worktree_clean` False until a human removes
-    # it — the same exposure `decisions._write_store`, `policy.write_mux_backend` and
+    # is no payload for `atomic_write_*` to take. Older installs may not gitignore
+    # this directory until init is re-run, so a stranded temp here can still hold
+    # `worktree_clean` False until a human removes it — the same exposure
+    # `decisions._write_store`, `policy.write_mux_backend` and
     # `tui.settings.PolicyDoc.save` had. (Not the sweep's two `decisions.json`
     # writes, which look like the same fix but write under the ignored run dir.)
     #
