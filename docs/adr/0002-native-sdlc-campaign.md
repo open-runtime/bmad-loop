@@ -1,8 +1,8 @@
 # ADR 0002: A deterministic SDLC campaign with GitHub delivery
 
-- **Status:** Accepted design; implementation planned
+- **Status:** Accepted scope; architecture review pending
 - **Date:** 2026-11-05
-- **Scope:** An opt-in campaign supervisor, isolated workers, planning and GitHub synchronization
+- **Scope:** An opt-in campaign supervisor, isolated workers, planning, GitHub synchronization and native Paradev reflection
 
 ## Problem
 
@@ -93,6 +93,220 @@ each boundary so a restart resumes the existing PR and worker rather than
 creating replacements. The supervisor runs continuously; no scheduled Paradev
 automation is needed for its routine decisions.
 
+### Native Paradev reflection
+
+Include an optional reflection mode that uses Paradev's existing project sidebar,
+workspace tag folders, branches, PR indicators and terminal tabs. Bundle the
+transport in bmad-loop, adapting the existing paradev-tooling implementation and
+its tests. The installed package must not depend on another repository checkout.
+BMAD retains scheduling and delivery authority; Paradev supplies registered
+workspaces, worker PTYs and their native presentation.
+
+The proposed entry point is a campaign option, `--paradev-reflect`, with an
+explicit Paradev project selector and equivalent policy settings. It selects
+the Paradev workspace provider, native `paradev` mux and projection together.
+Exact command syntax remains subject to architecture review. A separate
+reflection-only command must not suggest it can adopt an arbitrary live tmux
+worker as a native Paradev agent.
+
+#### Sidebar and execution mapping
+
+| BMAD concept                                         | Paradev representation                                                                      |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| Target repository                                    | Its registered Paradev project.                                                             |
+| Story with independently planned child units         | One managed story tag folder containing the child workspaces.                               |
+| Independently editable and mergeable unit            | One workspace, one worktree, one branch and one draft PR.                                   |
+| Planning, implementation, review and repair sessions | Actual worker terminals/tabs within the owning workspace, named for their role and attempt. |
+| Campaign/epic identity and dependencies              | Stable BMAD IDs and linked task metadata; the dependency graph remains in BMAD.             |
+| Delivered unit                                       | Confirmed GitHub merge plus tracking reconciliation; terminal activity is advisory.         |
+
+A story need not be split merely to fill a folder. An unsplit story has one unit
+workspace. Splitting creates explicit child units with independent acceptance
+criteria and dependencies; the parent story is delivered only when all required
+children are delivered. Parallel editors never share an editing checkout. Phase
+tabs do not imply simultaneous writers or create extra PRs for one unit.
+
+Use stable, normalized managed tags and readable names carrying campaign, epic,
+story and unit identity. Keep issue/PR links and full names in task metadata;
+do not use mutable names as identity. Story grouping is the initial layout, with
+an epic grouping option for larger campaigns. Both use the existing flat folder
+model; no nested folder hierarchy or custom Paradev dashboard is required.
+
+Paradev currently renders a workspace in exactly one tag folder, choosing by
+folder order and then tag name. Multiple tags do not create multiple workspace
+rows or nested groups. Preserve human and locally mandated tags, including
+side-task tags where applicable. Detect competing grouping tags and report the
+placement limitation visibly; names, links and CLI filtering remain available.
+Do not reorder user folders or remove their tags to force placement.
+
+#### Workspace and terminal ownership
+
+The workspace provider creates or reconciles the registered project workspace
+first, without `--agent`, then records its returned ID, actual branch and
+worktree path. Verify the project repository and checkout identity before using
+it. Run the unit engine in place in that worktree with an explicit workspace
+selector; do not create another nested BMAD worktree. The existing native
+transport requires matching Git top-level and per-worktree Git directory.
+
+The mux launches the coding session once and attaches that same terminal to a
+pane. Do not also call `agents create`, import its conversation or launch a
+viewer agent. Persist campaign/unit, workspace, task, branch/PR, mux session,
+terminal and native session identities with attempt/ownership generations.
+After uncertain allocation or launch, reconcile those identities before retrying.
+An unrelated existing workspace or unknown live terminal is not reusable.
+Retain caller-minted launch IDs, tombstones, bootstrap identity checks,
+sequence-addressed output with visible gap markers and disposal read-back.
+The current CLI alone does not supply all these facts; keep a narrow,
+schema-checked host RPC/WebSocket boundary for native terminal operations.
+
+Make task projection optional within reflection mode. Discover status IDs and
+use the explicit Paradev task tracker. Preserve unmanaged task text and labels;
+use managed links for relationships absent from the flat task API. Project
+blocked/held states visibly without pretending an agent's idle status proves
+completion. Persist external mutation intents and reconcile uncertain outcomes
+before repeating workspace or task creation.
+Campaign state independently owns the complete hierarchy and external-ID map;
+task metadata only mirrors them. Reflection with tasks disabled must retain
+identity, links and discovery through campaign state and workspace metadata.
+
+Viewing and basic terminal input use the real worker PTY. An explicit operator
+hold/takeover must reserve ownership, suppress automatic input/retries and
+record a durable event; resume rechecks identities and invalidates affected
+review/verification evidence. A formal takeover UI and arbitrary bidirectional
+plan editing are deferred. Raw input alone never grants policy changes or
+creates another completion signal.
+
+Pane disappearance is a presentation observation, not proof of worker death.
+Closing a terminal can stop its worker; reconciliation must distinguish that
+from closing only a view. Define retention for completed/failed sessions and
+never clean up a live or uncertain worker to make the sidebar look finished.
+Use supported lifecycle controls, respecting any project retirement guard.
+
+#### Terminal tabs and operator layout
+
+Persist pane/tab bindings separately from execution identities. Titles identify
+the unit, phase, attempt and coding agent without changing the stable mux window
+identity. Review and verification views identify the source head they cover.
+Create only views for real sessions or clearly labelled deterministic output;
+an unused phase must not appear to be a running agent.
+
+After launch or restart, inspect the layout and attach the existing terminal
+when needed. Reuse an existing view instead of adding duplicate tabs, preserve
+operator names/layout where possible and avoid taking keyboard focus on each
+phase change. Report an unverifiable or multiply attached view without closing
+another pane. Qualify the displayed tab title, native agent binding and status
+against the installed app, not merely an internal terminal record.
+Read back workspace, terminal, native session and CLI session/attempt bindings;
+missing native attribution stays visibly pending/unknown within a bounded
+registration window. A visible terminal alone does not prove native agent
+attribution, and a missing binding never authorizes a replacement launch.
+
+Keep failures and recent completed output inspectable with bounded retention.
+Durable logs and session accounting survive view removal. Removing a view must
+use the keep-terminal operation; disposing an owned worker follows the declared
+stop/retirement protocol. A closed tab never means the work was delivered.
+Current adapter finalization always tears down its window. Architecture review
+must settle how to retain the latest completed/failed phase output without
+retaining a live coding process: either verified parked terminal history or
+the existing file/output views. Keep this distinction explicit in the transport
+contract rather than silently skipping teardown to preserve a tab.
+
+#### Packaging and portability
+
+Port the transport, bootstrap/output reader, minimal authenticated host client
+and relevant fake-host tests with source provenance and applicable notices.
+Record the owner's authorization to incorporate the tooling and audit source
+ownership; do not treat its vendored BMAD license as a license for the transport.
+Replace checkout imports and hardcoded paths with package-local runtime and
+CLI discovery. Route Git calls through `verify.py`, use the existing portable
+locking seam, register core environment variables and policy defaults, and keep
+POSIX shell construction inside the sanctioned transport boundary.
+Provide a bundled context-verification entry point for account wrappers, with
+no external script path. Preserve worker-owned hook/account attribution while
+removing inherited parent-terminal identities.
+
+Bundle `paradev` as an explicitly selected backend with lazy optional imports
+and an optional dependency extra for its output stream support. It must not
+change platform defaults or break standalone installs when Paradev is absent.
+Register it through the builtin loader without an automatic platform match.
+Detect a conflicting external `paradev` plugin and version existing transport
+records; do not replace an active backend or silently adopt its live records.
+There is no separate program named mux to install: mux is the transport seam.
+Preflight checks the installed Paradev CLI/host schema, project registration,
+checkout allocation, native hook/account context and terminal/pane support.
+Qualify macOS first; advertise other platforms only after their transport gates.
+
+Persist reflection and backend selection for later attach, stop and resume;
+configuration is fixed for the lifetime of a run. Host unavailability,
+schema mismatch or lost acknowledgements remain visible as blocked/unknown
+observations. Do not fall back by launching a replacement worker in another
+transport. A missing view alone does not stop the existing worker.
+
+### Optional hcom awareness
+
+Use hcom as an optional session communication integration. The existing fork
+already forwards hook-reported hcom identities and can send recovery nudges to
+a listening actor. Extend awareness around the campaign roster rather than
+introducing a second scheduler. Standalone execution must not require hcom.
+
+Supply each worker with relevant sibling units, roles, branch/PR links,
+ownership and planned interface contracts. Where hcom is available, workers
+can inspect bounded peer progress and transcripts, share findings and ask
+targeted questions. Important interface or dependency decisions must also become
+durable product artifacts; a message saying work is ready cannot release a
+dependent unit before confirmed delivery.
+
+Keep the configured project room and give each campaign unique routing tags
+and threads. These are filters, not isolation boundaries. Persist room, campaign,
+unit/attempt, hcom actor/process generation, native conversation and Paradev
+terminal identities separately. Discover and validate an existing worker's
+registration; do not wrap an already enrolled launch chain in another hcom
+session or assume a reused name belongs to its former worker.
+
+Address only exact, currently bound campaign recipients; avoid room broadcasts
+and implicit thread membership for scheduler-originated messages. Bound message
+volume, requests and context reads. Persist event cursors and handle database
+reset explicitly. Expose unavailable or partial observations instead of treating
+them as an empty, healthy roster. Reconcile uncertain sends without blindly
+repeating requests or interpreting accepted delivery as processed input.
+
+hcom text and activity remain advisory. They cannot assign work, transfer an
+editing lease, authorize policy changes, establish completion or satisfy review
+and merge gates. Only BMAD launches, resumes and stops owned coding sessions.
+Peer sessions must not use hcom lifecycle commands to create replacement
+executors or stop each other. Operator holds apply to hcom nudges as well as
+terminal input. Autonomous peer delegation and message-driven scheduling are
+outside this change.
+
+#### Stop-hook compatibility gate
+
+Automatic inbound peer delivery is disabled until its completion interaction is
+qualified for the selected launch chain. In the source revision named by the
+installed hcom image, Claude/Codex Stop handlers can mark an actor listening and
+wake delivery asynchronously; Claude stdio Stop can also block for unread mail.
+BMAD independently accepts a Stop with a result and can begin window teardown.
+Those paths can race: a queued continuation may be cut off, or a new turn may
+start after BMAD accepted the previous turn's result.
+
+A listening status, send receipt, zero unread count or `stop_hook_active` field
+alone does not resolve that race. Define and qualify admission/closing semantics
+for queued, in-flight and late messages, preserving hook/window completion
+authority and post-session verification. Do not solve it with sleeps or a new
+prose/idle-based completion path. If the installed integration lacks the needed
+capability, report that and retain the supported communication mode.
+
+Observe-only operation also needs capability checks: a launch wrapper may have
+already installed automatic hcom delivery hooks. Merely stopping campaign sends
+does not make those hooks passive. Do not claim a passive mode unless incoming
+wakeups are demonstrably excluded or the closing protocol handles them. Active
+delivery can remain deferred while structured campaign context and supported
+peer observations provide initial awareness.
+The inspected hcom version has no supported per-actor mute/observe setting;
+disabling automatic subscriptions does not disable ordinary inbound mail.
+Observation means BMAD emits no messages/subscriptions, while preexisting actor
+delivery can remain active. A stronger no-wakeup guarantee requires a qualified
+unenrolled launch or a new delivery capability, not an inferred configuration.
+
 ### Planning
 
 Run requirements, architecture, decomposition/refinement and planning review as
@@ -108,15 +322,17 @@ independence.
 
 ## Implementation plan
 
-| Stage | Deliverable                                                     | Acceptance                                                                                                                                  |
-| ----- | --------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1     | Versioned campaign specifications, state, transitions and store | Invalid/cyclic inputs refuse before effects; persistence is atomic; duplicate coordinators refuse.                                          |
-| 2     | GitHub gateway, outbox and publication controller               | Early drafts, pagination, exact-head/base gates, unknown-write reconciliation and merge read-back work through fake transport.              |
-| 3     | Issue hierarchy, managed content and discussion inbox           | Stable IDs, native subissues, milestone progress and linked comments survive retry without duplicates or lost human edits.                  |
-| 4     | Planning sessions and source import                             | A brief yields validated product plans and ready units through existing session completion authority.                                       |
-| 5     | Isolated workers and dependency scheduler                       | Multiple units execute concurrently without shared engine state; dependencies release only after delivery.                                  |
-| 6     | CLI and complete delivery/recovery loop                         | One command plans, dispatches, reviews, publishes, waits, merges, reconciles and continues; stop/resume preserves identities.               |
-| 7     | Qualification and migration                                     | Zero-token end-to-end tests cover crashes and moving heads; configured project preflight proves readiness before replacing its automations. |
+| Stage | Deliverable                                                     | Acceptance                                                                                                                                          |
+| ----- | --------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1     | Versioned campaign specifications, state, transitions and store | Invalid/cyclic inputs refuse before effects; persistence is atomic; duplicate coordinators refuse.                                                  |
+| 2     | GitHub gateway, outbox and publication controller               | Early drafts, pagination, exact-head/base gates, unknown-write reconciliation and merge read-back work through fake transport.                      |
+| 3     | Issue hierarchy, managed content and discussion inbox           | Stable IDs, native subissues, milestone progress and linked comments survive retry without duplicates or lost human edits.                          |
+| 4     | Planning sessions and source import                             | A brief yields validated product plans and ready units through existing session completion authority.                                               |
+| 5     | Isolated workers, workspace providers and dependency scheduler  | Multiple units execute concurrently without shared engine state; provider allocation precedes launch; dependencies release only after delivery.     |
+| 6     | CLI and complete delivery/recovery loop                         | One command plans, dispatches, reviews, publishes, waits, merges, reconciles and continues; stop/resume preserves identities.                       |
+| 7     | Bundled Paradev transport and native workspace reflection       | Story/epic folders, unit workspaces/PRs and actual worker tabs reconcile without duplicate launches or lost operator holds.                         |
+| 8     | Optional hcom awareness and compatibility checks                | Exact actor bindings, scoped observations and operator holds work; automatic inbound delivery remains unavailable until Stop interleavings qualify. |
+| 9     | Qualification and migration                                     | Zero-token end-to-end tests cover crashes, moving heads and native reflection; project preflight proves readiness before replacing its automations. |
 
 Implementation ownership follows these responsibilities: neutral model/store and
 CLI; GitHub transport/publication; planning/project synchronization; and worker
@@ -135,6 +351,31 @@ The complete fixture must show brief to plan/spec commit, draft PR, linked issue
 hierarchy, concurrent workers, exact-source review/verification, confirmed merge,
 tracking reconciliation and dependent dispatch. No unit may become delivered
 before the remote merge and fresh canonical ancestry observation.
+
+Reflection qualification uses fake host/CLI responses plus scripted zero-token
+PTY sessions. Cover workspace creation with a lost response, branch/path
+rewrites, foreign checkouts, simultaneous child units, competing tags, task
+update conflicts, host loss/restart, missing panes, output gaps, native hook
+identity, worker exit, operator holds and retention. Prove a pane attaches the
+existing worker terminal and cannot cause a second launch. Standalone Linux and
+Windows installation/import tests must pass without reflection dependencies.
+
+Communication qualification uses fake hcom responses and scripted hook/PTY
+events with zero model tokens. Cover both hook orderings, a result followed by
+unread delivery, zero unread with delivery in flight, late mail, provider errors
+without Stop, stale generations/name reuse, parent identity/room leakage,
+database reset, stop/recovery and operator takeover. Existing mocked nudge tests
+do not establish compatibility with automatic peer delivery.
+
+### Architecture review checkpoints
+
+Before implementation, fact-check the core GitHub and planning contracts plus
+the pinned external source and installed capability observations. Resolve the
+terminal history/teardown contract, full native-session attribution, optional
+task-free reflection and external-backend migration. Determine whether an hcom
+completion fence can be implemented entirely within bmad-loop with the deployed
+launchers; otherwise explicitly defer automatic inbound coordination. The final
+reviewed scope must not require an unplanned Paradev or hcom release.
 
 ## Alternatives
 
@@ -157,3 +398,16 @@ before the remote merge and fresh canonical ancestry observation.
 - [Milestone APIs](https://docs.github.com/en/rest/issues/milestones)
 - [Native subissue APIs](https://docs.github.com/en/rest/issues/sub-issues)
 - [API pagination, serialization and rate-limit practices](https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api)
+- [Paradev workspace, task and terminal CLI](https://docs.paradev.com/cli/getting-started)
+- [Paradev workspace and agent model](https://docs.paradev.com/superset-model)
+- [Existing native transport source, port baseline](https://github.com/open-runtime/paradev-tooling/blob/a5d76d363da3cca58db5e110942c1490a49f8fae/superset_tooling/native_transport.py)
+- [Paradev fork folder membership and ordering, inspected source](https://github.com/tsavo-at-pieces/Paradev/blob/f8d0a3131def87cfd525ece3ace6867540011610/apps/desktop/src/renderer/routes/_authenticated/utils/workspaceTagFolders/workspaceTagFolders.ts)
+- [hcom Claude Stop delivery, installed-image source revision](https://github.com/tsavo-at-pieces/hcom/blob/c578fe92ccb714572801e60fa29555c0b6a1929c/src/hooks/claude.rs)
+- [Existing BMAD hcom recovery nudges](../loop-recovery-guide.md#nudges-over-hcom)
+
+The folder constraints above were inspected in the local Paradev fork source;
+CLI capabilities were checked against the installed command schema. Qualify the
+installed desktop/host against those expectations rather than assuming a source
+checkout proves the running app's version or behavior.
+The hcom source check establishes the interaction to qualify; it is not a live
+installed-binary reproduction or proof of an unmodified build.
