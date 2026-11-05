@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from stat import S_ISREG
-from typing import TYPE_CHECKING, Callable, Literal, NamedTuple, NoReturn, Protocol, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Literal, NamedTuple, NoReturn, Protocol, Sequence
 
 from . import (
     artifact_publication,
@@ -5361,6 +5361,35 @@ class Engine:
         midnight can carry a new ``parked_at`` and therefore require a new commit.
         ``commit_sha`` is stamped only here and is write-only (never routing),
         so the empty persisted value is harmless."""
+        if task.commit_retry is not None:
+            from . import bmadconfig, commit_recovery
+            from .policy import PolicyError
+
+            head = task.commit_retry.get("head")
+            try:
+                commit_recovery.validate_entry(
+                    self.state,
+                    task,
+                    run_dir=self.run_dir,
+                    project_root=self.paths.project,
+                )
+            except (
+                ValueError,
+                OSError,
+                bmadconfig.BmadConfigError,
+                PolicyError,
+                verify.GitError,
+            ) as exc:
+                reason = f"commit retry refused: {exc}; restore the attested state, then resume"
+                self.journal.append("commit-retry-refused", story_key=task.story_key, reason=reason)
+                self._save()
+                self._escalation_pause(reason, task.story_key, cause=exc)
+            # From this save onward the ordinary COMMITTING replay contract
+            # applies, including a crash after finalization changed HEAD. Do not
+            # mistake that successful append for pre-entry operator drift.
+            task.commit_retry = None
+            self.journal.append("commit-retry-entered", story_key=task.story_key, head=head)
+            self._save()
         message = self._commit_message(task)
         # pre_commit: a plugin may rewrite the commit message or escalate (pause).
         # A defer/skip veto would have to unwind a COMMITTING task (no legal move
@@ -7766,6 +7795,8 @@ class Engine:
         task: StoryTask,
         verification_stage: str,
         results: tuple[verify.CommandResult, ...],
+        *,
+        verification_source: dict[str, Any] | None = None,
     ) -> int | None:
         """Record each verifier subprocess result plus bounded log pointers, and
         return the sequence they were recorded under — ``None`` when there was
@@ -7848,6 +7879,9 @@ class Engine:
             marks: dict[str, bool] = {}
             if result.interrupted:
                 marks["interrupted"] = True
+            source_fields: dict[str, object] = {}
+            if verification_source is not None:
+                source_fields["verification_source"] = verification_source
             self.journal.append(
                 "verify-command-result",
                 story_key=task.story_key,
@@ -7868,6 +7902,7 @@ class Engine:
                 capture_error=capture_error,
                 **streams,
                 **marks,
+                **source_fields,
             )
         return verification_sequence
 
@@ -9053,8 +9088,18 @@ class Engine:
         be a second, drift-prone vocabulary for a fact the journal already carries.
         """
 
+        from .commit_recovery import source_snapshot
+
+        root = self.workspace.paths.repo_root
+        before = source_snapshot(root)
+
         def sink(results: tuple[verify.CommandResult, ...]) -> None:
-            sequence = self._journal_verify_command_results(task, "review", results)
+            sequence = self._journal_verify_command_results(
+                task,
+                "review",
+                results,
+                verification_source={"before": before, "after": source_snapshot(root)},
+            )
             self._review_verify_records = VerifyCommandRecords(
                 results=results, stage="review", sequence=sequence
             )
@@ -12250,6 +12295,7 @@ class Engine:
     def _escalate(self, task: StoryTask, reason: str) -> None:
         advance(task, Phase.ESCALATED)
         task.adopt_pending = False  # an escalation spends any adoption (DW-386)
+        task.commit_retry = None
         # Two literal writes rather than a conditional `**` splat, so the journal
         # field guard reads every name; `env_fault_site` appears only when set.
         if task.env_fault_site is None:

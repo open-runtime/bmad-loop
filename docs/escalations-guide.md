@@ -79,7 +79,22 @@ The reason names both sides. The work is kept: uncommitted in the checkout, or o
 - `--no-resume` only re-arms and prints `resume when ready: bmad-loop resume <id>`.
 - `--force` proceeds when the engine's liveness cannot be verified. A running engine always blocks: run `bmad-loop stop <run-id>` first.
 
-`--restore-patch`, `--adopt-branch`, `--reverify`, `--review-implemented` and `--abandon` are mutually exclusive.
+`--restore-patch`, `--adopt-branch`, `--reverify`, `--review-implemented`, `--retry-commit` and `--abandon` are mutually exclusive.
+
+### Retry a failed finalization
+
+When an in-place ticket completed development, review and verification but its commit window failed, use:
+
+```sh
+bmad-loop resolve <run-id> --story <key> --retry-commit <full-reviewed-head-sha> --no-resume
+bmad-loop resume <run-id>
+```
+
+The SHA attests that this is the unchanged reviewed and verified HEAD; the command also requires independent recorded source evidence. New review verification records capture HEAD, tree and cleanliness before and after the commands. Every record must identify the same clean, unchanged source as the attested HEAD. For older records, the command accepts a matching `sync-with-main.json` chain only when its timestamp matches the successful `sync-with-main` pre-commit hook for that review, between the final verification and the commit failure. Missing, changed or incomplete evidence refuses recovery. Merging main or committing new work after verification requires normal review and verification of that work; attesting the new HEAD does not replace them.
+
+The command requires a stopped run, a clean checkout, the bound built plan, the original accepted development decision, a completed converged primary review as the last session and a complete successful final verification sequence matching the current commands. Runs with later workflow sessions, other failures or outstanding review or operator obligations refuse without rearming the task. Verification and gate policy must match the recorded run snapshot.
+
+This restores only the existing commit continuation. It preserves the baseline, session history and attempt counters; it does not run another development session, review, verification or pre-commit workflow. Normal `pre_commit` hooks, including their pause veto, and post-commit hooks still run. The attestation is rechecked when the commit window is entered. Keep source, plan and verification configuration unchanged until then. Once entry is recorded, the ordinary durable commit-window crash recovery applies. Multiple merge bases already covered by the recorded baseline preserve the existing commit chain and append only new bookkeeping; uncovered ambiguous ancestry still refuses.
 
 ### Review implementation already in the baseline
 

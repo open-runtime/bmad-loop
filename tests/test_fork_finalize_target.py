@@ -295,7 +295,8 @@ def test_finalize_graph_probe_error_refuses_before_mutation(project, monkeypatch
     assert _snapshot(repo) == before
 
 
-def test_finalize_multiple_common_bases_refuses_before_mutation(project):
+@pytest.mark.parametrize("partial_baseline", [False, True])
+def test_finalize_multiple_common_bases_refuses_before_mutation(project, partial_baseline):
     """Crisscross histories require reconciliation, not an arbitrary squash base.
 
     Ablation: bypass the finalization graph guard; the expected refusal goes
@@ -312,9 +313,67 @@ def test_finalize_multiple_common_bases_refuses_before_mutation(project):
     git(repo, "reset", "--hard", first)
     git(repo, "update-ref", "refs/remotes/origin/main", second)
     assert set(git(repo, "merge-base", "--all", first, second).splitlines()) == {left, right}
+    if partial_baseline:
+        baseline = left
     before = _stage_and_dirty(repo)
 
     with pytest.raises(verify.GitError, match="(?i)ambiguous"):
+        verify.finalize_commit(repo, baseline, "must not finalize")
+
+    assert _snapshot(repo) == before
+
+
+def _covered_common_bases(project):
+    repo = project.project
+    fork = git(repo, "rev-parse", "HEAD")
+    left = _commit(repo, "left.txt", "left history\n")
+    git(repo, "checkout", "-q", "-b", "epic", fork)
+    right = _commit(repo, "right.txt", "right history\n")
+    git(repo, "merge", "--no-ff", "-m", "accepted baseline", left)
+    baseline = git(repo, "rev-parse", "HEAD")
+    tree = git(repo, "rev-parse", "HEAD^{tree}")
+    target = git(repo, "commit-tree", tree, "-p", left, "-p", right, "-m", "target merge")
+    git(repo, "update-ref", "refs/remotes/origin/main", target)
+    _commit(repo, "dev.txt", "accepted development\n")
+    head = _commit(repo, "review.txt", "accepted review\n")
+    assert set(git(repo, "merge-base", "--all", head, target).splitlines()) == {left, right}
+    assert git(repo, "rev-list", "--merges", f"{baseline}..{head}") == ""
+    return repo, baseline, target, head
+
+
+@pytest.mark.parametrize("bookkeeping", [False, True])
+def test_finalize_baseline_covering_common_bases_preserves_entire_history(project, bookkeeping):
+    """The accepted baseline contains the crisscross; keep later reviewed commits too."""
+    repo, baseline, _target, head = _covered_common_bases(project)
+    original_history = git(repo, "rev-list", "HEAD").splitlines()
+    original_tree = git(repo, "rev-parse", "HEAD^{tree}")
+    if bookkeeping:
+        (repo / "bookkeeping.txt").write_text("done\n", encoding="utf-8")
+    plans = []
+
+    result = verify.finalize_commit(repo, baseline, "finalized bookkeeping", on_plan=plans.append)
+
+    assert result == git(repo, "rev-parse", "HEAD")
+    assert plans == [verify.FinalizationPlan(head, "covered-common-ancestors", False)]
+    assert set(original_history).issubset(git(repo, "rev-list", "HEAD").splitlines())
+    if bookkeeping:
+        assert git(repo, "rev-parse", "HEAD^") == head
+        assert git(repo, "diff", "--name-only", head, "HEAD") == "bookkeeping.txt"
+        assert git(repo, "show", "HEAD:bookkeeping.txt") == "done"
+    else:
+        assert result == head
+        assert git(repo, "rev-parse", "HEAD^{tree}") == original_tree
+    assert git(repo, "status", "--porcelain") == ""
+    assert verify.finalize_commit(repo, baseline, "replayed bookkeeping") == result
+
+
+def test_finalize_covered_common_bases_still_checks_published_branch(project):
+    """A covered target must not bypass the independently published branch's guard."""
+    repo, baseline, target, _head = _covered_common_bases(project)
+    git(repo, "update-ref", "refs/remotes/origin/epic", target)
+    before = _stage_and_dirty(repo)
+
+    with pytest.raises(verify.GitError, match="published branch.*not contained"):
         verify.finalize_commit(repo, baseline, "must not finalize")
 
     assert _snapshot(repo) == before

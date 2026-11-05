@@ -393,6 +393,8 @@ _JOURNAL_DROP_FIELDS = frozenset(
         "spawn_error",
         "stdout_path",
         "stderr_path",
+        # Recovery-only nested HEAD/tree identities stay in the local journal.
+        "verification_source",
         # An absolute host path naming the run's code tree
         # (`rearm-baseline-advance-failed`). Dropped rather than aliased: unlike a
         # spec filename it correlates nothing across events — one run has one code

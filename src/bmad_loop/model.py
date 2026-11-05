@@ -827,6 +827,10 @@ class StoryTask:
     # original acceptance; it never substitutes a new SessionRecord or acceptance.
     # Kept through the mandatory primary review and its ordinary verification.
     implemented_review: dict[str, Any] | None = None
+    # Explicit unchanged-HEAD attestation for a failed finalization whose dev,
+    # review and verification already completed. Rechecked and consumed on entry
+    # to the normal durable COMMITTING window; never synthesizes SessionRecords.
+    commit_retry: dict[str, Any] | None = None
     # sweep bundles only: the deferred-work ids this task closes and the
     # rendered intent file handed to dev sessions
     dw_ids: list[str] = field(default_factory=list)
@@ -1051,6 +1055,7 @@ class StoryTask:
             "reverify_from": self.reverify_from,
             "reverify_replayed": self.reverify_replayed,
             "implemented_review": deepcopy(self.implemented_review),
+            "commit_retry": deepcopy(self.commit_retry),
             "dw_ids": self.dw_ids,
             "bundle_file": self.bundle_file,
             "worktree_path": self.worktree_path,
@@ -1351,6 +1356,9 @@ class StoryTask:
                 deepcopy(dict(d["implemented_review"]))
                 if d.get("implemented_review") is not None
                 else None
+            ),
+            commit_retry=(
+                deepcopy(dict(d["commit_retry"])) if d.get("commit_retry") is not None else None
             ),
             dw_ids=[str(i) for i in d.get("dw_ids", [])],
             bundle_file=d.get("bundle_file"),

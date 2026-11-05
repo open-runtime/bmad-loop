@@ -660,6 +660,9 @@ def test_verify_command_free_text_drops_to_presence_booleans():
             "stderr_path": None,
             "stdout_bytes": 12,
             "stdout_truncated": False,
+            "verification_source": {
+                "before": {"head": "private-head", "tree": "private-tree", "clean": True}
+            },
         },
         pseudo,
         {},
@@ -673,6 +676,7 @@ def test_verify_command_free_text_drops_to_presence_booleans():
         "spawn_error",
         "stdout_path",
         "stderr_path",
+        "verification_source",
     ):
         assert field not in out, f"{field} must never be emitted"
     assert out["command_present"] is True
@@ -683,6 +687,7 @@ def test_verify_command_free_text_drops_to_presence_booleans():
     # at all — `stream_capture_kb = 0` and a failed write both leave it null.
     assert out["stdout_path_present"] is True
     assert out["stderr_path_present"] is False
+    assert out["verification_source_present"] is True
     # ... while everything a maintainer correlates on still ships verbatim
     assert (out["verification_stage"], out["verification_sequence"]) == ("dev", 3)
     assert (out["command_index"], out["returncode"], out["attempt"]) == (0, 1, 2)
@@ -934,6 +939,33 @@ def test_the_owed_code_root_discharge_row_keeps_both_of_its_booleans():
     rendered = json.dumps([discharge, own_move])
     for canary in (HOME_PATH, PROPRIETARY, *CANARIES):
         assert canary not in rendered, f"LEAK: {canary!r}"
+
+
+def test_commit_recovery_journal_fields():
+    """Retry events retain correlation with normal completion, without refusal prose."""
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    reason = "UnreviewedPrivateCommit"
+    raw = [
+        {"kind": "story-done", "story_key": STORY_KEY, "commit": SHA},
+        {"kind": "commit-retry-armed", "story_key": STORY_KEY, "head": SHA},
+        {"kind": "commit-retry-entered", "story_key": STORY_KEY, "head": SHA},
+        {"kind": "commit-retry-refused", "story_key": STORY_KEY, "reason": reason},
+    ]
+    scrubbed = [
+        diagnostics._scrub_entry({"ts": float(i), **entry}, pseudo, {}, 0.0)
+        for i, entry in enumerate(raw)
+    ]
+    done, armed, entered, refused = scrubbed
+    story_alias = next(a for ns, orig, a in pseudo.entries() if ns == "story" and orig == STORY_KEY)
+    commit_alias = next(a for ns, orig, a in pseudo.entries() if ns == "commit" and orig == SHA)
+    assert [entry["kind"] for entry in scrubbed] == [entry["kind"] for entry in raw]
+    assert [entry["story_key"] for entry in scrubbed] == [story_alias] * 4
+    assert done["commit"] == armed["head"] == entered["head"] == commit_alias
+    assert story_alias != STORY_KEY and commit_alias != SHA
+    assert "reason" not in refused and refused["reason_present"] is True
+    assert not any(orig == reason for _ns, orig, _a in pseudo.entries())
+    rendered = json.dumps(scrubbed)
+    assert all(value not in rendered for value in (STORY_KEY, SHA, reason))
 
 
 def test_the_two_commit_probe_records_alias_one_baseline_to_one_name():
