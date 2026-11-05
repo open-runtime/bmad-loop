@@ -449,8 +449,9 @@ def test_first_primary_refuses_post_hook_drift(accepted_implementation, monkeypa
 
 @pytest.mark.parametrize("after_strip", [False, True])
 @pytest.mark.parametrize("crash_count", [1, 2])
+@pytest.mark.parametrize("max_review_cycles", [1, 3])
 def test_recovery_replays_crash_after_real_marker_removal(
-    accepted_implementation, monkeypatch, after_strip, crash_count
+    accepted_implementation, monkeypatch, after_strip, crash_count, max_review_cycles
 ):
     from bmad_loop.adapters.base import SessionResult
 
@@ -462,7 +463,8 @@ def test_recovery_replays_crash_after_real_marker_removal(
     engine, adapter = _armed_engine(case)
     task = engine.state.tasks[case.task.story_key]
     engine.policy = dataclasses.replace(
-        engine.policy, limits=dataclasses.replace(engine.policy.limits, max_review_cycles=1)
+        engine.policy,
+        limits=dataclasses.replace(engine.policy.limits, max_review_cycles=max_review_cycles),
     )
     reset = engine._reset_spec_for_review
 
@@ -476,6 +478,8 @@ def test_recovery_replays_crash_after_real_marker_removal(
     with pytest.raises(RuntimeError, match="host lost at marker removal"):
         engine._resume_after_dev_verify(task)
     assert adapter.sessions == []
+    crashed = load_state(case.run_dir).tasks[case.task.story_key]
+    assert crashed.phase == Phase.REVIEW_RUNNING and crashed.review_cycle == 1
 
     state = load_state(case.run_dir)
     recovered = TicketsEngine(
@@ -526,6 +530,7 @@ def test_recovery_replays_crash_after_real_marker_removal(
     recovered._finish_inflight()
     resumed_task = state.tasks[case.task.story_key]
     assert resumed_task.phase == Phase.DONE
+    assert resumed_task.review_cycle == crash_count + 1
     assert [spec.role for spec in adapter.sessions] == ["review"]
     assert resumed_task.accepted_dev_session_index == 0
     assert read_frontmatter(case.plan)["verify_unmet"] == 1
