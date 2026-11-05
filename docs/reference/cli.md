@@ -213,7 +213,7 @@ bmad-loop resume [--project PROJECT] [--accept-baseline] run_id
 - Refused with exit 1 for a live engine, a finished run, a sweep whose ledger cannot be read, and the same git-floor, isolation, skill and plugin-trust gates as `run`. Does not require a clean worktree.
 - Refused with exit 1, before any side effect, for a story run whose work source this version does not know (the run was started by a newer bmad-loop) or cannot run yet. Do not downgrade bmad-loop while a run is in progress.
 - Discards any pending stop request and re-reads the policy and config before continuing.
-- For a story run, prints `warning: run <id>: story '<key>' is still escalated — resume skips it; resolve it with bmad-loop resolve <id>` on stderr for each escalated story, then continues.
+- For a story run, prints `warning: run <id>: story '<key>' is still escalated — resume skips it; resolve it with bmad-loop resolve <id>` on stderr for each escalated story, then continues. An explicitly attested, bound primary with an exact pool-interruption receipt instead continues its original native review when its evidence and ordinary budgets permit; see [same-review recovery](../escalations-guide.md#review-implementation-already-in-the-baseline).
 - Clears the pause before the engine starts. A resume that fails before that (an adapter, profile or multiplexer error, `error: …`) puts the cleared pause fields back and journals `resume-aborted` with `error` set to the exception class, unless the run finished or was paused again meanwhile; a restore that fails prints `could not restore the pause this resume cleared` and the original error still ends the command. After a resolve re-arm the story is already `pending`, so a plain `resume` re-drives it.
 
 ### `resolve`

@@ -141,6 +141,7 @@ def _evidence(
     project_root: Path,
     require_stopped: bool,
     source_generation: int | None = None,
+    pool_pause: bool = False,
 ) -> dict[str, Any]:
     from . import runs
 
@@ -157,7 +158,13 @@ def _evidence(
         in (
             (Phase.DEV_RUNNING, Phase.DEV_VERIFY)
             if require_stopped
-            else (Phase.DEV_RUNNING, Phase.DEV_VERIFY, Phase.REVIEW_RUNNING, Phase.REVIEW_VERIFY)
+            else (
+                Phase.DEV_RUNNING,
+                Phase.DEV_VERIFY,
+                Phase.REVIEW_RUNNING,
+                Phase.REVIEW_VERIFY,
+                *((Phase.ESCALATED,) if pool_pause else ()),
+            )
         ),
         "the task is not at a recoverable dev boundary",
     )
@@ -553,6 +560,148 @@ def primary_was_bound(state: RunState, task: StoryTask, run_dir: Path) -> bool:
         and re.fullmatch(pattern, str(e.get("task_id", "")))
         for e in entries
     )
+
+
+def pool_review_record(task: StoryTask, *, launching: bool = False) -> SessionRecord | None:
+    """The exact unfinished pool-bound review, never an older usable conversation."""
+    if not task.implemented_review or not task.sessions:
+        return None
+    record = task.sessions[-1]
+    cycle = task.review_cycle - int(launching)
+    if (
+        cycle > 0
+        and record.task_id == session_task_id(task.story_key, "review", cycle, task.generation)
+        and record.role == "review"
+        and not record.label
+        and record.status == "stalled"
+        and record.ended == "pool"
+        and record.result_json is None
+        and record.session_id
+        and record.adapter
+    ):
+        return record
+    return None
+
+
+def pool_resume_recorded(task: StoryTask) -> bool:
+    """Discharge native-only continuation only with that native's durable result."""
+    if not task.implemented_review or not task.sessions:
+        return False
+    native = task.implemented_review.get("pool_resume_required")
+    record = task.sessions[-1]
+    return (
+        isinstance(native, str)
+        and bool(native)
+        and record.task_id
+        == session_task_id(task.story_key, "review", task.review_cycle, task.generation)
+        and record.role == "review"
+        and not record.label
+        and bool(record.adapter)
+        and record.session_id == native
+        and record.resumed_from == native
+    )
+
+
+def pool_review_refusal(
+    state: RunState,
+    task: StoryTask,
+    run_dir: Path,
+    project_root: Path,
+    *,
+    launching: bool = False,
+) -> str | None:
+    """Authorize only the same attested primary after its recorded pool failure.
+
+    A bound primary owns unfinished plan edits. Everything else in the original
+    attestation still holds; this is neither a fresh attestation nor acceptance.
+    The caller separately requires the ordinary native-resume adapter contract.
+    """
+    record = pool_review_record(task, launching=launching)
+    if record is None:
+        return "no exact unfinished pool review"
+    held = task.implemented_review
+    assert isinstance(held, dict)
+    if (
+        held.get("version") != 1
+        or type(held.get("source_generation")) is not int
+        or task.generation != held["source_generation"] + 1
+        or task.env_fault_site is not None
+        or task.defer_reason is not None
+        or task.resume_blocked
+        or held.get("pool_resume_required", record.session_id) != record.session_id
+    ):
+        return "the pool review's recovery identity or boundary changed"
+    try:
+        current = _evidence(
+            state,
+            task,
+            task.story_key,
+            str(held.get("implementation_commit", "")),
+            run_dir=run_dir,
+            project_root=project_root,
+            require_stopped=False,
+            source_generation=held["source_generation"],
+            pool_pause=True,
+        )
+        expected = dict(held)
+        expected.pop("prepared_plan", None)
+        expected.pop("pool_resume_required", None)
+        expected.pop("plan_digest", None)
+        current.pop("plan_digest")
+        if current != expected:
+            return "the source or accepted evidence changed during the pool review"
+        live_policy = policy.load(project_root / policy.POLICY_FILE)
+        if task.charged_review_cycles - int(launching) >= live_policy.limits.max_review_cycles:
+            return "the pool review has no remaining review budget"
+        entries = Journal(run_dir, pin=state).entries()
+        if any(
+            not isinstance(e, dict) or e.get("kind") == "journal-line-unreadable" for e in entries
+        ):
+            return "the pool review journal is unreadable"
+        starts = [
+            i
+            for i, e in enumerate(entries)
+            if e.get("kind") == "session-start" and e.get("task_id") == record.task_id
+        ]
+        if len(starts) != 1:
+            return "the pool review has no unique recorded launch"
+        tail = entries[starts[0] :]
+        if any(e.get("kind") in {"session-start", "session-resume"} for e in tail[1:]):
+            return "a later session already started after the pool review"
+        bound = [e for e in tail if e.get("kind") == "session-bound"]
+        ends = [e for e in tail if e.get("kind") == "session-end"]
+        if (
+            not bound
+            or any(
+                e.get("task_id") != record.task_id or e.get("session_id") != record.session_id
+                for e in bound
+            )
+            or len(ends) != 1
+            or ends[0].get("task_id") != record.task_id
+            or ends[0].get("status") != "stalled"
+            or ends[0].get("env_fault") is not True
+            or ends[0].get("turn_error") != "pool"
+            or any(tail.index(e) > tail.index(ends[0]) for e in bound)
+        ):
+            return "the bound native review has no unambiguous pool-failure receipt"
+        escalations = [e for e in tail if e.get("kind") == "story-escalated"]
+        if (
+            len(escalations) != 1
+            or escalations[0].get("story_key") != task.story_key
+            or escalations[0].get("log_task") != record.task_id
+            or escalations[0].get("env_fault_site") is not None
+            or tail.index(escalations[0]) < tail.index(ends[0])
+        ):
+            return "the escalation is not attributable to the interrupted pool review"
+    except (
+        ValueError,
+        OSError,
+        bmadconfig.BmadConfigError,
+        verify.GitError,
+        policy.PolicyError,
+    ) as exc:
+        return str(exc)
+    return None
 
 
 def review_reservation_unlaunched(state: RunState, task: StoryTask, run_dir: Path) -> bool:

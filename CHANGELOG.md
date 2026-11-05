@@ -7,6 +7,12 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+## [0.13.11] — 2026-11-05
+
+### Fixed
+
+- Resume a pool-interrupted attested primary in its existing native review without restarting development.
+
 ## [0.13.10] — 2026-11-05
 
 ### Added
@@ -6811,7 +6817,8 @@ enforced in CI.
   implementation phase, driven by a Python control loop with hook-based session transport and
   resumable on-disk run state.
 
-[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.13.10...HEAD
+[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.13.11...HEAD
+[0.13.11]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.11
 [0.13.10]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.10
 [0.13.9]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.9
 [0.13.8]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.8
