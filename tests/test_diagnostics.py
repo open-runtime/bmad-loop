@@ -936,6 +936,33 @@ def test_the_owed_code_root_discharge_row_keeps_both_of_its_booleans():
         assert canary not in rendered, f"LEAK: {canary!r}"
 
 
+def test_commit_recovery_journal_fields():
+    """Retry events retain correlation with normal completion, without refusal prose."""
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    reason = "UnreviewedPrivateCommit"
+    raw = [
+        {"kind": "story-done", "story_key": STORY_KEY, "commit": SHA},
+        {"kind": "commit-retry-armed", "story_key": STORY_KEY, "head": SHA},
+        {"kind": "commit-retry-entered", "story_key": STORY_KEY, "head": SHA},
+        {"kind": "commit-retry-refused", "story_key": STORY_KEY, "reason": reason},
+    ]
+    scrubbed = [
+        diagnostics._scrub_entry({"ts": float(i), **entry}, pseudo, {}, 0.0)
+        for i, entry in enumerate(raw)
+    ]
+    done, armed, entered, refused = scrubbed
+    story_alias = next(a for ns, orig, a in pseudo.entries() if ns == "story" and orig == STORY_KEY)
+    commit_alias = next(a for ns, orig, a in pseudo.entries() if ns == "commit" and orig == SHA)
+    assert [entry["kind"] for entry in scrubbed] == [entry["kind"] for entry in raw]
+    assert [entry["story_key"] for entry in scrubbed] == [story_alias] * 4
+    assert done["commit"] == armed["head"] == entered["head"] == commit_alias
+    assert story_alias != STORY_KEY and commit_alias != SHA
+    assert "reason" not in refused and refused["reason_present"] is True
+    assert not any(orig == reason for _ns, orig, _a in pseudo.entries())
+    rendered = json.dumps(scrubbed)
+    assert all(value not in rendered for value in (STORY_KEY, SHA, reason))
+
+
 def test_the_two_commit_probe_records_alias_one_baseline_to_one_name():
     """`old_baseline` is a 40-hex sha on BOTH of `_stale_restore_residue`'s records,
     and routing is by field NAME, so one entry has to cover both kinds (DW-81).

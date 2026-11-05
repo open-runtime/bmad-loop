@@ -8,7 +8,16 @@ from types import SimpleNamespace
 import pytest
 from conftest import EntrySpec, EpicSpec, git, write_plan, write_ticket_tree
 
-from bmad_loop import bmadconfig, cli, commit_recovery, platform_util, policy, runs, verify
+from bmad_loop import (
+    bmadconfig,
+    cli,
+    commit_recovery,
+    platform_util,
+    policy,
+    runs,
+    ticketstore,
+    verify,
+)
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.engine import RunPaused
 from bmad_loop.journal import Journal, load_state, save_state
@@ -346,6 +355,17 @@ def test_confirmed_evidence_rechecked_under_lock(commit_case):
             project_root=case.root,
             expected_evidence=observed,
         )
+    assert (case.run_dir / "state.json").read_bytes() == before
+
+
+def test_changed_ticket_store_refuses_without_rearming(commit_case, monkeypatch):
+    case = commit_case
+    before = (case.run_dir / "state.json").read_bytes()
+    monkeypatch.setattr(
+        ticketstore, "store_conflict", lambda *_args, **_kwargs: "ticket store moved"
+    )
+    with pytest.raises(runs.RearmError, match="ticket store moved"):
+        case.arm()
     assert (case.run_dir / "state.json").read_bytes() == before
 
 

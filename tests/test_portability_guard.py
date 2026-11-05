@@ -259,6 +259,7 @@ REARM_ESCALATION_CALLERS = {
 # relying on a reviewer to find it by grep.
 SAVE_STATE_CALLERS = {
     ("accepted_review.py", "rearm_for_implemented_review"),
+    ("commit_recovery.py", "arm"),
     ("cli.py", "_prepare_resume_locked"),
     # a resume that failed before its engine started puts its cleared pause back
     ("cli.py", "_restore_aborted_resume"),
@@ -277,6 +278,7 @@ SAVE_STATE_CALLERS = {
 }
 RUN_STATE_TRANSACTIONS = {
     ("accepted_review.py", "rearm_for_implemented_review"),
+    ("commit_recovery.py", "arm"),
     ("cli.py", "_resume_paused_run"),
     # the failed-resume restore: reload, re-check finished / a concurrent re-pause,
     # then put back the pause `_prepare_resume_locked` cleared
@@ -407,6 +409,7 @@ ISOLATION_CONFLICT_CALLERS = {
 # caller lands with a row and the test that it refuses.
 STORE_TOPOLOGY_CALLERS = {
     ("accepted_review.py", "_evidence"): 2,  # admission, locked mutation and dispatch
+    ("commit_recovery.py", "evidence"): 1,  # admission, locked arm and commit entry
     ("ticketstore.py", "store_conflict"): 1,  # the predicate's own text call
     ("install.py", "_tickets_store_findings"): 1,  # validate + run preflight findings
     ("cli.py", "_reject_store_topology"): 1,  # the wrapper's own predicate call
@@ -1485,6 +1488,11 @@ JOURNAL_KINDS = frozenset(
         # The chosen squash/preserve rule and pinned commit use routed fields;
         # actual fast-forward publication is covered by test_fork_finalize_published.
         "finalization-strategy",
+        # Explicit finalization retry: story/head correlate through existing
+        # aliases; a refusal's reason is dropped. test_commit_recovery_journal_fields.
+        "commit-retry-armed",
+        "commit-retry-entered",
+        "commit-retry-refused",
         # adapters/generic.py — the only adapter-side writer. The engine hands its
         # `Journal` to every adapter it owns (`CodingCLIAdapter.journal`, #680) so
         # the wait loop can record what only it sees: the live transcript's idle
