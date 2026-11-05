@@ -7,6 +7,10 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Fixed
+
+- Keep a resumed primary bound to its original native review until it completes with a recorded result.
+
 ## [0.13.11] — 2026-11-05
 
 ### Fixed

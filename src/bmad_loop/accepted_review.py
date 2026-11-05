@@ -597,6 +597,8 @@ def pool_resume_recorded(task: StoryTask) -> bool:
         and record.role == "review"
         and not record.label
         and bool(record.adapter)
+        and record.status == "completed"
+        and record.result_json is not None
         and record.session_id == native
         and record.resumed_from == native
     )
