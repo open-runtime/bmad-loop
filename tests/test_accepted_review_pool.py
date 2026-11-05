@@ -354,7 +354,15 @@ def test_pool_review_requires_recorded_adapter(pool_review):
 
 @pytest.mark.parametrize(
     "native,resumed",
-    [(None, None), ("different-native", "interrupted-primary"), ("interrupted-primary", None)],
+    [
+        (None, None),
+        ("different-native", "interrupted-primary"),
+        ("interrupted-primary", None),
+        # Same IDs without a completed payload must not discharge: otherwise a
+        # crash/stall falls through to an ordinary review retry and can launch a
+        # fresh primary once native resume is spent or unavailable.
+        ("interrupted-primary", "interrupted-primary"),
+    ],
 )
 def test_pool_retry_unproven_native_never_clears_obligation(pool_review, native, resumed):
     case, engine, adapter, task, _record = pool_review
