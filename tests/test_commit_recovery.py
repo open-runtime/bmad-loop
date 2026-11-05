@@ -156,7 +156,7 @@ def commit_case(project_v7, monkeypatch):
         repo_root=str(root),
         started_at=stamp,
         source="tickets",
-        stopped=True,
+        paused_reason="commit failed: refuse",
         paused_stage="escalation",
         paused_story_key=key,
         tasks={key: task},
