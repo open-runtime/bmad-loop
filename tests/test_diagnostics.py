@@ -660,6 +660,9 @@ def test_verify_command_free_text_drops_to_presence_booleans():
             "stderr_path": None,
             "stdout_bytes": 12,
             "stdout_truncated": False,
+            "verification_source": {
+                "before": {"head": "private-head", "tree": "private-tree", "clean": True}
+            },
         },
         pseudo,
         {},
@@ -673,6 +676,7 @@ def test_verify_command_free_text_drops_to_presence_booleans():
         "spawn_error",
         "stdout_path",
         "stderr_path",
+        "verification_source",
     ):
         assert field not in out, f"{field} must never be emitted"
     assert out["command_present"] is True
@@ -683,6 +687,7 @@ def test_verify_command_free_text_drops_to_presence_booleans():
     # at all — `stream_capture_kb = 0` and a failed write both leave it null.
     assert out["stdout_path_present"] is True
     assert out["stderr_path_present"] is False
+    assert out["verification_source_present"] is True
     # ... while everything a maintainer correlates on still ships verbatim
     assert (out["verification_stage"], out["verification_sequence"]) == ("dev", 3)
     assert (out["command_index"], out["returncode"], out["attempt"]) == (0, 1, 2)

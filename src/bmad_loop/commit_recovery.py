@@ -1,14 +1,16 @@
 """Explicit retry of a failed commit window, retaining completed acceptance.
 
-Old verification journals do not identify the tested HEAD. The operator therefore
-attests the full unchanged HEAD; existing accepted development, review and verify
-records remain required. The attestation is checked again at commit-window entry.
+The operator's unchanged-HEAD attestation must agree with independent source
+evidence from final verification. Existing accepted development, review and verify
+records remain required. All evidence is checked again at commit-window entry.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +27,88 @@ def _require(condition: bool, reason: str) -> None:
 def _gate_policy(snapshot: dict[str, Any]) -> dict[str, Any]:
     keys = ("verify", "review", "gates", "workflows", "plugins", "tickets", "operator")
     return json.loads(json.dumps({key: snapshot.get(key) for key in keys}))
+
+
+def source_snapshot(root: Path) -> dict[str, Any]:
+    """Observe a review verifier's source without changing normal verification.
+
+    An unavailable identity is recorded explicitly, not mistaken for a clean
+    tree. It prevents commit-only recovery; it does not discard verifier output.
+    """
+    try:
+        head = verify.rev_parse_head(root)
+        return {
+            "head": head,
+            "tree": verify.revision_tree_oid(root, head),
+            "clean": not verify.dirty_paths(root),
+        }
+    except (OSError, verify.GitError) as exc:
+        return {"error": type(exc).__name__}
+
+
+def _timestamp(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError("verification source timestamp is missing or invalid")
+    return float(value)
+
+
+def _verified_source(
+    *,
+    head: str,
+    root: Path,
+    run_dir: Path,
+    key: str,
+    review_task: str,
+    checks: list[dict[str, Any]],
+    following: list[dict[str, Any]],
+    failure: dict[str, Any],
+) -> dict[str, Any]:
+    """Bind recovery to the final verifier, never solely to an operator SHA."""
+    identity = {"head": head, "tree": verify.revision_tree_oid(root, head), "clean": True}
+    if any("verification_source" in row for row in checks):
+        expected = {"before": identity, "after": identity}
+        _require(
+            all(row.get("verification_source") == expected for row in checks),
+            "verification source is missing, changed, dirty or belongs to another HEAD",
+        )
+        return {"kind": "review-verification", **identity}
+
+    # Older engines did not record verifier identities. The sync-with-main
+    # pre_commit hook did independently record its HEAD without changing source.
+    # Admit that legacy record only when the matching successful hook ran after
+    # this final verification and before this commit failure. A later main sync,
+    # stale chain, unrelated task or merely attesting a new HEAD cannot qualify.
+    try:
+        document = json.loads((run_dir / "sync-with-main.json").read_text(encoding="utf-8"))
+        chain = document["chains"][key]
+        recorded = datetime.fromisoformat(chain["recorded_at"])
+        _require(recorded.utcoffset() is not None, "verification source timestamp lacks a timezone")
+        recorded_at = recorded.timestamp()
+        _require(chain["chain_head"] == head, "verification source names another HEAD")
+    except (OSError, ValueError, TypeError, KeyError, OverflowError) as exc:
+        raise ValueError(f"independent verification source is unavailable: {exc}") from exc
+    verified_at = _timestamp(checks[-1].get("ts"))
+    failed_at = _timestamp(failure.get("ts"))
+    hooks = [
+        row
+        for row in following
+        if row.get("kind") == "plugin-hook"
+        and row.get("plugin") == "sync-with-main"
+        and row.get("stage") == "pre_commit"
+        and row.get("rc") == 0
+        and row.get("log_task") == review_task
+    ]
+    # The hook's ISO record has whole-second precision; journal timestamps have
+    # fractions. Compare the same second while retaining exact journal ordering.
+    _require(
+        any(
+            verified_at <= _timestamp(row.get("ts")) <= failed_at
+            and math.floor(recorded_at) == math.floor(_timestamp(row.get("ts")))
+            for row in hooks
+        ),
+        "verification source has no matching hook between final verification and failure",
+    )
+    return {"kind": "legacy-pre-commit", **identity, "recorded_at": recorded_at}
 
 
 def evidence(
@@ -258,6 +342,16 @@ def evidence(
         ),
         "a verification failure remains after the review",
     )
+    source = _verified_source(
+        head=head,
+        root=root,
+        run_dir=run_dir,
+        key=key,
+        review_task=review.task_id,
+        checks=checks,
+        following=rows[rows.index(checks[-1]) + 1 : end],
+        failure=failure,
+    )
     return {
         "version": 1,
         "head": head,
@@ -269,6 +363,7 @@ def evidence(
         "review": review.to_dict(),
         "commands": commands,
         "verification_sequence": sequence,
+        "verification_source": source,
         "gate_policy": gate_policy,
         "escalation_time": failure.get("ts"),
     }

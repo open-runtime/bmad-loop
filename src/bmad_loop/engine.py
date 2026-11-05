@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from stat import S_ISREG
-from typing import TYPE_CHECKING, Callable, Literal, NamedTuple, NoReturn, Protocol, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Literal, NamedTuple, NoReturn, Protocol, Sequence
 
 from . import (
     artifact_publication,
@@ -7795,6 +7795,8 @@ class Engine:
         task: StoryTask,
         verification_stage: str,
         results: tuple[verify.CommandResult, ...],
+        *,
+        verification_source: dict[str, Any] | None = None,
     ) -> int | None:
         """Record each verifier subprocess result plus bounded log pointers, and
         return the sequence they were recorded under — ``None`` when there was
@@ -7877,6 +7879,9 @@ class Engine:
             marks: dict[str, bool] = {}
             if result.interrupted:
                 marks["interrupted"] = True
+            source_fields: dict[str, object] = {}
+            if verification_source is not None:
+                source_fields["verification_source"] = verification_source
             self.journal.append(
                 "verify-command-result",
                 story_key=task.story_key,
@@ -7897,6 +7902,7 @@ class Engine:
                 capture_error=capture_error,
                 **streams,
                 **marks,
+                **source_fields,
             )
         return verification_sequence
 
@@ -9082,8 +9088,18 @@ class Engine:
         be a second, drift-prone vocabulary for a fact the journal already carries.
         """
 
+        from .commit_recovery import source_snapshot
+
+        root = self.workspace.paths.repo_root
+        before = source_snapshot(root)
+
         def sink(results: tuple[verify.CommandResult, ...]) -> None:
-            sequence = self._journal_verify_command_results(task, "review", results)
+            sequence = self._journal_verify_command_results(
+                task,
+                "review",
+                results,
+                verification_source={"before": before, "after": source_snapshot(root)},
+            )
             self._review_verify_records = VerifyCommandRecords(
                 results=results, stage="review", sequence=sequence
             )
