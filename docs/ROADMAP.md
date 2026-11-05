@@ -7,6 +7,23 @@ Status legend: **planned** (agreed, not started) · **in progress** (started; so
 
 ---
 
+## Match retries to the bound native harness
+
+**Status:** planned
+
+Record the actual native harness and profile identity bound to each session, and validate that
+binding before retrying a native conversation. Matching logical adapter labels alone must not
+authorize a resume. Select a supported continuation through the matching harness, or hold
+deterministically without resetting the working tree or discarding native history when the
+binding is missing, uncertain or incompatible.
+
+The regression must cover a logical Codex adapter falling back to Claude, timing out, then
+automatically retrying. It must prove that a Claude native session ID never reaches Codex, the
+existing work is preserved, and recovery takes the matching-harness continuation or a visible
+hold.
+
+---
+
 ## Native Windows multiplexer backend
 
 **Status:** in progress — the platform seams and the experimental `psmux` backend ship in-tree; a second tmux-family backend and herdr's win32 launch path are still open.
