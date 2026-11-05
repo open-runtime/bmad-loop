@@ -1,6 +1,6 @@
 [bmod]
 code = "bmad-loop"
-version = "0.13.12"
+version = "0.13.13"
 update_source = "github:bmad-code-org/bmad-loop/skills"
 skills = ["bmad-loop-setup", "bmad-loop-resolve", "bmad-loop-sweep"]
 required_skills = [

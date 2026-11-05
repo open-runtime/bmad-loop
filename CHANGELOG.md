@@ -7,6 +7,8 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+## [0.13.13] — 2026-11-05
+
 ### Fixed
 
 - Preserve reviewed history when all merge bases are covered by the finalization baseline.
@@ -6828,7 +6830,8 @@ enforced in CI.
   implementation phase, driven by a Python control loop with hook-based session transport and
   resumable on-disk run state.
 
-[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.13.12...HEAD
+[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.13.13...HEAD
+[0.13.13]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.13
 [0.13.12]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.12
 [0.13.11]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.11
 [0.13.10]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.10
