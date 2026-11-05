@@ -304,3 +304,38 @@ def check_initiative_close(slug: str, current: str, *, total: int, closed: int) 
             slug, current, f"not drained: {closed} of {total} tickets done or dropped"
         )
     return True
+
+
+# Campaign workers retain the legacy graphs above. This separate graph governs
+# remote delivery, never promoting an engine's local DONE into landed work.
+# Strings keep the pure transition table independent of serialization machinery.
+CAMPAIGN_TRANSITIONS: Final[dict[str, frozenset[str]]] = {
+    "pending": frozenset({"planning", "draft", "ready", "canceled"}),
+    "planning": frozenset({"draft", "pending", "canceled"}),
+    "draft": frozenset({"ready", "planning", "canceled"}),
+    "ready": frozenset({"claimed", "planning", "canceled"}),
+    "claimed": frozenset({"running", "ready", "canceled"}),
+    "running": frozenset({"locally_complete", "ready", "canceled"}),
+    "locally_complete": frozenset({"syncing", "ready", "canceled"}),
+    "syncing": frozenset({"verifying", "ready", "canceled"}),
+    "verifying": frozenset({"reviewing", "syncing", "ready", "canceled"}),
+    "reviewing": frozenset({"ready_to_publish", "syncing", "ready", "canceled"}),
+    "ready_to_publish": frozenset({"merge_requested", "syncing", "ready", "canceled"}),
+    "merge_requested": frozenset({"merged_pending_sync", "syncing", "ready_to_publish"}),
+    "merged_pending_sync": frozenset({"delivered"}),
+    "delivered": frozenset(),
+    "canceled": frozenset(),
+}
+
+
+def check_campaign_transition(unit: str, current: str, target: str) -> None:
+    """Validate the campaign's sole legal delivery transitions.
+
+    Evidence checks belong to the publication controller; this table prevents
+    local completion, cancellation or a tracking fault from skipping delivery.
+    Reconciliation of a genuinely externally merged unit uses its own evidence
+    path; it must not falsify intermediate acceptance states to use this graph.
+    """
+    allowed = CAMPAIGN_TRANSITIONS.get(current)
+    if allowed is None or target not in allowed:
+        raise IllegalTransition(f"{unit}: campaign {current} -> {target}")
