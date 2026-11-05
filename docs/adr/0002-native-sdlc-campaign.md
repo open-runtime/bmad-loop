@@ -86,7 +86,8 @@ crash, reconcile the remote marker/identity before retrying. Unknown outcomes
 remain visible. Pagination failure is not an empty result. Preserve unmanaged
 body sections and hold conflicting simultaneous edits.
 
-Intake selects unmapped issues explicitly or by configured labels. A durable,
+Intake selects unmapped issues explicitly, by configured labels, or through the
+rollout's all-open-and-new repository scope. A durable,
 versioned inbox deduplicates remote edits and excludes the campaign's own
 comments. Bounded triage sessions propose reuse, repair, new work, duplicates,
 clarifications or holds; deterministic validation admits only authorized scope.
@@ -94,6 +95,13 @@ Required review findings repair the same PR. New scope becomes a reviewed
 planning change before execution, without blocking unrelated units. Use ordinary
 issue references in PRs and close tracking explicitly after confirmed merge and
 source reconciliation; parent issues wait for all required children.
+
+Planning also inventories existing PRs, relevant branches, local worktrees and
+known runs. It records whether proposed work is already delivered, actively
+covered, reusable, new or unresolved. Carry exact head/source identities and
+remaining acceptance gaps into the plan. Observe external work without launching
+a duplicate worker or taking over another author's branch. Adoption preserves
+the existing PR/history when authorized and ownership can be reconciled.
 
 ### Parallelism and recovery
 
@@ -115,6 +123,22 @@ limits. The coordinator must remain responsive while those operations run.
 Tracking debt after a confirmed merge blocks only that unit's dependents;
 unrelated work and merges continue. No implicit per-epic serial ceiling applies
 to the campaign's independent stories.
+
+### Model roles and escalation resolution
+
+The rollout configuration explicitly uses Astra for planning, independent
+planning review, semantic triage and escalation diagnosis through the configured
+Codex/TeamRouter launch chain. Generic role settings remain configurable and
+legacy execution defaults remain intact. Validate effective model/effort rather
+than inheriting this chat's selection or silently falling back. Publication
+review retains project-required provider-family independence.
+
+An opt-in bounded resolution stage diagnoses technical escalations, proposes
+typed actions and verifies any permitted repair before returning to normal
+execution/review. Preserve partial work and lifetime retry budgets. Automatic
+resolution cannot waive human-only decisions, operator holds, permissions,
+required checks/reviews or product intent. Unknown ownership remains held.
+Repeated failure produces a linked owner-action item; unrelated work continues.
 
 ### Native Paradev reflection
 
@@ -349,9 +373,9 @@ independence.
 | 1     | Versioned campaign specifications, state, transitions and store | Invalid/cyclic inputs refuse before effects; persistence is atomic; duplicate coordinators refuse.                                                  |
 | 2     | GitHub gateway, outbox and publication controller               | Early drafts, pagination, exact-head/base gates, unknown-write reconciliation and merge read-back work through fake transport.                      |
 | 3     | Issue hierarchy, managed content, intake and triage             | Stable IDs, native subissues, bounded new work and linked dispositions survive retry without duplicates, lost human edits or premature closure.     |
-| 4     | Planning sessions and source import                             | A brief yields validated product plans and ready units through existing session completion authority.                                               |
+| 4     | Repository discovery, planning sessions and source import       | Existing work informs scoped plans without duplicate ownership; Astra roles and structured results are validated.                                   |
 | 5     | Isolated workers, workspace providers and dependency scheduler  | Multiple units execute concurrently without shared engine state; provider allocation precedes launch; dependencies release only after delivery.     |
-| 6     | CLI and complete delivery/recovery loop                         | One command plans, dispatches, reviews, publishes, waits, merges, reconciles and continues; stop/resume preserves identities.                       |
+| 6     | CLI and complete delivery/recovery loop                         | One command plans, dispatches, resolves permitted failures, reviews and delivers; bounded recovery preserves identities, work and human-only gates. |
 | 7     | Bundled Paradev transport and native workspace reflection       | Story/epic folders, unit workspaces/PRs and actual worker tabs reconcile without duplicate launches or lost operator holds.                         |
 | 8     | Optional hcom awareness and compatibility checks                | Exact actor bindings, scoped observations and operator holds work; automatic inbound delivery remains unavailable until Stop interleavings qualify. |
 | 9     | Qualification and migration                                     | Zero-token end-to-end tests cover crashes, moving heads and native reflection; project preflight proves readiness before replacing its automations. |

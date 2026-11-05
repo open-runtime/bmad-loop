@@ -73,6 +73,34 @@ verify_slots = 2
 enabled = true
 merge_mode = "direct-strict"
 
+[roles.planning]
+profile = "codex"
+model = "gpt-6-astra"
+effort = "high"
+
+[roles.triage]
+profile = "codex"
+model = "gpt-6-astra"
+effort = "high"
+
+[roles.planning_review]
+profile = "codex"
+model = "gpt-6-astra"
+effort = "high"
+
+[roles.escalation]
+profile = "codex"
+model = "gpt-6-astra"
+effort = "high"
+
+[resolution]
+mode = "bounded-auto"
+max_attempts_per_unit = 2
+max_sessions = 2
+
+[intake]
+issues = "all-open-and-new"
+
 [paradev]
 reflect = true
 project_id = "configured-project-id"
@@ -92,6 +120,35 @@ overrides are resolved once and persisted. Resume reports incompatible changes
 instead of silently applying another launch environment. Continue using existing
 configuration trust/digest machinery; do not invent document-hash ceremonies.
 
+### Campaign model roles
+
+Campaign roles are planning, planning_review, triage, escalation and publication
+review, with independently resolved profile/model/effort and session budgets.
+Execution retains the existing dev/review stage settings. Generic defaults
+inherit project settings; the rollout preset explicitly pins planning, planning
+review, semantic triage and escalation diagnosis to Codex with gpt-6-astra.
+The example's high effort is configurable. This chat's selected model is never
+used as runtime configuration. Independent planning review uses a fresh session;
+publication review additionally honors project family-independence rules. Astra
+and Sol are both OpenAI models and cannot satisfy a cross-provider-family rule
+merely by being different model IDs.
+
+Build these roles through the existing profile/adapter factory with immutable
+role snapshots, without changing legacy role inheritance. Preflight reports the
+resolved launch chain and model capability for each role. An unavailable pinned
+model waits visibly; it cannot silently fall back to another model. Record
+requested and observed model/provider separately. A policy requiring an exact
+model is not satisfied by unknown or mismatching observed attribution.
+
+The current generic mux adapter ignores SessionSpec.effort; setting that field
+alone would not configure Codex. Qualify additive native CLI/profile arguments
+for model_reasoning_effort while preserving permission, hook and resume arguments.
+Do not use extra_args in a way that replaces the profile's permission flags.
+Honor client-advertised effort levels rather than assuming API and CLI catalogs
+are identical. Test fresh and resumed argv and effective configuration without
+spending model tokens. Project wrappers must accept the new campaign skills and
+preserve explicit role selection instead of applying a dev-only retry fallback.
+
 ## State, ownership and module boundaries
 
 Implement by responsibility, with the following public contracts agreed before
@@ -103,7 +160,9 @@ parallel editing. Names below are module boundaries, not required class names.
 | statemachine              | Legal campaign transitions alongside, without changing, existing engine/plan transitions.      |
 | campaign_store            | Atomic snapshot, coordinator lock, revision checks, outbox and command inbox.                  |
 | campaign_sources          | Import/refresh sprint, stories and ticket sources; private-store preparation and publication.  |
+| campaign_discovery        | Repository work inventory, coverage receipts and planning overlap evidence.                    |
 | campaign_intake           | Durable remote observations, triage sessions, dispositions and bounded graph-change proposals. |
+| campaign_resolution       | Typed escalation diagnosis, bounded repair actions and verified re-arm decisions.              |
 | campaign_planning         | Session stages, artifact validators, planning PR and graph revisions.                          |
 | campaign_workers          | Spawn/reconcile isolated single-unit engines and collect final worker receipts.                |
 | campaign_scheduler        | Pure admission decisions from dependencies, claims, scopes, budgets and resources.             |
@@ -259,11 +318,68 @@ change holds reconciliation. Separate versioned stores retain their own commit
 and remote-publication requirements. Failure after code merge remains
 merged_pending_sync; dependents do not run until that debt is settled.
 
+## Repository discovery and avoiding duplicate work
+
+Before initial planning, and incrementally before a planning revision or new
+unit admission, assemble a repository-scoped work inventory. Intake selection
+controls which issues become work, not which existing work can inform planning.
+Read all open/draft PR and open issue metadata for the repository, plus mapped
+work and a configured recent window of merged and closed-unmerged
+PRs. Expand beyond that window for explicit links and relevant commit history.
+Record each PR's repository/head/base identities, draft/merge state, linked
+issues, changed paths, checks and unresolved review findings. Fetch relevant
+diffs/commits after deterministic candidate selection; a title match alone is
+not evidence that two units implement the same acceptance criteria.
+
+List remote branch tips and local refs/worktrees in the selected Git common
+directory. Inspect relevant unmerged diffs, merge bases, committed artifacts and
+known BMAD runs/Paradev bindings; record whether another actor owns the work.
+Unpublished local changes are only visible in explicitly accessible local
+worktrees. Archive roots are opt-in and read-only; do not scan arbitrary disks,
+revive archived workspaces, run code from an inspected branch or claim visibility
+into another machine's unpushed work. Fetch into isolated observation refs through
+the Git chokepoint, without checking out or modifying another worker's branch.
+Do not treat an old branch or an idle terminal as proof of abandonment.
+
+Produce a versioned inventory receipt with query scope, pagination completeness,
+observed SHAs, timestamps, unavailable sources and bounded/truncated details.
+Use cached unchanged objects and targeted refreshes; do not repeat a full diff
+audit for every worker. A required inventory failure holds the affected planning
+or admission decision. Explicitly report optional missing context; never label
+a partial inventory as proof that no competing work exists.
+
+Planning writes an overlap disposition for each proposed unit: already delivered,
+covered by active work, continue existing work, reuse partial work, new work, or
+unresolved overlap. Cite exact source/PR/commit identities and acceptance coverage,
+including remaining gaps and intentional exclusions. Same-file changes are a
+conflict signal, not automatic duplication. Deterministic delivery reconciliation
+must confirm an already-delivered claim; closed-unmerged PRs and patch similarity
+alone cannot satisfy dependencies. Superseding abandoned work requires a recorded
+reason so later planning does not repeatedly revive rejected approaches.
+
+An active external PR becomes an observed dependency or overlap hold, with no
+second worker assigned to its covered scope. Continue the same PR automatically
+only for an already-owned campaign binding or an explicitly authorized adoption
+whose process/worktree ownership, clean preserved state and review obligations
+reconcile. Other work gets an adoption proposal; observation is not authority to
+push to a collaborator's branch. Preserve existing commits and feedback. If the
+original branch cannot be safely adopted, an authorized replacement PR links the
+predecessor and explains which parts it retains. No stale state files are imported
+as execution authority. Revalidate ownership/head identities immediately before
+claiming a unit, and invalidate affected planning evidence when they change.
+External publishers do not participate in local claims; a new competing PR can
+appear after discovery. Periodic reconciliation catches that overlap and holds
+affected publication. Do not promise global duplicate exclusion across humans,
+other hosts and independent schedulers.
+
 ## Intake and triage
 
-Always refresh mapped issues/PRs in the selected repository. New unmapped issues
-enter through explicit selectors or configured intake labels; do not import the
-repository's entire backlog by default. Existing BMAD tracker bindings take
+Always refresh mapped issues/PRs in the selected repository. Generic intake uses
+explicit selectors or configured labels. The rollout preset selects
+all-open-and-new: inventory open issues at activation and observe new/edited
+issues thereafter, including issues created outside BMAD. Deduplicate existing
+bindings before bounded triage batches; discovery does not automatically admit
+the entire backlog for implementation. Existing BMAD tracker bindings take
 precedence over title matching. Distinguish issue records from PRs returned by
 the issues API. Generic sources without initiatives use an explicitly configured
 campaign milestone; they do not require rewriting the source hierarchy.
@@ -312,6 +428,68 @@ planning change is delivered can dependent implementation be admitted. Keep
 proposed, accepted and delivered work distinct in comments and machine status.
 Shared/external source publication follows the same sole-writer contract as
 implementation delivery; a triage session never patches the canonical board.
+
+## Bounded escalation diagnosis and resolution
+
+Existing resolve is an interactive human workflow; CRITICAL pauses do not already
+invoke Astra automatically. Preserve that behavior for legacy runs. Add an opt-in
+campaign resolution controller with off, diagnose and bounded-auto modes. Generic
+default is diagnose; the rollout preset selects bounded-auto within trusted
+project policy. The original escalation, reason and attempts remain durable.
+Resolution is a separate stage, never a model-issued completion verdict.
+
+Classify causes with typed producer codes and evidence, not a regex over the
+human-facing pause reason or a model's severity downgrade. Unknown legacy causes
+can receive diagnosis but are not automatically cleared. Deterministic transient
+conditions use existing quota/backoff/reconciliation paths first; Astra is useful
+for ambiguous technical failures, conflicting evidence and proposing repairs.
+Owner holds, explicit human-only tickets/checkpoints, credentials/permissions,
+spend increases, policy changes, uncertain live ownership and unsatisfied required
+approvals cannot be waived by the resolver. Conflicting product intent goes back
+to a planning decision; it is not permission to weaken acceptance criteria.
+
+Before launching the resolver, confirm the failed worker is quiescent and acquire
+its unit ownership. Build a bounded evidence packet from resolve.build_context,
+journal and session results, current main/head, frozen intent, failed commands, preserved
+work, prior diagnoses and GitHub review/check observations. Redact credentials.
+Start a fresh Astra diagnosis through CodingCLIAdapter in its registered unit
+workspace/tab, with observation-only instructions and permission scope where
+supported. Diagnostics have no authority to mutate campaign state, canonical
+sources, GitHub or project policy. Verify the candidate is unchanged afterward;
+unexpected edits invalidate diagnosis and hold rather than silently becoming an
+approved repair. Use normal Stop/window completion and validate a versioned
+diagnosis artifact against the exact input coordinates.
+
+The artifact records cause, cited evidence, proposed action, affected paths,
+preserved work, expected verification and unresolved decisions. Allowed actions
+are wait/reprobe, retry an interrupted stage, reverify preserved work, repair
+within the accepted contract, propose a plan amendment, or require owner input.
+Confidence or model prose alone cannot authorize an action. A deterministic
+policy check chooses whether and how the controller may apply the proposal.
+Repairs run as separately owned coding sessions in the same unit branch/PR;
+they never introduce a second writer. Environment repairs are limited to
+explicit project repair commands and require successful reprobes; the resolver
+cannot restart shared services or alter host settings from a proposed command.
+
+Reuse the existing transactional preservation and re-arm primitives only through
+a campaign adapter that proves their supported preconditions. Generic resolve
+can reset attempts and roll back work; it is not a safe blind retry primitive.
+Preserve partial commits, recovery refs, native/session generations and source
+identity. Do not automate --force, --adopt-branch, operator confirmation or a
+global acceptance reset. Campaign lifetime diagnosis/repair counters persist
+across child re-arms and restarts, even where legacy attempt counters reset.
+Changed code/spec invalidates affected verification and review; successful repair
+returns to the normal delivery pipeline, never directly to delivered.
+
+Limit resolver concurrency separately from coding/review/verification. The preset
+allows two sessions and at most two automatic resolution attempts per unit;
+repeating the same failure with unchanged evidence stops earlier. New evidence
+can support another attempt only within the remaining lifetime budget. A failed
+diagnosis or exhausted budget produces one deduplicated owner-action item with
+evidence, attempted repairs and the smallest unresolved decision, linked to the
+existing issue/PR and visible in Paradev/status. Unrelated units keep running.
+Publish resolution start, disposition and verified result through the existing
+GitHub outbox; preserve human holds and every unresolved required review finding.
 
 ## Planning and draft PR lifecycle
 
@@ -607,6 +785,8 @@ spends LLM tokens. Each negative gate gets its required ablation check.
 | Scheduler          | Two epics and two independent sibling stories overlap; dependent units wait for delivery; scope collisions, fair resource limits and crash-held claims.                    |
 | GitHub gateway     | All pages, auth/rate-limit faults, lost create/update/merge replies, conflicting markers, hierarchy IDs, preserved human text and event cursor restart.                    |
 | Intake/triage      | Issue versus PR identity, edited/duplicate inputs, bot feedback, cursor crashes, existing issue reuse, scope limits, same-PR repair and safe graph revisions.              |
+| Discovery          | Active/abandoned/merged PR overlap, squash history, branch-only partial work, external ownership, stale heads, partial coverage and no duplicate admission.                |
+| Model/resolution   | Explicit Astra argv/attribution, no silent fallback, ignored-effort regression, human-only gates, verified repairs, unchanged-failure stop and persistent retry budgets.   |
 | Publication        | Moving H/B, late review changes, draft/ready transitions, required app/status identity, strict-rule absence, queue candidate changes, squash/rebase, merged tracking debt. |
 | Planning/source    | Brief to planning PR to graph, malformed artifacts, existing-plan import, private shared stores, three-way unit updates, multiple initiatives and closure units.           |
 | Paradev            | Real PTY identity, same-terminal pane attach, title and native-agent read-back, missing/duplicate panes, user focus, output history after teardown, absent optional extra. |
@@ -637,6 +817,9 @@ capacity is visible during REM qualification.
 - [Milestone membership and progress](https://docs.github.com/en/issues/using-labels-and-milestones-to-track-work/about-milestones)
 - [Check-run observations](https://docs.github.com/en/rest/checks/runs)
 - [REST retries and pagination](https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api)
+- [Branch inventory](https://docs.github.com/en/rest/branches/branches)
+- [Astra model identity](https://developers.openai.com/api/docs/models/gpt-6-astra)
+- [Codex model and reasoning configuration](https://learn.chatgpt.com/docs/config-file/config-reference)
 
 Repository sources inspected include runsetup.compose_run, TicketsEngine's
 selection/store/closure paths, CodingCLIAdapter.run, multiplexer selection,
