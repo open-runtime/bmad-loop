@@ -7886,6 +7886,13 @@ class Engine:
                     spec.read_bytes(), task.implemented_review["plan_digest"]
                 )
                 self._save()
+            # Crash after the loop charged this cycle and saved REVIEW_RUNNING,
+            # but before session-bound, left an unlaunched charge. Refund it so
+            # re-entry dispatches the owed primary under the same cycle instead
+            # of skipping at max_review_cycles=1 or minting review-N+1.
+            if task.review_cycle > 0:
+                task.review_cycle -= 1
+                self._save()
         self.journal.append("implemented-review-resumed", story_key=task.story_key)
         self._review_and_commit(task, resumed_loop=task.review_cycle > 0)
 

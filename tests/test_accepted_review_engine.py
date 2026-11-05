@@ -14,7 +14,14 @@ from bmad_loop.engine import RunPaused
 from bmad_loop.frontmatter import read_frontmatter, status_of
 from bmad_loop.journal import Journal, load_state
 from bmad_loop.model import Phase
-from bmad_loop.policy import GatesPolicy, NotifyPolicy, Policy, ReviewPolicy, VerifyPolicy
+from bmad_loop.policy import (
+    GatesPolicy,
+    LimitsPolicy,
+    NotifyPolicy,
+    Policy,
+    ReviewPolicy,
+    VerifyPolicy,
+)
 from bmad_loop.tickets_engine import TicketsEngine
 
 accepted_implementation = _accepted_implementation
@@ -247,6 +254,29 @@ def test_recovery_started_primary_keeps_its_partial_work(accepted_implementation
     assert adapter.sessions == []
 
 
+def test_recovery_pre_native_crash_refunds_unlaunched_charge(accepted_implementation, monkeypatch):
+    """A host loss after REVIEW_RUNNING saved the charged cycle, but before
+    session-bound, must refund that unlaunched charge so re-entry dispatches the
+    owed primary under the same cycle. Ablation: drop the refund and max=1
+    never launches; a larger budget mints review-2."""
+    case = accepted_implementation
+    engine, adapter = _armed_engine(case)
+    task = engine.state.tasks[case.task.story_key]
+    task.phase, task.review_cycle = Phase.REVIEW_RUNNING, 1
+    calls = []
+    monkeypatch.setattr(
+        engine,
+        "_review_and_commit",
+        lambda *a, **kw: calls.append((task.review_cycle, kw)),
+    )
+
+    engine._resume_implemented_review(task)
+
+    assert task.review_cycle == 0
+    assert calls == [(0, {"resumed_loop": False})]
+    assert adapter.sessions == []
+
+
 def test_recovery_green_fix_uses_current_acceptance_before_returning_to_review(
     project, monkeypatch
 ):
@@ -444,8 +474,9 @@ def test_first_primary_refuses_post_hook_drift(accepted_implementation, monkeypa
 
 
 @pytest.mark.parametrize("after_strip", [False, True])
+@pytest.mark.parametrize("max_review_cycles", [1, 3])
 def test_recovery_replays_crash_after_real_marker_removal(
-    accepted_implementation, monkeypatch, after_strip
+    accepted_implementation, monkeypatch, after_strip, max_review_cycles
 ):
     from bmad_loop.adapters.base import SessionResult
 
@@ -455,6 +486,9 @@ def test_recovery_replays_crash_after_real_marker_removal(
         + "\n## Auto Run Result\n\nStatus: built\nRetained completion evidence.\n"
     )
     engine, adapter = _armed_engine(case)
+    engine.policy = dataclasses.replace(
+        engine.policy, limits=LimitsPolicy(max_review_cycles=max_review_cycles)
+    )
     task = engine.state.tasks[case.task.story_key]
     reset = engine._reset_spec_for_review
 
@@ -468,11 +502,17 @@ def test_recovery_replays_crash_after_real_marker_removal(
     with pytest.raises(RuntimeError, match="host lost at marker removal"):
         engine._resume_after_dev_verify(task)
     assert adapter.sessions == []
+    crashed = load_state(case.run_dir).tasks[case.task.story_key]
+    assert crashed.phase == Phase.REVIEW_RUNNING and crashed.review_cycle == 1
 
     state = load_state(case.run_dir)
     recovered = TicketsEngine(
         paths=engine.paths,
-        policy=dataclasses.replace(engine.policy, verify=VerifyPolicy(commands=(_OK,))),
+        policy=dataclasses.replace(
+            engine.policy,
+            verify=VerifyPolicy(commands=(_OK,)),
+            limits=LimitsPolicy(max_review_cycles=max_review_cycles),
+        ),
         adapter=adapter,
         run_dir=case.run_dir,
         state=state,
@@ -481,6 +521,10 @@ def test_recovery_replays_crash_after_real_marker_removal(
 
     def primary(spec):
         assert spec.role == "review"
+        # Owed primary under the charged cycle, not a burned extra review-N+1.
+        assert spec.task_id.endswith(
+            "-review-1-g" + str(state.tasks[case.task.story_key].generation)
+        )
         assert case.implementation in spec.prompt
         case.plan.write_text(case.plan.read_text().replace("status: in-review", "status: built"))
         return SessionResult(
@@ -496,6 +540,7 @@ def test_recovery_replays_crash_after_real_marker_removal(
     recovered._finish_inflight()
     resumed_task = state.tasks[case.task.story_key]
     assert resumed_task.phase == Phase.DONE
+    assert resumed_task.review_cycle == 1
     assert [spec.role for spec in adapter.sessions] == ["review"]
     assert resumed_task.accepted_dev_session_index == 0
     assert read_frontmatter(case.plan)["verify_unmet"] == 1
