@@ -57,7 +57,7 @@ Skip this step entirely if `{project-root}/_bmad/` does not exist.
 
 The orchestrator is what spawns fresh coding CLI sessions through the selected adapter(s) to invoke `bmad-build-auto` (the upstream dev primitive; `bmad-dev-auto` on pre-rename releases) for the dev pass — then re-invokes it on the `done` spec for the follow-up review pass — and `bmad-loop-sweep`, watches their hook signals, and verifies their artifacts. Installing it is therefore part of setup, not an optional extra.
 
-> **Why from Git?** The BMAD installer copies only skill directories into a project — it does not carry sibling files, so the tool can't ride along in the skill folder. The canonical source is <https://github.com/bmad-code-org/bmad-loop>. (The reverse holds, though: the tool's wheel **bundles** the skills, so `bmad-loop init` lays them down into a project's skill trees on its own — see step 3.)
+> **Why from Git?** The BMAD installer copies only skill directories into a project — it does not carry sibling files, so the tool can't ride along in the skill folder. This skill installs the open-runtime fork from <https://github.com/open-runtime/bmad-loop>. (The reverse holds, though: the tool's wheel **bundles** the skills, so `bmad-loop init` lays them down into a project's skill trees on its own — see step 3.)
 
 Unless the user explicitly asked to skip it (e.g. `skills only` / `--no-tool`), install **or upgrade** and bootstrap now. Resolve `{project-root}` to the real project path before running.
 
@@ -68,7 +68,7 @@ Unless the user explicitly asked to skip it (e.g. `skills only` / `--no-tool`), 
    - **Fresh install** (no uv-managed `bmad-loop`):
 
      ```bash
-     uv tool install "bmad-loop[tui] @ git+https://github.com/bmad-code-org/bmad-loop.git"
+     uv tool install "bmad-loop[tui] @ git+https://github.com/open-runtime/bmad-loop.git"
      ```
 
      Pin a release tag for reproducibility by appending `@v<X.Y.Z>` to the Git URL.
@@ -85,7 +85,7 @@ Unless the user explicitly asked to skip it (e.g. `skills only` / `--no-tool`), 
         The `--reinstall` is **required** for a Git source: a plain `uv tool upgrade` reuses the cached commit and won't pull new code. Then **offer to pin a release tag** for reproducibility — if the user wants a specific version, move to it with:
 
         ```bash
-        uv tool install --force "bmad-loop[tui] @ git+https://github.com/bmad-code-org/bmad-loop.git@v<X.Y.Z>"
+        uv tool install --force "bmad-loop[tui] @ git+https://github.com/open-runtime/bmad-loop.git@v<X.Y.Z>"
         ```
 
      3. Re-run `bmad-loop --version` and note the before → after for the confirmation step.

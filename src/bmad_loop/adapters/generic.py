@@ -44,10 +44,10 @@ from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 import regex
 
-from .. import devcontract, gates, runs, tokens
+from .. import devcontract, gates, native_binding, runs, tokens
 from ..bmadconfig import ProjectPaths
 from ..journal import LOGS_DIR, TASK_CYCLE_ARTIFACTS
-from ..model import TokenUsage
+from ..model import UNATTRIBUTED_MODEL, TokenUsage
 from ..policy import Policy
 from ..process_host import ProcessHostError, get_process_host
 from ..signals import REBIND_SOURCES, HookEvent, SessionAttribution, SignalWatcher
@@ -1533,6 +1533,9 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         path = spec.resume_transcript_path
         if not path or self.profile.usage_parser == "none":
             return
+        if not spec.resume_usage_accounted:
+            self._usage_base.pop(path, None)
+            return
         try:
             base = tally_usage(self.profile.usage_parser, Path(path))
         except (OSError, ValueError):
@@ -1547,16 +1550,54 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         base = self._usage_base.get(transcript_path)
         if base is None:
             return usage
-        return TokenUsage(
-            input_tokens=max(0, usage.input_tokens - base.input_tokens),
-            output_tokens=max(0, usage.output_tokens - base.output_tokens),
-            cache_read_tokens=max(0, usage.cache_read_tokens - base.cache_read_tokens),
-            cache_creation_tokens=max(0, usage.cache_creation_tokens - base.cache_creation_tokens),
-        )
+
+        def delta(current: TokenUsage, prior: TokenUsage) -> TokenUsage:
+            return TokenUsage(
+                input_tokens=max(0, current.input_tokens - prior.input_tokens),
+                output_tokens=max(0, current.output_tokens - prior.output_tokens),
+                cache_read_tokens=max(0, current.cache_read_tokens - prior.cache_read_tokens),
+                cache_creation_tokens=max(
+                    0, current.cache_creation_tokens - prior.cache_creation_tokens
+                ),
+            )
+
+        rebased = delta(usage, base)
+        rebased.models = usage.models
+        rebased.unread = tuple(dict.fromkeys((*base.unread, *usage.unread)))
+        if usage.by_model is not None:
+            split: dict[str, TokenUsage] = {}
+            if base.by_model is not None:
+                for model, current in usage.by_model.items():
+                    part = delta(current, base.by_model.get(model, TokenUsage()))
+                    if part.total:
+                        split[model] = part
+            summed = TokenUsage()
+            for part in split.values():
+                summed.add(part)
+            # A late attribution or unread baseline can move usage between
+            # buckets. Never invent model precision or break sum-to-total.
+            if summed != rebased:
+                split = {UNATTRIBUTED_MODEL: delta(usage, base)} if rebased.total else {}
+            rebased.by_model = split
+        return rebased
 
     # --------------------------------------------------------------- adapter
 
     def start_session(self, spec: SessionSpec) -> SessionHandle:
+        # Refuse before touching prompt/artifact files or opening a window.
+        # The engine performs the same check before a retry can reset the tree;
+        # this boundary also protects callers outside Engine.
+        if spec.resume_session_id:
+            refusal = native_binding.resume_refusal(
+                spec.resume_binding,
+                self.profile,
+                self.binary,
+                spec.resume_session_id,
+                spec.resume_transcript_path,
+                extra_args=self.extra_args,
+            )
+            if refusal:
+                raise native_binding.NativeBindingError(refusal)
         task_dir = validated_task_directory(self.tasks_dir, spec.task_id)
         validate_adapter_artifact_paths(
             task_dir,
@@ -1679,7 +1720,28 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         resumed = self._resumed_ids.pop(handle.task_id, None)
         if resumed:
             result = dataclasses.replace(result, resumed_from=resumed)
+        result = dataclasses.replace(
+            result,
+            native_binding=native_binding.capture_binding(
+                self.profile,
+                self.binary,
+                result.session_id,
+                result.transcript_path,
+                extra_args=self.extra_args,
+            ),
+        )
         return result
+
+    def native_resume_refusal(self, record: object) -> str | None:
+        """Check actual native identity before Engine preserves/retries work."""
+        return native_binding.resume_refusal(
+            getattr(record, "native_binding", None),
+            self.profile,
+            self.binary,
+            getattr(record, "session_id", None),
+            getattr(record, "transcript_path", None),
+            extra_args=self.extra_args,
+        )
 
     def _relabel_dead_window(
         self,
@@ -3219,7 +3281,10 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         spawn_marker,
                         event.session_id,
                         event.transcript_path,
-                        since_ns=handle.launched_ns,
+                        # A resumed parent's folder predates this launch; its
+                        # nested marker can still identify a newly spawned
+                        # child without changing the parent's directory mtime.
+                        since_ns=None if self._resuming(spec) else handle.launched_ns,
                         settled=settled,
                     )
                 except OSError as e:
@@ -3275,7 +3340,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     # F6 (open-runtime fork): the CLI session id, durable in the
                     # journal from the session's first admitted start.
                     session_bound = True
-                    self._note_session_bound(handle, session_id, event.source)
+                    self._note_session_bound(handle, session_id, event.source, transcript_path)
                 if not session_model_noted and (
                     event.model or self.profile.hooks.dialect == "codex-hooks-json"
                 ):
@@ -4513,7 +4578,11 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             pass
 
     def _note_session_bound(
-        self, handle: SessionHandle, session_id: str, source: str | None
+        self,
+        handle: SessionHandle,
+        session_id: str,
+        source: str | None,
+        transcript_path: str | None = None,
     ) -> None:
         """open-runtime fork (F6, with ``[recovery] max_session_resumes`` on):
         journal ``session-bound`` with the CLI session id at the session's first
@@ -4528,6 +4597,13 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 session_id=session_id,
                 source=source or "",
                 resumed_from=self._resumed_ids.get(handle.task_id) or "",
+                native_binding=native_binding.capture_binding(
+                    self.profile,
+                    self.binary,
+                    session_id,
+                    transcript_path,
+                    extra_args=self.extra_args,
+                ),
             )
         except OSError:
             pass
@@ -4639,8 +4715,9 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         (a possible reuse), so it is never signalled AT ALL — not terminated, not
         polled against the deadline, not force-killed; even a SIGTERM to a recycled
         pid kills an innocent process. It only surfaces in the ``unreaped`` field
-        via the bare-liveness degrade. Nothing alive at all → silent return: the
-        clean-end path leaves no breadcrumb."""
+        via the bare-liveness degrade. A nonempty observed tree with no live
+        members records a clean teardown receipt for explicit continuation.
+        No captured pids cannot prove process-tree ownership and stays unknown."""
 
         def _confirmed_survivors() -> list[int]:
             return [
@@ -4654,6 +4731,10 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             pid for pid, identity in tree.items() if identity is None and host.is_alive(pid)
         ]
         if not survivors and not unconfirmed:
+            if tree:
+                self._note_lifecycle(
+                    handle.task_id, "kill-outcome", reaped=True, forced=[], unreaped=[]
+                )
             return
         forced: list[int] = []
         if survivors:
@@ -5868,6 +5949,7 @@ class _DevSynthesisMixin(_ResultFileMixin):
             timeout_expired_clock=result.timeout_expired_clock,
             budget_weighted=result.budget_weighted,
             stop_seen=result.stop_seen,
+            native_binding=result.native_binding,
             quota_wait_s=result.quota_wait_s,
         )
 

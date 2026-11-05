@@ -270,6 +270,13 @@ class SessionSpec:
     # Appended after `quota_wait_max_s` so positional constructions stay valid.
     usage_relaunch_mode: bool = False
     usage_relaunch_left: bool = False
+    # Observed native harness + original launch profile for a continuation.
+    # A logical adapter label alone cannot authorize a cross-process resume.
+    resume_binding: dict[str, Any] | None = None
+    # False only for explicit continuation of a hard-stopped session whose
+    # original spend has no SessionRecord. Its first real record accounts for
+    # the whole native transcript; ordinary retries subtract earlier spend.
+    resume_usage_accounted: bool = True
 
 
 @dataclass(frozen=True)
@@ -445,6 +452,9 @@ class SessionResult:
     # `wait_for_completion` returns. Diagnostic, plus #959 usage-relaunch
     # routing (`account` qualifies, `account-fatal` never does). APPENDED.
     stop_failure_action: str | None = None
+    # Independently observed native transcript identity and launch profile.
+    # Kept separate from the engine's configured adapter/model labels.
+    native_binding: dict[str, Any] | None = None
 
 
 class CodingCLIAdapter(ABC):

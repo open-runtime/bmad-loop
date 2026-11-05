@@ -219,12 +219,13 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
 - **Stability:** experimental
 - **Description:** A dev or review retry after a stalled, timed-out, crashed or transport-failed session continues the previous CLI conversation (`claude --resume`, `codex resume`) on the kept tree instead of starting over; a failed verify or review starts fresh.
 - **Properties:**
-  - A retry resumes only the immediately previous session of the same role and adapter, with a known session id and transcript, on a tree no rollback reset since.
+  - A retry resumes only the immediately previous session of the same role, with matching native harness and profile evidence, a known session id and transcript, on a tree no rollback reset since.
   - An in-run retry that resumes skips the rollback and keeps the attempt's tree.
   - A session parked on a human or one that did no work is never resumed, and resumes in a row are capped by `[recovery] max_session_resumes`.
   - A resumed session is charged only for its own usage.
-- **Config:** `[recovery] max_session_resumes`; profile keys `resume_flag`, `resume_subcommand`, `resume_prompt_template`
-- **Tested by:** `tests/test_fork_session_resume.py`, `tests/test_fork_wait_loop.py`
+  - `resume --continue-native` can continue an explicitly stopped in-place development session only after proving its prior engine and transport are gone and its native evidence matches; original source and session artifacts remain intact.
+- **Config:** `[recovery] max_session_resumes`; `resume --continue-native SESSION_ID`; profile keys `resume_flag`, `resume_subcommand`, `resume_prompt_template`
+- **Tested by:** `tests/test_fork_session_resume.py`, `tests/test_fork_wait_loop.py`, `tests/test_stopped_native.py`, `tests/test_native_binding.py`
 - **Docs:** [Session resume](loop-recovery-guide.md#session-resume), [Profile field reference](adapter-authoring-guide.md#cliprofile)
 
 ### Resume and policy continuity

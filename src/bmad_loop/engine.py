@@ -141,6 +141,7 @@ from .worktree_flow import WorktreeFlow
 if TYPE_CHECKING:
     # Type-only: the worktree-provisioning helpers speak in CLI profiles.
     from .adapters.profile import CLIProfile
+    from .stopped_native import NativeResume
 
 
 # `origin:` marker prefix for ledger entries harvested out of a spec's
@@ -2580,9 +2581,75 @@ class Engine:
             self.state.accept_baseline = False
             self._save()
 
+    def _continue_stopped_native(self, task: StoryTask) -> None:
+        from . import stopped_native
+
+        def refuse(reason: str) -> NoReturn:
+            self.journal.append("stopped-native-refused", story_key=task.story_key, reason=reason)
+            raise RunPaused(
+                f"cannot continue stopped native: {reason}", PAUSE_ESCALATION, task.story_key
+            )
+
+        def validate() -> None:
+            try:
+                stopped_native.validate(self.state, task, self.paths.project, self.policy)
+            except (OSError, ValueError) as exc:
+                refuse(str(exc))
+
+        if not stopped_native.recorded(task):
+            if task.stopped_native.get("reserved"):
+                refuse(
+                    "a native launch was reserved without a completed matching result; preserve its evidence"
+                )
+            validate()
+            if not getattr(getattr(self.adapters["dev"], "profile", None), "resumable", False):
+                refuse("the selected adapter cannot resume this conversation")
+            self._gate_dispatch(task, "dev")
+            validate()
+            held = task.stopped_native
+            task.stopped_native["reserved"] = True
+            self._save()
+            resume = stopped_native.NativeResume(
+                held["native_id"], held["transcript_path"], held["native_binding"]
+            )
+            result = self._run_session(
+                task,
+                "dev",
+                self._resume_prompt(task, "dev", resume),
+                task.attempt,
+                resume=resume,
+                continuation=int(held["resumes"]) + 1,
+                prelaunch_validator=validate,
+                commit_engine_ledger=False,
+            )
+            if not stopped_native.recorded(task):
+                refuse(
+                    "the continuation did not return a completed result from the original native"
+                )
+        else:
+            replay = self._resumable_session(task)
+            if replay is None:
+                refuse("the completed native result cannot be replayed")
+            _role, result = replay
+        self.journal.append(
+            "stopped-native-completed",
+            story_key=task.story_key,
+            session_id=task.stopped_native["native_id"],
+        )
+        task.stopped_native = {}
+        # Exactly the existing completed-result replay transition below. No
+        # attempt, generation, baseline, or source reset accompanies it.
+        task.phase = Phase.PENDING
+        self._drive_story(task, dev_resume=result)
+
     def _finish_inflight(self) -> None:
         """Complete or roll back tasks interrupted by a pause or crash."""
         for task in list(self.state.tasks.values()):
+            if task.stopped_native:
+                self._continue_stopped_native(task)
+                self._post_story_after_replay(task)
+                self._after_story(task)
+                continue
             if task.phase == Phase.ESCALATED and task.implemented_review is not None:
                 from .accepted_review import pool_review_refusal
 
@@ -2879,6 +2946,14 @@ class Engine:
                 # task keeps its half-built worktree mounted until a resume gets
                 # past the gate — the same thing an escalation pause does, and the
                 # cheaper of the two mistakes.
+                # Validate any resumable native before a restart can discard its
+                # tree. An unknown or changed harness stays a visible hold across
+                # engine restarts as well as inside the ordinary retry loop.
+                native_role = (
+                    "review" if task.phase in (Phase.REVIEW_RUNNING, Phase.REVIEW_VERIFY) else "dev"
+                )
+                native_seq = task.review_cycle if native_role == "review" else task.attempt
+                self._resume_candidate(task, native_role, native_seq + 1)
                 self._refuse_gated_story(task.story_key)
                 task.salvage_refile_pending = False  # abandoning this product's retry
                 self.journal.append(
@@ -2966,8 +3041,6 @@ class Engine:
             return None
         adapter = self.adapters.get(role)
         profile = getattr(adapter, "profile", None)
-        if profile is None or not getattr(profile, "resumable", False):
-            return None
         record = next((r for r in reversed(task.sessions) if r.role == role and not r.label), None)
         if record is None or not record.session_id:
             return None
@@ -2977,13 +3050,34 @@ class Engine:
             return None
         if record.ended in UNRESUMABLE_SESSION_ENDS:
             return None
-        if record.adapter and record.adapter != self.policy.adapter.resolved(role).name:
-            return None
-        if record.transcript_path and not Path(record.transcript_path).is_file():
+        native_refusal = getattr(adapter, "native_resume_refusal", None)
+        if callable(native_refusal):
+            reason = native_refusal(record)
+            if reason is not None:
+                self.journal.append(
+                    "native-resume-refused",
+                    story_key=task.story_key,
+                    role=role,
+                    session_id=record.session_id,
+                    reason=reason,
+                )
+                raise RunPaused(
+                    f"cannot resume native session: {reason}",
+                    PAUSE_ESCALATION,
+                    task.story_key,
+                )
+        elif (
+            profile is None
+            or not getattr(profile, "resumable", False)
+            or (record.adapter and record.adapter != self.policy.adapter.resolved(role).name)
+            or (record.transcript_path and not Path(record.transcript_path).is_file())
+        ):
             return None
         return record
 
-    def _resume_prompt(self, task: StoryTask, role: str, record: SessionRecord) -> str:
+    def _resume_prompt(
+        self, task: StoryTask, role: str, record: SessionRecord | NativeResume
+    ) -> str:
         """F6: the plain-text continuation a resumed session gets instead of the
         skill command (which would restart the workflow's steps)."""
         why = {
@@ -9668,16 +9762,26 @@ class Engine:
         spec_snapshot: SpecSnapshot | None = None,
         preserve_dispatched_spec_snapshot: bool = False,
         prelaunch_validator: Callable[[], None] | None = None,
-        resume: SessionRecord | None = None,
+        resume: SessionRecord | NativeResume | None = None,
         *,
         commit_engine_ledger: bool = False,
+        continuation: int = 0,
     ) -> SessionResult:
         # A session may change the environment a probe pass vouched for, so no
         # pass survives a launch (DW-523).
         self._env_probes_fresh_root = None
         # ``label`` names a non-standard session (a plugin-provided workflow) so
         # its task_id stays distinct from the role's own dev/review attempts.
-        task_id = _session_task_id(task.story_key, label if label else role, seq, task.generation)
+        logical_task_id = _session_task_id(
+            task.story_key, label if label else role, seq, task.generation
+        )
+        task_id = _session_task_id(
+            task.story_key,
+            label if label else role,
+            seq,
+            task.generation,
+            continuation=continuation,
+        )
         adapter = self.adapters[role]
         if self.workspace.root != self.paths.repo_root:
             # DW-341: Codex silently skips hooks it has not trusted for this exact
@@ -9940,11 +10044,17 @@ class Engine:
             fallback_result_dirs=self._session_fallback_dirs(role, label),
             resume_session_id=resume.session_id if resume is not None else None,
             resume_transcript_path=resume.transcript_path if resume is not None else None,
+            resume_binding=resume.native_binding if resume is not None else None,
+            # Explicit stopped continuations have no prior accounting record;
+            # count the entire native transcript once when they finally return.
+            resume_usage_accounted=continuation == 0,
         )
         if label is None and role in ("dev", "review"):
             # F6 (open-runtime fork): the resume chain's bookkeeping, at launch.
             task.session_resumes = task.session_resumes + 1 if resume is not None else 0
             task.resume_blocked = False
+            if continuation:
+                self._save()  # charged before the adapter can launch
         self.journal.set_active_log(task_id)
         if resume is not None:
             self.journal.append(
@@ -10035,7 +10145,8 @@ class Engine:
                 raise RunStopped(via="stop-request")
             task.record_session(
                 SessionRecord(
-                    task_id=task_id,
+                    task_id=logical_task_id,
+                    log_task_id=task_id if continuation else "",
                     role=role,
                     status=result.status,
                     adapter=cfg.name,
@@ -10056,6 +10167,7 @@ class Engine:
                     label=label or "",
                     ended=_session_ended(result),
                     resumed_from=result.resumed_from or "",
+                    native_binding=result.native_binding,
                 )
             )
             # Make the completed session durable before the usage read, post-session
@@ -10065,7 +10177,7 @@ class Engine:
             # not a durability gate.
             self._save()
             usage = adapter.read_usage(result)
-            task.attach_session_usage(task_id, usage)
+            task.attach_session_usage(logical_task_id, usage)
             self.journal.append(
                 "session-end",
                 task_id=task_id,
@@ -10103,6 +10215,14 @@ class Engine:
                             status=result.status,
                             tokens=None,
                             tokens_weighted=None,
+                            # A returned hard-stop verdict raises RunStopped
+                            # before recording a result. Preserve that explicit
+                            # provenance just like the exception-only stop path.
+                            **(
+                                {"error": type(sys.exc_info()[1]).__name__}
+                                if result.status == "aborted" and sys.exc_info()[1] is not None
+                                else {}
+                            ),
                             **self._session_end_extras(result),
                         )
                     else:
@@ -11257,7 +11377,7 @@ class Engine:
                     task,
                     site="defer",
                     message=(
-                        "chore(deferred-work): restore ledger after deferring " f"{task.story_key}"
+                        f"chore(deferred-work): restore ledger after deferring {task.story_key}"
                     ),
                 )
         self._record_defer(task, reason)

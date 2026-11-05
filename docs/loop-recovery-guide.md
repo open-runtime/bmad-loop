@@ -127,7 +127,7 @@ with `HCOM_DIR` set to the session's room and the orchestrator's own hcom identi
 With `max_session_resumes > 0`, a dev or review retry continues the previous CLI conversation instead of starting a fresh session, when all of these hold:
 
 - the role's previous session in this attempt chain ended `stalled`, `timeout` or `crashed` (including after a turn error), not parked on a human and not without work;
-- it ran on the adapter the role runs now, its CLI session id is known, and its transcript still exists;
+- its recorded native harness and profile match the current launch, its CLI session id is known, and its transcript still exists;
 - the tree it left was kept: an in-run retry of such a session skips the rollback, and a restart that reset the tree (a rollback that undid changes, a discarded worktree) starts fresh;
 - fewer than `max_session_resumes` resumes in a row.
 
@@ -147,6 +147,40 @@ resume_subcommand = ["resume"]
 
 Records, with resumes on: `session-bound` (the CLI session id at the first SessionStart), `session-resume` before a resumed launch (`session_id`, `ended`, `resumes`), and `resumed_from` on `session-end`. Session records in `state.json` gain `ended` and `resumed_from`; tasks gain `session_resumes` and `resume_blocked`.
 
+The binding records the observed native transcript family and the launch profile,
+not just the logical adapter name. A wrapper that launches Claude for a logical
+Codex role cannot authorize a later Codex resume with that Claude session ID.
+Missing or incompatible binding evidence holds recovery visibly before a new
+session or rollback can discard the existing work.
+
+### Continue an explicitly stopped development session
+
+For a stopped, unfinished development session that has no completed session result:
+
+```bash
+bmad-loop resume --project /path/to/project --continue-native <native-session-id> <run-id>
+```
+
+This opt-in continuation requires an in-place run, one active development attempt,
+a bound plan, a positive remaining `max_session_resumes` budget, a dead prior engine,
+no remaining run transport, and a recorded clean teardown. Journal, hook, transcript
+and native-profile evidence must agree on the requested session. Missing evidence
+refuses the continuation; older sessions without that evidence are not guessed.
+
+The continuation keeps the attempt, generation, baseline and unfinished source.
+Its new prompt and result go to separate continuation artifacts, preserving the
+original artifacts. A real completed result still passes the normal development
+verification and review gates before commit and post-story hooks. A reserved
+continuation whose launch was interrupted holds for inspection instead of silently
+launching the native conversation twice. The option cannot be combined with
+`--accept-baseline`.
+
+Because the original stopped session has no usage-bearing result, this explicit
+continuation accounts for its earlier transcript usage as well as the new work.
+An ordinary retry whose previous session was already recorded counts only new usage.
+If an earlier recorded attempt already charged the same native conversation, this
+explicit path refuses; use the ordinary recorded-session recovery instead.
+
 ## Policy reload at story boundaries
 
 With `reload_policy = "story-boundary"`, the engine re-reads `policy.toml` and the profiles at the top of the story loop, where no session is live:
@@ -162,7 +196,7 @@ With `reload_policy = "story-boundary"`, the engine re-reads `policy.toml` and t
 
 ## Compatibility
 
-- State: every new field loads with a default, so a run started by an upstream engine resumes here, and upstream ignores the new fields if it resumes a run this fork started.
+- State: every new field loads with a default, so existing run state remains readable. Native continuation needs recorded harness/profile evidence; a legacy session without it holds instead of guessing. Upstream ignores the new fields if it reads a run this fork started.
 - Policy: upstream ignores the `[recovery]` table, so a policy that sets it still loads there.
 - Profiles: upstream ignores `resume_flag`, `resume_subcommand` and `resume_prompt_template`, but refuses a `StopFailure` event mapping (see [Turn errors](#turn-errors)).
 - Journal: new kinds only; no existing kind changed shape, and `session-end` gains present-only fields.

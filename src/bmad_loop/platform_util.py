@@ -2468,7 +2468,9 @@ def safe_segment(name: str) -> str:
     return cleaned[: MAX_SEGMENT - len(suffix)] + suffix
 
 
-def session_task_id(story_key: str, part: str, seq: int, generation: int) -> str:
+def session_task_id(
+    story_key: str, part: str, seq: int, generation: int, *, continuation: int = 0
+) -> str:
     """Single composition point for session task ids. Sanitize the whole
     composition, not the parts: two individually capped parts can still compose
     past a Windows filename segment limit, and ``safe_segment``'s digest suffix
@@ -2496,7 +2498,8 @@ def session_task_id(story_key: str, part: str, seq: int, generation: int) -> str
     existing run already wrote to disk stays byte-identical and a run resumed
     across this upgrade still finds its ``tasks/`` directories."""
     gen = f"-g{generation}" if generation > 0 else ""
-    return safe_segment(f"{story_key}-{part}-{seq}{gen}")
+    resumed = f"-continue{continuation}" if continuation > 0 else ""
+    return safe_segment(f"{story_key}-{part}-{seq}{gen}{resumed}")
 
 
 def _is_clean_ref_segment(seg: str) -> bool:

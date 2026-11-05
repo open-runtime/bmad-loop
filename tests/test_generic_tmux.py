@@ -875,10 +875,10 @@ def test_kill_reaps_clean_end_straggler(tmp_path, monkeypatch):
     assert events[1]["unreaped"] == []  # reaped clean (distinct key from the wedged `alive`)
 
 
-def test_kill_clean_end_no_stragglers_leaves_no_breadcrumb(tmp_path, monkeypatch):
+def test_kill_clean_end_no_stragglers_records_teardown(tmp_path, monkeypatch):
     """Clean end, harvested tree already dead: the pane pids are read once and the
-    window killed once, but the reap finds nothing — no terminate, no force_kill, no
-    breadcrumb (the #157 clean path, now with a one-time pre-harvest read)."""
+    window killed once. The no-straggler receipt proves the harvested native
+    process tree is gone without another terminate or force_kill."""
     monkeypatch.setattr(generic, "KILL_POLL_S", 0)
     host = _RecordingHost(alive=set(), descendants_map={100: [200]})
     monkeypatch.setattr(generic, "get_process_host", lambda: host)
@@ -889,7 +889,11 @@ def test_kill_clean_end_no_stragglers_leaves_no_breadcrumb(tmp_path, monkeypatch
     assert mux.kill_windows == 1
     assert host.terminated == []
     assert host.force_killed == []
-    assert _lifecycle_lines(adapter) == []
+    events = _lifecycle_lines(adapter)
+    assert len(events) == 1
+    assert events[0]["event"] == "kill-outcome"
+    assert events[0]["reaped"] is True
+    assert events[0]["forced"] == events[0]["unreaped"] == []
 
 
 def test_kill_never_signals_identity_none_straggler(tmp_path, monkeypatch):
@@ -2363,6 +2367,27 @@ def test_wait_for_completion_drops_a_spawned_child_conversations_stop(tmp_path):
     ]
     assert _lifecycle_events(adapter, "subagent-marker-unjudged") == []
     assert _lifecycle_events(adapter, "subagent-marker-unreadable") == []
+
+
+def test_resumed_parent_keeps_child_markers_in_its_old_folder(tmp_path):
+    """The resumed parent's old folder still owns new nested spawn markers."""
+    adapter, impl = make_dev_adapter(tmp_path, profile_name="antigravity")
+    adapter.profile = dataclasses.replace(adapter.profile, resume_flag="--resume")
+    parent_t, _ = _agy_child_run(tmp_path, adapter, impl)
+    parent = tmp_path / "brain" / "agy-parent"
+    _age_folder(parent)
+    launch = time.time_ns()
+    # Child-marker writes occur in a nested directory, leaving the root old.
+    (parent / _AGY_MARKER.format(session_id="agy-child")).write_text("{}")
+    spec_path = impl / "spec-3-1-foo.md"
+    os.utime(spec_path, ns=(launch + _MTIME_TICK_NS, launch + _MTIME_TICK_NS))
+    spec = dataclasses.replace(_dev_spec(tmp_path), resume_session_id="agy-parent")
+    result = adapter.wait_for_completion(_dev_handle(launch), spec)
+    assert result.status == "completed"
+    assert result.session_id == "agy-parent"
+    assert result.transcript_path == parent_t
+    assert adapter.watcher.calls == 4
+    assert _lifecycle_events(adapter, "subagent-stop-ignored")[0]["child_session_id"] == "agy-child"
 
 
 def test_wait_for_completion_without_a_spawn_marker_is_unchanged(tmp_path):

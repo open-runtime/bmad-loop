@@ -5,6 +5,7 @@ guides below go deeper, roughly in the order you'll need them.
 
 ## Using bmad-loop
 
+- **[The open-runtime fork](fork-guide.md)** — fork capabilities, parallel epic runs, TeamRouter routing, and installing this fork.
 - **[Setup guide](setup-guide.md)** — install the tools, pick a CLI, initialize a project, pass preflight, and uninstall.
 - **[TUI guide](tui-guide.md)** — the dashboard: layout, key bindings, the settings editor, and troubleshooting.
 - **[Ticket-tree mode](tickets-guide.md)** — driving a BMAD v7 initiative ticket tree: prerequisites, store layouts, pick order, every pause and how to clear it, marking done, checkpoints, the epic retrospective and closure, parking and resolve, and the v7 ledger and sweep.

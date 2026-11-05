@@ -203,12 +203,13 @@ bmad-loop sweep [--project PROJECT] [--no-prompt] [--decisions-only] [--max-bund
 Continues a paused or interrupted run or sweep.
 
 ```text
-bmad-loop resume [--project PROJECT] [--accept-baseline] run_id
+bmad-loop resume [--project PROJECT] [--accept-baseline | --continue-native SESSION_ID] run_id
 ```
 
-| Option              | Description                                                                                                                                          |
-| ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--accept-baseline` | For this resume only, adopt the current HEAD as the baseline of every restarted in-place story instead of preserving commits above the old baseline. |
+| Option                         | Description                                                                                                                                                                                                                                                                                         |
+| ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--accept-baseline`            | For this resume only, adopt the current HEAD as the baseline of every restarted in-place story instead of preserving commits above the old baseline.                                                                                                                                                |
+| `--continue-native SESSION_ID` | Explicitly continue a stopped unfinished in-place development session with matching native evidence, preserving its source and attempt. Requires remaining session-resume budget; see [stopped-session continuation](../loop-recovery-guide.md#continue-an-explicitly-stopped-development-session). |
 
 - Refused with exit 1 for a live engine, a finished run, a sweep whose ledger cannot be read, and the same git-floor, isolation, skill and plugin-trust gates as `run`. Does not require a clean worktree.
 - Refused with exit 1, before any side effect, for a story run whose work source this version does not know (the run was started by a newer bmad-loop) or cannot run yet. Do not downgrade bmad-loop while a run is in progress.

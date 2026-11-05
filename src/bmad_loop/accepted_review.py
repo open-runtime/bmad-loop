@@ -118,7 +118,7 @@ def _accepted_proceeded(state: RunState, task: StoryTask, run_dir: Path) -> bool
         elif kind == "session-end" and task_id == current:
             ended = entry.get("status") == "completed"
         elif kind == "dev-decision" and entry.get("story_key") == task.story_key:
-            if current == accepted.task_id and ended:
+            if current == accepted.artifact_task_id and ended:
                 return (
                     bool(accepted.session_id)
                     and bound == accepted.session_id
@@ -663,7 +663,7 @@ def pool_review_refusal(
         starts = [
             i
             for i, e in enumerate(entries)
-            if e.get("kind") == "session-start" and e.get("task_id") == record.task_id
+            if e.get("kind") == "session-start" and e.get("task_id") == record.artifact_task_id
         ]
         if len(starts) != 1:
             return "the pool review has no unique recorded launch"
@@ -675,11 +675,12 @@ def pool_review_refusal(
         if (
             not bound
             or any(
-                e.get("task_id") != record.task_id or e.get("session_id") != record.session_id
+                e.get("task_id") != record.artifact_task_id
+                or e.get("session_id") != record.session_id
                 for e in bound
             )
             or len(ends) != 1
-            or ends[0].get("task_id") != record.task_id
+            or ends[0].get("task_id") != record.artifact_task_id
             or ends[0].get("status") != "stalled"
             or ends[0].get("env_fault") is not True
             or ends[0].get("turn_error") != "pool"
@@ -690,7 +691,7 @@ def pool_review_refusal(
         if (
             len(escalations) != 1
             or escalations[0].get("story_key") != task.story_key
-            or escalations[0].get("log_task") != record.task_id
+            or escalations[0].get("log_task") != record.artifact_task_id
             or escalations[0].get("env_fault_site") is not None
             or tail.index(escalations[0]) < tail.index(ends[0])
         ):

@@ -7,7 +7,7 @@
 Plain Python drives the loop — **pick story → implement → adversarially review → verify → commit** — while LLMs do only the creative work, inside disposable, fresh-context coding-agent sessions you can attach to and watch.
 
 ![Status: early open beta](https://img.shields.io/badge/status-early%20open%20beta-orange)
-[![CI](https://github.com/bmad-code-org/bmad-loop/actions/workflows/ci.yml/badge.svg)](https://github.com/bmad-code-org/bmad-loop/actions/workflows/ci.yml)
+[![CI](https://github.com/open-runtime/bmad-loop/actions/workflows/ci.yml/badge.svg)](https://github.com/open-runtime/bmad-loop/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.11%E2%80%933.14-blue)
 ![CLIs](https://img.shields.io/badge/agents-claude%20%C2%B7%20codex%20%C2%B7%20gemini%20%C2%B7%20copilot%20%C2%B7%20antigravity%20%C2%B7%20opencode-8a2be2)
 ![No LLM in the loop](https://img.shields.io/badge/control%20loop-deterministic-success)
@@ -26,11 +26,15 @@ Plain Python drives the loop — **pick story → implement → adversarially re
 ---
 
 > ⚠️ **Early open beta — experimental, and moving fast.** Expect rough edges and **breaking changes in any pre-1.0 release** (CLI flags, policy keys, on-disk run state, skill contracts). bmad-loop drives real coding agents that write and commit in your repository, so point it at work you can review and roll back (`[scm] isolation = "worktree"` keeps attempts off your main checkout), pin a release tag for a stable base, and read the [CHANGELOG](CHANGELOG.md) before upgrading.
-> Report bugs as an [issue](https://github.com/bmad-code-org/bmad-loop/issues) with `bmad-loop diagnose` output attached, or talk to us on [Discord](https://discord.gg/gk8jAdXWmj).
+> Report bugs as an [issue](https://github.com/open-runtime/bmad-loop/issues) with `bmad-loop diagnose` output attached, or talk to us on [Discord](https://discord.gg/gk8jAdXWmj).
 
 bmad-loop runs BMAD stories unattended. It reads your sprint board (or a v6 `bmad-spec` story breakdown, or a BMAD v7 initiative ticket tree), launches a fresh coding-agent session for each story inside a terminal multiplexer, checks what the session left on disk, runs your tests, and commits — then moves to the next story. It was inspired by the original [bmad-automator](https://github.com/bmad-code-org/bmad-automator) (a separate, legacy project), but here the orchestrator is ordinary code, not an LLM session.
 
 ## Why bmad-loop
+
+This is the **open-runtime fork**. See the [fork guide](docs/fork-guide.md) for
+its recovery extensions, factory dashboard, TeamRouter integration and the
+distinction between parallel epic runs and sequential stories within one run.
 
 - 🧠 **No LLM in the control loop.** Story selection, retry budgets, gates and completion checks are plain Python: deterministic, debuggable, and free. A session counts as complete only on a completion event from the coding agent or the death of its session, never on model prose; timeouts, stalls and budget caps end it as a failure.
 - 🔍 **Trust nothing, verify everything.** After each session the orchestrator checks the spec status, the baseline commit, that code actually changed, and that the board matches, then runs _your_ `[verify]` commands before it commits.
@@ -52,7 +56,7 @@ bmad-loop runs BMAD stories unattended. It reads your sprint board (or a v6 `bma
 ## Quick start
 
 ```bash
-uv tool install "bmad-loop[tui] @ git+https://github.com/bmad-code-org/bmad-loop.git"
+uv tool install "bmad-loop[tui] @ git+https://github.com/open-runtime/bmad-loop.git"
 
 cd /path/to/your/bmad/project
 bmad-loop init                   # bundled skills, hooks, .bmad-loop/policy.toml, gitignore
@@ -64,7 +68,7 @@ bmad-loop tui                    # …or drive everything from the dashboard
 
 > **One-time setup:** start the coding CLI once in the project (`claude`) and accept its workspace-trust and hooks prompts before `bmad-loop run`. Spawned sessions can't answer first-run dialogs; see [First-run notes](docs/setup-guide.md#first-run-notes) for each CLI.
 
-On BMAD v7, add the skills with `npx skills add bmad-code-org/bmad-loop`, run `/bmad setup bmad-loop` and then `/bmad-loop-setup`, and set `[stories] source = "tickets"`; see [Installing on BMAD v7](docs/setup-guide.md#installing-on-bmad-v7-bmad-setup).
+On BMAD v7, add the skills with `npx skills add open-runtime/bmad-loop`, run `/bmad setup bmad-loop` and then `/bmad-loop-setup`, and set `[stories] source = "tickets"`; see [Installing on BMAD v7](docs/setup-guide.md#installing-on-bmad-v7-bmad-setup).
 
 Every subcommand, flag, `--json` document and exit code is in the [CLI reference](docs/reference/cli.md).
 
@@ -147,7 +151,7 @@ A live dashboard over every run, and a launcher for new ones. It observes runs o
 
 ## Installing and upgrading
 
-`bmad-loop init` installs the three bundled skills — `bmad-loop-resolve`, `bmad-loop-sweep` and `bmad-loop-setup` — into each CLI's skills directory, plus the hook relay and the policy file. Your BMAD install is never modified. If the BMAD-method installer already placed the skills, run `claude "/bmad-loop-setup accept all defaults"`: it installs the tool, wires the hooks, and runs the preflight. On BMAD v7, `npx skills add bmad-code-org/bmad-loop` and `/bmad setup bmad-loop` place the skills and the `bmod-bmad-loop` module record, and `/bmad-loop-setup` then does the rest.
+`bmad-loop init` installs the three bundled skills — `bmad-loop-resolve`, `bmad-loop-sweep` and `bmad-loop-setup` — into each CLI's skills directory, plus the hook relay and the policy file. Your BMAD install is never modified. If the BMAD-method installer already placed the skills, run `claude "/bmad-loop-setup accept all defaults"`: it installs the tool, wires the hooks, and runs the preflight. On BMAD v7, `npx skills add open-runtime/bmad-loop` and `/bmad setup bmad-loop` place the skills and the `bmod-bmad-loop` module record, and `/bmad-loop-setup` then does the rest.
 
 To upgrade, run `claude "/bmad-loop-setup upgrade"`, or by hand `uv tool upgrade bmad-loop --reinstall` followed by `bmad-loop init --force-skills` in each project. Pinned-tag installs, other CLIs, upgrading and uninstalling are in the [setup guide](docs/setup-guide.md).
 

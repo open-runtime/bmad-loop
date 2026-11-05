@@ -280,6 +280,20 @@ class SessionRecord:
     # APPENDED.
     tokens_by_model: dict[str, TokenUsage] = field(default_factory=dict)
 
+    # An explicit stopped-native continuation retains the logical dev attempt,
+    # but must never overwrite the prior launch's artifacts or journal offsets.
+    log_task_id: str = ""
+    # Launch profile and independently observed native family for safe retries.
+    native_binding: dict[str, Any] | None = None
+
+    @property
+    def artifact_task_id(self) -> str:
+        from .platform_util import safe_segment
+
+        if self.log_task_id and safe_segment(self.log_task_id) != self.log_task_id:
+            raise ValueError("unsafe session artifact identity")
+        return self.log_task_id or self.task_id
+
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
             "task_id": self.task_id,
@@ -302,6 +316,10 @@ class SessionRecord:
             d["tokens_by_model"] = {
                 model: usage.to_dict() for model, usage in self.tokens_by_model.items()
             }
+        if self.log_task_id:
+            d["log_task_id"] = self.log_task_id
+        if self.native_binding is not None:
+            d["native_binding"] = self.native_binding
         return d
 
     @classmethod
@@ -328,6 +346,8 @@ class SessionRecord:
             resumed_from=str(d.get("resumed_from", "") or ""),
             models=models,
             tokens_by_model=_tokens_by_model_from(d.get("tokens_by_model")),
+            log_task_id=str(d.get("log_task_id", "") or ""),
+            native_binding=d.get("native_binding"),
         )
 
 
@@ -985,6 +1005,9 @@ class StoryTask:
     # resuming that conversation unsafe. Cleared by the next launch.
     session_resumes: int = 0
     resume_blocked: bool = False
+    # Explicit stopped-inflight resume authority. Retained on uncertain launch;
+    # only a real, identity-matching completed adapter result consumes it.
+    stopped_native: dict[str, Any] = field(default_factory=dict)
     # Uncharged usage relaunches (#959, `limits.usage_limit_action = "relaunch"`):
     # how many of `attempt` (dev + fix sessions) and `review_cycle` (review
     # sessions) were relaunches of a session that ended on a usage limit or an
@@ -1161,6 +1184,7 @@ class StoryTask:
             "ticket_premark_status": self.ticket_premark_status,
             "ticket_premark_digest": self.ticket_premark_digest,
             "session_resumes": self.session_resumes,
+            "stopped_native": self.stopped_native,
             "resume_blocked": self.resume_blocked,
         }
 
@@ -1330,7 +1354,7 @@ class StoryTask:
                 )
             except ValueError as exc:
                 raise ValueError(
-                    f"story {d.get('story_key')!r}: dispatched_spec_snapshot " "is not valid base64"
+                    f"story {d.get('story_key')!r}: dispatched_spec_snapshot is not valid base64"
                 ) from exc
         return cls(
             story_key=d["story_key"],
@@ -1466,6 +1490,7 @@ class StoryTask:
             ticket_premark_status=str(d.get("ticket_premark_status", "") or ""),
             ticket_premark_digest=str(d.get("ticket_premark_digest", "") or ""),
             session_resumes=int(d.get("session_resumes", 0) or 0),
+            stopped_native=dict(d.get("stopped_native", {}) or {}),
             resume_blocked=bool(d.get("resume_blocked", False)),
         )
 
