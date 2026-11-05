@@ -305,7 +305,7 @@ class RunPaused(Exception):
         self.usage_limit: UsageLimitPause | None = None
 
 
-SpecWriteReason = Literal["salvage", "reconcile", "adoption", "repair"]
+SpecWriteReason = Literal["salvage", "reconcile", "adoption", "repair", "implemented-review"]
 """Why an engine site writes a spec's frontmatter ``status`` — the token
 :meth:`Engine._spec_status_write` receives, one per writer site."""
 
@@ -2689,6 +2689,14 @@ class Engine:
                 else:
                     self._release_orphaned_mount(task)
                     continuation()
+            elif task.implemented_review is not None and task.phase in (
+                Phase.REVIEW_RUNNING,
+                Phase.REVIEW_VERIFY,
+            ):
+                # A stopped primary still owes review of its retained work. The
+                # ordinary completed-result arm above wins when a result exists.
+                # Never restart a dev/rollback merely because the primary died.
+                self._resume_implemented_review(task)
             elif task.phase == Phase.COMMITTING:
                 # the host died in the commit window: the gate+advance save
                 # landed (pre_commit_gate ran clean) but the DONE save that
@@ -2796,6 +2804,7 @@ class Engine:
                 task.generation += 1
                 task.review_cycle = 0
                 task.review_usage_relaunches = 0  # refunds never exceed review_cycle (#959)
+                task.review_unlaunched_cycles = 0
                 task.followup_reviews_spent = 0
                 task.salvage_refile_pending = False
                 self._save()
@@ -4320,6 +4329,9 @@ class Engine:
         *,
         resumed_loop: bool = False,
     ) -> None:
+        if task.implemented_review is not None and not self.policy.review.enabled:
+            self._escalate(task, "implemented recovery still owes an enabled primary review")
+            return
         # A replayed REVIEW result finalized at `awaiting-operator` under
         # on_review_demotion = "park" is a review demotion (DW-383), not a dev park
         # (a dev park never reaches a review session): the loop below replays it
@@ -4369,6 +4381,7 @@ class Engine:
             and self.policy.review.trigger == "recommended"
             and not task.followup_review_recommended
             and not task.salvage_refile_pending
+            and task.implemented_review is None
         ):
             self.journal.append("review-not-recommended", story_key=task.story_key)
             self._skip_review_and_commit(task)
@@ -4422,6 +4435,16 @@ class Engine:
                 result = resume_result
                 resume_result = None
             else:
+                from .accepted_review import primary_was_bound
+
+                first_attested_primary = (
+                    task.implemented_review is not None
+                    and not primary_was_bound(self.state, task, self.run_dir)
+                )
+                if first_attested_primary:
+                    # Phase/gate hooks have already run. Validate before our
+                    # own marker removal so their edits cannot become trusted.
+                    self._validate_implemented_review(task)
                 # Strip the prior pass's stale `## Auto Run Result` before launch:
                 # the review re-invokes bmad-build-auto on the done spec, and the
                 # session's own entry write would otherwise lift that leftover
@@ -4429,6 +4452,11 @@ class Engine:
                 # on its first result-less Stop (issue #160). Non-replay branch
                 # only — the replay path above launches no session.
                 snapshot = self._reset_spec_for_review(task)
+                prelaunch_validator = None
+                if first_attested_primary:
+                    prelaunch_validator = functools.partial(
+                        self._validate_implemented_review, task, require_prepared=True
+                    )
                 # F6 (open-runtime fork): a review retry after a stalled, timed
                 # out or crashed review session continues that conversation; the
                 # tree is kept between review cycles.
@@ -4440,14 +4468,18 @@ class Engine:
                         self._resume_prompt(task, "review", review_resume)
                         if review_resume is not None
                         else self._review_prompt(task)
-                    ),
+                    )
+                    + self._implemented_review_context(task),
                     seq=task.review_cycle,
                     spec_snapshot=snapshot,
                     resume=review_resume,
                     # #772: a fresh review follows engine bookkeeping (dev
                     # harvest, bundle close or reclose, post-fix harvest). A
                     # resumed reviewer still owns its unfinished ledger edits.
-                    commit_engine_ledger=review_resume is None,
+                    # Initial attestation requires a clean ledger. Hook-owned
+                    # dirt must be refused, not committed as engine bookkeeping.
+                    commit_engine_ledger=review_resume is None and not first_attested_primary,
+                    prelaunch_validator=prelaunch_validator,
                 )
             advance(task, Phase.REVIEW_VERIFY)
             self._save()
@@ -5383,6 +5415,7 @@ class Engine:
             # So is a replay continuation (DW-527): the post-replay resume arm
             # re-latches only a continuation that has not committed yet.
             task.reverify_replayed = ""
+            task.implemented_review = None
             task.dispatched_spec_file = None
             task.dispatched_spec_snapshot = None
             task.dispatched_spec_absent = False
@@ -7805,6 +7838,9 @@ class Engine:
         Every fresh entry starts at ``review_cycle`` 0, except a restart-arm
         re-drive. That re-drive keeps its counters and so reviews once instead of
         skipping, which is the conservative direction."""
+        if task.implemented_review is not None and self._current_dev_session_index(task) is None:
+            self._resume_implemented_review(task)
+            return
         # Acceptance belongs to the current attempt's record, not merely any
         # retained index. A successful reverify separately persists its PROCEED
         # receipt without a current-generation dev session.
@@ -7823,6 +7859,83 @@ class Engine:
         self.journal.append("resume-review", story_key=task.story_key)
         self._finish_post_dev_accepted_sync(task)
         self._review_and_commit(task, resumed_loop=task.review_cycle > 0)
+
+    def _resume_implemented_review(self, task: StoryTask) -> None:
+        """Consume an explicit source attestation only through normal primary review."""
+        from .accepted_review import (
+            prepared_plan_evidence,
+            primary_was_bound,
+            review_reservation_unlaunched,
+        )
+
+        unlaunched = task.phase == Phase.REVIEW_RUNNING and review_reservation_unlaunched(
+            self.state, task, self.run_dir
+        )
+        if task.phase == Phase.REVIEW_RUNNING:
+            # The native process is gone; inspect its retained state before
+            # either re-entering review or escalating. This records no result.
+            advance(task, Phase.REVIEW_VERIFY)
+        if not primary_was_bound(self.state, task, self.run_dir):
+            self._validate_implemented_review(task)
+            if unlaunched:
+                task.review_unlaunched_cycles += 1
+                # Save the refund with REVIEW_VERIFY: another crash cannot
+                # credit this reservation twice. Keep review_cycle for unique IDs.
+                self._save()
+            assert task.spec_file is not None
+            spec = verify.resolve_spec_path(task.spec_file, self.workspace.paths)
+            self._spec_status_write(
+                task,
+                spec,
+                "in-review",
+                "implemented-review",
+                confine_root=self._spec_confine_root(task),
+            )
+            assert task.implemented_review is not None
+            if "prepared_plan" not in task.implemented_review:
+                # Persist both known controller forms before any review hook
+                # or marker-removal write, so either crash boundary is replayable.
+                task.implemented_review["prepared_plan"] = prepared_plan_evidence(
+                    spec.read_bytes(), task.implemented_review["plan_digest"]
+                )
+                self._save()
+        self.journal.append("implemented-review-resumed", story_key=task.story_key)
+        self._review_and_commit(task, resumed_loop=task.review_cycle > 0)
+
+    def _validate_implemented_review(
+        self, task: StoryTask, *, require_prepared: bool = False
+    ) -> None:
+        """Refuse changed recovery authority before the first native launch."""
+        from .accepted_review import pending_review_refusal
+
+        refusal = pending_review_refusal(
+            self.state,
+            task,
+            self.run_dir,
+            self.paths.project,
+            require_prepared=require_prepared,
+        )
+        if refusal is not None:
+            if task.phase == Phase.REVIEW_RUNNING:
+                advance(task, Phase.REVIEW_VERIFY)
+            self._escalate(task, f"cannot resume implemented review: {refusal}")
+
+    def _implemented_review_context(self, task: StoryTask) -> str:
+        """Give the normal primary its actual retained implementation range."""
+        evidence = task.implemented_review
+        if evidence is None:
+            return ""
+        return (
+            "\n\nThis is an explicit recovery of previously accepted implementation. "
+            f"Review the retained change from {evidence.get('original_baseline')} through "
+            f"implementation commit {evidence.get('implementation_commit')} in the complete "
+            f"current tree pinned at {evidence.get('head')}. The current task baseline already "
+            "contains that work, so baseline..HEAD alone is not the implementation diff. "
+            f"Its historical accepted dev was {evidence.get('accepted_task_id')} "
+            f"(native {evidence.get('accepted_native_id')}). This attestation is not a review "
+            "verdict. Perform the normal primary review, preserve unmet criteria, and return "
+            "the normal structured result; do not invent a new implementation delta."
+        )
 
     def _resume_reverify(self, task: StoryTask) -> None:
         """Replay dev verification against the kept attempt product (DW-522).

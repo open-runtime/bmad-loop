@@ -27363,6 +27363,7 @@ def test_rearm_resets_usage_relaunch_counters(project):
     task = engine.state.tasks["1-1-a"]
     task.review_cycle = 1
     task.review_usage_relaunches = 1
+    task.review_unlaunched_cycles = 1
     engine._save()
 
     rearm_escalation(engine.run_dir, isolated_redrive=False, resolution_recorded=True)
@@ -27371,6 +27372,7 @@ def test_rearm_resets_usage_relaunch_counters(project):
     assert (rearmed.attempt, rearmed.dev_usage_relaunches) == (0, 0)
     assert (rearmed.review_cycle, rearmed.review_usage_relaunches) == (0, 0)
     assert rearmed.usage_relaunches == 0
+    assert rearmed.review_unlaunched_cycles == 0
 
 
 # --- #772: the engine's own ledger bookkeeping commit ---------------------------

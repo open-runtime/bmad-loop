@@ -45,6 +45,8 @@ from . import (
     verify,
     worksource,
 )
+from .accepted_review import rearm_for_implemented_review as rearm_for_implemented_review
+from .accepted_review import review_implemented_refusal as review_implemented_refusal
 from .adapters.multiplexer import (
     MultiplexerError,
     TerminalMultiplexer,
@@ -6878,10 +6880,12 @@ def _rearm_escalation_locked(
         task.escalations_resolved_upto = len(task.sessions)
     task.review_cycle = 0
     task.review_usage_relaunches = 0  # refunds never exceed review_cycle (#959)
+    task.review_unlaunched_cycles = 0
     task.followup_reviews_spent = 0  # human-resolved re-drive gets a fresh damping budget
     task.defer_reason = None
     task.env_fault_site = None  # the re-armed story starts with no fault on record (DW-523)
     task.rearmed = True  # resume-time recovery notice describes a clean rebuild,
+    task.implemented_review = None
     # not a failed attempt (engine._finish_inflight clears it once the rebuild runs)
     # Always (re)assign the latch: a None restore_patch clears a stale one left by
     # a prior restore attempt the human then chose to redo from scratch.
@@ -8009,6 +8013,7 @@ def latch_for_reverify(task: StoryTask, origin: str) -> None:
     `_rearm_escalation_locked`), and DEV_VERIFY is the persisted "dev product on the
     tree, verify it" phase the engine's reverify arm replays."""
     task.phase = Phase.DEV_VERIFY
+    task.implemented_review = None
     task.reverify_from = origin
     # A prior replay's post-PROCEED marker (DW-527) belongs to that continuation; this
     # replay sets its own when it PROCEEDs.
@@ -8019,6 +8024,7 @@ def latch_for_reverify(task: StoryTask, origin: str) -> None:
     task.generation += 1  # #705: no session id the earlier attempt minted is reused
     task.review_cycle = 0
     task.review_usage_relaunches = 0  # refunds never exceed review_cycle (#959)
+    task.review_unlaunched_cycles = 0
     task.followup_reviews_spent = 0
     task.salvage_refile_pending = False
     task.adopt_pending = False

@@ -1941,3 +1941,16 @@ def test_nested_spec_outside_the_mount_project_stays_verbatim():
     state.tasks[task.story_key] = task
 
     assert state.to_dict()["tasks"]["1-1-a"]["spec_file"] == f"{wt}/other/s.md"
+
+
+def test_unlaunched_review_refunds_round_trip_without_usage_relaunches():
+    task = StoryTask(
+        "1-1-a", 1, review_cycle=4, review_usage_relaunches=1, review_unlaunched_cycles=2
+    )
+    back = StoryTask.from_dict(task.to_dict())
+    assert back.review_cycle == 4 and back.review_unlaunched_cycles == 2
+    assert back.charged_review_cycles == 1
+    assert back.usage_relaunches == 1
+    old = task.to_dict()
+    del old["review_unlaunched_cycles"]
+    assert StoryTask.from_dict(old).review_unlaunched_cycles == 0

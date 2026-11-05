@@ -3275,6 +3275,7 @@ class SweepEngine(Engine):
         task.dev_usage_relaunches = 0  # refunds never exceed attempt (#959)
         task.review_cycle = 0
         task.review_usage_relaunches = 0  # refunds never exceed review_cycle (#959)
+        task.review_unlaunched_cycles = 0
         task.followup_reviews_spent = 0
         task.defer_reason = None
         _rearm_generation(task)

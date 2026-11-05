@@ -7389,7 +7389,11 @@ def _resolve_pre_session_gates(
     # The resume's ticket-store refusal, judged ahead of the reverify/adopt
     # dispatches for the same reason: each persists its transition before the
     # resume that would refuse a changed store. The re-arm path judges it below.
-    early = getattr(args, "reverify", False) or getattr(args, "adopt_branch", False)
+    early = (
+        getattr(args, "reverify", False)
+        or getattr(args, "adopt_branch", False)
+        or getattr(args, "review_implemented", None) is not None
+    )
     if (
         early
         and state.source == worksource.SOURCE_TICKETS
@@ -7491,6 +7495,15 @@ def cmd_resolve(args: argparse.Namespace) -> int:
             "proceeding anyway (--force)",
             file=sys.stderr,
         )
+    if getattr(args, "review_implemented", None) is not None:
+        if live != "dead":
+            print(
+                "error: implemented review requires a demonstrably stopped engine", file=sys.stderr
+            )
+            return 1
+        if (rc := _resolve_pre_session_gates(args, project, run_dir, state)) is not None:
+            return rc
+        return _resolve_implemented_review(args, project, run_dir, state)
     # A tickets run's epic-boundary pause, answered by closing the epic: routed ahead
     # of the escalation gate, which refuses it. Only a resolve with no mode flag takes
     # it (interactive or not); a mode flag on that pause keeps the refusal below.
@@ -8442,6 +8455,7 @@ def _at_reset_usage_error(args: argparse.Namespace) -> str | None:
         ("--restore-patch", args.restore_patch is not None),
         ("--adopt-branch", getattr(args, "adopt_branch", False)),
         ("--reverify", getattr(args, "reverify", False)),
+        ("--review-implemented", getattr(args, "review_implemented", None) is not None),
     ):
         if given:
             return (
@@ -8760,6 +8774,66 @@ def _resolve_pause_admits(state: RunState, *, reverify_named: bool) -> bool:
     if reverify_named:
         return state.paused_stage is not None
     return runs.escalation_resolvable(state)
+
+
+def _resolve_implemented_review(
+    args: argparse.Namespace,
+    project: Path,
+    run_dir: Path,
+    state: RunState,
+) -> int:
+    """Record an explicit implementation attestation; the engine still owes review."""
+    from .accepted_review import _evidence
+
+    key = args.story or state.paused_story_key
+    task = state.tasks.get(key) if key else None
+    if task is None or key is None:
+        print("error: name the stopped ticket with --story", file=sys.stderr)
+        return 1
+    try:
+        evidence = _evidence(
+            state,
+            task,
+            key,
+            args.review_implemented,
+            run_dir=run_dir,
+            project_root=project,
+            require_stopped=True,
+        )
+    except (
+        ValueError,
+        OSError,
+        bmadconfig.BmadConfigError,
+        verify.GitError,
+        policy_mod.PolicyError,
+    ) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(
+        f"attesting that {args.review_implemented} implements {key} at HEAD {evidence['head']}; "
+        "resume will run the owed primary review and normal review verification, "
+        "without a new dev session or a repeated dev verification",
+        file=sys.stderr,
+    )
+    if args.resume is None and not _confirm(f"record this attestation and resume {args.run_id}?"):
+        print("cancelled — run is still stopped")
+        return 0
+    try:
+        runs.rearm_for_implemented_review(
+            run_dir,
+            key,
+            args.review_implemented,
+            project_root=project,
+            expected_evidence=evidence,
+        )
+    except runs.RearmError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"armed {key} for its required primary review")
+    if args.resume is False:
+        print(f"resume when ready: bmad-loop resume {args.run_id}")
+        return 0
+    return _resume_paused_run(project, run_dir)
 
 
 def _resolve_reverify(
@@ -11561,6 +11635,14 @@ def main(argv: list[str] | None = None) -> int:
         "With --abandon, skips its confirm",
     )
     resolve_mode = resolve_p.add_mutually_exclusive_group()
+    resolve_mode.add_argument(
+        "--review-implemented",
+        metavar="COMMIT",
+        help="attest a full implementation commit already retained in a stopped ticket's "
+        "baseline; require its historical accepted dev result and unchanged implementation "
+        "content, then resume the owed primary review at current HEAD without another dev "
+        "session or dev verification. Normal review verification still runs (in-place tickets only)",
+    )
     resolve_mode.add_argument(
         "--restore-patch",
         metavar="PATH",

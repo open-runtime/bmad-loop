@@ -822,6 +822,11 @@ class StoryTask:
     # Survives the resume serialization round-trip; deliberately absent from
     # `documents.py`'s `--json` projection (schema 1).
     reverify_replayed: str = ""
+    # Explicit operator attestation for a historically accepted ticket whose
+    # implementation is already in the current baseline. This binds source and
+    # original acceptance; it never substitutes a new SessionRecord or acceptance.
+    # Kept through the mandatory primary review and its ordinary verification.
+    implemented_review: dict[str, Any] | None = None
     # sweep bundles only: the deferred-work ids this task closes and the
     # rendered intent file handed to dev sessions
     dw_ids: list[str] = field(default_factory=list)
@@ -902,6 +907,9 @@ class StoryTask:
     # capped per story by `limits.max_usage_relaunches`.
     dev_usage_relaunches: int = 0
     review_usage_relaunches: int = 0
+    # Reserved review identities whose launch never began. Separate from usage
+    # relaunches: a host crash before dispatch spends no provider/budget slot.
+    review_unlaunched_cycles: int = 0
 
     @property
     def terminal(self) -> bool:
@@ -916,8 +924,8 @@ class StoryTask:
     @property
     def charged_review_cycles(self) -> int:
         """Review cycles charged against `limits.max_review_cycles`: every launch
-        minus the uncharged usage relaunches (#959)."""
-        return self.review_cycle - self.review_usage_relaunches
+        minus usage relaunches and proven unlaunched reservations."""
+        return self.review_cycle - self.review_usage_relaunches - self.review_unlaunched_cycles
 
     @property
     def usage_relaunches(self) -> int:
@@ -972,6 +980,7 @@ class StoryTask:
             "followup_reviews_spent": self.followup_reviews_spent,
             "dev_usage_relaunches": self.dev_usage_relaunches,
             "review_usage_relaunches": self.review_usage_relaunches,
+            "review_unlaunched_cycles": self.review_unlaunched_cycles,
             "generation": self.generation,
             "escalations_resolved_upto": self.escalations_resolved_upto,
             "followup_review_recommended": self.followup_review_recommended,
@@ -1041,6 +1050,7 @@ class StoryTask:
             "adopt_pending": self.adopt_pending,
             "reverify_from": self.reverify_from,
             "reverify_replayed": self.reverify_replayed,
+            "implemented_review": deepcopy(self.implemented_review),
             "dw_ids": self.dw_ids,
             "bundle_file": self.bundle_file,
             "worktree_path": self.worktree_path,
@@ -1236,6 +1246,7 @@ class StoryTask:
             followup_reviews_spent=int(d.get("followup_reviews_spent", 0)),
             dev_usage_relaunches=int(d.get("dev_usage_relaunches", 0)),
             review_usage_relaunches=int(d.get("review_usage_relaunches", 0)),
+            review_unlaunched_cycles=int(d.get("review_unlaunched_cycles", 0)),
             generation=int(d.get("generation", 0)),
             escalations_resolved_upto=int(d.get("escalations_resolved_upto", 0)),
             followup_review_recommended=bool(d.get("followup_review_recommended", False)),
@@ -1336,6 +1347,11 @@ class StoryTask:
             adopt_pending=bool(d.get("adopt_pending", False)),
             reverify_from=str(d.get("reverify_from", "") or ""),
             reverify_replayed=str(d.get("reverify_replayed", "") or ""),
+            implemented_review=(
+                deepcopy(dict(d["implemented_review"]))
+                if d.get("implemented_review") is not None
+                else None
+            ),
             dw_ids=[str(i) for i in d.get("dw_ids", [])],
             bundle_file=d.get("bundle_file"),
             worktree_path=str(d.get("worktree_path", "")),
