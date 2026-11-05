@@ -126,12 +126,21 @@ to the campaign's independent stories.
 
 ### Model roles and escalation resolution
 
-The rollout configuration explicitly uses Astra for planning, independent
-planning review, semantic triage and escalation diagnosis through the configured
-Codex/TeamRouter launch chain. Generic role settings remain configurable and
+The rollout configuration permits Astra or Fable, whichever has eligible capacity,
+for planning, independent planning review, semantic triage, escalation diagnosis
+and decision evidence review through qualified Codex/Claude/TeamRouter profiles.
+Generic role settings remain configurable and
 legacy execution defaults remain intact. Validate effective model/effort rather
-than inheriting this chat's selection or silently falling back. Publication
+than inheriting this chat's selection or selecting an unapproved model. Publication
 review retains project-required provider-family independence.
+
+Before requesting owner input, a bounded evidence review searches authorized
+owner notes, instructions, GitHub discussions and available bound conversations.
+Apply a still-valid prior decision, exercise explicitly delegated routine judgment,
+or recognize a satisfied approval condition with source attribution. Persist the
+decision and its invalidation conditions. An explicit stop, genuinely new decision
+or required fresh attestation stays outstanding until its actual condition clears;
+model confidence cannot create authority. CI/resource waits are not approval holds.
 
 An opt-in bounded resolution stage diagnoses technical escalations, proposes
 typed actions and verifies any permitted repair before returning to normal
@@ -373,7 +382,7 @@ independence.
 | 1     | Versioned campaign specifications, state, transitions and store | Invalid/cyclic inputs refuse before effects; persistence is atomic; duplicate coordinators refuse.                                                  |
 | 2     | GitHub gateway, outbox and publication controller               | Early drafts, pagination, exact-head/base gates, unknown-write reconciliation and merge read-back work through fake transport.                      |
 | 3     | Issue hierarchy, managed content, intake and triage             | Stable IDs, native subissues, bounded new work and linked dispositions survive retry without duplicates, lost human edits or premature closure.     |
-| 4     | Repository discovery, planning sessions and source import       | Existing work informs scoped plans without duplicate ownership; Astra roles and structured results are validated.                                   |
+| 4     | Repository discovery, planning sessions and source import       | Existing work informs scoped plans without duplicate ownership; available Astra/Fable roles and structured results are validated.                   |
 | 5     | Isolated workers, workspace providers and dependency scheduler  | Multiple units execute concurrently without shared engine state; provider allocation precedes launch; dependencies release only after delivery.     |
 | 6     | CLI and complete delivery/recovery loop                         | One command plans, dispatches, resolves permitted failures, reviews and delivers; bounded recovery preserves identities, work and human-only gates. |
 | 7     | Bundled Paradev transport and native workspace reflection       | Story/epic folders, unit workspaces/PRs and actual worker tabs reconcile without duplicate launches or lost operator holds.                         |

@@ -73,25 +73,29 @@ verify_slots = 2
 enabled = true
 merge_mode = "direct-strict"
 
+[role_pools.reasoning]
+candidates = [
+  { profile = "codex", model = "gpt-6-astra", effort = "high" },
+  { profile = "claude", model = "claude-fable-5-1", effort = "high" },
+]
+
 [roles.planning]
-profile = "codex"
-model = "gpt-6-astra"
-effort = "high"
+pool = "reasoning"
 
 [roles.triage]
-profile = "codex"
-model = "gpt-6-astra"
-effort = "high"
+pool = "reasoning"
 
 [roles.planning_review]
-profile = "codex"
-model = "gpt-6-astra"
-effort = "high"
+pool = "reasoning"
 
 [roles.escalation]
-profile = "codex"
-model = "gpt-6-astra"
-effort = "high"
+pool = "reasoning"
+
+[roles.decision_review]
+pool = "reasoning"
+
+[decisions]
+mode = "evidence-first"
 
 [resolution]
 mode = "bounded-auto"
@@ -122,23 +126,32 @@ configuration trust/digest machinery; do not invent document-hash ceremonies.
 
 ### Campaign model roles
 
-Campaign roles are planning, planning_review, triage, escalation and publication
-review, with independently resolved profile/model/effort and session budgets.
+Campaign roles are planning, planning_review, triage, escalation, decision_review
+and publication_review, with independently resolved profiles and session budgets.
 Execution retains the existing dev/review stage settings. Generic defaults
-inherit project settings; the rollout preset explicitly pins planning, planning
-review, semantic triage and escalation diagnosis to Codex with gpt-6-astra.
-The example's high effort is configurable. This chat's selected model is never
-used as runtime configuration. Independent planning review uses a fresh session;
+inherit project settings; the rollout preset permits Astra through Codex or Fable
+through Claude for planning, planning review, semantic triage, escalation diagnosis
+and decision evidence review. The example's high effort is configurable. A role
+selects either a named pool or one exact profile/model, never ambiguous mixtures.
+This chat's selected model is never runtime configuration. Planning review uses a fresh session;
 publication review additionally honors project family-independence rules. Astra
 and Sol are both OpenAI models and cannot satisfy a cross-provider-family rule
 merely by being different model IDs.
 
 Build these roles through the existing profile/adapter factory with immutable
 role snapshots, without changing legacy role inheritance. Preflight reports the
-resolved launch chain and model capability for each role. An unavailable pinned
-model waits visibly; it cannot silently fall back to another model. Record
-requested and observed model/provider separately. A policy requiring an exact
-model is not satisfied by unknown or mismatching observed attribution.
+resolved launch chains, advertised models and eligible pools for each role.
+Choose an available authorized candidate using account/router capacity and fair
+admission, with stable configured order as the tie-breaker. Do not wait for Astra
+while an eligible Fable slot is available. Availability includes route readiness,
+model access, quota and campaign budget; a binary on PATH alone is insufficient.
+No eligible candidate produces a visible resource wait, not permission to use an
+unlisted model or account. An exact-model role still refuses substitution.
+Record selected and observed model/provider separately and validate membership.
+Missing or mismatching required attribution does not satisfy the role contract.
+Keep a launched attempt on its selected model. A provider change after failure
+starts a fresh session with saved artifacts/context and the same lifetime budget;
+do not pass a Codex conversation ID to Claude or pretend it is the same session.
 
 The current generic mux adapter ignores SessionSpec.effort; setting that field
 alone would not configure Codex. Qualify additive native CLI/profile arguments
@@ -163,6 +176,7 @@ parallel editing. Names below are module boundaries, not required class names.
 | campaign_discovery        | Repository work inventory, coverage receipts and planning overlap evidence.                    |
 | campaign_intake           | Durable remote observations, triage sessions, dispositions and bounded graph-change proposals. |
 | campaign_resolution       | Typed escalation diagnosis, bounded repair actions and verified re-arm decisions.              |
+| campaign_decisions        | Authorized context retrieval, decision ledger and evidence-backed hold satisfaction.           |
 | campaign_planning         | Session stages, artifact validators, planning PR and graph revisions.                          |
 | campaign_workers          | Spawn/reconcile isolated single-unit engines and collect final worker receipts.                |
 | campaign_scheduler        | Pure admission decisions from dependencies, claims, scopes, budgets and resources.             |
@@ -429,6 +443,87 @@ proposed, accepted and delivered work distinct in comments and machine status.
 Shared/external source publication follows the same sole-writer contract as
 implementation delivery; a triage session never patches the canonical board.
 
+## Evidence review before requesting owner input
+
+The autonomous preset does not introduce an owner approval at every phase. Where
+project policy permits, use gates.mode=none for routine child-engine checkpoints
+and retain automated planning/publication review. Explicit source HITL records,
+owner holds and project-required fresh approvals remain individually represented.
+Do not silently turn an intentional project gate into a routine checkpoint.
+
+Before notifying the owner about a decision or approval hold, first check whether
+it is already answered, satisfied or delegated. The decision_review role uses
+the available Astra/Fable pool. It receives the exact question, hold ID/type,
+unit/source/head coordinates and relevant evidence, not a generic instruction
+to find a reason to proceed. Deterministic reconciliation runs first for facts
+such as already-recorded GitHub approval or a completed required check.
+
+Retrieve from configured project instruction/decision documents and owner notes,
+mapped GitHub issue/PR discussions and approved plans, plus explicitly bound
+conversation sources. Prior chat can be supplied as owner-imported messages or
+read from an available authorized transcript provider for that project/session.
+Preserve original role/author IDs and message/commit/object IDs, timestamps and
+source revisions. A provider unable to establish origin yields contextual evidence,
+not owner authorization. Report inaccessible history; do not promise a search of
+all past chats. Do not require the owner to restate an accessible decision in a
+new template. Source adapters remain bounded and read-only; raw private chat stays
+local, while GitHub receives the permitted decision summary and source references.
+
+Distinguish authoritative owner directions and adopted policy from suggestions,
+quoted statements, issue proposals and agent-authored summaries. Trust comes from
+configured source identity/authority, not the words "owner approved" in a document.
+Apply instruction precedence and scoped supersession; newer low-authority text
+cannot override an owner hold. A broad instruction may delegate routine design
+choices, but a specific later hold still governs its unit. Match evidence to the
+actual action, constraints, revision and conditions; approval of an earlier plan
+does not automatically cover a materially expanded plan or changed PR head.
+
+Return a typed disposition: prior_decision_applies, delegated_choice,
+already_satisfied, needs_new_owner_decision, conflicting_evidence, or external_wait.
+Include the chosen answer/action, exact supporting passages and identities,
+applicability rationale, contrary evidence, constraints and invalidation triggers.
+The controller validates source authority, current bindings and the action's
+policy envelope. Within an existing delegation the model may choose the routine
+implementation detail; it does not need to find a verbatim prior answer.
+Model confidence or agreement between two models cannot supply missing authority.
+Use one reviewer normally; a second eligible family is optional for a genuinely
+ambiguous interpretation, bounded by budget, never a mandatory serial debate.
+
+Persist the accepted decision receipt and any permitted hold transition in the
+same authoritative campaign transaction. The versioned repository decision ledger
+is a recoverable index of those receipts; independent file writes are not an
+atomic transaction. Reuse decisions across campaigns only with freshly validated
+scope/authority bindings and while their
+conditions remain true, and invalidate on relevant source edits, revocation,
+scope/head changes or conflicting newer direction. Apply hold satisfaction only
+through the typed state/confirmation APIs with actual attribution; the reviewer
+cannot write state or issue a blanket confirm --yes. Preserve the original hold
+and its disposition in the audit trail. This is evidence-backed satisfaction or
+exercise of delegated authority, never fabrication of a new owner approval.
+
+Distinguish these hold classes:
+
+| Hold                             | How it can clear                                                                                                                                              |
+| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Unanswered product/design choice | Apply an existing owner decision or choose within delegated scope; ask only for genuinely new authority or unresolved conflict.                               |
+| Configured plan/spec checkpoint  | Accept prior approval only if the gate permits it and the approved scope/revision still matches; a fresh-signoff requirement remains explicit.                |
+| Explicit owner stop/hold         | Match a later authorized release or the hold's stated release condition; earlier general autonomy never overrides a specific stop.                            |
+| Required GitHub review           | Read actual current approval state, or have an authorized eligible reviewer perform and submit the required review; model inference is not a GitHub approval. |
+| Human-only action/attestation    | Reconcile trustworthy evidence that the exact action already happened and any required attestation exists; otherwise keep the action outstanding.             |
+
+CI, quota, model capacity, dependency and tracking waits are operational states,
+not requests for owner approval. They reconcile automatically unless a real
+unresolved owner action remains. Required reviewer identity, CODEOWNERS, last-push
+and stale-review rules still apply; never impersonate a human or dismiss a blocking
+review to convert a recommendation into approval. Automated review is usable only
+where project policy and GitHub permit that actual reviewer identity.
+
+If evidence cannot settle a decision, notify once with the smallest concrete
+question, recommended answer, sources checked and why existing authority is
+insufficient. Cache the request; re-evaluate on relevant new evidence instead
+of repeatedly asking or spending a new model session every scheduler tick.
+Unrelated units continue while that decision is pending.
+
 ## Bounded escalation diagnosis and resolution
 
 Existing resolve is an interactive human workflow; CRITICAL pauses do not already
@@ -441,18 +536,20 @@ Resolution is a separate stage, never a model-issued completion verdict.
 Classify causes with typed producer codes and evidence, not a regex over the
 human-facing pause reason or a model's severity downgrade. Unknown legacy causes
 can receive diagnosis but are not automatically cleared. Deterministic transient
-conditions use existing quota/backoff/reconciliation paths first; Astra is useful
+conditions use existing quota/backoff/reconciliation paths first; a reasoning agent is useful
 for ambiguous technical failures, conflicting evidence and proposing repairs.
 Owner holds, explicit human-only tickets/checkpoints, credentials/permissions,
 spend increases, policy changes, uncertain live ownership and unsatisfied required
-approvals cannot be waived by the resolver. Conflicting product intent goes back
-to a planning decision; it is not permission to weaken acceptance criteria.
+approvals cannot be waived by the resolver. First apply the evidence-review
+contract above to recognize an existing decision or a satisfied hold. Remaining
+conflicting product intent goes back to a planning decision; it is not permission
+to weaken acceptance criteria.
 
 Before launching the resolver, confirm the failed worker is quiescent and acquire
 its unit ownership. Build a bounded evidence packet from resolve.build_context,
 journal and session results, current main/head, frozen intent, failed commands, preserved
 work, prior diagnoses and GitHub review/check observations. Redact credentials.
-Start a fresh Astra diagnosis through CodingCLIAdapter in its registered unit
+Start a fresh Astra or Fable diagnosis through CodingCLIAdapter in its registered unit
 workspace/tab, with observation-only instructions and permission scope where
 supported. Diagnostics have no authority to mutate campaign state, canonical
 sources, GitHub or project policy. Verify the candidate is unchanged afterward;
@@ -475,8 +572,8 @@ Reuse the existing transactional preservation and re-arm primitives only through
 a campaign adapter that proves their supported preconditions. Generic resolve
 can reset attempts and roll back work; it is not a safe blind retry primitive.
 Preserve partial commits, recovery refs, native/session generations and source
-identity. Do not automate --force, --adopt-branch, operator confirmation or a
-global acceptance reset. Campaign lifetime diagnosis/repair counters persist
+identity. Do not automate --force, --adopt-branch, unsubstantiated operator
+confirmation or a global acceptance reset. Campaign lifetime diagnosis/repair counters persist
 across child re-arms and restarts, even where legacy attempt counters reset.
 Changed code/spec invalidates affected verification and review; successful repair
 returns to the normal delivery pipeline, never directly to delivered.
@@ -485,7 +582,8 @@ Limit resolver concurrency separately from coding/review/verification. The prese
 allows two sessions and at most two automatic resolution attempts per unit;
 repeating the same failure with unchanged evidence stops earlier. New evidence
 can support another attempt only within the remaining lifetime budget. A failed
-diagnosis or exhausted budget produces one deduplicated owner-action item with
+diagnosis or exhausted budget passes through decision evidence review, then
+produces any remaining deduplicated owner-action item with
 evidence, attempted repairs and the smallest unresolved decision, linked to the
 existing issue/PR and visible in Paradev/status. Unrelated units keep running.
 Publish resolution start, disposition and verified result through the existing
@@ -773,6 +871,18 @@ Do not rewrite environments used by live old workers. Smoke-test package import,
 CLI/JSON, profiles, native mux selection and scripted zero-token PTY lifecycle.
 Only then perform REM preflight and the staged opt-in activation above.
 
+The implementation handoff is complete only when the merged fork SHA is both
+the canonical Paradev base and the verified global installation, the REM-specific
+launch/source/merge contracts qualify, and preflight reports no unresolved gate
+to the requested autonomous mode. Exercise the full campaign on scripted,
+zero-token fixtures and the actual installed native transport. Record any real
+REM canary against an explicitly selected unit with its own draft PR and normal
+delivery evidence; do not use an LLM-spending run as an E2E test. Retire replaced
+automations only after their responsibilities are covered and existing workers
+are accounted for. Passing bmad-loop tests or installing the wheel alone does
+not establish REM readiness; an unresolved activation prerequisite leaves the
+overall outcome incomplete.
+
 ## Required qualification matrix
 
 Use existing sandbox fixtures and scripted coding sessions; no live/E2E gate
@@ -786,7 +896,8 @@ spends LLM tokens. Each negative gate gets its required ablation check.
 | GitHub gateway     | All pages, auth/rate-limit faults, lost create/update/merge replies, conflicting markers, hierarchy IDs, preserved human text and event cursor restart.                    |
 | Intake/triage      | Issue versus PR identity, edited/duplicate inputs, bot feedback, cursor crashes, existing issue reuse, scope limits, same-PR repair and safe graph revisions.              |
 | Discovery          | Active/abandoned/merged PR overlap, squash history, branch-only partial work, external ownership, stale heads, partial coverage and no duplicate admission.                |
-| Model/resolution   | Explicit Astra argv/attribution, no silent fallback, ignored-effort regression, human-only gates, verified repairs, unchanged-failure stop and persistent retry budgets.   |
+| Model/resolution   | Astra/Fable availability and attribution, exact-model refusal, fresh cross-provider attempts, effort propagation, verified repairs and persistent retry budgets.           |
+| Decision evidence  | Prior/delegated decisions, authenticated sources, spoofed summaries, scope/head drift, revocation, conditional holds, actual GitHub approvals and deduplicated owner asks. |
 | Publication        | Moving H/B, late review changes, draft/ready transitions, required app/status identity, strict-rule absence, queue candidate changes, squash/rebase, merged tracking debt. |
 | Planning/source    | Brief to planning PR to graph, malformed artifacts, existing-plan import, private shared stores, three-way unit updates, multiple initiatives and closure units.           |
 | Paradev            | Real PTY identity, same-terminal pane attach, title and native-agent read-back, missing/duplicate panes, user focus, output history after teardown, absent optional extra. |
