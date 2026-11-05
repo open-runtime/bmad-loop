@@ -7,6 +7,7 @@ and a stopped second dev with no SessionRecord. No live run is changed.
 from __future__ import annotations
 
 import copy
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -546,6 +547,90 @@ def ignored_store_implementation(accepted_implementation, request):
     assert topology.layout == request.param
     assert case.refusal() is None
     return case, ledger
+
+
+def retarget_ignored_ticket(case):
+    """Change only the ignored registry's resolution, retaining the old plan."""
+    from bmad_loop.tickettree import TicketTree
+
+    old_epic = case.plan.parent.parent
+    new_epic = old_epic.with_name("epic-other")
+    shutil.copytree(old_epic, new_epic)
+    (new_epic / f"{EPIC}.md").rename(new_epic / "epic-other.md")
+    registry = old_epic.parent / "tickets.toml"
+    registry.write_text(registry.read_text().replace(f'slug = "{EPIC}"', 'slug = "epic-other"'))
+    found = TicketTree(case.root).find(KEY)
+    assert Path(found.plan) == new_epic / "tickets" / case.plan.name
+    assert case.plan.is_file()
+
+
+@pytest.mark.parametrize("boundary", ["admission", "confirmation", "dispatch"])
+def test_ignored_registry_retarget_refuses_recovery(ignored_store_implementation, boundary):
+    case, _ledger = ignored_store_implementation
+    assert case.refusal() is None
+    evidence = accepted_review._evidence(
+        case.state,
+        case.task,
+        KEY,
+        case.implementation,
+        run_dir=case.run_dir,
+        project_root=case.root,
+        require_stopped=True,
+    )
+    if boundary == "dispatch":
+        runs.rearm_for_implemented_review(
+            case.run_dir, KEY, case.implementation, project_root=case.root
+        )
+        state = load_state(case.run_dir)
+        assert (
+            accepted_review.pending_review_refusal(state, state.tasks[KEY], case.run_dir, case.root)
+            is None
+        )
+    before = (case.run_dir / "state.json").read_bytes()
+    original_plan = case.plan.read_bytes()
+    retarget_ignored_ticket(case)
+    assert case.plan.read_bytes() == original_plan
+    if boundary == "admission":
+        assert case.refusal() is not None
+    elif boundary == "confirmation":
+        with pytest.raises(runs.RearmError):
+            runs.rearm_for_implemented_review(
+                case.run_dir,
+                KEY,
+                case.implementation,
+                project_root=case.root,
+                expected_evidence=evidence,
+            )
+    else:
+        assert (
+            accepted_review.pending_review_refusal(state, state.tasks[KEY], case.run_dir, case.root)
+            is not None
+        )
+    assert (case.run_dir / "state.json").read_bytes() == before
+
+
+def test_source_rename_into_plan_is_not_plan_only_dirt(accepted_implementation):
+    case = accepted_implementation
+    rel = case.plan.relative_to(case.root).as_posix()
+    # T1 remains tracked, while the operator's current plan is initially untracked.
+    git(case.root, "rm", "--cached", rel)
+    git(case.root, "commit", "-qm", "keep current plan outside the index")
+    assert case.refusal() is None
+    original_plan = case.plan.read_bytes()
+    git(case.root, "mv", "-f", "crate-readme.md", rel)
+    case.plan.write_bytes(original_plan)
+    dirty = verify.dirty_paths(case.root)
+    assert set(dirty) == {rel}
+    assert "R" in dirty[rel]
+    before = (case.run_dir / "state.json").read_bytes()
+    index = git(case.root, "ls-files", "--stage")
+    with pytest.raises(runs.RearmError, match="renames or copies"):
+        runs.rearm_for_implemented_review(
+            case.run_dir, KEY, case.implementation, project_root=case.root
+        )
+    assert (case.run_dir / "state.json").read_bytes() == before
+    assert git(case.root, "ls-files", "--stage") == index
+    assert case.plan.read_bytes() == original_plan
 
 
 @pytest.mark.parametrize("boundary", ["confirmation", "dispatch"])

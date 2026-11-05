@@ -9,6 +9,9 @@ from test_accepted_review_recovery import accepted_implementation as _accepted_i
 from test_accepted_review_recovery import (
     ignored_store_implementation as _ignored_store_implementation,
 )
+from test_accepted_review_recovery import (
+    retarget_ignored_ticket,
+)
 from test_engine import _dev_verify_crash_state, make_engine
 
 from bmad_loop import bmadconfig, cli, runs, verify
@@ -558,6 +561,26 @@ def test_ignored_store_hook_ledger_edit_never_launches_or_commits(
     assert not adapter.sessions
     assert verify.rev_parse_head(case.root) == head
     assert ledger.read_text() == "Hook-owned unfinished work.\n"
+
+
+def test_ignored_store_hook_retarget_never_launches_review(
+    ignored_store_implementation, monkeypatch
+):
+    case, _ledger = ignored_store_implementation
+    engine, adapter = _armed_engine(case)
+    task = engine.state.tasks[case.task.story_key]
+    head = verify.rev_parse_head(case.root)
+    adapter.script.append(lambda _spec: pytest.fail("launched with a retargeted ticket reference"))
+
+    def hook(_task, _role, prompt, env, _stage):
+        retarget_ignored_ticket(case)
+        return prompt, env, None
+
+    monkeypatch.setattr(engine, "_emit_session_gate", hook)
+    with pytest.raises(RunPaused):
+        engine._resume_after_dev_verify(task)
+    assert not adapter.sessions
+    assert verify.rev_parse_head(case.root) == head
 
 
 def test_recovery_does_not_refund_same_reservation_twice(accepted_implementation, monkeypatch):

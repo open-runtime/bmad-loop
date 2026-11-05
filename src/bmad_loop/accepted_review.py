@@ -14,7 +14,7 @@ import stat
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import bmadconfig, devcontract, frontmatter, policy, ticketstore, verify
+from . import bmadconfig, devcontract, frontmatter, policy, ticketstore, tickettree, verify
 from .journal import Journal, load_state, save_state, state_lock
 from .model import Phase, RunState, SessionRecord, StoryTask
 from .platform_util import session_task_id
@@ -215,6 +215,19 @@ def _evidence(
     plan = runs.task_spec_path(task, state).resolve(strict=True)
     require(plan == Path(task.ticket.plan).resolve(strict=True), "the bound plan changed")
     require(plan.is_relative_to(root), "the plan is outside the code checkout")
+    pin, folder = runs.tree_pin(state, paths)
+    try:
+        found = tickettree.TicketTree(project_root, pinned_initiative=pin, folder=folder).find(
+            task.ticket.ref
+        )
+    except tickettree.TicketsError as exc:
+        raise ValueError(f"the live ticket reference cannot be verified: {exc}") from exc
+    require(
+        found.row.ref == task.ticket.ref
+        and found.row.id == str(task.ticket.id)
+        and Path(found.plan).resolve(strict=True) == plan,
+        "the live ticket reference no longer names the bound plan",
+    )
     fm = frontmatter.parse_frontmatter(plan.read_bytes().decode("utf-8"))
     require(str(fm.get("ticket")) == str(task.ticket.id), "the plan names another ticket")
     require(task.ticket.ref == story_key, "the ticket binding names another story")
@@ -321,8 +334,15 @@ def _evidence(
             ),
             "the recorded implementation is no longer present in the retained source",
         )
+    dirty = verify.dirty_paths(root)
+    # dirty_paths names only rename/copy destinations. A destination equal to
+    # the plan must not conceal an uncommitted source removal from this proof.
     require(
-        not (set(verify.dirty_paths(root)) - {plan.relative_to(root).as_posix()}),
+        not any("R" in status or "C" in status for status in dirty.values()),
+        "uncommitted renames or copies must be preserved first",
+    )
+    require(
+        not (set(dirty) - {plan.relative_to(root).as_posix()}),
         "uncommitted source or ledger outside the bound plan must be preserved first",
     )
     require(
