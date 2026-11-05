@@ -86,6 +86,7 @@ from .platform_util import (
     retrying_unlink,
     root_identity_record,
     safe_segment,
+    session_task_id,
 )
 from .process_host import ProcessHostError, get_process_host
 
@@ -4704,7 +4705,8 @@ def escalation_story_admitted(state: RunState, story_key: str) -> bool:
 def deferred_timeout_rearmable(state: RunState, task: StoryTask, story_key: str) -> bool:
     """Whether a deferred partial attempt can use the in-place restart path.
 
-    A completed dev attempt still uses re-verification. A timeout needs a fresh
+    A completed dev attempt still uses re-verification. A timeout, including its
+    linked retry that crashed before binding a native session, needs a fresh
     dev session instead, but only while this task still owns the paused tree.
     Workflow sessions are not the story's attempt. SessionRecord does not persist
     produced_work, so admission uses the latest primary dev status, not prose.
@@ -4721,15 +4723,26 @@ def deferred_timeout_rearmable(state: RunState, task: StoryTask, story_key: str)
         or next(reversed(state.tasks)) != story_key
     ):
         return False
-    latest = next(
-        (
-            session
-            for session in reversed(task.sessions)
-            if session.role == "dev" and not session.label
-        ),
-        None,
+    primary = [session for session in task.sessions if session.role == "dev" and not session.label]
+    if not primary:
+        return False
+    latest = primary[-1]
+    if latest.status == "timeout":
+        return True
+    if len(primary) < 2 or task.attempt < 2:
+        return False
+    previous = primary[-2]
+    return (
+        latest.status == "crashed"
+        and not latest.session_id
+        and latest.result_json is None
+        and previous.status == "timeout"
+        and previous.result_json is None
+        and bool(previous.session_id)
+        and latest.resumed_from == previous.session_id
+        and latest.task_id == session_task_id(story_key, "dev", task.attempt, task.generation)
+        and previous.task_id == session_task_id(story_key, "dev", task.attempt - 1, task.generation)
     )
-    return latest is not None and latest.status == "timeout"
 
 
 def validate_restore_latch(

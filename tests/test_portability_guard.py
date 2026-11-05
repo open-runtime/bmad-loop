@@ -19,7 +19,7 @@ prose alone (or by nothing):
 
 * the task-directory artifact names are ``journal.TASK_CYCLE_ARTIFACTS`` and not a
   literal repeated per reader/writer — ``test_task_cycle_artifacts_named_only_through_the_constant``
-* a session task id is composed only in ``engine._session_task_id`` —
+* a session task id is composed only in ``platform_util.session_task_id`` —
   ``test_session_task_id_composed_only_at_the_chokepoint``
 * every journal field name a call spells is either routed by ``diagnostics``'
   redaction tables — by name, or by name-and-kind — or declared benign:
@@ -229,9 +229,9 @@ TASK_ARTIFACT_LITERAL_ALLOW = {
 }
 
 # The one file allowed to COMPOSE a session task id, and within it only inside
-# ``_session_task_id`` — keyed file -> the ONE enclosing function, like
-# ``VERIFY_CLASSIFY_CHOKEPOINT``. Every mint site (`engine.py` ×3, `resolve.py`)
-# calls it; none spells the format itself.
+# ``session_task_id`` — keyed file -> the ONE enclosing function, like
+# ``VERIFY_CLASSIFY_CHOKEPOINT``. Mint sites call it, through the engine's legacy
+# alias where needed; none spells the format itself.
 #
 # The sanction is a POSITION, not the file: engine.py is where a fifth mint would
 # most naturally be written (it already binds `task_id` three times), so a file-wide
@@ -239,7 +239,7 @@ TASK_ARTIFACT_LITERAL_ALLOW = {
 # function's own docstring states why every caller must be byte-identical —
 # ``_resumable_session``'s resume match, and the ``-g<N>`` re-arm discriminator that
 # a hand-rolled fourth mint would omit (#705).
-SESSION_TASK_ID_CHOKEPOINT = {"engine.py": "_session_task_id"}
+SESSION_TASK_ID_CHOKEPOINT = {"platform_util.py": "session_task_id"}
 
 # The complete set of ``runs.rearm_escalation`` call sites, as
 # ``(file, enclosing function)``. Serialization now comes from the shared run-state
@@ -4538,7 +4538,8 @@ def _scan_source(src: str, rel: str):
                 )
             )
 
-    # A session task id COMPOSED rather than obtained from `engine._session_task_id`.
+    # A session task id COMPOSED rather than obtained from the canonical helper
+    # (or its `engine._session_task_id` compatibility alias).
     # Two value positions, because those are the two a fifth mint can occupy: a
     # binding (`task_id = …`, `SessionSpec(task_id=…)`) and a return from a function
     # named for what it returns. A forward — `task_id=spec.task_id`,
@@ -5510,7 +5511,7 @@ def _session_task_id_offenders(findings) -> list[tuple[str, int, str]]:
 
 
 def test_session_task_id_composed_only_at_the_chokepoint():
-    """Every session task id is composed in ``engine._session_task_id`` and nowhere
+    """Every session task id is composed in ``platform_util.session_task_id`` and nowhere
     else.
 
     The four mint sites (``engine.py`` ×3, ``resolve.py``) all call it and bind or
@@ -5531,7 +5532,7 @@ def test_session_task_id_composed_only_at_the_chokepoint():
 
     * the SANCTION, yes. The chokepoint's own ``return safe_segment(f"…")`` is a
       real finding on today's tree, cleared only by its position, so emptying
-      ``SESSION_TASK_ID_CHOKEPOINT`` reddens this naming ``engine.py:393``. That is
+      ``SESSION_TASK_ID_CHOKEPOINT`` reddens this naming the canonical composer. That is
       more than the sibling guards' repo-wide assertions can say for themselves.
     * the DETECTOR, no. Delete the ``taskid`` emit and this goes green with an empty
       finding list — indistinguishable from an invariant that holds.
@@ -5542,7 +5543,7 @@ def test_session_task_id_composed_only_at_the_chokepoint():
     ``task_id=f"{story_key}-resolve-1"`` and this reddens naming that line."""
     offenders = _session_task_id_offenders(_of("taskid"))
     assert offenders == [], (
-        "a session task id composed outside engine._session_task_id — call that "
+        "a session task id composed outside platform_util.session_task_id — call that "
         "function instead, so the id keeps its whole-composition sanitize and its "
         "-g<N> re-arm generation suffix (#705):\n"
         + "\n".join(f"  {rel}:{ln}: {txt.strip()}" for rel, ln, txt in offenders)
@@ -8310,8 +8311,8 @@ SESSION_TASK_ID_SCOPE_CASES = [
     # The real chokepoint, in the shape it ships.
     (
         "sanctioned-chokepoint",
-        "engine.py",
-        "def _session_task_id(story_key, part, seq, generation):\n"
+        "platform_util.py",
+        "def session_task_id(story_key, part, seq, generation):\n"
         '    gen = f"-g{generation}" if generation > 0 else ""\n'
         '    return safe_segment(f"{story_key}-{part}-{seq}{gen}")\n',
         False,
@@ -8327,12 +8328,19 @@ SESSION_TASK_ID_SCOPE_CASES = [
         "    return task_id\n",
         True,
     ),
+    (
+        "platform-other-function",
+        "platform_util.py",
+        "def other_task_id(story_key, part, seq, generation):\n"
+        '    return safe_segment(f"{story_key}-{part}-{seq}")\n',
+        True,
+    ),
     # The name does not travel: the same function grown in another module cannot
     # sanction itself, which is why the sanction pairs the function with the FILE.
     (
         "chokepoint-name-in-another-file",
         "sweep.py",
-        "def _session_task_id(story_key, part, seq, generation):\n"
+        "def session_task_id(story_key, part, seq, generation):\n"
         '    return safe_segment(f"{story_key}-{part}-{seq}")\n',
         True,
     ),
@@ -8354,8 +8362,8 @@ SESSION_TASK_ID_SCOPE_CASES = [
     # matching how the verify sanctions treat closures.
     (
         "nested-inside-chokepoint",
-        "engine.py",
-        "def _session_task_id(story_key, part, seq, generation):\n"
+        "platform_util.py",
+        "def session_task_id(story_key, part, seq, generation):\n"
         "    def compose():\n"
         '        return f"{story_key}-{part}-{seq}"\n'
         "    return safe_segment(compose())\n",
@@ -8368,16 +8376,16 @@ SESSION_TASK_ID_SCOPE_CASES = [
     # `for inner in ast.walk(fn)` in `sanctioned_task_id_nodes` and both rows FAIL.
     (
         "decorator-bypass",
-        "engine.py",
+        "platform_util.py",
         '@register(SessionSpec(task_id=f"{story_key}-dev-1", prompt=p))\n'
-        "def _session_task_id(story_key, part, seq, generation):\n"
+        "def session_task_id(story_key, part, seq, generation):\n"
         "    return safe_segment(story_key)\n",
         True,
     ),
     (
         "default-arg-bypass",
-        "engine.py",
-        "def _session_task_id(\n"
+        "platform_util.py",
+        "def session_task_id(\n"
         '    story_key, part, seq, generation, *, spec=SessionSpec(task_id=f"{k}-dev-1", prompt=p)\n'
         "):\n"
         "    return safe_segment(story_key)\n",
@@ -8392,7 +8400,7 @@ SESSION_TASK_ID_SCOPE_CASES = [
     ids=[c[0] for c in SESSION_TASK_ID_SCOPE_CASES],
 )
 def test_session_task_id_exemption_is_scoped_to_the_chokepoint(label, rel, source, is_offender):
-    """Being engine.py buys the file its `_session_task_id` body and nothing wider.
+    """Being platform_util.py buys only its `session_task_id` body and nothing wider.
     Without this, the sanction could go back to a bare file set and every assertion
     here would stay green — the difference only shows up on a fifth mint, which is
     the only kind a tripwire is for."""

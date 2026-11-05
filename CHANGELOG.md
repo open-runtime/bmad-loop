@@ -7,6 +7,12 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+## [0.13.9] — 2026-11-05
+
+### Fixed
+
+- Re-arm deferred timeouts when their linked retry crashed before binding a native session.
+
 ## [0.13.8] — 2026-11-04
 
 ### Fixed
@@ -6799,7 +6805,8 @@ enforced in CI.
   implementation phase, driven by a Python control loop with hook-based session transport and
   resumable on-disk run state.
 
-[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.13.8...HEAD
+[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.13.9...HEAD
+[0.13.9]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.9
 [0.13.8]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.8
 [0.13.7]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.7
 [0.13.6]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.6

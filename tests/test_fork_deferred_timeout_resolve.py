@@ -5,16 +5,26 @@ from __future__ import annotations
 import copy
 import dataclasses
 import json
+from types import SimpleNamespace
 
 import pytest
-from conftest import dev_effect, git, install_bmad_config, spec_path, write_ledger, write_sprint
+from conftest import (
+    dev_effect,
+    git,
+    install_bmad_config,
+    spec_path,
+    write_ledger,
+    write_spec,
+    write_sprint,
+)
 from test_engine import _committing_dev, _reverify_policy, make_engine, resume_engine
 
 from bmad_loop import cli, resolve, runs, verify
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.journal import load_state, save_state
 from bmad_loop.model import PAUSE_ESCALATION, Phase, RunState, SessionRecord, StoryTask
-from bmad_loop.policy import ReviewPolicy
+from bmad_loop.platform_util import session_task_id
+from bmad_loop.policy import AdapterPolicy, RecoveryPolicy, ReviewPolicy
 
 KEY = "1-1-a"
 
@@ -25,6 +35,16 @@ def _deferred_attempt(project, tmp_path, *, latest="timeout"):
     write_ledger(project, {"DW-1": "open"})
     marker = tmp_path / "verification-ready"
     policy = dataclasses.replace(_reverify_policy(marker), review=ReviewPolicy(enabled=False))
+    unbound_retry = latest == "unbound-retry"
+    if unbound_retry:
+        policy = dataclasses.replace(
+            policy,
+            adapter=AdapterPolicy(name="codex"),
+            recovery=RecoveryPolicy(max_session_resumes=2),
+        )
+        write_spec(
+            spec_path(project, KEY), "in-progress", git(project.project, "rev-parse", "HEAD")
+        )
 
     def timeout_with_work(_spec):
         partial = project.project / "partial.txt"
@@ -35,29 +55,59 @@ def _deferred_attempt(project, tmp_path, *, latest="timeout"):
             source.write("unfinished source edit\n")
         with spec_path(project, KEY).open("a", encoding="utf-8") as spec:
             spec.write("\nKeep the partial implementation and finish it.\n")
+        transcript = tmp_path / "claude-native.jsonl"
+        transcript.write_text("{}\n", encoding="utf-8")
         return SessionResult(
             status="timeout",
             produced_work=True,
             session_id="timed-out-conversation",
-            result_json={"spec_file": str(spec_path(project, KEY)), "status": "in-progress"},
+            transcript_path=str(transcript),
+            result_json=(
+                None
+                if unbound_retry
+                else {"spec_file": str(spec_path(project, KEY)), "status": "in-progress"}
+            ),
         )
 
     engine, adapter = make_engine(
         project,
         [
-            _committing_dev(project, KEY, "first-attempt.txt"),
             (
                 timeout_with_work
-                if latest == "timeout"
-                else _committing_dev(project, KEY, "second-attempt.txt")
+                if unbound_retry
+                else _committing_dev(project, KEY, "first-attempt.txt")
+            ),
+            (
+                (lambda spec: SessionResult(status="crashed", resumed_from=spec.resume_session_id))
+                if unbound_retry
+                else (
+                    timeout_with_work
+                    if latest == "timeout"
+                    else _committing_dev(project, KEY, "second-attempt.txt")
+                )
             ),
         ],
         policy=policy,
     )
+    if unbound_retry:
+        adapter.profile = SimpleNamespace(resumable=True)
+        engine.state.tasks[KEY] = StoryTask(
+            story_key=KEY, epic=1, spec_file=str(spec_path(project, KEY))
+        )
     summary = engine.run()
     task = engine.state.tasks[KEY]
     assert summary.paused and task.phase == Phase.DEFERRED
-    assert len(adapter.sessions) == 2 and task.sessions[-1].status == latest
+    assert len(adapter.sessions) == 2
+    if unbound_retry:
+        timeout, crash = task.sessions
+        assert timeout.status == "timeout" and timeout.adapter == "codex"
+        assert timeout.session_id == "timed-out-conversation" and timeout.result_json is None
+        assert crash.status == "crashed" and crash.adapter == "codex"
+        assert crash.session_id is None and crash.result_json is None
+        assert crash.resumed_from == timeout.session_id
+        assert adapter.sessions[1].resume_session_id == timeout.session_id
+    else:
+        assert task.sessions[-1].status == latest
     decisions = [row for row in engine.journal.entries() if row["kind"] == "dev-decision"]
     assert decisions[-1]["produced_work"] is True
     with project.deferred_work.open("a", encoding="utf-8") as ledger:
@@ -93,10 +143,11 @@ def _no_launch(monkeypatch):
 
 
 @pytest.mark.parametrize("later_workflow", [False, True])
+@pytest.mark.parametrize("latest", ["timeout", "unbound-retry"])
 def test_resolve_deferred_timeout_keeps_work_and_starts_one_fresh_dev(
-    project, tmp_path, monkeypatch, capsys, later_workflow
+    project, tmp_path, monkeypatch, capsys, later_workflow, latest
 ):
-    engine, marker = _deferred_attempt(project, tmp_path)
+    engine, marker = _deferred_attempt(project, tmp_path, latest=latest)
     if later_workflow:
         state = load_state(engine.run_dir)
         state.tasks[KEY].sessions.append(
@@ -181,23 +232,30 @@ def test_resolve_completed_verify_failure_still_requires_reverify(
     assert armed.phase == Phase.DEV_VERIFY and armed.reverify_from == "deferred"
 
 
-def test_reverify_still_refuses_latest_timeout_partial_work(project, tmp_path, monkeypatch, capsys):
-    engine, _marker = _deferred_attempt(project, tmp_path)
+@pytest.mark.parametrize("latest", ["timeout", "unbound-retry"])
+def test_reverify_still_refuses_latest_timeout_partial_work(
+    project, tmp_path, monkeypatch, capsys, latest
+):
+    engine, _marker = _deferred_attempt(project, tmp_path, latest=latest)
     before = (engine.run_dir / "state.json").read_bytes()
     _no_launch(monkeypatch)
 
     assert _resolve(project, "--reverify") == 1
 
     error = capsys.readouterr().err
-    assert "ended timeout" in error and "partial work" in error
+    if latest == "unbound-retry":
+        assert "no completed dev session result" in error
+    else:
+        assert "ended timeout" in error and "partial work" in error
     assert (engine.run_dir / "state.json").read_bytes() == before
 
 
 @pytest.mark.parametrize("isolation", ["mounted", "policy"])
+@pytest.mark.parametrize("latest", ["timeout", "unbound-retry"])
 def test_resolve_timeout_refuses_isolated_restart_before_writes(
-    project, tmp_path, monkeypatch, isolation
+    project, tmp_path, monkeypatch, isolation, latest
 ):
-    engine, _marker = _deferred_attempt(project, tmp_path)
+    engine, _marker = _deferred_attempt(project, tmp_path, latest=latest)
     if isolation == "mounted":
         state = load_state(engine.run_dir)
         state.tasks[KEY].worktree_path = str(tmp_path / "kept-unit")
@@ -216,13 +274,16 @@ def test_resolve_timeout_refuses_isolated_restart_before_writes(
     assert spec_path(project, KEY).read_bytes() == spec
 
 
-def test_deferred_timeout_baseline_probe_fault_refuses_transaction(project, tmp_path, monkeypatch):
+@pytest.mark.parametrize("latest", ["timeout", "unbound-retry"])
+def test_deferred_timeout_baseline_probe_fault_refuses_transaction(
+    project, tmp_path, monkeypatch, latest
+):
     """A timeout re-drive cannot authorize reset to an unverified old baseline.
 
     Ablation: retain the old best-effort baseline-probe handler for this lane;
     no RearmError propagates and the DEFERRED state is spent despite the fault.
     """
-    engine, _marker = _deferred_attempt(project, tmp_path)
+    engine, _marker = _deferred_attempt(project, tmp_path, latest=latest)
     before = (engine.run_dir / "state.json").read_bytes()
     spec = spec_path(project, KEY).read_bytes()
     head = git(project.project, "rev-parse", "HEAD")
@@ -247,10 +308,99 @@ def test_deferred_timeout_baseline_probe_fault_refuses_transaction(project, tmp_
     assert git(project.project, "rev-parse", "HEAD") == head
 
 
+def _unbound_retry_state(*, generation=0, key=KEY):
+    task = StoryTask(story_key=key, epic=1, phase=Phase.DEFERRED, attempt=2, generation=generation)
+    task.sessions = [
+        SessionRecord(
+            task_id=session_task_id(key, "dev", 1, generation),
+            role="dev",
+            status="timeout",
+            session_id="original-native",
+        ),
+        SessionRecord(
+            task_id=session_task_id(key, "dev", 2, generation),
+            role="dev",
+            status="crashed",
+            resumed_from="original-native",
+        ),
+    ]
+    state = RunState(
+        run_id="test-run",
+        project="sandbox",
+        started_at="now",
+        tasks={key: task},
+        paused_reason="manual recovery",
+        paused_stage=PAUSE_ESCALATION,
+        paused_story_key=key,
+    )
+    return state, task
+
+
+@pytest.mark.parametrize("generation,key", [(0, KEY), (8, KEY), (8, "k" * 130)])
+def test_linked_unbound_retry_admits_only_its_current_chain(generation, key):
+    state, task = _unbound_retry_state(generation=generation, key=key)
+    assert runs.deferred_timeout_rearmable(state, task, key)
+
+
+@pytest.mark.parametrize(
+    "conflict",
+    [
+        "bound-crash",
+        "crash-result",
+        "timeout-result",
+        "wrong-link",
+        "missing-link",
+        "missing-native",
+        "prior-not-timeout",
+        "latest-not-crashed",
+        "stale-latest",
+        "stale-previous",
+        "old-generation",
+        "single-record",
+        "wrong-phase",
+    ],
+)
+def test_unbound_retry_refuses_conflicting_or_unrelated_history(conflict):
+    """Ablation: removing each corresponding admission guard admits its conflict."""
+    state, task = _unbound_retry_state(generation=8)
+    assert runs.deferred_timeout_rearmable(state, task, KEY)
+    previous, latest = task.sessions
+    if conflict == "bound-crash":
+        latest.session_id = "another-native"
+    elif conflict == "crash-result":
+        latest.result_json = {}
+    elif conflict == "timeout-result":
+        previous.result_json = {}
+    elif conflict == "wrong-link":
+        latest.resumed_from = "unrelated-native"
+    elif conflict == "missing-link":
+        latest.resumed_from = ""
+    elif conflict == "missing-native":
+        previous.session_id = ""
+        latest.resumed_from = ""
+    elif conflict == "prior-not-timeout":
+        previous.status = "crashed"
+    elif conflict == "latest-not-crashed":
+        latest.status = "stalled"
+    elif conflict == "stale-latest":
+        latest.task_id = session_task_id(KEY, "dev", 3, task.generation)
+    elif conflict == "stale-previous":
+        previous.task_id = session_task_id(KEY, "dev", 3, task.generation)
+    elif conflict == "old-generation":
+        task.generation += 1
+    elif conflict == "single-record":
+        task.sessions.pop(0)
+    else:
+        task.phase = Phase.ESCALATED
+
+    assert not runs.deferred_timeout_rearmable(state, task, KEY)
+
+
 @pytest.mark.parametrize(
     "disqualified", ["finished", "sweep", "wrong-owner", "later-task", "no-dev", "mounted"]
 )
-def test_deferred_timeout_rearm_requires_owned_unfinished_attempt(disqualified):
+@pytest.mark.parametrize("unbound_retry", [False, True])
+def test_deferred_timeout_rearm_requires_owned_unfinished_attempt(disqualified, unbound_retry):
     """Ablation: returning True from the admission predicate breaks every row."""
     task = StoryTask(story_key=KEY, epic=1, phase=Phase.DEFERRED)
     task.sessions.append(SessionRecord(task_id="timed-out-dev", role="dev", status="timeout"))
@@ -263,6 +413,8 @@ def test_deferred_timeout_rearm_requires_owned_unfinished_attempt(disqualified):
         paused_stage=PAUSE_ESCALATION,
         paused_story_key=KEY,
     )
+    if unbound_retry:
+        state, task = _unbound_retry_state()
     assert runs.deferred_timeout_rearmable(state, task, KEY)
     if disqualified == "finished":
         state.finished = True
