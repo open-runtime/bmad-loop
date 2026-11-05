@@ -278,6 +278,11 @@ _JOURNAL_ALIAS_FIELDS = {
 # a generic name (`state.source` is a run mode). The producers keep the name for the
 # same correlation reason too — `_replay_unlatched_ledger_carries` keys on it.
 _JOURNAL_KIND_ALIAS_FIELDS: dict[str, dict[str, str]] = {
+    # Explicit native recovery correlates through opaque session/task aliases;
+    # its profile digest and transcript-derived identity stay local below.
+    "stopped-native-armed": {"session_id": "session", "artifact_task_id": "story"},
+    "stopped-native-completed": {"session_id": "session"},
+    "native-resume-refused": {"session_id": "session"},
     "unit-merge-started": {
         "target": "branch",
         "operation_id": "operation",
@@ -395,6 +400,9 @@ _JOURNAL_DROP_FIELDS = frozenset(
         "stderr_path",
         # Recovery-only nested HEAD/tree identities stay in the local journal.
         "verification_source",
+        # Native binding carries operator-selected profile names and may carry
+        # transcript errors. Shared diagnostics need only its presence.
+        "native_binding",
         # An absolute host path naming the run's code tree
         # (`rearm-baseline-advance-failed`). Dropped rather than aliased: unlike a
         # spec filename it correlates nothing across events — one run has one code

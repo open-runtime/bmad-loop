@@ -490,7 +490,7 @@ def test_run_git_locale_merge_preserves_explicit_env(project, monkeypatch):
 @pytest.mark.skipif(
     sys.platform == "win32", reason="Windows filenames are UTF-16; no undecodable path exists"
 )
-def test_z_output_undecodable_path_becomes_git_error(project):
+def test_z_output_undecodable_path_becomes_git_error(project, requires_non_utf8_filenames):
     """#377: a filename carrying bytes invalid in the run's codec makes `_run_git`'s
     strict decode raise UnicodeDecodeError — a third fault raised before any return
     code exists, and the one the taxonomy missed. Being a ValueError it matched
@@ -5896,7 +5896,9 @@ def test_safe_rollback_preserves_file_to_directory_replacement(project):
     sys.platform == "win32", reason="Windows filenames are UTF-16; no undecodable path exists"
 )
 @pytest.mark.parametrize("replace_with_directory", [False, True], ids=["deleted", "replaced"])
-def test_safe_rollback_reads_preserved_deletion_inventory_as_bytes(project, replace_with_directory):
+def test_safe_rollback_reads_preserved_deletion_inventory_as_bytes(
+    project, replace_with_directory, requires_non_utf8_filenames
+):
     """Protected deletion inventories keep POSIX filenames as bytes until use.
 
     The plain-deletion row exercises ``git diff --name-only -z`` and the later

@@ -1284,3 +1284,20 @@ def test_probe_argv_carries_codex_launch_args(monkeypatch):
     assert argv[:2] == ["/bin/codex", "--no-daemon"]
     assert argv[2] == probe.PROBE_PROMPT
     assert "--dangerously-bypass-approvals-and-sandbox" in argv[3:]
+
+
+@pytest.mark.parametrize("component", ["home", "Users", "root"])
+def test_nested_wrapper_home_location_remains_safe_to_render(tmp_path, monkeypatch, component):
+    monkeypatch.setattr(probe.os.path, "expanduser", lambda _: str(tmp_path))
+    transcript = tmp_path / "runtime" / component / "sessions" / "turn.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text("{}\n", encoding="utf-8")
+    finding = probe.ProfileFinding(
+        cli="codex", mode="scan", known_profile=False, binary="codex", parser="none"
+    )
+    finding.transcript = probe._describe_transcript(transcript, glob_pat=None, multiple=False)
+
+    rendered = probe.render_json(finding)
+
+    assert component not in finding.transcript.location.split("/")
+    assert json.loads(rendered)["transcript"]["location"].endswith("/sessions/turn.jsonl")

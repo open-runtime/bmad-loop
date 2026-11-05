@@ -24,6 +24,52 @@ from bmad_loop.journal import UNREADABLE_LINE_KIND, Journal, load_state, save_st
 from bmad_loop.model import Phase, RunState, SessionRecord, StoryTask, TokenUsage
 from bmad_loop.policy import Policy
 
+
+@pytest.mark.parametrize(
+    "kind,fields",
+    [
+        (
+            "stopped-native-armed",
+            {
+                "session_id": "native-customer-secret",
+                "artifact_task_id": "customer-dev-1-continue1",
+            },
+        ),
+        ("stopped-native-completed", {"session_id": "native-customer-secret"}),
+        (
+            "native-resume-refused",
+            {"session_id": "native-customer-secret", "reason": "customer-profile-secret"},
+        ),
+        ("stopped-native-refused", {"reason": "customer-profile-secret"}),
+        (
+            "session-bound",
+            {
+                "native_binding": {
+                    "profile": "customer-profile-secret",
+                    "error": "/Users/private/transcript",
+                }
+            },
+        ),
+    ],
+)
+def test_native_recovery_journal_fields_are_redacted(kind, fields):
+    pseudo = sanitize.Pseudonymizer()
+    result = diagnostics._scrub_entry({"kind": kind, **fields}, pseudo, {}, None)
+    raw = json.dumps(result)
+    assert "native-customer-secret" not in raw
+    assert "customer-profile-secret" not in raw
+    assert "customer-dev-1-continue1" not in raw
+    assert "/Users/private/transcript" not in raw
+    for key, value in fields.items():
+        if key in {"reason", "native_binding"}:
+            assert key not in result
+            assert result[f"{key}_present"] is True
+        else:
+            assert result[key] != value
+            expected_ns = "session" if key == "session_id" else "story"
+            assert result[key] == pseudo.alias(value, ns=expected_ns)
+
+
 # Labelled canaries planted across the run dir. NONE may appear in the dump.
 EMAIL = "victim.canary@example.com"
 STORY_KEY = "1.2-AcmeQuantumBillingEngine"

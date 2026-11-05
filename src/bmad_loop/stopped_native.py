@@ -122,7 +122,7 @@ def snapshot(state: RunState, task: StoryTask, project: Path) -> dict[str, Any]:
         )
 
     def git_bytes(*args: str) -> bytes:
-        proc = verify._run_git(["git", "-C", str(root), *args], root, binary=True)
+        proc = verify.git_bytes(root, *args)
         _require(proc.returncode == 0, "cannot snapshot source")
         return proc.stdout
 

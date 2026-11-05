@@ -8905,7 +8905,7 @@ def test_shield_seeds_an_excludesfile_whose_path_has_edge_whitespace(project, tm
 @pytest.mark.skipif(
     sys.platform == "win32", reason="POSIX-only: a 0xff byte cannot be a Windows filename"
 )
-def test_shield_preserves_a_non_utf8_excludesfile(project, tmp_path):
+def test_shield_preserves_a_non_utf8_excludesfile(project, tmp_path, requires_non_utf8_filenames):
     """The regression the bytes conversion fixed (#384): the seed is a VERBATIM BYTE
     COPY, so an operator's excludes file that is not UTF-8 survives it intact.
 
@@ -10112,7 +10112,9 @@ def test_worktree_local_exclude_short_write_leaves_exclude_intact(project, tmp_p
     sys.platform == "win32",
     reason="POSIX-only fault: Windows paths are UTF-16, so git cannot emit an undecodable path",
 )
-def test_worktree_local_exclude_undecodable_git_output_degrades(tmp_path, monkeypatch):
+def test_worktree_local_exclude_undecodable_git_output_degrades(
+    tmp_path, monkeypatch, requires_non_utf8_filenames
+):
     """#374: the git-query arm used `text=True`, decoding stdout strictly, so a
     repo path with bytes invalid in the locale encoding raised UnicodeDecodeError
     — a type in NEITHER arm's tuple, straight out of a function whose whole

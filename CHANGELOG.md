@@ -20,6 +20,9 @@ breaking changes may land in a minor release.
 - Validate native harness and launch-profile bindings before resuming a conversation.
 - Retain per-model usage and unread-transcript diagnostics when charging resumed sessions.
 - Install the open-runtime fork from its setup skill and installation examples.
+- Preserve continuation identity when recovering a completed session that lost its Stop event.
+- Redact nested wrapper home directories without refusing safe adapter probe reports.
+- Register recovery diagnostics and check filename-test support on the target filesystem.
 - Preserve retry decisions and escalation state before notifying or relaunching a session.
 - Keep unfinished source and ledger edits during usage-limit relaunches and recheck environment gates.
 - Improve per-model token accounting, descendant activity tracking and OpenCode budget enforcement.

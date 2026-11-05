@@ -7,18 +7,84 @@ import time
 from types import SimpleNamespace
 
 import pytest
-from conftest import _OK, install_bmad_config, write_spec, write_sprint
+from conftest import (
+    _OK,
+    EntrySpec,
+    EpicSpec,
+    git,
+    install_bmad_config,
+    write_plan,
+    write_spec,
+    write_sprint,
+    write_ticket_tree,
+)
 from test_engine import _dev_verify_crash_state, make_engine
 
-from bmad_loop import cli, runs, verify
+from bmad_loop import bmadconfig, cli, policy, runs, ticketstore, verify
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.profile import get_profile
 from bmad_loop.journal import load_state
-from bmad_loop.model import Phase
+from bmad_loop.model import Phase, RunState, StoryTask, TicketBinding
 from bmad_loop.native_binding import capture_binding
 from bmad_loop.policy import RecoveryPolicy, VerifyPolicy
 
 NATIVE = "01a1aafb-e50b-7020-a9f4-ba036230a4fe"
+
+
+def test_stopped_snapshot_refuses_changed_live_ticket_store(project_v7):
+    """A tracked store becoming shared cannot reuse stopped-native authority."""
+    from bmad_loop import stopped_native as recovery
+
+    root = project_v7.project
+    epic = "epic-native-store"
+    write_ticket_tree(
+        project_v7,
+        [EpicSpec(205, epic, "Native store", (EntrySpec(9, "Keep work", refined=True),))],
+    )
+    plan = write_plan(project_v7, epic, "story-keep-work-plan", 9, "ready-for-dev")
+    git(root, "add", "-A")
+    git(root, "commit", "-qm", "tracked ticket store")
+    (root / policy.POLICY_FILE).parent.mkdir(parents=True, exist_ok=True)
+    (root / policy.POLICY_FILE).write_text("")
+    paths = bmadconfig.load_paths(root, want_tickets=True)
+    topology = ticketstore.assess_store(paths, "in-place")
+    assert isinstance(topology, ticketstore.StoreTopology)
+    task = StoryTask(
+        "205.9",
+        0,
+        spec_file=str(plan),
+        ticket=TicketBinding.from_dict(
+            {
+                "ref": "205.9",
+                "id": "9",
+                "epic_id": "205",
+                "epic_slug": epic,
+                "risk": "medium",
+                "plan": str(plan),
+            }
+        ),
+    )
+    state = RunState(
+        "native-store",
+        str(root),
+        "now",
+        source="tickets",
+        initiative=project_v7.initiative,
+        initiative_folder=str(project_v7.initiative_folder),
+        store_topology=topology.to_dict(),
+    )
+    observed = recovery.snapshot(state, task, root)
+    store_rel = project_v7.output_folder.relative_to(root).as_posix()
+    git(root, "rm", "-r", "--cached", store_rel)
+    with (root / ".gitignore").open("a") as stream:
+        stream.write(f"\n/{store_rel}/\n")
+    current = ticketstore.assess_store(bmadconfig.load_paths(root, want_tickets=True), "in-place")
+    assert isinstance(current, ticketstore.StoreTopology) and current != topology
+    before = plan.read_bytes()
+    with pytest.raises(ValueError, match="ticket store changed"):
+        recovery.snapshot(state, task, root)
+    assert plan.read_bytes() == before
+    assert observed["head"] == verify.rev_parse_head(root)
 
 
 @pytest.fixture

@@ -348,7 +348,7 @@ With `[environment] probes` configured, a dev relaunch runs them first, before t
 With `[recovery] classify_turn_errors` ([Loop recovery guide](loop-recovery-guide.md#turn-errors)), a session whose last turn ended on an API error, and that in-place nudges did not recover, pauses uncharged with a reason that names the class:
 
 ```text
-transport fault: dev session stalled (API Error: Connection lost mid-response.; the API connection failed and in-place nudges did not recover it; the attempt is not charged; bmad-loop resolve <run> re-arms it)
+transport fault: dev session stalled (API Error: <transport error>; the API connection failed and in-place nudges did not recover it; the attempt is not charged; bmad-loop resolve <run> re-arms it)
 pool unavailable: dev session stalled (API Error: Request rejected (429) · Local TeamRouter pool unavailable for <model> ...; return <ISO>; the model's account pool refused the request; wait for the return or switch model, then bmad-loop resolve <run>)
 environment fault: dev session stalled (failed to load workspace requirements; the CLI could not load its configuration or credentials and a nudge cannot fix that; fix the environment, then bmad-loop resolve <run>)
 ```

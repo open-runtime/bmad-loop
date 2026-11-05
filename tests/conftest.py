@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import errno
 import importlib
 import importlib.util
 import io
@@ -84,6 +85,7 @@ _MUX_BINDING_MODULES = (
     "bmad_loop.adapters.generic",
     "bmad_loop.probe",
     "bmad_loop.runs",
+    "bmad_loop.stopped_native",
     "bmad_loop.tui.app",
     "bmad_loop.tui.launch",
 )
@@ -3610,3 +3612,28 @@ def _reverify_run(tmp_path, *, phase="deferred", spec="live", env_fault_site=Non
     state.run_dir_identity = platform_util.root_identity_record(run_dir)
     save_state(run_dir, state)
     return run_dir, spec_path
+
+
+def _require_non_utf8_filenames(directory: Path) -> None:
+    """Gate raw filename tests on this filesystem's actual byte-name support.
+
+    POSIX alone is insufficient: APFS rejects bytes invalid in UTF-8 with
+    EILSEQ, while Linux filesystems commonly preserve them. Only that explicit
+    rejection skips; permission, space and other I/O faults still fail loudly.
+    """
+    raw_path = os.fsencode(directory) + b"/pytest-non-utf8-\xff"
+    try:
+        fd = os.open(raw_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except OSError as exc:
+        if exc.errno == errno.EILSEQ:
+            pytest.skip("test filesystem rejects non-UTF-8 filenames (EILSEQ)")
+        raise
+    else:
+        os.close(fd)
+        os.unlink(raw_path)
+
+
+@pytest.fixture
+def requires_non_utf8_filenames(tmp_path: Path) -> None:
+    """Only filename-dependent tests request this filesystem capability."""
+    _require_non_utf8_filenames(tmp_path)

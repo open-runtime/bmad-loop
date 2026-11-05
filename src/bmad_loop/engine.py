@@ -10209,6 +10209,9 @@ class Engine:
                         # UNBOUND here (read_usage itself is a candidate raiser),
                         # so referencing it would raise NameError on a path that
                         # is already unwinding an exception.
+                        fallback_extras = self._session_end_extras(result)
+                        if result.status == "aborted" and sys.exc_info()[1] is not None:
+                            fallback_extras["error"] = type(sys.exc_info()[1]).__name__
                         self.journal.append(
                             "session-end",
                             task_id=task_id,
@@ -10218,12 +10221,7 @@ class Engine:
                             # A returned hard-stop verdict raises RunStopped
                             # before recording a result. Preserve that explicit
                             # provenance just like the exception-only stop path.
-                            **(
-                                {"error": type(sys.exc_info()[1]).__name__}
-                                if result.status == "aborted" and sys.exc_info()[1] is not None
-                                else {}
-                            ),
-                            **self._session_end_extras(result),
+                            **fallback_extras,
                         )
                     else:
                         exc = sys.exc_info()[1]

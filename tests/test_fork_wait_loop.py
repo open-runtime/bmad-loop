@@ -62,7 +62,7 @@ API_ERROR = {
     "error": "server_error",
     "message": {
         "role": "assistant",
-        "content": [{"type": "text", "text": "API Error: Connection lost mid-response."}],
+        "content": [{"type": "text", "text": "API Error: " "Connection lost mid-response."}],
     },
 }
 POOL_ERROR = {
@@ -345,7 +345,7 @@ def test_turn_end_nudge_s_nudges_a_status_report_sooner(tmp_path, monkeypatch):
 
 
 def test_transport_error_is_nudged_once_then_pauses_uncharged(tmp_path, monkeypatch):
-    """11.1-dev-1: the turn ended on `API Error: Connection lost mid-response`.
+    """11.1-dev-1: the turn ended on `API Error` followed by `Connection lost mid-response`.
     One in-place transport nudge; the error stays, so the session ends with a
     transport fault the deciders pause uncharged as `transport fault:`."""
     t = _transcript(tmp_path, [_claude_text("Writing the plan."), API_ERROR])
@@ -359,10 +359,10 @@ def test_transport_error_is_nudged_once_then_pauses_uncharged(tmp_path, monkeypa
     result = adapter.wait_for_completion(handle, spec)
 
     assert _sent(mux) == [
-        generic.TRANSPORT_NUDGE_TEXT.format(error="API Error: Connection lost mid-response.")
+        generic.TRANSPORT_NUDGE_TEXT.format(error="API Error: " "Connection lost mid-response.")
     ]
     assert (result.status, result.transport_fault) == ("stalled", "transport")
-    assert result.transport_evidence == "API Error: Connection lost mid-response."
+    assert result.transport_evidence == "API Error: " "Connection lost mid-response."
     classified = adapter._classify_env_fault(handle, spec, result)
     assert classified.env_fault and classified.env_fault_overruled is None
     decision = decide_dev(StoryTask(story_key="3-1", epic=3, attempt=1), classified, None, Policy())

@@ -65,7 +65,8 @@ API_ERROR_TRANSPORT = {
         "content": [
             {
                 "type": "text",
-                "text": "API Error: Connection lost mid-response. The response above may "
+                "text": "API Error: "
+                "Connection lost mid-response. The response above may "
                 "be incomplete.",
             }
         ],
@@ -137,7 +138,7 @@ def test_claude_api_error_is_a_transport_turn_end(tmp_path):
     path = _write(tmp_path / "t.jsonl", [_claude_text("Writing the plan."), API_ERROR_TRANSPORT])
     state = read_turn_state(path, "claude-jsonl")
     assert (state.error_code, state.error_class) == ("server_error", "transport")
-    assert state.error_text.startswith("API Error: Connection lost mid-response")
+    assert state.error_text.startswith("API Error: " "Connection lost mid-response")
     assert state.turn_ended
 
 
@@ -291,7 +292,7 @@ def test_codex_open_exec_call_is_pending(tmp_path):
 @pytest.mark.parametrize(
     ("code", "text", "expected"),
     [
-        ("server_error", "API Error: Connection lost mid-response.", "transport"),
+        ("server_error", "API Error: " "Connection lost mid-response.", "transport"),
         # split so no tracked line carries a sentence the shipped patterns match
         ("overloaded", "API Error: 529 " + "Overloaded", "transport"),
         ("rate_limit", POOL_TEXT, "pool"),

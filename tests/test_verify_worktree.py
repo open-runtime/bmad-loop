@@ -453,7 +453,7 @@ def test_receipt_restore_cas_preserves_commit_winning_after_checkout_preparation
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Windows paths are Unicode")
-def test_receipt_restore_round_trips_non_utf8_changed_path(project):
+def test_receipt_restore_round_trips_non_utf8_changed_path(project, requires_non_utf8_filenames):
     repo = project.project
     name = os.fsdecode(b"artifact-\xff.bin")
     artifact = repo / name

@@ -37,6 +37,41 @@ from conftest import make_git_noisy
 from bmad_loop import bmadconfig, envvars, verify
 
 
+def test_non_utf8_filename_probe_accepts_supported_filesystem(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        conftest.os,
+        "open",
+        lambda path, flags, mode: calls.append(("open", path, flags, mode)) or 41,
+    )
+    monkeypatch.setattr(conftest.os, "close", lambda fd: calls.append(("close", fd)))
+    monkeypatch.setattr(conftest.os, "unlink", lambda path: calls.append(("unlink", path)))
+
+    conftest._require_non_utf8_filenames(tmp_path)
+
+    raw = os.fsencode(tmp_path) + b"/pytest-non-utf8-\xff"
+    assert calls == [
+        ("open", raw, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600),
+        ("close", 41),
+        ("unlink", raw),
+    ]
+
+
+@pytest.mark.parametrize("error", [errno.EILSEQ, errno.EACCES, errno.ENOSPC])
+def test_non_utf8_filename_probe_skips_only_encoding_rejection(tmp_path, monkeypatch, error):
+    def refuse(*_):
+        raise OSError(error, "filesystem rejected probe")
+
+    monkeypatch.setattr(conftest.os, "open", refuse)
+    if error == errno.EILSEQ:
+        with pytest.raises(pytest.skip.Exception, match="non-UTF-8 filenames"):
+            conftest._require_non_utf8_filenames(tmp_path)
+    else:
+        with pytest.raises(OSError) as raised:
+            conftest._require_non_utf8_filenames(tmp_path)
+        assert raised.value.errno == error
+
+
 def test_template_drops_sample_hooks_but_keeps_hooks_dir_and_exclude(project):
     """`git init` seeds 14 dead `*.sample` hooks that nothing reads; the template
     deletes the files so each per-test copy stops replicating them.
