@@ -6641,6 +6641,7 @@ def adopt_escalated_branch(run_dir: Path, story_key: str | None = None) -> str:
         # engine's resume arm already completes without re-running any gate.
         task.phase = Phase.COMMITTING
         task.adopt_pending = True
+        task.commit_retry = None
         # The adopted branch is finalized as-is, never through a post-replay re-verify
         # (DW-527): a marker a prior `--reverify` continuation left must not outlive it.
         task.reverify_replayed = ""
@@ -6893,6 +6894,7 @@ def _rearm_escalation_locked(
     # A re-arm abandons any adoption a prior `resolve --adopt-branch` latched (DW-386):
     # the re-drive re-implements from the baseline, so no adopt leg may fire on it.
     task.adopt_pending = False
+    task.commit_retry = None
     # Likewise a `resolve --reverify` latch (DW-522) left by a replay that escalated
     # before its decision cleared it (a refused board write): left set, the fresh
     # attempt's next DEV_VERIFY pause would resume through the verify-replay arm.
@@ -8028,6 +8030,7 @@ def latch_for_reverify(task: StoryTask, origin: str) -> None:
     task.followup_reviews_spent = 0
     task.salvage_refile_pending = False
     task.adopt_pending = False
+    task.commit_retry = None
     task.rearmed = False  # not a clean rebuild: the tree is kept
     task.env_fault_site = None  # the operator vouches the environment is fixed (DW-523)
 

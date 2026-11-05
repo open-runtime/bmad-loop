@@ -7400,6 +7400,7 @@ def _resolve_pre_session_gates(
         getattr(args, "reverify", False)
         or getattr(args, "adopt_branch", False)
         or getattr(args, "review_implemented", None) is not None
+        or getattr(args, "retry_commit", None) is not None
     )
     if (
         early
@@ -7502,6 +7503,13 @@ def cmd_resolve(args: argparse.Namespace) -> int:
             "proceeding anyway (--force)",
             file=sys.stderr,
         )
+    if getattr(args, "retry_commit", None) is not None:
+        if live != "dead":
+            print("error: commit retry requires a demonstrably stopped engine", file=sys.stderr)
+            return 1
+        if (rc := _resolve_pre_session_gates(args, project, run_dir, state)) is not None:
+            return rc
+        return _resolve_retry_commit(args, project, run_dir, state)
     if getattr(args, "review_implemented", None) is not None:
         if live != "dead":
             print(
@@ -8463,6 +8471,7 @@ def _at_reset_usage_error(args: argparse.Namespace) -> str | None:
         ("--adopt-branch", getattr(args, "adopt_branch", False)),
         ("--reverify", getattr(args, "reverify", False)),
         ("--review-implemented", getattr(args, "review_implemented", None) is not None),
+        ("--retry-commit", getattr(args, "retry_commit", None) is not None),
     ):
         if given:
             return (
@@ -8781,6 +8790,51 @@ def _resolve_pause_admits(state: RunState, *, reverify_named: bool) -> bool:
     if reverify_named:
         return state.paused_stage is not None
     return runs.escalation_resolvable(state)
+
+
+def _resolve_retry_commit(
+    args: argparse.Namespace, project: Path, run_dir: Path, state: RunState
+) -> int:
+    """Attest unchanged verified HEAD and retry only its failed commit window."""
+    from . import commit_recovery
+
+    key = args.story or state.paused_story_key
+    task = state.tasks.get(key) if key else None
+    if task is None or key is None:
+        print("error: name the failed finalization ticket with --story", file=sys.stderr)
+        return 1
+    try:
+        observed = commit_recovery.evidence(
+            state, task, args.retry_commit, run_dir=run_dir, project_root=project
+        )
+    except (
+        ValueError,
+        OSError,
+        bmadconfig.BmadConfigError,
+        policy_mod.PolicyError,
+        verify.GitError,
+    ) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(
+        f"attesting unchanged reviewed and verified HEAD {args.retry_commit} for {key}; "
+        "resume retries finalization without new development, review or verification",
+        file=sys.stderr,
+    )
+    if args.resume is None and not _confirm(f"record this attestation and resume {args.run_id}?"):
+        print("cancelled — run is still stopped")
+        return 0
+    try:
+        commit_recovery.arm(
+            run_dir, key, args.retry_commit, project_root=project, expected_evidence=observed
+        )
+    except runs.RearmError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if args.resume is False:
+        print(f"resume when ready: bmad-loop resume {args.run_id}")
+        return 0
+    return _resume_paused_run(project, run_dir)
 
 
 def _resolve_implemented_review(
@@ -11642,6 +11696,14 @@ def main(argv: list[str] | None = None) -> int:
         "With --abandon, skips its confirm",
     )
     resolve_mode = resolve_p.add_mutually_exclusive_group()
+    resolve_mode.add_argument(
+        "--retry-commit",
+        metavar="HEAD",
+        help="attest the full unchanged reviewed and verified HEAD of a stopped in-place "
+        "ticket whose finalization failed; require completed acceptance records, then "
+        "retry only its commit window without another development, review or verification "
+        "session. Source must be clean and unchanged until resume",
+    )
     resolve_mode.add_argument(
         "--review-implemented",
         metavar="COMMIT",

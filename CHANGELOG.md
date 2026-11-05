@@ -7,6 +7,11 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserve reviewed history when all merge bases are covered by the finalization baseline.
+- Retry a failed commit window with an explicit unchanged-HEAD attestation, retaining completed development, review and verification.
+
 ## [0.13.11] — 2026-11-05
 
 ### Fixed

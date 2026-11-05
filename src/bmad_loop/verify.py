@@ -10688,15 +10688,19 @@ def commit_story(repo: Path, message: str) -> str:
     return rev_parse_head(repo)
 
 
-def _finalization_baseline(repo: Path, baseline: str, head: str, target_ref: str) -> str:
+def _finalization_baseline(
+    repo: Path, baseline: str, head: str, target_ref: str
+) -> tuple[str, bool]:
     """Pin the squash boundary without discarding target-reachable history.
 
     Read the local remote-tracking ref; refreshing it belongs to the caller's
     sync workflow. A repository with neither that ref nor its remote retains
     offline finalization. A configured remote with missing evidence, a failed
-    graph probe or incomparable common ancestors must refuse before any write.
+    graph probe or uncovered incomparable common ancestors must refuse before any write.
     A unique merge base covers every ancestor shared with the publication target,
     including a target merged into a private story branch after its baseline.
+    Return the boundary and whether multiple common ancestors already covered
+    by the accepted baseline require retaining HEAD instead of squashing.
     """
     if not target_ref.startswith("refs/remotes/"):
         raise GitError(f"finalization target must be a remote-tracking ref: {target_ref}")
@@ -10711,7 +10715,7 @@ def _finalization_baseline(repo: Path, baseline: str, head: str, target_ref: str
             raise GitError(
                 f"finalization target ref {target_ref} is missing; fetch it before retrying"
             )
-        return baseline
+        return baseline, False
 
     target = rev_parse_revision(repo, target_ref)
 
@@ -10726,16 +10730,18 @@ def _finalization_baseline(repo: Path, baseline: str, head: str, target_ref: str
     # the historical verification baseline need not remain on the rewritten arm.
     rc, out, detail = _git_out(repo, "merge-base", "--all", head, target)
     if rc == 1 and not out:
-        return baseline  # independent histories, nothing shared with the target
+        return baseline, False  # independent histories, nothing shared with the target
     if rc != 0:
         raise GitError(f"cannot read finalization target ancestry: {detail}")
     common = out.splitlines()
     if len(common) != 1:
+        if len(common) > 1 and all(ancestor(shared, baseline) for shared in common):
+            return baseline, True
         raise GitError("ambiguous finalization target ancestry; refusing to rewrite shared history")
     shared = common[0]
     if ancestor(shared, baseline):
-        return baseline
-    return shared
+        return baseline, False
+    return shared, False
 
 
 class FinalizationPlan(NamedTuple):
@@ -10760,11 +10766,12 @@ def _finalization_plan(
     remote, independently of Git's upstream configuration. Pin that tracking
     ref when present. A remote tip not contained in HEAD requires a sync before
     finalization; a missing same-name ref permits the branch's first publication.
-    Merges above the attempt baseline and a historical baseline removed by an
-    earlier squash retain HEAD. These conservative cases append only the staged
-    delta, keeping earlier stories and merge parents byte-for-byte reachable.
+    Merges above the attempt baseline, multiple common ancestors already covered
+    by that baseline, and a historical baseline removed by an earlier squash
+    retain HEAD. These conservative cases append only the staged delta, keeping
+    earlier stories and merge parents byte-for-byte reachable.
     """
-    candidate = _finalization_baseline(repo, baseline, head, target_ref)
+    candidate, covered_common_ancestors = _finalization_baseline(repo, baseline, head, target_ref)
 
     def ancestor(older: str, newer: str) -> bool:
         rc, out = _git(repo, "merge-base", "--is-ancestor", older, newer)
@@ -10789,6 +10796,8 @@ def _finalization_plan(
                 raise GitError(
                     f"published branch {published_ref} is not contained in HEAD; sync before retrying"
                 )
+    if covered_common_ancestors:
+        return FinalizationPlan(head, "covered-common-ancestors", False)
     if published is not None and not ancestor(published, candidate):
         return FinalizationPlan(head, "published-branch", False)
     if not ancestor(baseline, head):

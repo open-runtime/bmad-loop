@@ -222,7 +222,7 @@ Resolves an escalated story, or re-arms a deferred in-place story whose latest d
 
 ```text
 bmad-loop resolve [--project PROJECT] [--story STORY] [--no-interactive]
-                  [--restore-patch PATH | --adopt-branch | --reverify | --review-implemented COMMIT | --abandon] [--resume | --no-resume] [--force]
+                  [--restore-patch PATH | --adopt-branch | --reverify | --review-implemented COMMIT | --retry-commit HEAD | --abandon] [--resume | --no-resume] [--force]
                   [--at-reset [--margin-min N]] run_id
 ```
 
@@ -233,6 +233,7 @@ bmad-loop resolve [--project PROJECT] [--story STORY] [--no-interactive]
 | `--restore-patch PATH`        | Re-arm the spec to `in-review` and re-apply this saved patch, so review resumes on the attempted change.                                                                                                                                                                                                                   |
 | `--adopt-branch`              | Commit and merge the kept worktree branch as-is and mark the story done. Worktree isolation only; not for sweeps.                                                                                                                                                                                                          |
 | `--reverify`                  | Keep a DEFERRED (or environment-fault ESCALATED) story's attempt, replay `[verify]`, then review and commit. No dev session; not for sweeps.                                                                                                                                                                               |
+| `--retry-commit HEAD`         | Attest the full unchanged reviewed and verified HEAD of a stopped in-place ticket whose finalization failed. Retain completed acceptance and retry only the commit window; the checkout must remain clean and unchanged until entry. See [finalization recovery](../escalations-guide.md#retry-a-failed-finalization).     |
 | `--review-implemented COMMIT` | Attest a full implementation commit retained in a stopped in-place ticket's baseline. Bind its historical acceptance and current HEAD, then require normal primary review and review verification without repeating dev. See [the evidence guards](../escalations-guide.md#review-implementation-already-in-the-baseline). |
 | `--abandon`                   | Close an escalated replay run unmerged: park dirty work on a preserve ref, remove the worktree, keep the branch.                                                                                                                                                                                                           |
 | `--resume` / `--no-resume`    | Resume without prompting / only re-arm. Default: prompt, then resume. Not with `--abandon` (exit 2).                                                                                                                                                                                                                       |

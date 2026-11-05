@@ -5361,6 +5361,35 @@ class Engine:
         midnight can carry a new ``parked_at`` and therefore require a new commit.
         ``commit_sha`` is stamped only here and is write-only (never routing),
         so the empty persisted value is harmless."""
+        if task.commit_retry is not None:
+            from . import bmadconfig, commit_recovery
+            from .policy import PolicyError
+
+            head = task.commit_retry.get("head")
+            try:
+                commit_recovery.validate_entry(
+                    self.state,
+                    task,
+                    run_dir=self.run_dir,
+                    project_root=self.paths.project,
+                )
+            except (
+                ValueError,
+                OSError,
+                bmadconfig.BmadConfigError,
+                PolicyError,
+                verify.GitError,
+            ) as exc:
+                reason = f"commit retry refused: {exc}; restore the attested state, then resume"
+                self.journal.append("commit-retry-refused", story_key=task.story_key, reason=reason)
+                self._save()
+                self._escalation_pause(reason, task.story_key, cause=exc)
+            # From this save onward the ordinary COMMITTING replay contract
+            # applies, including a crash after finalization changed HEAD. Do not
+            # mistake that successful append for pre-entry operator drift.
+            task.commit_retry = None
+            self.journal.append("commit-retry-entered", story_key=task.story_key, head=head)
+            self._save()
         message = self._commit_message(task)
         # pre_commit: a plugin may rewrite the commit message or escalate (pause).
         # A defer/skip veto would have to unwind a COMMITTING task (no legal move
@@ -12250,6 +12279,7 @@ class Engine:
     def _escalate(self, task: StoryTask, reason: str) -> None:
         advance(task, Phase.ESCALATED)
         task.adopt_pending = False  # an escalation spends any adoption (DW-386)
+        task.commit_retry = None
         # Two literal writes rather than a conditional `**` splat, so the journal
         # field guard reads every name; `env_fault_site` appears only when set.
         if task.env_fault_site is None:
