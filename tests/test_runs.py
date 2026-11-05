@@ -6227,9 +6227,8 @@ def test_archive_run_names_its_temp_after_the_destination(tmp_path, monkeypatch)
 
 
 def test_archive_run_failed_replace_strands_no_temp(tmp_path, monkeypatch):
-    """#363. `.bmad-loop/archive/` is gitignored by NOTHING — `bmad-loop init` writes
-    `.bmad-loop/runs/`, `.bmad-loop/cache/`, `.bmad-loop/policy.toml` and
-    `_bmad/render/` — so a temp stranded here is an untracked file that holds
+    """#363. Older installs may not gitignore `.bmad-loop/archive/` until init is
+    re-run, so a temp stranded here can be an untracked file that holds
     `verify.worktree_clean` False until a human deletes it by hand.
 
     This site cannot use `atomic_write_*`: the path is handed to `tarfile.open`, so

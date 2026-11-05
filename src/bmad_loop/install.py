@@ -6,7 +6,8 @@
 - installs the bundled bmad-loop-* skills into each selected CLI's skill tree
   (.claude/skills for claude, .agents/skills for codex/gemini/copilot)
 - writes .bmad-loop/policy.toml from the template (if missing)
-- gitignores generated dirs: .bmad-loop/runs/ (per-run state) and
+- gitignores generated dirs: .bmad-loop/runs/ (per-run state),
+  .bmad-loop/archive/ (retained run tarballs), and
   .bmad-loop/cache/ (engine plugins' rebuildable caches, e.g. the Unity Library)
 
 Every dialect registers the same installed relay under the CLI's native event
@@ -4381,6 +4382,7 @@ def install_into(
         print(f"  policy written: {policy_path}")
 
     # 5. gitignore generated/machine-local state: per-run state (.bmad-loop/runs/),
+    # retained run tarballs (.bmad-loop/archive/),
     # the game-engine plugins' rebuildable caches, e.g. the per-worktree Unity
     # Library (.bmad-loop/cache/), and the policy file itself — policy.toml is
     # per-machine-per-repo (it carries this machine's [mux] backend choice, and
@@ -4391,6 +4393,7 @@ def install_into(
         line
         for line in (
             ".bmad-loop/runs/",
+            ".bmad-loop/archive/",
             ".bmad-loop/cache/",
             ".bmad-loop/policy.toml",
             f"{RENDER_DIR_REL}/",

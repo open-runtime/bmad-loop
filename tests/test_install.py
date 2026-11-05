@@ -1230,6 +1230,28 @@ def test_install_into_copilot(tmp_path):
     assert len(settings["hooks"]["agentStop"]) == 1
 
 
+@pytest.mark.parametrize("reinitialize", [False, True], ids=["fresh", "existing"])
+def test_init_keeps_run_archives_out_of_story_commits(project, reinitialize):
+    root = project.project
+    if reinitialize:
+        assert install_into(root, clis=(), skills=False) == 0
+        gitignore = root / ".gitignore"
+        gitignore.write_text(
+            gitignore.read_text().replace(".bmad-loop/archive/\n", ""), encoding="utf-8"
+        )
+
+    archive = root / ".bmad-loop" / "archive" / "completed-run.tar.gz"
+    archive.parent.mkdir(parents=True)
+    archive.write_bytes(b"machine-local run evidence")
+    (root / "src.txt").write_text("story implementation\n", encoding="utf-8")
+
+    assert install_into(root, clis=(), skills=False) == 0
+    git(root, "add", "-A")
+    staged = git(root, "diff", "--cached", "--name-only").splitlines()
+    assert "src.txt" in staged
+    assert archive.relative_to(root).as_posix() not in staged
+
+
 def test_install_into_full(tmp_path):
     assert install_into(tmp_path) == 0
     assert not (tmp_path / ".bmad-loop" / "bmad_loop_hook.py").exists()
@@ -1238,6 +1260,7 @@ def test_install_into_full(tmp_path):
     assert "Stop" in settings["hooks"]
     gitignore = (tmp_path / ".gitignore").read_text()
     assert ".bmad-loop/runs/" in gitignore
+    assert ".bmad-loop/archive/" in gitignore
 
     assert ".bmad-loop/cache/" in gitignore  # engine plugins' rebuildable caches
     assert ".bmad-loop/policy.toml" in gitignore  # per-machine config ([mux] backend)
@@ -1255,6 +1278,7 @@ def test_install_into_full(tmp_path):
     assert len(settings["hooks"]["Stop"]) == 1
     final_gitignore = (tmp_path / ".gitignore").read_text()
     assert final_gitignore.count(".bmad-loop/runs/") == 1
+    assert final_gitignore.count(".bmad-loop/archive/") == 1
     assert final_gitignore.count(".bmad-loop/cache/") == 1
     assert final_gitignore.count(".bmad-loop/policy.toml") == 1
     assert final_gitignore.count(f"{RENDER_DIR_REL}/") == 1
@@ -2306,7 +2330,7 @@ def test_init_gitignore_append_preserves_content_mode_and_is_idempotent(project)
 
     assert gitignore.read_bytes() == (
         b"node_modules/\n*.log\n"
-        b".bmad-loop/runs/\n.bmad-loop/cache/\n.bmad-loop/policy.toml\n"
+        b".bmad-loop/runs/\n.bmad-loop/archive/\n.bmad-loop/cache/\n.bmad-loop/policy.toml\n"
         + f"{RENDER_DIR_REL}/\n".encode()
     )
     assert stat.S_IMODE(gitignore.stat().st_mode) == 0o640
