@@ -105,6 +105,25 @@ def test_committed_mirror_cannot_name_different_bytes(project):
         bind_mirrors(repo, receipt)
 
 
+def test_planning_rename_cannot_hide_undeclared_source_deletion(project):
+    repo = project.project
+    (repo / "unowned.md").write_text("Existing unrelated document")
+    git(repo, "add", "unowned.md")
+    git(repo, "commit", "-m", "unrelated source document")
+    base = verify.rev_parse_head(repo)
+    (repo / "docs").mkdir(exist_ok=True)
+    git(repo, "config", "diff.renames", "true")
+    git(repo, "mv", "unowned.md", "docs/planned.md")
+    git(repo, "commit", "-m", "move existing document into planning scope")
+    receipt = {
+        "base": base,
+        "head": verify.rev_parse_head(repo),
+        "validated": {"artifacts": [{"path": "docs/planned.md"}]},
+    }
+    with pytest.raises(CampaignError, match="outside its declared product artifacts"):
+        validate_stage_products(repo, receipt, ())
+
+
 @pytest.mark.parametrize("duplicate", [False, True])
 def test_planning_native_story_manifest_is_validated_before_publication(project, duplicate):
     setup_stories(project, [{"id": "one", "title": "One", "description": "One"}])

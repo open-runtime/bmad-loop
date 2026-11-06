@@ -126,7 +126,7 @@ def prior_delivery(runtime, snapshot, unit) -> PriorDeliveryProof | None:
     pre-campaign work deliberately falls back to a fresh verification draft.
     """
     from .campaign_model import UnitState
-    from .campaign_publication import Candidate, PublicationController
+    from .campaign_publication import Candidate, PublicationController, PublicationRequirements
 
     source = runtime.source(snapshot, unit)
     try:
@@ -216,7 +216,9 @@ def prior_delivery(runtime, snapshot, unit) -> PriorDeliveryProof | None:
             str(previous.config_revision),
             snapshot.spec.target,
         )
-        controller = PublicationController(gateway)
+        controller = PublicationController(
+            gateway, requirements=PublicationRequirements.from_spec(snapshot.spec.github)
+        )
         receipt = controller.merge_status(pr["number"], expected_head=head)
         if receipt.state != "merged_pending_sync" or receipt.merge_commit != merged["merge_commit"]:
             continue

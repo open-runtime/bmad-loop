@@ -256,6 +256,13 @@ class ScriptedGithub:
                     pr = self._pull(number)
                     if len(parts) == 2:
                         return self._response(pr)
+                    if parts[2] == "requested_reviewers":
+                        return self._response(
+                            {
+                                "users": pr.get("requested_reviewers", []),
+                                "teams": pr.get("requested_teams", []),
+                            }
+                        )
                     if parts[2] == "reviews":
                         return self._response(
                             []
@@ -726,6 +733,7 @@ def production_case(project, tmp_path, monkeypatch, request):
 
 def diagnose(snapshot):
     return {
+        "phase": snapshot.phase,
         "units": {
             key: {
                 "state": unit.state.value,
@@ -742,10 +750,24 @@ def diagnose(snapshot):
     }
 
 
-def run_case(case, *, ticks=1500):
-    return CampaignSupervisor(
-        case.store, case.runtime, clock=case.runtime.clock, progress=lambda _: None
-    ).run(case.snapshot.id, max_ticks=ticks)
+def run_case(case, *, ticks=None, timeout_s=300.0):
+    """Wait for the real terminal predicate; ticks are only for intermediate-state tests."""
+    deadline = time.monotonic() + timeout_s
+
+    def bounded_clock():
+        if time.monotonic() >= deadline:
+            details = diagnose(case.store.load(case.snapshot.id))
+            details["active_effects"] = sorted(supervisor._active)
+            raise AssertionError(
+                f"campaign did not reach its terminal state within {timeout_s:g}s: "
+                + json.dumps(details, indent=2)
+            )
+        return case.runtime.clock()
+
+    supervisor = CampaignSupervisor(
+        case.store, case.runtime, clock=bounded_clock, progress=lambda _: None
+    )
+    return supervisor.run(case.snapshot.id, max_ticks=ticks)
 
 
 def test_production_delivery_parallel_drafts_review_merge_and_tracking(production_case):
@@ -874,7 +896,7 @@ def test_tracking_debt_blocks_only_affected_dependent_until_reconciled(
 @pytest.mark.parametrize("production_case", [{"planning": True}], indirect=True)
 def test_brief_to_reviewed_planning_pr_activates_new_story_then_parallel_delivery(production_case):
     case = production_case
-    result = run_case(case, ticks=2500)
+    result = run_case(case)
     assert result.phase == "delivered", diagnose(result)
     assert "source:project:planned" in result.units
     assert result.units["source:project:planned"].state == UnitState.DELIVERED

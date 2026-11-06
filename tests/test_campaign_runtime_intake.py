@@ -620,7 +620,7 @@ def test_github_issue_triage_planning_review_delivery_and_reused_issue_binding(p
         + text[end:]
     )
     script.write_text(text)
-    result = run_case(case, ticks=500)
+    result = run_case(case)
     if result.phase != "delivered":
         pytest.fail(json.dumps(diagnose(result), indent=2))
     assert "source:project:incoming" in result.units
@@ -772,7 +772,7 @@ def test_live_story_acceptance_amendment_drains_retains_same_pr_and_reexecutes_r
             released.write_text("triage accepted; original actor may finish")
 
     monkeypatch.setattr(case.runtime, "apply", apply)
-    result = run_case(case, ticks=600)
+    result = run_case(case)
     if result.phase != "delivered":
         pytest.fail(json.dumps(diagnose(result), indent=2))
     assert injected and live_amendments == [True]
@@ -827,7 +827,7 @@ def test_nonwork_intake_closes_only_owned_control_and_keeps_original_issue_open(
     if name in {"requirements","architecture","decomposition"}:""",
     )
     script.write_text(text, encoding="utf-8")
-    result = run_case(case, ticks=450)
+    result = run_case(case)
     if result.phase != "delivered":
         pytest.fail(json.dumps(diagnose(result), indent=2))
     controls = [unit for unit in result.units.values() if intake.control(unit)]

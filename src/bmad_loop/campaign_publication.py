@@ -16,7 +16,30 @@ from typing import Any, Callable
 from urllib.parse import quote
 
 from .campaign_github import GithubError, GithubGateway, JsonObject, MutationIntent
+from .campaign_model import GitHubSpec
 from .verify import git_bytes
+
+
+@dataclass(frozen=True)
+class PublicationRequirements:
+    """Frozen campaign requirements shared by preparation, replay and repair."""
+
+    hold_labels: tuple[str, ...] = ("bmad:hold",)
+    required_checks: tuple[str, ...] = ()
+
+    @classmethod
+    def from_spec(cls, spec: GitHubSpec) -> PublicationRequirements:
+        return cls(tuple(spec.hold_labels), tuple(spec.required_checks))
+
+    def checks(self, server: tuple[RequiredCheck, ...]) -> tuple[RequiredCheck, ...]:
+        """Add campaign contexts without weakening any server App identity."""
+        known = {check.context for check in server}
+        extra = tuple(
+            RequiredCheck(context)
+            for context in dict.fromkeys(self.required_checks)
+            if context not in known
+        )
+        return server + extra
 
 
 @dataclass(frozen=True)
@@ -83,6 +106,7 @@ class PublicationObservation:
     observed_at: float
     review_decision: str = ""
     requested_reviewers: tuple[str, ...] = ()
+    requested_teams: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -196,10 +220,12 @@ class PublicationController:
         *,
         clock: Callable[[], float] = time.time,
         max_observation_age_s: float = 30,
+        requirements: PublicationRequirements = PublicationRequirements(),
     ):
         self.gateway = gateway
         self.clock = clock
         self.max_observation_age_s = max_observation_age_s
+        self.requirements = requirements
 
     def inspect(self, pr_number: int) -> PublicationObservation:
         gateway = self.gateway
@@ -225,6 +251,18 @@ class PublicationController:
             decision = response.data["data"]["repository"]["pullRequest"]["reviewDecision"] or ""
         except (TypeError, KeyError) as exc:
             raise GithubError("Server review eligibility response is incomplete") from exc
+        # PR summary arrays are not a pagination/coverage guarantee. Read both
+        # collections through the bounded authenticated endpoint; failures remain
+        # observation failures, never an apparently empty reviewer list.
+        requested_path = f"{gateway.root}/pulls/{pr_number}/requested_reviewers"
+        requested_users = gateway.pages(requested_path, collection="users")
+        requested_teams = gateway.pages(requested_path, collection="teams")
+        if any(
+            not isinstance(row.get("login"), str) or not row["login"] for row in requested_users
+        ) or any(
+            not isinstance(row.get("slug"), str) or not row["slug"] for row in requested_teams
+        ):
+            raise GithubError("Requested reviewer observation lacks user/team identities")
         return PublicationObservation(
             gateway.repository,
             pr,
@@ -237,7 +275,8 @@ class PublicationController:
             gateway.issue(pr_number),
             self.clock(),
             decision,
-            tuple(row["login"] for row in pr.get("requested_reviewers", [])),
+            tuple(row["login"] for row in requested_users),
+            tuple(row["slug"] for row in requested_teams),
         )
 
     def evaluate(
@@ -249,7 +288,6 @@ class PublicationController:
         merge_mode: str = "direct-strict",
         independent_families: bool = False,
         queue_evidence_context: str = "",
-        hold_labels: tuple[str, ...] = ("hold", "owner-hold", "blocked", "approval-required"),
         queued_base: str = "",
         canonical_merge: MergeReceipt | None = None,
     ) -> GateResult:
@@ -328,7 +366,7 @@ class PublicationController:
         ):
             reasons.append("GitHub mergeability is not confirmed")
         labels = {str(row.get("name", "")).lower() for row in observation.issue.get("labels", [])}
-        if labels.intersection(label.lower() for label in hold_labels):
+        if labels.intersection(label.lower() for label in self.requirements.hold_labels):
             reasons.append("Remote owner/review hold is active")
         rules = observation.rules
         if not rules.complete:
@@ -351,7 +389,7 @@ class PublicationController:
                 reasons.append("Required merge_group candidate evidence producer is missing")
         else:
             reasons.append("Unsupported merge mode")
-        for check in rules.checks:
+        for check in self.requirements.checks(rules.checks):
             check_reason = _check_reason(
                 check, observation.checks, observation.statuses, candidate.head
             )
@@ -379,6 +417,8 @@ class PublicationController:
             rules.required_reviews or rules.last_push_approval
         ) and observation.review_decision != "APPROVED":
             reasons.append("GitHub has not confirmed eligible approval under current review rules")
+        if observation.requested_reviewers or observation.requested_teams:
+            reasons.append("Outstanding requested GitHub reviews remain")
         if any(thread.get("isResolved") is not True for thread in observation.threads):
             reasons.append("Unresolved review threads remain")
         return GateResult(not reasons, tuple(reasons), candidate, rules.fingerprint)

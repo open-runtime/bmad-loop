@@ -248,7 +248,6 @@ def check_project_gate(
     merge_mode: str = "direct-strict",
     queue_context: str = "",
     independent_families: bool = True,
-    hold_labels: tuple[str, ...] = ("bmad:hold",),
     runner: Callable = run_argv,
     timeout_s: float = 120,
     max_output_bytes: int = 1024 * 1024,
@@ -266,7 +265,6 @@ def check_project_gate(
         merge_mode=merge_mode,
         independent_families=independent_families,
         queue_evidence_context=queue_context,
-        hold_labels=hold_labels,
     )
     if not gate.ready:
         return AdapterReceipt(
@@ -301,7 +299,6 @@ def check_project_gate(
         merge_mode=merge_mode,
         independent_families=independent_families,
         queue_evidence_context=queue_context,
-        hold_labels=hold_labels,
     )
     if not final.ready or final.rules_fingerprint != gate.rules_fingerprint:
         state = "held"

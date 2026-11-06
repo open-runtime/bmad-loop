@@ -14,7 +14,7 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 from .campaign_model import CampaignError, CampaignSnapshot, Hold, UnitState
-from .campaign_publication import Candidate, PublicationObservation
+from .campaign_publication import Candidate, PublicationObservation, PublicationRequirements
 from .campaign_store import add_event, transition
 
 
@@ -32,7 +32,7 @@ def collect(
     observation: PublicationObservation,
     *,
     now: float,
-    hold_labels: tuple[str, ...],
+    requirements: PublicationRequirements,
     max_age_s: float = 30,
 ) -> RemoteFeedback | None:
     pr = observation.pr
@@ -49,7 +49,7 @@ def collect(
     ):
         return None
     labels = {str(row.get("name", "")).lower() for row in observation.issue.get("labels", [])}
-    if labels.intersection(label.lower() for label in hold_labels):
+    if labels.intersection(label.lower() for label in requirements.hold_labels):
         return None
     defects = []
     failed_conclusions = {
@@ -60,7 +60,7 @@ def collect(
         "startup_failure",
         "stale",
     }
-    for required in observation.rules.checks:
+    for required in requirements.checks(observation.rules.checks):
         checks = [
             row
             for row in observation.checks
@@ -163,11 +163,29 @@ def collect(
 
 
 def apply(snapshot: CampaignSnapshot, unit_id: str, feedback: RemoteFeedback) -> None:
+    _apply(snapshot, unit_id, feedback, expected_state=UnitState.READY_TO_PUBLISH)
+
+
+def apply_after_queue_removal(
+    snapshot: CampaignSnapshot, unit_id: str, feedback: RemoteFeedback
+) -> None:
+    """Use the existing repair budget only after exact-H queue removal readback."""
+    queue = snapshot.units[unit_id].evidence.get("queue", {})
+    if queue.get("dequeue_confirmed") != asdict(feedback.candidate):
+        raise CampaignError(
+            "remote repair requires confirmed removal of its exact queued candidate"
+        )
+    _apply(snapshot, unit_id, feedback, expected_state=UnitState.MERGE_REQUESTED)
+
+
+def _apply(
+    snapshot: CampaignSnapshot, unit_id: str, feedback: RemoteFeedback, *, expected_state: UnitState
+) -> None:
     unit = snapshot.units[unit_id]
     candidate = feedback.candidate
     integrated = unit.evidence.get("integrated", {})
     if (
-        unit.state != UnitState.READY_TO_PUBLISH
+        unit.state != expected_state
         or unit.hold
         or not unit.claim
         or not unit.claim.quiescent
@@ -185,6 +203,11 @@ def apply(snapshot: CampaignSnapshot, unit_id: str, feedback: RemoteFeedback) ->
         )
     seen = unit.evidence.setdefault("remote_feedback_attempted", [])
     if feedback.digest in seen:
+        if expected_state == UnitState.MERGE_REQUESTED:
+            for name in ("integrated", "pushed", "verification", "review"):
+                unit.evidence.pop(name, None)
+            unit.resume_state = UnitState.SYNCING
+            transition(snapshot, unit.id, UnitState.SYNCING)
         unit.hold = Hold(
             "external_wait",
             "remote feedback revision was already attempted; wait for actual check/reviewer/thread update",
@@ -231,12 +254,14 @@ def apply(snapshot: CampaignSnapshot, unit_id: str, feedback: RemoteFeedback) ->
 
 
 def repair_current(
-    gateway, feedback: dict[str, Any], *, now: float, hold_labels: tuple[str, ...]
+    gateway, feedback: dict[str, Any], *, now: float, requirements: PublicationRequirements
 ) -> bool:
     """Refresh actual remote authority before the bounded writer starts."""
     from .campaign_publication import PublicationController
 
     candidate = Candidate(**feedback["candidate"])
-    observation = PublicationController(gateway).inspect(candidate.pr_number)
-    fresh = collect(candidate, observation, now=now, hold_labels=hold_labels)
+    observation = PublicationController(gateway, requirements=requirements).inspect(
+        candidate.pr_number
+    )
+    fresh = collect(candidate, observation, now=now, requirements=requirements)
     return fresh is not None and fresh.digest == feedback["digest"]

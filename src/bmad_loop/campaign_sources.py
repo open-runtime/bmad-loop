@@ -234,7 +234,7 @@ def import_sources(
 
 
 def _prepare_ticket_source(
-    project: Path, workspace: Path, source: SourceSelector
+    project: Path, workspace: Path, source: SourceSelector, *, authority_dir: Path | None = None
 ) -> bmadconfig.ProjectPaths:
     """Copy shared stores and redirect only the newly owned worker checkout."""
     canonical = source_paths(project, source)
@@ -250,8 +250,6 @@ def _prepare_ticket_source(
         or not canonical.output_folder.is_relative_to(project)
     ):
         private = workspace / ".bmad-loop" / "campaign-source"
-        if private.exists():
-            raise CampaignError("private source destination already exists without a binding")
         from .install import _worktree_local_exclude
 
         refusal = _worktree_local_exclude(
@@ -259,17 +257,34 @@ def _prepare_ticket_source(
         )
         if refusal:
             raise CampaignError(f"cannot shield private ticket source: {refusal}")
-        _check_source_tree(canonical.output_folder)
-        shutil.copytree(
-            canonical.output_folder,
-            private,
-            ignore=shutil.ignore_patterns(".git", ".bmad-loop", "*.lock"),
-            symlinks=False,
-        )
+        initiative = source.initiative or canonical.active_initiative
+        if authority_dir is None:
+            if private.exists():
+                raise CampaignError("private source destination already exists without a binding")
+            _check_source_tree(canonical.output_folder)
+            shutil.copytree(
+                canonical.output_folder,
+                private,
+                ignore=shutil.ignore_patterns(".git", ".bmad-loop", "*.lock"),
+                symlinks=False,
+            )
+        else:
+            from .campaign_source_views import prepare
+
+            initiative = prepare(
+                canonical.output_folder,
+                workspace,
+                private,
+                authority_dir,
+                initiative=initiative,
+                store_remote=source.store_remote,
+                store_branch=source.store_branch,
+            )
+            _check_source_tree(private)
         ticketstore.redirect_mount_config(
             workspace,
             main_store=private,
-            initiative=source.initiative or canonical.active_initiative,
+            initiative=initiative,
         )
     elif (
         source.initiative
@@ -277,7 +292,7 @@ def _prepare_ticket_source(
         != bmadconfig.load_paths(workspace, want_tickets=True).active_initiative
     ):
         ticketstore.redirect_mount_config(workspace, main_store=None, initiative=source.initiative)
-    paths = bmadconfig.load_paths(workspace, want_tickets=True)
+    paths = source_paths(workspace, source)
     if not paths.output_folder.resolve().is_relative_to(workspace.resolve()):
         raise CampaignError("worker source still resolves outside its private checkout")
     return paths
@@ -379,7 +394,9 @@ def _overlay_table(text: str, table: str, fields: dict[str, str]) -> str:
     return result
 
 
-def prepare_source_view(project: Path, workspace: Path, source: SourceSelector) -> PreparedSource:
+def prepare_source_view(
+    project: Path, workspace: Path, source: SourceSelector, *, authority_dir: Path | None = None
+) -> PreparedSource:
     """Return effective worker selectors and paths with no shared source writer.
 
     Relative tracked source stays on the branch. Ignored source is copied to the
@@ -389,8 +406,11 @@ def prepare_source_view(project: Path, workspace: Path, source: SourceSelector) 
     project, workspace = project.resolve(), workspace.resolve()
     canonical = source_paths(project, source)
     if source.kind == "tickets":
-        paths = _prepare_ticket_source(project, workspace, source)
-        return PreparedSource(paths, source, (paths.output_folder,))
+        paths = _prepare_ticket_source(project, workspace, source, authority_dir=authority_dir)
+        # Freeze the effective initiative: later source preparation may not
+        # reinterpret an implicit selector through another native default.
+        effective = dataclasses.replace(source, initiative=paths.active_initiative)
+        return PreparedSource(paths, effective, (paths.output_folder,))
     if source.kind not in {"sprint-status", "stories"}:
         raise CampaignError(f"unsupported campaign source: {source.kind}")
     values = {

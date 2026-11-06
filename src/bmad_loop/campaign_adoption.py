@@ -1018,7 +1018,9 @@ def prepare(runtime, snapshot, action) -> dict[str, Any]:
     runtime._seed_checkout(workspace)
     selector = runtime.source(snapshot, unit)
     if not state.get("source"):
-        prepared = prepare_source_view(runtime.project, workspace, selector)
+        prepared = prepare_source_view(
+            runtime.project, workspace, selector, authority_dir=directory / "source-views"
+        )
         binding = runtime._source_publisher(snapshot, project=workspace).capture(
             prepared.selector, unit.spec
         )

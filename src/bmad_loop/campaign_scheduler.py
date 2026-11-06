@@ -46,8 +46,9 @@ class Admission:
 class CapacityObservation:
     """An explicit observed route, not a binary-on-PATH inference.
 
-    Unknown telemetry is unavailable. Counts are concurrent sessions; usage/budget
-    accounting remains campaign-owned and cannot be reset by a provider switch.
+    Unknown route availability blocks admission. Unknown concurrency falls back
+    to campaign limits. Usage/budget accounting remains campaign-owned and cannot
+    be reset by a provider switch.
     """
 
     available: bool
@@ -58,6 +59,21 @@ class CapacityObservation:
     budget_remaining: float | None = None
     known: bool = True
     concurrency_known: bool = True
+
+
+def route_unavailable(observation: CapacityObservation | None) -> str:
+    """One route gate for startup and admission; missing slot telemetry is not zero."""
+    if observation is None or not observation.known:
+        return "capacity unknown"
+    if (
+        not observation.available
+        or not observation.model_access
+        or (observation.concurrency_known and observation.active >= observation.slots)
+    ):
+        return observation.reason or "route/model/quota unavailable"
+    if observation.budget_remaining is not None and observation.budget_remaining <= 0:
+        return "account budget exhausted"
+    return ""
 
 
 def epic_key(source: str, initiative: str, epic: str) -> str:
@@ -239,19 +255,9 @@ def select_role(
     reasons = []
     for index, candidate in enumerate(options):
         key = (candidate.profile, candidate.model)
-        observation = capacities.get(key)
-        if observation is None or not observation.known:
-            reasons.append(f"{candidate.profile}/{candidate.model}: capacity unknown")
-        elif (
-            not observation.available
-            or not observation.model_access
-            or (observation.concurrency_known and observation.active >= observation.slots)
-        ):
-            reasons.append(
-                f"{candidate.profile}/{candidate.model}: {observation.reason or 'route/model/quota unavailable'}"
-            )
-        elif observation.budget_remaining is not None and observation.budget_remaining <= 0:
-            reasons.append(f"{candidate.profile}/{candidate.model}: account budget exhausted")
+        reason = route_unavailable(capacities.get(key))
+        if reason:
+            reasons.append(f"{candidate.profile}/{candidate.model}: {reason}")
         else:
             eligible.append(((selections or {}).get(key, 0), index, candidate))
     if not eligible:

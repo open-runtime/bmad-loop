@@ -151,7 +151,7 @@ def test_single_missing_gate_blocks_otherwise_valid_candidate(publishable, chang
     elif change == "draft":
         pr["draft"] = True
     elif change == "remotehold":
-        observation = replace(observation, issue={"labels": [{"name": "owner-hold"}]})
+        observation = replace(observation, issue={"labels": [{"name": "bmad:hold"}]})
     elif change == "rules":
         observation = replace(observation, rules=replace(observation.rules, strict=False))
     elif change == "check":

@@ -12,7 +12,7 @@ from pathlib import Path
 
 from .campaign_merge_adapter import AdapterReceipt
 from .campaign_model import Hold, UnitState
-from .campaign_publication import PublicationController, read_rules
+from .campaign_publication import PublicationController, PublicationRequirements, read_rules
 from .campaign_queue import (
     QueueGroup,
     allocate_checkout,
@@ -102,7 +102,17 @@ def observe_effect(runtime, snapshot, action) -> Observation:
             retry_at=runtime.clock() + 5,
         )
     if member.get("mergeQueueEntry") is None and prior.get("needs_dequeue"):
-        return Observation("confirmed", {"observed_at": runtime.clock(), "dequeued": True})
+        return Observation(
+            "confirmed",
+            {
+                "observed_at": runtime.clock(),
+                "dequeued": True,
+                "candidate": asdict(candidate),
+                "acceptance_changed": bool(
+                    prior.get("candidate") and prior["candidate"] != asdict(candidate)
+                ),
+            },
+        )
     if prior.get("candidate") and prior["candidate"] != asdict(candidate):
         return Observation(
             "confirmed", {"observed_at": runtime.clock(), "acceptance_changed": True}
@@ -148,7 +158,46 @@ def observe_effect(runtime, snapshot, action) -> Observation:
             },
         )
     group = observe_group(gateway, candidate, clock=runtime.clock)
+    controller = PublicationController(
+        gateway,
+        clock=runtime.clock,
+        requirements=PublicationRequirements.from_spec(snapshot.spec.github),
+    )
+    observed = controller.inspect(candidate.pr_number)
+    gate = controller.evaluate(
+        candidate,
+        runtime._publication_evidence(snapshot, unit),
+        observed,
+        merge_mode="queue",
+        independent_families=snapshot.spec.github.require_independent_review,
+        queue_evidence_context=snapshot.spec.github.candidate_check_context,
+        queued_base=observed.base_head,
+    )
+    from .campaign_remote_feedback import collect as collect_remote_feedback
+
+    remote_feedback = (
+        collect_remote_feedback(
+            candidate, observed, now=runtime.clock(), requirements=controller.requirements
+        )
+        if not prior.get("failure")
+        else None
+    )
+    if remote_feedback is not None and not any(
+        row["kind"] in {"required_check", "required_status"} for row in remote_feedback.defects
+    ):
+        remote_feedback = None
     if group is None:
+        if remote_feedback is not None:
+            return Observation(
+                "confirmed",
+                {
+                    "observed_at": runtime.clock(),
+                    "group": None,
+                    "gate_reasons": list(gate.reasons),
+                    "candidate": asdict(candidate),
+                    "remote_feedback": asdict(remote_feedback),
+                },
+            )
         if (member.get("mergeQueueEntry") or {}).get("state") == "UNMERGEABLE":
             return Observation(
                 "confirmed",
@@ -166,18 +215,6 @@ def observe_effect(runtime, snapshot, action) -> Observation:
                 "reason": "waiting for authenticated synthetic merge-group candidate",
             },
         )
-    controller = PublicationController(gateway, clock=runtime.clock)
-    observed = controller.inspect(candidate.pr_number)
-    gate = controller.evaluate(
-        candidate,
-        runtime._publication_evidence(snapshot, unit),
-        observed,
-        merge_mode="queue",
-        independent_families=snapshot.spec.github.require_independent_review,
-        queue_evidence_context=snapshot.spec.github.candidate_check_context,
-        hold_labels=snapshot.spec.github.hold_labels,
-        queued_base=observed.base_head,
-    )
     # After enqueue the explicit queue contract verifies current B/G over the
     # retained accepted B0. Every other current remote hold remains a veto.
     reasons = gate.reasons
@@ -220,6 +257,7 @@ def observe_effect(runtime, snapshot, action) -> Observation:
             "app_id": check_app,
             "failed_check": failed_check,
             "candidate": asdict(candidate),
+            "remote_feedback": asdict(remote_feedback) if remote_feedback is not None else None,
         },
     )
 
@@ -342,7 +380,7 @@ def apply_effect(runtime, snapshot, unit, action, data) -> None:
             membership_missing_count=state.get("membership_missing_count", 0) + 1,
         )
         return
-    if data.get("acceptance_changed"):
+    if data.get("acceptance_changed") and not data.get("dequeued"):
         state.update(
             observed_at=data["observed_at"],
             needs_dequeue=True,
@@ -362,6 +400,42 @@ def apply_effect(runtime, snapshot, unit, action, data) -> None:
         )
         return
     if data.get("dequeued"):
+        readback_candidate = data.get("candidate")
+        if readback_candidate:
+            current_candidate = asdict(runtime._candidate(snapshot, unit))
+            if any(
+                readback_candidate[key] != current_candidate[key]
+                for key in ("repository", "pr_number", "target", "head")
+            ):
+                state["observed_at"] = 0
+                add_event(snapshot, "queue-removal-readback-stale", unit=unit.id)
+                return
+            if readback_candidate != current_candidate:
+                state["restart_acceptance"] = True
+        if data.get("acceptance_changed"):
+            state["restart_acceptance"] = True
+        if (
+            state.get("remote_feedback")
+            and not state.get("failure")
+            and not state.get("restart_acceptance")
+        ):
+            from .campaign_publication import Candidate
+            from .campaign_remote_feedback import RemoteFeedback, apply_after_queue_removal
+
+            raw = state["remote_feedback"]
+            feedback = RemoteFeedback(
+                Candidate(**raw["candidate"]),
+                raw["rules_fingerprint"],
+                tuple(raw["defects"]),
+                raw["digest"],
+                raw["observed_at"],
+            )
+            # This branch is reached only from authenticated open/unmerged,
+            # exact-head membership readback with no queue entry.
+            state["dequeue_confirmed"] = data["candidate"]
+            apply_after_queue_removal(snapshot, unit.id, feedback)
+            unit.bindings.pop("merge_request_id", None)
+            return
         failure = data.get("failure") or state.get("failure")
         reasons = state.get("gate_reasons", [])
         unit.bindings.pop("merge_request_id", None)
@@ -430,6 +504,8 @@ def apply_effect(runtime, snapshot, unit, action, data) -> None:
         )
         if data.get("gate_reasons"):
             state["needs_dequeue"] = True
+        if data.get("remote_feedback"):
+            state.update(remote_feedback=data["remote_feedback"], needs_dequeue=True)
         if data.get("failed_check"):
             state.update(
                 needs_dequeue=True,

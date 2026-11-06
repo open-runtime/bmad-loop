@@ -14,6 +14,7 @@ from bmad_loop.campaign_model import (
     UnitState,
     WorkerClaim,
 )
+from bmad_loop.campaign_publication import PublicationRequirements
 from bmad_loop.campaign_remote_feedback import apply, collect
 from bmad_loop.campaign_resolution import CauseCode
 from bmad_loop.campaign_resolution_flow import typed_failure
@@ -67,14 +68,24 @@ def test_required_remote_defect_is_bound_to_exact_head_native_identity_and_rule_
     publishable, defect
 ):
     candidate, observed = observation(publishable, defect)
-    result = collect(candidate, observed, now=100, hold_labels=("owner-hold",))
+    result = collect(
+        candidate,
+        observed,
+        now=100,
+        requirements=PublicationRequirements(hold_labels=("owner-hold",)),
+    )
     assert result is not None and result.defects
     assert result.candidate == candidate and result.rules_fingerprint == observed.rules.fingerprint
     assert all(row["head"] == candidate.head for row in result.defects)
     assert all(row["id"] for row in result.defects)
     assert (
         result.digest
-        == collect(candidate, replace(observed, observed_at=101), now=101, hold_labels=()).digest
+        == collect(
+            candidate,
+            replace(observed, observed_at=101),
+            now=101,
+            requirements=PublicationRequirements(hold_labels=()),
+        ).digest
     )
 
 
@@ -113,7 +124,15 @@ def test_waits_and_unbound_findings_do_not_create_repair_authority(publishable, 
         observed = replace(observed, issue={"labels": [{"name": "owner-hold"}]})
     else:
         observed = replace(observed, observed_at=0)
-    assert collect(candidate, observed, now=100, hold_labels=("owner-hold",)) is None
+    assert (
+        collect(
+            candidate,
+            observed,
+            now=100,
+            requirements=PublicationRequirements(hold_labels=("owner-hold",)),
+        )
+        is None
+    )
 
 
 def test_remote_repair_preserves_pr_and_attempt_budget_and_must_return_through_full_acceptance(
@@ -122,7 +141,9 @@ def test_remote_repair_preserves_pr_and_attempt_budget_and_must_return_through_f
     candidate, observed = observation(publishable, "check")
     candidate = replace(candidate, config_revision="1", graph_revision=1)
     observed = replace(observed, pr=copy.deepcopy(observed.pr))
-    feedback = collect(candidate, observed, now=100, hold_labels=())
+    feedback = collect(
+        candidate, observed, now=100, requirements=PublicationRequirements(hold_labels=())
+    )
     spec = UnitSpec(candidate.unit_id, "s", "e", "Unit")
     unit = CampaignUnit(
         spec,

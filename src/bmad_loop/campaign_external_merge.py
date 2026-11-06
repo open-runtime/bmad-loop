@@ -13,7 +13,7 @@ from dataclasses import asdict, dataclass
 
 from . import verify
 from .campaign_model import CampaignError
-from .campaign_publication import PublicationController
+from .campaign_publication import PublicationController, PublicationRequirements
 from .campaign_supervisor import Observation
 
 
@@ -40,7 +40,11 @@ class ExternalMergeEvidence:
 
 def inspect(runtime, snapshot, unit, observation) -> Observation:
     candidate = runtime._candidate(snapshot, unit)
-    controller = PublicationController(runtime.gateway(snapshot), clock=runtime.clock)
+    controller = PublicationController(
+        runtime.gateway(snapshot),
+        clock=runtime.clock,
+        requirements=PublicationRequirements.from_spec(snapshot.spec.github),
+    )
     receipt = controller.merge_status(candidate.pr_number, expected_head=candidate.head)
     if receipt.state != "merged_pending_sync":
         return Observation(
@@ -126,7 +130,6 @@ def inspect(runtime, snapshot, unit, observation) -> Observation:
         merge_mode=snapshot.spec.github.merge_mode,
         independent_families=snapshot.spec.github.require_independent_review,
         queue_evidence_context=snapshot.spec.github.candidate_check_context,
-        hold_labels=snapshot.spec.github.hold_labels,
         canonical_merge=canonical,
     )
     if not gate.ready:

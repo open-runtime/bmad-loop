@@ -127,6 +127,12 @@ provide normalized ownership scopes; incomplete declarations stay conservative.
 For separately versioned ticket stores, configure both `store_remote` and
 `store_branch` on the source so source publication has its own remote contract.
 
+Selectors of the same shared ticket store reuse one bound private copy while
+retaining their own initiative identities. Planning publishes each artifact once
+through its source's native writer. Recovery preserves private edits and refuses
+canonical drift before the first planning preimages are captured; it never
+silently replaces the original source baseline with newer owner edits.
+
 Sources retain legacy ordering unless independence is explicitly declared or
 provided by their dependency graph. Unknown ownership is conservative. Isolated
 worktrees prevent file races, while ownership scopes prevent simultaneous writers
@@ -261,6 +267,23 @@ configured conflict-repair role, verifies the resulting candidate and reviews
 the full PR diff. Changed heads invalidate affected evidence. Draft-to-ready
 transition permits selected remote checks and reviewers to run. Model review
 and an eligible GitHub approval are separate obligations.
+
+`github.required_checks` adds checks on the exact PR head to the server's required
+checks, retaining any server App restrictions. Missing or pending checks wait;
+failed checks enter bounded repair after confirmed queue removal when enqueued.
+These checks do not replace the separate verification of a queue's combined
+candidate. Outstanding user or team review requests also wait, even when the
+approval count is otherwise sufficient.
+Configured `github.hold_labels` (default `bmad:hold`) apply to fresh publication
+and merge retries. Read-only reconciliation of an issued merge continues while
+held, without authorizing another merge write.
+
+Development attribution comes from the latest completed primary dev/fix session's
+observed main model. Clean follow-up reviews and plugin telemetry do not replace
+that identity; explicit planning and repair writers retain their own attribution.
+Missing observed development identity remains visible and prevents independent
+publication acceptance. Resume can recover the identity from saved native
+receipts and invalidates a publication review that is no longer independent.
 
 `github.max_base_refreshes` bounds repeated acceptance restarts when main moves
 (default eight). Exhaustion leaves a visible operator hold on that unit and

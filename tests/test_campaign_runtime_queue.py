@@ -226,7 +226,7 @@ def test_production_campaign_queue_checks_exact_g_and_preserves_h_on_lost_ack(
     snapshot.graph_revision += 1
     snapshot = case.store.save(snapshot, snapshot.revision)
     case.snapshot = snapshot
-    result = run_case(case, ticks=2500)
+    result = run_case(case)
     assert result.phase == "delivered", diagnose(result)
     assert all(unit.state == UnitState.DELIVERED for unit in result.units.values())
     assert len(server.group_numbers) >= 3

@@ -25,7 +25,7 @@ from .campaign_decisions import (
 )
 from .campaign_github import GithubError
 from .campaign_model import CampaignError
-from .campaign_publication import PublicationController
+from .campaign_publication import PublicationController, PublicationRequirements
 from .platform_util import file_lock
 
 
@@ -50,7 +50,9 @@ def _number(binding) -> int:
 def _approval(gateway, snapshot, unit) -> tuple[ObservedFact, ...]:
     if unit.hold.kind not in {"github_review", "required_review"} or not unit.bindings.get("pr"):
         return ()
-    observed = PublicationController(gateway).inspect(_number(unit.bindings["pr"]))
+    observed = PublicationController(
+        gateway, requirements=PublicationRequirements.from_spec(snapshot.spec.github)
+    ).inspect(_number(unit.bindings["pr"]))
     head = unit.bindings.get("head", "")
     pr = observed.pr
     if not observed.rules.complete or pr.get("state") != "open":

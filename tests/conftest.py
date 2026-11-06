@@ -17,6 +17,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import warnings
 from collections.abc import Iterator
@@ -210,6 +211,27 @@ def private_tmux_socket_path(base: Path) -> Path:
 
 
 @contextlib.contextmanager
+def short_socket_directory(endpoint: str) -> Iterator[Path]:
+    """Own only temporary IPC files, independently of pytest's possibly long root."""
+    with tempfile.TemporaryDirectory(prefix="bml-", dir="/tmp") as directory:
+        root = Path(directory).resolve()
+        path = root / endpoint
+        if len(os.fsencode(path)) > 96:
+            raise AssertionError(f"test socket endpoint exceeds its 96-byte budget: {path}")
+        yield root
+
+
+@pytest.fixture
+def short_socket_dir(tmp_path: Path) -> Iterator[Path]:
+    """A private short target tree for POSIX socket-substitution tests."""
+    if os.name != "posix":
+        yield tmp_path
+        return
+    with short_socket_directory("artifacts/owned.md") as directory:
+        yield directory
+
+
+@contextlib.contextmanager
 def private_tmux_socket(base: Path) -> Iterator[Path]:
     """Point every tmux client in this process tree at a private server under
     ``base`` and yield its socket path; kill that server, by explicit socket, on
@@ -232,10 +254,13 @@ def private_tmux_socket(base: Path) -> Iterator[Path]:
 
 
 @pytest.fixture
-def private_tmux_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
+def private_tmux_server() -> Iterator[Path]:
     """One private tmux server per test; yields its socket path for ``-S`` probes.
-    A short `mktemp` dir keeps the socket far below the 108-byte sun_path limit."""
-    with private_tmux_socket(tmp_path_factory.mktemp("tmux")) as socket:
+    The IPC directory does not inherit pytest's potentially long temporary root."""
+    with (
+        short_socket_directory(f"tmux-{os.getuid()}/default") as directory,
+        private_tmux_socket(directory) as socket,
+    ):
         yield socket
 
 

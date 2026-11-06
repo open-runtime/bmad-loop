@@ -52,6 +52,37 @@ def test_unknown_footprint_keeps_exclusive_scope_semantics(project):
     assert validate_execution(unit(project, ()), receipt, {}) == ["unknown.py"]
 
 
+@pytest.mark.parametrize(
+    "origin,destination,accepted",
+    [
+        ("unowned/original.py", "src/owned/moved.py", False),
+        ("src/owned/original.py", "unowned/moved.py", False),
+        ("src/owned/original.py", "src/owned/moved.py", True),
+    ],
+)
+def test_completed_worker_checks_both_rename_paths_before_any_checkpoint(
+    project, origin, destination, accepted
+):
+    repo = project.project
+    committed(project, origin)
+    base = verify.rev_parse_head(repo)
+    git(repo, "config", "diff.renames", "true")
+    (repo / destination).parent.mkdir(parents=True, exist_ok=True)
+    git(repo, "mv", origin, destination)
+    git(repo, "commit", "-m", "completed worker exact-content rename")
+    receipt = {"base": base, "head": verify.rev_parse_head(repo)}
+    # No checkpoint service participates: the terminal worker validator is the
+    # last ownership gate for a worker that commits and finishes immediately.
+    if accepted:
+        assert set(validate_execution(unit(project, ("src/owned",)), receipt, {})) == {
+            origin,
+            destination,
+        }
+    else:
+        with pytest.raises(CampaignError, match="escaped declared ownership"):
+            validate_execution(unit(project, ("src/owned",)), receipt, {})
+
+
 @pytest.mark.parametrize("scopes", [("src/owned",), ()])
 def test_sprint_bookkeeping_cannot_advance_a_different_story(project, scopes):
     from conftest import install_bmad_config, write_sprint

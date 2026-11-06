@@ -89,7 +89,7 @@ def test_real_child_retry_after_pushed_checkpoint_recovers_rearms_and_pushes_fas
 ):
     case = production_case
     configure_recovery_canary(case)
-    result = run_case(case, ticks=2200)
+    result = run_case(case)
     marker_root = case.events.parent / "parallel-markers"
     rejected = json.loads(
         (marker_root / "published-rejected-checkpoint.json").read_text(encoding="utf-8")

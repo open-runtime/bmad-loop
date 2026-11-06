@@ -20,7 +20,7 @@ def validate_execution(unit: Any, receipt: dict[str, Any], source: dict[str, Any
     base, head = receipt["base"], receipt["head"]
     if not verify.is_ancestor(workspace, base, head):
         raise CampaignError("execution rewrote its accepted candidate history")
-    result = verify.git_bytes(workspace, "diff", "--name-only", "-z", base, head)
+    result = verify.git_bytes(workspace, "diff", "--name-only", "--no-renames", "-z", base, head)
     if result.returncode:
         raise CampaignError("execution ownership observation failed")
     paths = [raw.decode("utf-8") for raw in result.stdout.split(b"\0") if raw]

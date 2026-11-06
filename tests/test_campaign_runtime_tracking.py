@@ -419,7 +419,7 @@ def test_production_runtime_automatically_merges_source_tracking_draft(
         return original_publish(self, action_id, source, unit, binding, **kwargs)
 
     monkeypatch.setattr(SourcePublication, "publish", source_debt)
-    result = run_case(case, ticks=3000)
+    result = run_case(case)
     assert result.phase == "delivered", diagnose(result)
     controls = [unit for unit in result.units.values() if unit.spec.kind == "tracking"]
     assert len(controls) == 1 and controls[0].state == UnitState.DELIVERED

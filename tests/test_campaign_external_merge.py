@@ -84,7 +84,7 @@ def test_canonical_merge_observation_retains_real_closed_state_and_native_remote
     assert controller.evaluate(
         candidate, evidence, observed, independent_families=True, canonical_merge=proof
     ).ready
-    held = replace(observed, issue={"labels": [{"name": "owner-hold"}]})
+    held = replace(observed, issue={"labels": [{"name": "bmad:hold"}]})
     assert not controller.evaluate(
         candidate, evidence, held, independent_families=True, canonical_merge=proof
     ).ready

@@ -224,6 +224,9 @@ class CampaignSupervisor:
         # Queued holds/stops must reach the authority before an uncertain
         # effect can authorize any retry during startup reconciliation.
         snapshot = self._commands(self.store.load(campaign_id))
+        prepare_resume = getattr(self.driver, "prepare_resume", None)
+        if prepare_resume is not None and prepare_resume(snapshot):
+            snapshot = self._save(snapshot)
         for action in tuple(snapshot.outbox):
             if action.state == "sent_unknown":
                 snapshot = self._submit(snapshot, action, executor, reconcile=True)

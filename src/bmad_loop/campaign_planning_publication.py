@@ -37,6 +37,7 @@ def capture(
     project: Path,
     workspace: Path,
     sources: tuple[tuple[SourceSelector, SourceSelector], ...],
+    source_authority: Path | None = None,
     max_files: int = 10000,
     max_bytes: int = 64 * 1024 * 1024,
 ) -> dict[str, Any]:
@@ -51,9 +52,25 @@ def capture(
         root, local = source_root(project, canonical), source_root(workspace, effective)
         if not local.is_relative_to(workspace.resolve()):
             raise CampaignError("planning source view is outside its owned checkout")
+        copy_manifest = None
+        if (
+            source_authority is not None
+            and canonical.kind == "tickets"
+            and local == workspace.resolve() / ".bmad-loop" / "campaign-source"
+        ):
+            from .campaign_source_views import captured_manifest
+
+            copy_manifest = captured_manifest(
+                source_authority, canonical=root, workspace=workspace, destination=local
+            )
         preimages = {}
         for directory, dirs, files in os.walk(root, followlinks=False):
-            dirs[:] = sorted(name for name in dirs if name not in {".git", "node_modules", "runs"})
+            dirs[:] = sorted(
+                name
+                for name in dirs
+                if name not in {".git", "node_modules", "runs"}
+                and (copy_manifest is None or (name != ".bmad-loop" and not name.endswith(".lock")))
+            )
             for name in dirs:
                 if is_link_like(Path(directory) / name):
                     raise CampaignError("planning canonical source contains redirected directories")
@@ -71,11 +88,31 @@ def capture(
                 preimages[item.relative_to(root).as_posix()] = base64.b64encode(
                     item.read_bytes()
                 ).decode("ascii")
+        if copy_manifest is not None:
+            expected = {
+                name: entry["sha256"]
+                for name, entry in copy_manifest.items()
+                if entry["kind"] == "file"
+                and Path(name).suffix in SUFFIXES
+                and not ({"node_modules", "runs"} & set(Path(name).parts[:-1]))
+            }
+            captured = {
+                name: hashlib.sha256(base64.b64decode(value, validate=True)).hexdigest()
+                for name, value in preimages.items()
+            }
+            if captured != expected:
+                raise CampaignError("canonical source changed since private copy capture")
         rows.append(
             {
                 "source": canonical.id,
+                "kind": canonical.kind,
                 "root": str(root),
                 "local_root": str(local),
+                "local_initiative": (
+                    str(source_paths(workspace, effective).initiative_folder)
+                    if canonical.kind == "tickets"
+                    else ""
+                ),
                 "preimages": preimages,
             }
         )
@@ -133,6 +170,65 @@ def mirror_artifacts(
     return paths, mirrors
 
 
+def _artifact_sources(
+    manifest: dict[str, Any],
+    workspace: Path,
+    artifacts: list[dict[str, Any]],
+    source_bindings: dict[str, Any],
+    units: dict[str, Any],
+) -> dict[str, str]:
+    """Route one canonical path once, using the reviewed graph's native identity."""
+    owners: dict[str, str] = {}
+    for artifact in artifacts:
+        relative = artifact["path"]
+        item = workspace / relative
+        if Path(relative).is_absolute() or ".." in Path(relative).parts or is_link_like(item):
+            raise CampaignError("planning artifact path is redirected or outside its checkout")
+        candidates = [
+            row
+            for row in manifest["sources"]
+            if item.resolve().is_relative_to(Path(row["local_root"]))
+        ]
+        if not candidates:
+            continue  # Ordinary code-owned planning documents have no source publication.
+        declared = {
+            units[key]["source"]
+            for key, binding in source_bindings.items()
+            if key in units and binding["path"] == relative
+        }
+        if len(declared) > 1:
+            raise CampaignError("planning artifact has conflicting source ownership")
+        if declared:
+            candidates = [row for row in candidates if row["source"] in declared]
+            if len(candidates) != 1:
+                raise CampaignError("planning artifact source differs from its captured authority")
+            selected_source = candidates[0]
+            if selected_source.get("kind") == "tickets" and (
+                not selected_source.get("local_initiative")
+                or not item.resolve().is_relative_to(Path(selected_source["local_initiative"]))
+            ):
+                raise CampaignError("planning ticket artifact belongs to another initiative")
+        elif len(candidates) > 1:
+            # Select a store's own initiative before the stable config-order
+            # owner of store-wide metadata. Never send B's plan through A's tree.
+            selected = [
+                row
+                for row in candidates
+                if row.get("local_initiative")
+                and item.resolve().is_relative_to(Path(row["local_initiative"]))
+            ]
+            if selected:
+                candidates = selected
+        destinations = {
+            str(Path(row["root"]) / item.resolve().relative_to(Path(row["local_root"])))
+            for row in candidates
+        }
+        if len(destinations) != 1:
+            raise CampaignError("planning artifact maps to conflicting canonical destinations")
+        owners[relative] = candidates[0]["source"]
+    return owners
+
+
 def changes(
     manifest: dict[str, Any],
     workspace: Path,
@@ -146,6 +242,7 @@ def changes(
     row = next((value for value in manifest["sources"] if value["source"] == source_id), None)
     if row is None or manifest["workspace"] != str(workspace.resolve()):
         raise CampaignError("planning source has no captured canonical preimage authority")
+    owners = _artifact_sources(manifest, workspace, artifacts, source_bindings, units)
     local, root = Path(row["local_root"]), Path(row["root"])
     result = []
     selectors = {
@@ -154,6 +251,8 @@ def changes(
         if key in units and units[key].get("source") == source_id
     }
     for artifact in artifacts:
+        if owners.get(artifact["path"]) != source_id:
+            continue
         item = workspace / artifact["path"]
         if not item.resolve().is_relative_to(local):
             continue
@@ -306,7 +405,7 @@ def validate_stage_products(
                     "planning authored an invalid native ticket tree: " + "; ".join(board.problems)
                 )
     observed = verify.git_bytes(
-        workspace, "diff", "--name-only", "-z", receipt["base"], receipt["head"]
+        workspace, "diff", "--name-only", "--no-renames", "-z", receipt["base"], receipt["head"]
     )
     if observed.returncode:
         raise CampaignError("planning changed-path observation failed")

@@ -47,7 +47,12 @@ from .campaign_model import (
 )
 from .campaign_planning import StageCoordinates, execution_spec, stage_packet, validate_result
 from .campaign_preflight import repository_name, resolve_roles
-from .campaign_publication import Candidate, PublicationController, PublicationEvidence
+from .campaign_publication import (
+    Candidate,
+    PublicationController,
+    PublicationEvidence,
+    PublicationRequirements,
+)
 from .campaign_recovery import CheckpointPusher
 from .campaign_scheduler import CapacityObservation, admit, select_role
 from .campaign_sources import import_sources, prepare_source_view
@@ -395,6 +400,11 @@ class CampaignRuntime:
             if proposal.kind == "observe-worker"
         )
         return tuple(proposals)
+
+    def prepare_resume(self, snapshot: CampaignSnapshot) -> bool:
+        from .campaign_attribution import restore
+
+        return restore(snapshot)
 
     def proposals(self, snapshot: CampaignSnapshot) -> tuple[Proposal, ...]:
         if self._units_settled(snapshot) and self.completion_ready(snapshot):
@@ -1039,7 +1049,10 @@ class CampaignRuntime:
                         transition(snapshot, waiting.id, UnitState.READY)
                     elif waiting.state == UnitState.VERIFYING:
                         transition(snapshot, waiting.id, UnitState.SYNCING)
-            if kind == "terminate-workers":
+            if (
+                kind == "terminate-workers"
+                or command.get("payload", {}).get("terminate_workers") is True
+            ):
                 snapshot.bindings["terminate_requested"] = True
         elif kind == "hold":
             unit = snapshot.units[key]
@@ -1145,7 +1158,9 @@ class CampaignRuntime:
                     adopted = dataclasses.replace(
                         intent, generation=current.generation, state="sent_unknown"
                     )
-                    result = PublicationController(gateway).reconcile_request(
+                    result = PublicationController(
+                        gateway, requirements=PublicationRequirements.from_spec(current.spec.github)
+                    ).reconcile_request(
                         adopted,
                         self._candidate(current, unit),
                         self._publication_evidence(current, unit),
@@ -1748,8 +1763,10 @@ class CampaignRuntime:
         if unit.spec.kind == "planning":
             source = next((row for row in snapshot.spec.sources if row.kind == "tickets"), source)
         source_marker = state_dir / "source.json"
-        if source.kind != "explicit" and not source_marker.exists():
-            prepared = prepare_source_view(self.project, workspace, source)
+        if source.kind != "explicit" and (not source_marker.exists() or source.kind == "tickets"):
+            prepared = prepare_source_view(
+                self.project, workspace, source, authority_dir=state_dir / "source-views"
+            )
             atomic_write_text(
                 source_marker,
                 json.dumps(
@@ -1765,6 +1782,7 @@ class CampaignRuntime:
         )
         planning_manifest = ""
         effective_sources = []
+        private_paths = list(source_binding.get("private_paths", []))
         if unit.spec.kind == "planning":
             from .campaign_planning_publication import capture
 
@@ -1773,11 +1791,24 @@ class CampaignRuntime:
                 if configured.id == source.id and source_binding.get("effective_source"):
                     effective = SourceSelector(**source_binding["effective_source"])
                 else:
-                    effective = prepare_source_view(self.project, workspace, configured).selector
+                    prepared = prepare_source_view(
+                        self.project,
+                        workspace,
+                        configured,
+                        authority_dir=state_dir / "source-views",
+                    )
+                    effective = prepared.selector
+                    private_paths.extend(str(path) for path in prepared.private_paths)
                 pairs.append((configured, effective))
                 effective_sources.append(dataclasses.asdict(effective))
             manifest_path = state_dir / "planning-preimages.json"
-            capture(manifest_path, project=self.project, workspace=workspace, sources=tuple(pairs))
+            capture(
+                manifest_path,
+                project=self.project,
+                workspace=workspace,
+                sources=tuple(pairs),
+                source_authority=state_dir / "source-views",
+            )
             planning_manifest = str(manifest_path)
         if unit.spec.kind not in {"planning", "tracking"}:
             effective = SourceSelector(
@@ -1846,7 +1877,7 @@ class CampaignRuntime:
                 "effective_source": source_binding.get(
                     "effective_source", dataclasses.asdict(source)
                 ),
-                "private_paths": source_binding.get("private_paths", []),
+                "private_paths": list(dict.fromkeys(private_paths)),
                 "canonical_source": canonical_binding,
                 "canonical_selector": dataclasses.asdict(self.source(snapshot, unit)),
                 "source_authority_root": str(
@@ -2442,7 +2473,7 @@ class CampaignRuntime:
                 self.gateway(snapshot),
                 unit.evidence["remote_feedback"],
                 now=time.time(),
-                hold_labels=snapshot.spec.github.hold_labels,
+                requirements=PublicationRequirements.from_spec(snapshot.spec.github),
             ):
                 return Observation(
                     "confirmed", {"not_launched": True, "remote_feedback_changed": True}
@@ -2977,7 +3008,10 @@ class CampaignRuntime:
                     or hashlib.sha256(path.read_bytes()).hexdigest() != artifact["sha256"]
                 ):
                     return Observation("confirmed", {"source_drift": artifact["path"]})
-        controller = PublicationController(self.gateway(snapshot))
+        controller = PublicationController(
+            self.gateway(snapshot),
+            requirements=PublicationRequirements.from_spec(snapshot.spec.github),
+        )
         candidate = self._candidate(snapshot, unit)
         observation = controller.inspect(candidate.pr_number)
         if observation.pr.get("merged") is True:
@@ -2990,7 +3024,7 @@ class CampaignRuntime:
             candidate,
             observation,
             now=controller.clock(),
-            hold_labels=snapshot.spec.github.hold_labels,
+            requirements=PublicationRequirements.from_spec(snapshot.spec.github),
         )
         if remote_defects is not None:
             return Observation("confirmed", {"remote_feedback": dataclasses.asdict(remote_defects)})
@@ -3006,7 +3040,6 @@ class CampaignRuntime:
             merge_mode=snapshot.spec.github.merge_mode,
             independent_families=snapshot.spec.github.require_independent_review,
             queue_evidence_context=snapshot.spec.github.candidate_check_context,
-            hold_labels=snapshot.spec.github.hold_labels,
         )
         if not gate.ready:
             return Observation(
@@ -3029,7 +3062,6 @@ class CampaignRuntime:
                 merge_mode=snapshot.spec.github.merge_mode,
                 queue_context=snapshot.spec.github.candidate_check_context,
                 independent_families=snapshot.spec.github.require_independent_review,
-                hold_labels=snapshot.spec.github.hold_labels,
                 clock=self.clock,
             )
             if project_gate.state != "ready":
@@ -3073,7 +3105,10 @@ class CampaignRuntime:
 
     def _perform_observe_merge(self, snapshot, action) -> Observation:
         unit = snapshot.units[action.unit]
-        controller = PublicationController(self.gateway(snapshot))
+        controller = PublicationController(
+            self.gateway(snapshot),
+            requirements=PublicationRequirements.from_spec(snapshot.spec.github),
+        )
         receipt = controller.merge_status(
             unit.bindings["pr"]["number"],
             request_id=unit.bindings.get("merge_request_id", ""),
@@ -4045,19 +4080,9 @@ class CampaignRuntime:
             unit.bindings["source_revision"] = hashlib.sha256(
                 json.dumps(unit.evidence["source_artifacts"], sort_keys=True).encode()
             ).hexdigest()
-            models = [
-                model for row in receipt.get("sessions", []) for model in row.get("models", [])
-            ]
-            family = (
-                "anthropic"
-                if models and all(model.startswith("claude") for model in models)
-                else (
-                    "openai"
-                    if models and all(model.startswith(("gpt", "o")) for model in models)
-                    else ""
-                )
-            )
-            unit.evidence["developer_family"] = family
+            from .campaign_attribution import record as record_development
+
+            record_development(snapshot, unit, receipt)
             transition(snapshot, unit.id, UnitState.LOCALLY_COMPLETE)
         elif outcome == "recovered":
             unit.evidence.setdefault("recovery_history", []).append(receipt)
@@ -4211,6 +4236,11 @@ class CampaignRuntime:
                 "planning stage completed; graph revision validation pending",
                 id=claim.launch_id,
             )
+
+        # A resumed review may have been live when startup attribution repair
+        # ran. Repair only after accepting its result, including deferred
+        # stage-boundary results, so a same-family review is invalidated too.
+        self.prepare_resume(snapshot)
 
     def attach(self, campaign_id: str, unit_id: str, role: str = "execution") -> int:
         snapshot = self.store.load(campaign_id)

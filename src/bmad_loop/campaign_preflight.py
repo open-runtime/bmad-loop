@@ -21,6 +21,7 @@ from .campaign_capacity import observe
 from .campaign_github import GhTransport, GithubGateway
 from .campaign_model import CampaignError, CampaignSpec, RoleSpec
 from .campaign_publication import read_rules
+from .campaign_scheduler import route_unavailable
 from .campaign_sources import import_sources
 from .campaign_workers import common_directory, git
 
@@ -179,11 +180,7 @@ def inspect(
                         "binary": profile.binary,
                         "installed": installed,
                         "capacity": dataclasses.asdict(route),
-                        "eligible": installed
-                        and route.available
-                        and route.model_access
-                        and route.known
-                        and route.slots > route.active,
+                        "eligible": installed and not route_unavailable(route),
                     }
                 )
             except (ValueError, OSError) as exc:
