@@ -102,6 +102,7 @@ class GitHubSpec:
     merge_command: tuple[str, ...] = ()
     recent_days: int = 30
     max_base_refreshes: int = 8
+    allow_publication_wait: bool = False
 
 
 @dataclass(frozen=True)
@@ -118,6 +119,7 @@ class ParadevSpec:
 class CheckpointSpec:
     push: bool = True
     target_interval_s: int = 600
+    max_backup_failures: int = 5
 
 
 @dataclass(frozen=True)
@@ -385,6 +387,7 @@ def _construct(cls: Any, value: Any, name: str) -> Any:
             "max_context_events",
             "recent_days",
             "max_base_refreshes",
+            "max_backup_failures",
             "max_new_units",
             "max_triage_attempts",
             "timeout_s",
@@ -399,6 +402,7 @@ def _construct(cls: Any, value: Any, name: str) -> Any:
             "push",
             "require_independent_review",
             "allow_new_units",
+            "allow_publication_wait",
         }:
             if type(item) is not bool:
                 raise CampaignError(f"{name}.{key} must be a boolean")

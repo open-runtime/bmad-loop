@@ -83,10 +83,12 @@ max_sessions = 6
 enabled = true
 merge_mode = "direct-strict"
 merge_method = "merge"
+allow_publication_wait = false
 
 [checkpoints]
 push = true
 target_interval_s = 600
+max_backup_failures = 5
 
 [intake]
 issues = "all-open-and-new"
@@ -239,7 +241,19 @@ it cannot change runtime policy or authorize an unrelated action.
 Meaningful checkpoints are committed by the worker and pushed as immutable
 commit IDs. Draft checkpoints can be incomplete. A soft time target encourages
 frequent coherent backups; it does not authorize another process to edit a live
-index. Published history stays append-only during campaign recovery.
+index. The worker's monitor only observes committed, dirty and private source
+progress; it never stages or commits the live tree. Status reports progress and
+dirty ages, unbacked commits, pending backup identities and failure counts.
+Unissued progress can coalesce to the latest worker commit. Once a push is issued,
+its original exact SHA must reconcile before replacement. After
+`checkpoints.max_backup_failures` attempts (default 5), backup remains visibly
+degraded and checks the existing remote intent at a slower read-only cadence.
+An explicit `campaign resume ID` authorizes one fresh capped write budget for
+previously exhausted backups that were never issued or remain prepared. It keeps
+their action IDs, prepared SHAs and prior failure history. Issued uncertain pushes
+continue exact-head readback. `campaign reconcile ID` can recognize an operator's
+already-pushed sealed commit without re-arming writes.
+Published history stays append-only during campaign recovery.
 
 Final delivery updates the branch from current main, resolves conflicts with the
 configured conflict-repair role, verifies the resulting candidate and reviews
@@ -393,6 +407,15 @@ permissions, holds and merge routes. Drain existing admissions and preserve live
 workers and their environments. Qualify the campaign's actual project commands,
 model attribution, source stores, GitHub rules and native terminal bindings.
 A package installation alone does not establish unattended delivery readiness.
+
+To explicitly begin planning and execution while server publication policy is
+unavailable, set `github.allow_publication_wait = true`. Preflight keeps `ok = false`
+and `publication.ready = false`, but reports `can_start = true` when every other
+capability is ready and GitHub integration is enabled. The run command accepts
+that frozen opt-in. Draft PRs and ready candidates remain tracked; fresh merge
+gates still require the configured server rules and every acceptance check.
+Waiting mode never counts unmerged work as delivered or changes repository rules.
+The default refuses to start when publication is unavailable.
 
 ```bash
 bmad-loop campaign migration-inventory campaign.toml --project /path/to/project --json

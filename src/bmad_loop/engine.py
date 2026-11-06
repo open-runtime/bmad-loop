@@ -9816,7 +9816,7 @@ class Engine:
         # pass survives a launch (DW-523).
         if self.campaign_execution is not None:
             prompt += (
-                "\n\nCampaign execution: make coherent commits frequently (target ten minutes) "
+                f"\n\nCampaign execution: make coherent commits frequently (target {self.campaign_execution.checkpoint_interval_s:g} seconds) "
                 "and at planning, implementation and repair boundaries. Keep the draft PR branch "
                 "append-only: no amend, reset, rebase or force push. The coordinator owns pushes, "
                 "main integration, GitHub tracking and merge. Stay within this unit; never start "
@@ -9969,6 +9969,10 @@ class Engine:
                 raise RuntimeError("attempt-owned spec became unreadable after pre-session hooks")
             if had_binding or snapshot_required:
                 self._save()
+        if self.campaign_execution is not None and role in {"dev", "review"}:
+            from .campaign_checkpoint import instruction as checkpoint_instruction
+
+            prompt += checkpoint_instruction(self.campaign_execution.checkpoint_interval_s)
         if label is not None:
             # Injected workflow session: name the sprint board's owner, then spell
             # out the completion-marker protocol and bound its stall nudges (see

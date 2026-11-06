@@ -529,6 +529,10 @@ def _stage(request: dict[str, Any], envelope: CampaignExecution) -> dict[str, An
         'It must be one JSON object with "status":"done" and the requested artifact fields. '
         "Do not change orchestration policy, publish, merge, or start other agents."
     )
+    if not request.get("read_only"):
+        from .campaign_checkpoint import instruction as checkpoint_instruction
+
+        prompt += checkpoint_instruction(envelope.checkpoint_interval_s)
     from .campaign_stage_prompt import instruction, materialize
 
     input_packet = materialize(envelope.directory, prompt)
@@ -843,7 +847,16 @@ def child_main(request_path: Path) -> int:
         )
     )
     result: dict[str, Any]
+    monitor = None
     try:
+        if request.get("checkpoint_interval_s") and (
+            request["kind"] == "execution"
+            or (request["kind"] == "stage" and not request.get("read_only"))
+        ):
+            from .campaign_checkpoint import ProgressMonitor
+
+            monitor = ProgressMonitor(request, envelope.directory)
+            monitor.start()
         action = {
             "execution": _execution,
             "tracking": _tracking,
@@ -863,6 +876,8 @@ def child_main(request_path: Path) -> int:
             "error": f"{type(exc).__name__}: {exc}",
         }
     finally:
+        if monitor is not None:
+            monitor.stop(result)
         campaign_hold.reset(hold_probe)
         childrun.reset_stop_probe(stop_probe)
     from .campaign_usage import worker_accounting

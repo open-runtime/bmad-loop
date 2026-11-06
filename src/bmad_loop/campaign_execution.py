@@ -86,6 +86,7 @@ class CampaignExecution:
     policy: Policy
     profiles: dict[str, CLIProfile]
     grants: GrantSet = dataclasses.field(default_factory=GrantSet.empty)
+    checkpoint_interval_s: float = 600.0
 
     def save(self) -> tuple[Path, str]:
         self.directory.mkdir(parents=True, exist_ok=True)

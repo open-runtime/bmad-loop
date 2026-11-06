@@ -855,16 +855,47 @@ class CampaignRuntime:
                 proposals.append(Proposal("reflection", key))
             if not self._pending(snapshot, key, "observe-worker"):
                 proposals.append(Proposal("observe-worker", key, {"launch_id": claim.launch_id}))
+            writable_session = launch.payload.get("kind") == "execution" or (
+                launch.payload.get("kind") == "stage"
+                and not launch.payload.get(
+                    "read_only",
+                    launch.payload.get("stage")
+                    in {
+                        "publication_review",
+                        "planning_review",
+                        "decision_review",
+                        "escalation",
+                        "admission_review",
+                    },
+                )
+            )
+            if (
+                writable_session
+                and not self._pending(snapshot, key, "checkpoint-progress")
+                and (
+                    self.clock() - unit.bindings.get("checkpoint_observed_at", 0)
+                    >= min(5, snapshot.spec.checkpoints.target_interval_s)
+                )
+            ):
+                proposals.append(Proposal("checkpoint-progress", key))
+            progress = unit.evidence.get("checkpoint_progress", {})
             if (
                 snapshot.spec.checkpoints.push
                 and not unit.hold
-                and claim.role not in {"recovery", "queue_verify"}
+                and writable_session
+                and progress.get("state") == "observed"
+                and progress.get("launch_id") == claim.launch_id
+                and progress.get("head") != unit.bindings.get("last_pushed_head")
                 and unit.bindings.get("workspace")
                 and not self._pending(snapshot, key, "checkpoint")
                 and self.clock() - unit.bindings.get("last_checkpoint_at", 0)
                 >= snapshot.spec.checkpoints.target_interval_s
             ):
-                proposals.append(Proposal("checkpoint", key))
+                proposals.append(
+                    Proposal(
+                        "checkpoint", key, {"launch_id": claim.launch_id, "progress": progress}
+                    )
+                )
         return tuple(proposals)
 
     def control(self, snapshot: CampaignSnapshot, command: dict[str, Any]) -> None:
@@ -909,6 +940,39 @@ class CampaignRuntime:
                 from .campaign_resolution_delivery import prepare as prepare_resolution_effect
 
                 prepare_resolution_effect(unit, payload)
+                if payload.get("role") == "conflict_repair":
+                    base = unit.evidence.get("integration_conflict", {}).get("base")
+                    if base:
+                        payload["checkpoint_preserved_bases"] = [base]
+                        next(row for row in snapshot.outbox if row.id == action["id"]).payload[
+                            "checkpoint_preserved_bases"
+                        ] = [base]
+                if payload.get("result_contract") == "repair-v1":
+                    extra = unit.evidence.get("accepted_resolution", {}).get("affected_paths", [])
+                    payload["checkpoint_extra_paths"] = extra
+                    next(row for row in snapshot.outbox if row.id == action["id"]).payload[
+                        "checkpoint_extra_paths"
+                    ] = extra
+                if self._writes(payload) and payload.get("kind") in {"execution", "stage"}:
+                    from .campaign_checkpoint import seal as seal_checkpoint
+
+                    scope_request = {
+                        **payload,
+                        "unit": dataclasses.asdict(unit.spec),
+                        "source": unit.bindings.get(
+                            "effective_source", dataclasses.asdict(self.source(snapshot, unit))
+                        ),
+                        "sources": unit.bindings.get("effective_sources", []),
+                    }
+                    capsule = seal_checkpoint(
+                        Path(unit.bindings["workspace"]),
+                        scope_request,
+                        baseline=unit.bindings["head"],
+                    )
+                    payload.update(capsule)
+                    next(row for row in snapshot.outbox if row.id == action["id"]).payload.update(
+                        capsule
+                    )
                 from .campaign_runtime_intake import prepare_stage as prepare_intake_stage
 
                 prepare_intake_stage(snapshot, unit.id, payload, launch_id=action["id"])
@@ -1024,6 +1088,7 @@ class CampaignRuntime:
         if action.unit in snapshot.units and action.kind not in {
             "launch",
             "observe-worker",
+            "checkpoint-progress",
             "reflection",
             "release-observation",
             "stage-boundary-after",
@@ -1127,6 +1192,8 @@ class CampaignRuntime:
         if action.kind in {"push", "checkpoint"}:
             unit = snapshot.units[action.unit]
             pusher = self._pusher(snapshot, unit)
+            if action.kind == "checkpoint":
+                return self._reconcile_checkpoint(snapshot, action)
             row = pusher.reconcile(action.id)
             return Observation(
                 "confirmed" if row.state == "confirmed" else "unknown", dataclasses.asdict(row)
@@ -1149,6 +1216,7 @@ class CampaignRuntime:
             "adopt-draft",
             "adopt-retire",
             "observe-worker",
+            "checkpoint-progress",
             "release-observation",
             "stage-boundary-before",
             "stage-boundary-after",
@@ -1181,7 +1249,87 @@ class CampaignRuntime:
             return self.perform(dataclasses.replace(snapshot, generation=action.generation), action)
         return Observation("unknown", reason="effect requires explicit reconciliation")
 
+    def authorize_backup_resume(self, snapshot) -> None:
+        """Capture CLI resume intent; re-arm authority is saved under coordinator lock."""
+        self._backup_resume_epoch = uuid.uuid4().hex
+        self._backup_resume_actions = {
+            row.id
+            for row in snapshot.outbox
+            if row.kind == "checkpoint"
+            and row.state in {"prepared", "sent_unknown"}
+            and row.receipt.get("backup_failures", 0)
+            >= snapshot.spec.checkpoints.max_backup_failures
+        }
+
     def prepare_reconciliation(self, snapshot, action) -> None:
+        if action.kind == "checkpoint":
+            epoch = getattr(self, "_backup_resume_epoch", "")
+            if (
+                not epoch
+                or action.id not in getattr(self, "_backup_resume_actions", set())
+                or action.receipt.get("backup_retry_epoch") == epoch
+            ):
+                return
+            unit = snapshot.units[action.unit]
+            from . import campaign_hold
+
+            if (
+                (unit.hold and unit.hold.kind != "technical_failure")
+                or snapshot.phase not in {"active", "stopped"}
+                or campaign_hold.active(
+                    campaign_hold.channel(self.store.directory(snapshot.id), unit.id),
+                    campaign=snapshot.id,
+                    unit=unit.id,
+                )
+            ):
+                return
+            try:
+                prior = next(
+                    (
+                        row
+                        for row in self._pusher(snapshot, unit).observations()
+                        if row.action_id == action.id
+                    ),
+                    None,
+                )
+            except Exception as exc:
+                add_event(
+                    snapshot,
+                    "checkpoint-rearm-unavailable",
+                    unit=unit.id,
+                    action=action.id,
+                    reason=str(exc),
+                )
+                return
+            if prior is not None and prior.state != "prepared":
+                return
+            failures = action.receipt.get("backup_failures", 0)
+            if failures < snapshot.spec.checkpoints.max_backup_failures:
+                return
+            history = list(action.receipt.get("backup_retry_history", []))
+            history.append(
+                {
+                    "epoch": action.receipt.get("backup_retry_epoch", "initial"),
+                    "failures": failures,
+                    "generation": snapshot.generation,
+                }
+            )
+            action.receipt.update(
+                backup_retry_epoch=epoch,
+                backup_failures=0,
+                backup_retry_exhausted=False,
+                backup_retry_history=history,
+            )
+            action.next_retry_at = 0
+            add_event(
+                snapshot,
+                "checkpoint-write-budget-rearmed",
+                unit=unit.id,
+                action=action.id,
+                epoch=epoch,
+                prior_failures=failures,
+            )
+            return
         if not action.kind.startswith("github"):
             return
         intent = action.receipt.get("intent") or action.payload["intent"]
@@ -2044,13 +2192,67 @@ class CampaignRuntime:
 
     def _perform_checkpoint(self, snapshot, action) -> Observation:
         unit = snapshot.units[action.unit]
-        head = verify.rev_parse_head(Path(unit.bindings["workspace"]))
+        from . import campaign_hold
+        from .campaign_checkpoint import read as read_checkpoint
+        from .campaign_checkpoint import request as checkpoint_request
+
+        if campaign_hold.active(
+            campaign_hold.channel(self.store.directory(snapshot.id), unit.id),
+            campaign=snapshot.id,
+            unit=unit.id,
+        ):
+            return self._checkpoint_wait(snapshot, action, "operator hold delays checkpoint backup")
+        launch_id = action.payload.get("launch_id")
+        if not launch_id or not action.payload.get("progress"):
+            return Observation(
+                "rejected", reason="checkpoint requires an immutable worker progress receipt"
+            )
+        if (
+            action.receipt.get("backup_failures", 0)
+            >= snapshot.spec.checkpoints.max_backup_failures
+        ):
+            return self._checkpoint_wait(
+                snapshot, action, "backup write budget exhausted; no new push is authorized"
+            )
+        directory, expected = checkpoint_request(self, snapshot, unit, launch_id)
+        progress = read_checkpoint(
+            directory, expected, now=time.time(), max_age_s=None, receipt=action.payload["progress"]
+        )
+        pusher = self._pusher(snapshot, unit)
+        prior = next((row for row in pusher.observations() if row.action_id == action.id), None)
+        if prior is not None:
+            # This durable branch intent was written after progress validation.
+            # Even prepared writes retain that exact SHA across worker progress.
+            head = prior.head
+            coalescing = "frozen_branch_intent"
+        else:
+            try:
+                latest = read_checkpoint(directory, expected, now=time.time(), max_age_s=None)
+            except (OSError, ValueError, KeyError, CampaignError) as exc:
+                return self._checkpoint_wait(
+                    snapshot,
+                    action,
+                    str(exc),
+                    {"head": progress["head"], "coalescing": "observation_failed"},
+                )
+            if not 0 <= time.time() - latest["observed_at"] <= 30:
+                coalescing = "skipped_stale_observation"
+            elif verify.is_ancestor(Path(expected["workspace"]), progress["head"], latest["head"]):
+                progress = latest
+                coalescing = "latest_valid_descendant"
+            elif verify.is_ancestor(Path(expected["workspace"]), latest["head"], progress["head"]):
+                coalescing = "sealed_receipt_is_newer"
+            else:
+                return self._checkpoint_wait(
+                    snapshot,
+                    action,
+                    "checkpoint progress no longer preserves its sealed lineage",
+                    {"head": progress["head"], "coalescing": "lineage_failed"},
+                )
+            head = progress["head"]
         if unit.claim:
             request = (
-                self.store.directory(snapshot.id)
-                / "workers"
-                / unit.claim.launch_id
-                / "recovery-request.json"
+                self.store.directory(snapshot.id) / "workers" / launch_id / "recovery-request.json"
             )
             if request.exists():
                 return Observation(
@@ -2061,9 +2263,141 @@ class CampaignRuntime:
                         "reason": "child handed candidate to append-only recovery",
                     },
                 )
-        row = self._pusher(snapshot, unit).push(action.id, head)
+        try:
+            row = pusher.push(action.id, head)
+        except Exception as exc:
+            return self._checkpoint_wait(
+                snapshot, action, str(exc), {"head": head, "coalescing": coalescing}
+            )
+        return (
+            self._checkpoint_done(action, {**dataclasses.asdict(row), "coalescing": coalescing})
+            if row.state == "confirmed"
+            else self._checkpoint_wait(
+                snapshot,
+                action,
+                "checkpoint push requires exact remote readback",
+                {**dataclasses.asdict(row), "coalescing": coalescing},
+            )
+        )
+
+    def _checkpoint_wait(self, snapshot, action, reason, data=None) -> Observation:
+        failures = min(
+            action.receipt.get("backup_failures", 0) + 1,
+            snapshot.spec.checkpoints.max_backup_failures,
+        )
+        exhausted = failures >= snapshot.spec.checkpoints.max_backup_failures
         return Observation(
-            "confirmed" if row.state == "confirmed" else "unknown", dataclasses.asdict(row)
+            "unknown",
+            {
+                **self._checkpoint_history(action),
+                **(data or {}),
+                "backup_failures": failures,
+                "backup_total_failures": action.receipt.get(
+                    "backup_total_failures", action.receipt.get("backup_failures", 0)
+                )
+                + 1,
+                "backup_retry_exhausted": exhausted,
+            },
+            reason
+            + (
+                "; bounded backup attempts exhausted; exact-SHA readback remains pending"
+                if exhausted
+                else ""
+            ),
+            self.clock() + (300 if exhausted else min(60, 2**failures)),
+        )
+
+    def _checkpoint_history(self, action) -> dict:
+        return {
+            key: value
+            for key, value in action.receipt.items()
+            if key
+            in {
+                "backup_failures",
+                "backup_total_failures",
+                "backup_retry_epoch",
+                "backup_retry_history",
+            }
+        }
+
+    def _checkpoint_done(self, action, data) -> Observation:
+        return Observation(
+            "confirmed",
+            {**self._checkpoint_history(action), **data, "backup_retry_exhausted": False},
+        )
+
+    def _reconcile_checkpoint(self, snapshot, action) -> Observation:
+        unit = snapshot.units[action.unit]
+        pusher = self._pusher(snapshot, unit)
+        # Absence of a durable branch intent proves no Git push was issued.
+        # Re-enter only the original sealed receipt, never a later worker HEAD.
+        try:
+            prior = next((row for row in pusher.observations() if row.action_id == action.id), None)
+        except Exception as exc:
+            return self._checkpoint_wait(snapshot, action, str(exc))
+        if prior is None:
+            if (
+                action.receipt.get("backup_failures", 0)
+                >= snapshot.spec.checkpoints.max_backup_failures
+            ):
+                from .campaign_checkpoint import read as read_checkpoint
+                from .campaign_checkpoint import request as checkpoint_request
+
+                try:
+                    directory, expected = checkpoint_request(
+                        self, snapshot, unit, action.payload["launch_id"]
+                    )
+                    sealed = read_checkpoint(
+                        directory,
+                        expected,
+                        now=time.time(),
+                        max_age_s=None,
+                        receipt=action.payload["progress"],
+                    )
+                    observed = pusher.observe_existing(action.id, sealed["head"])
+                except Exception as exc:
+                    return self._checkpoint_wait(
+                        snapshot, action, "exhausted backup readback unavailable: " + str(exc)
+                    )
+                if observed.state == "confirmed":
+                    return self._checkpoint_done(action, dataclasses.asdict(observed))
+                return self._checkpoint_wait(
+                    snapshot,
+                    action,
+                    "backup write budget exhausted; exact sealed-head readback remains pending",
+                    dataclasses.asdict(observed),
+                )
+            return self._perform_checkpoint(snapshot, action)
+        try:
+            row = pusher.reconcile(action.id)
+        except Exception as exc:
+            return self._checkpoint_wait(snapshot, action, str(exc))
+        if row.state == "confirmed":
+            return self._checkpoint_done(action, dataclasses.asdict(row))
+        if prior.state == "prepared":
+            if (
+                action.receipt.get("backup_failures", 0)
+                >= snapshot.spec.checkpoints.max_backup_failures
+            ):
+                return self._checkpoint_wait(
+                    snapshot,
+                    action,
+                    "backup write budget exhausted; no new push is authorized",
+                    dataclasses.asdict(row),
+                )
+            return self._perform_checkpoint(snapshot, action)
+        return self._checkpoint_wait(
+            snapshot,
+            action,
+            "issued checkpoint remains uncertain; replacement forbidden",
+            dataclasses.asdict(row),
+        )
+
+    def _perform_checkpoint_progress(self, snapshot, action) -> Observation:
+        from .campaign_checkpoint import status as checkpoint_status
+
+        return Observation(
+            "confirmed", checkpoint_status(self, snapshot, snapshot.units[action.unit])
         )
 
     def _coordinates(self, snapshot, unit, stage: str) -> StageCoordinates:
@@ -2124,6 +2458,7 @@ class CampaignRuntime:
             attempt=claim.attempt,
             generation=claim.generation,
             directory=directory,
+            checkpoint_interval_s=float(snapshot.spec.checkpoints.target_interval_s),
         )
         if action.payload["kind"] == "execution":
             from .campaign_usage import remaining
@@ -2160,6 +2495,7 @@ class CampaignRuntime:
             "target": snapshot.spec.target,
             "sources": unit.bindings.get("effective_sources", []),
             "private_paths": unit.bindings.get("private_paths", []),
+            "checkpoint_interval_s": snapshot.spec.checkpoints.target_interval_s,
         }
         from .campaign_hold import channel
 
@@ -2339,6 +2675,17 @@ class CampaignRuntime:
             request["profile_key"] = "campaign:" + request["candidate"]["profile"]
             request["timeout_s"] = snapshot.spec.role(role).timeout_s
             request["max_tokens"] = snapshot.spec.role(role).max_tokens
+        if request["kind"] == "execution" or (
+            request["kind"] == "stage" and not request.get("read_only")
+        ):
+            if (
+                not all(key in action.payload for key in ("checkpoint_base", "checkpoint_paths"))
+                or verify.rev_parse_head(workspace) != action.payload["checkpoint_base"]
+            ):
+                return Observation(
+                    "rejected",
+                    reason="checkpoint scope/baseline must match the durable launch and exact accepted head",
+                )
         path = prepare_launch(envelope, request)
         launch_env = None
         if snapshot.spec.paradev.reflect:
@@ -3506,10 +3853,14 @@ class CampaignRuntime:
                 amendments[-1].setdefault("first_execution", action.id)
             if unit.state == UnitState.CLAIMED:
                 transition(snapshot, unit.id, UnitState.RUNNING)
+        elif kind == "checkpoint-progress":
+            unit.evidence["checkpoint_progress"] = data
+            unit.bindings["checkpoint_observed_at"] = self.clock()
         elif kind in {"push", "checkpoint"}:
             unit.bindings["last_checkpoint_at"] = self.clock()
             if not data.get("skipped"):
                 unit.bindings["last_pushed_head"] = data["head"]
+                unit.bindings["last_pushed_at"] = time.time()
             if kind == "push":
                 unit.evidence["pushed"] = data["head"]
         elif kind in {"queue-observe", "queue-checkout", "queue-publish", "queue-dequeue"}:

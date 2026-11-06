@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import time
 from dataclasses import asdict, dataclass
@@ -332,7 +333,14 @@ class RepositoryDiscovery:
                 unavailable.append("ref:" + row["ref"] + ":" + str(exc))
 
     def _git(self, args: list[str], *, repo: Path | None = None) -> str:
-        result = git_bytes(repo or self.repo, *args)
+        # Status/diff observations must not refresh another live worker's index.
+        result = git_bytes(
+            repo or self.repo,
+            "-c",
+            "diff.autoRefreshIndex=false",
+            *args,
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+        )
         if result.returncode:
             raise GithubError("Repository inventory git observation failed: " + args[0])
         return result.stdout.decode("utf-8")

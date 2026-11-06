@@ -55,6 +55,9 @@ def runtime(tmp_path, monkeypatch):
         def __init__(self, project, saved_store):
             calls.append(("runtime", project, saved_store.root))
 
+        def authorize_backup_resume(self, saved_snapshot):
+            calls.append(("backup-resume", saved_snapshot.id))
+
         def attach(self, campaign_id, unit_id, role="execution"):
             calls.append(("attach", campaign_id, unit_id, role))
             return 0
@@ -248,9 +251,11 @@ def test_resume_and_reconcile_use_distinct_no_launch_entrypoints(runtime, capsys
     assert json.loads(capsys.readouterr().out)["command"] == "campaign.reconcile"
     assert ("reconcile", snapshot.id) in calls
     assert ("run", snapshot.id) not in calls
+    assert ("backup-resume", snapshot.id) not in calls
     assert cli.main(["campaign", "resume", snapshot.id, "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["command"] == "campaign.resume"
     assert ("run", snapshot.id) in calls
+    assert calls.index(("backup-resume", snapshot.id)) < calls.index(("run", snapshot.id))
 
 
 def test_attach_uses_existing_runtime_identity_and_role(runtime, capsys):

@@ -21,6 +21,25 @@ from bmad_loop.engine import RunPaused
 from bmad_loop.model import Phase, StoryTask
 
 
+def test_campaign_checkpoint_prompt_preserves_final_workflow_completion_contract(project, tmp_path):
+    from bmad_loop.adapters.base import SessionResult
+
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    context = dataclasses.replace(envelope(project, tmp_path), checkpoint_interval_s=13.0)
+    engine, adapter = make_engine(
+        project, [SessionResult(status="completed")], campaign_execution=context
+    )
+    task = StoryTask(story_key="1-1-a", epic=1, phase=Phase.DEV_RUNNING)
+    engine.state.tasks[task.story_key] = task
+    engine._run_session(
+        task, role="review", prompt="Inspect selected documents.", seq=1, label="docs"
+    )
+    prompt = adapter.sessions[0].prompt
+    assert "every 13 seconds" in prompt
+    assert prompt.index("Campaign backup contract") < prompt.index("## Completion signal")
+    assert prompt.endswith("stalled and its work may be discarded.")
+
+
 def envelope(project, tmp_path, policy=None):
     pol = policy or policy_mod.Policy()
     context = CampaignExecution(

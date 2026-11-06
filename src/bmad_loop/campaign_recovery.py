@@ -178,6 +178,32 @@ class CheckpointPusher:
         with file_lock(self.scope / "push.lock"):
             return self._reconcile_locked(action_id)
 
+    def observe_existing(self, action_id: str, head: str) -> PushObservation:
+        """Record an already-remote checkpoint without authorizing any push."""
+        _oid(head)
+        with file_lock(self.scope / "push.lock"):
+            path = self._path(action_id)
+            if path.exists():
+                if _load(path)["head"] != head:
+                    raise RecoveryHold("Checkpoint observation cannot replace its durable head")
+                return self._reconcile_locked(action_id)
+            remote = self.remote_head()
+            if remote is not None and self._ancestor(head, remote):
+                _save(
+                    path,
+                    {
+                        "schema_version": 1,
+                        "action_id": action_id,
+                        "head": head,
+                        "state": "confirmed",
+                        "remote_head": remote,
+                        "recovery_action": None,
+                        "observed_without_push": True,
+                    },
+                )
+                return PushObservation(action_id, head, "confirmed", remote)
+            return PushObservation(action_id, head, "not_observed", remote)
+
     def _reconcile_locked(self, action_id: str) -> PushObservation:
         path, row = self._path(action_id), _load(self._path(action_id))
         remote = self.remote_head()

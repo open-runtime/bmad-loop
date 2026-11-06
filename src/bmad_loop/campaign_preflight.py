@@ -330,9 +330,17 @@ def inspect(
             problem(
                 "execution", "Native project ownership inventory unavailable: " + type(exc).__name__
             )
+    ready = all(value["ready"] for value in capabilities.values())
+    can_start = ready or (
+        spec.github.allow_publication_wait
+        and spec.github.enabled
+        and not capabilities["publication"]["ready"]
+        and all(value["ready"] for key, value in capabilities.items() if key != "publication")
+    )
     return {
         "schema_version": 1,
-        "ok": all(value["ready"] for value in capabilities.values()),
+        "ok": ready,
+        "can_start": can_start,
         "repository": repository,
         "common_dir": str(common),
         "root": str(project),

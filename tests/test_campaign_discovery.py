@@ -1,5 +1,6 @@
 """Inventory coverage and adoption are explicit, read-only evidence."""
 
+import os
 from dataclasses import replace
 
 import pytest
@@ -31,6 +32,29 @@ def test_inventory_observes_local_refs_worktree_dirty_content_without_checkouts(
     detail = discovery.inspect_branch("HEAD", "HEAD")
     assert detail["base"] == detail["head"]
     assert detail["diff"] == ""
+
+
+def test_inventory_status_preserves_live_worker_index_bytes_after_timestamp_change(
+    project, monkeypatch
+):
+    from conftest import git
+
+    repo = project.project
+    product = repo / "tracked-product.txt"
+    product.write_text("Existing worker content\n")
+    git(repo, "add", product.name)
+    git(repo, "commit", "-qm", "tracked worker product")
+    git(repo, "update-index", "--refresh")
+    index = repo / ".git" / "index"
+    before = index.read_bytes()
+    stat = product.stat()
+    os.utime(product, ns=(stat.st_atime_ns, stat.st_mtime_ns + 2_000_000_000))
+    monkeypatch.setenv("GIT_OPTIONAL_LOCKS", "1")  # the observation must override its caller
+
+    receipt = RepositoryDiscovery(Gateway(), repo).collect()
+    observed = next(row for row in receipt.worktrees if row["worktree"] == str(repo))
+    assert observed["dirty_porcelain"] == ""
+    assert index.read_bytes() == before
 
 
 def test_partial_inventory_and_active_overlap_do_not_authorize_adoption(project):

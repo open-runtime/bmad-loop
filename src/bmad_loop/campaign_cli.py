@@ -94,6 +94,67 @@ def _result(command: str, *, ok: bool = True, **fields: Any) -> dict[str, Any]:
     return {"schema_version": SCHEMA_VERSION, "command": f"campaign.{command}", "ok": ok, **fields}
 
 
+def _checkpoint_document(snapshot, unit, now: float) -> dict[str, Any]:
+    """Public progress coordinates, never private source paths or worker prose."""
+    progress = unit.evidence.get("checkpoint_progress", {})
+    value = {
+        name: progress[name]
+        for name in (
+            "state",
+            "head",
+            "observed_at",
+            "dirty",
+            "private_source_changed",
+            "private_source_unbacked",
+            "unbacked_committed",
+            "progress_at",
+            "dirty_since",
+        )
+        if name in progress
+    }
+    value.setdefault("state", "not_observed")
+    for field, age in (("progress_at", "progress_age_s"), ("dirty_since", "dirty_age_s")):
+        stamp = progress.get(field)
+        value[age] = max(0.0, now - stamp) if isinstance(stamp, (int, float)) else None
+    if progress.get("reason") or progress.get("error") or value["state"] == "unavailable":
+        value["reason"] = "Checkpoint observation unavailable; inspect the private campaign record."
+    metadata = progress.get("commit_metadata", "")
+    stamp = metadata.rsplit("\n", 1)[-1] if isinstance(metadata, str) else ""
+    if stamp.isascii() and stamp.isdigit() and len(stamp) <= 20:
+        value["committed_at"] = int(stamp)
+    actions = {action.id: action for action in snapshot.outbox}
+    debt = []
+    for entry in progress.get("backup_debt", []):
+        row = {
+            name: entry.get(name) for name in ("action_id", "head", "state", "retry_at", "failures")
+        }
+        if entry.get("reason"):
+            row["reason"] = (
+                "Backup awaits exact remote reconciliation; inspect the private campaign record."
+            )
+        action = actions.get(entry.get("action_id"))
+        observed = action.payload.get("progress", {}).get("observed_at") if action else None
+        row["pending_since"] = observed
+        row["pending_age_s"] = (
+            max(0.0, now - observed) if isinstance(observed, (int, float)) else None
+        )
+        debt.append(row)
+    value["backup_debt"] = debt
+    value["backup_observation_unavailable"] = bool(progress.get("backup_observation_unavailable"))
+    if value["backup_observation_unavailable"]:
+        value["backup_observation_reason"] = (
+            "Backup observations unavailable; inspect the private campaign record."
+        )
+    value["backup_retry_exhausted"] = bool(progress.get("backup_retry_exhausted"))
+    value["last_backed_head"] = unit.bindings.get("last_pushed_head")
+    backed_at = unit.bindings.get("last_pushed_at")
+    value["last_backed_at"] = backed_at
+    value["backup_age_s"] = (
+        max(0.0, now - backed_at) if isinstance(backed_at, (int, float)) else None
+    )
+    return value
+
+
 def status_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
     """Project execution identities; omit private configuration and evidence."""
     from .campaign_metrics import document as timing_document
@@ -161,6 +222,7 @@ def status_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
                     else None
                 ),
                 "usage": unit.evidence.get("usage", {}),
+                "checkpoint": _checkpoint_document(snapshot, unit, time.time()),
                 "queue": {
                     "group": unit.evidence.get("queue", {}).get("group"),
                     "workspace": unit.evidence.get("queue", {}).get("workspace"),
@@ -312,7 +374,9 @@ def dispatch(args: argparse.Namespace) -> int:
         from .campaign_preflight import inspect
 
         observed = inspect(project, spec)
-        if not observed["ok"]:
+        if not observed["ok"] and not (
+            spec.github.allow_publication_wait and observed.get("can_start") is True
+        ):
             return _emit(args, {**observed, "command": "campaign.run"})
         store, snapshot = campaign_runtime.create(project, spec)
         runtime = campaign_runtime.CampaignRuntime(project, store)
@@ -371,6 +435,8 @@ def dispatch(args: argparse.Namespace) -> int:
         )
         return _emit(args, _result(command, request=request))
     runtime = campaign_runtime.CampaignRuntime(project, store)
+    if command == "resume":
+        runtime.authorize_backup_resume(snapshot)
     if command == "attach":
         return runtime.attach(campaign_id, args.unit, role=args.role)
     supervisor = CampaignSupervisor(store, runtime)

@@ -18,6 +18,7 @@ def execution(request, session):
     workspace=Path(request["workspace"])
     marker=MARKERS/"published-rejected-checkpoint.json"
     assert envelope_for_test.policy.scm.rollback_on_failure is True
+    assert "Campaign backup contract" in session.prompt
     if not marker.exists():
         MARKERS.mkdir(exist_ok=True)
         baseline=verify.rev_parse_head(workspace)
