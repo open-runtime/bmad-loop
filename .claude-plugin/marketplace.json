@@ -16,7 +16,13 @@
       "author": {
         "name": "pinkyd"
       },
-      "skills": ["./skills/bmad-loop-setup", "./skills/bmad-loop-resolve", "./skills/bmad-loop-sweep", "./skills/bmod-bmad-loop"]
+      "skills": [
+        "./skills/bmad-loop-setup",
+        "./skills/bmad-loop-resolve",
+        "./skills/bmad-loop-sweep",
+        "./skills/bmad-loop-campaign-plan",
+        "./skills/bmod-bmad-loop"
+      ]
     }
   ]
 }
