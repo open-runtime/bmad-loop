@@ -220,6 +220,25 @@ def test_release_retains_landed_acceptance_and_pending_failure_hold(project, tmp
     assert unit.evidence["review"]["approved"] and unit.evidence["integrated"]["head"]
 
 
+def test_takeover_release_never_waives_a_preexisting_owner_approval_hold(project, tmp_path):
+    runtime, snapshot, unit = configured(project, tmp_path)
+    unit.hold = Hold("owner", "acceptance decision required", id="decision-1")
+    runtime.control(snapshot, {"kind": "hold", "unit": unit.id, "id": "takeover"})
+    runtime.control(snapshot, {"kind": "hold", "unit": unit.id, "id": "repeat-takeover"})
+    runtime._set_hold(unit, Hold("technical_failure", "actor failed while held", id="failure-1"))
+    runtime.control(snapshot, {"kind": "release", "unit": unit.id, "id": "release"})
+    action = OutboxAction(
+        "release-observation",
+        "release-observation",
+        unit.id,
+        unit.bindings["operator_release"],
+        snapshot.generation,
+    )
+    runtime.apply(snapshot, action, runtime._perform_release_observation(snapshot, action))
+    assert unit.hold.kind == "owner" and unit.hold.id == "decision-1"
+    assert unit.evidence["pending_failure_hold"]["id"] == "failure-1"
+
+
 def test_release_refuses_changed_canonical_source(project, tmp_path, monkeypatch):
     runtime, snapshot, unit = configured(project, tmp_path)
     binding = SourceBinding(
@@ -359,3 +378,31 @@ def test_http_held_resultless_idle_waits_for_real_completion_and_ignores_timeout
     finally:
         campaign_hold.reset(token)
     assert result.status == "completed" and len(turns) == 2
+
+
+def test_satisfied_decision_promotes_pending_failure_without_waiving_other_gates():
+    from test_campaign_decisions import artifact, context, snapshot
+
+    from bmad_loop.campaign_decisions import apply_decision, validate_decision
+
+    ctx = context()
+    state = snapshot(ctx)
+    unit = state.units["s:e:u"]
+    CampaignRuntime._set_hold(unit, Hold("verification_failed", "failed suite", id="verify"))
+    CampaignRuntime._set_hold(unit, Hold("required_review", "required remote review", id="review"))
+    apply_decision(state, unit.id, validate_decision(artifact(ctx), ctx))
+    assert campaign_hold.promote_pending(unit)
+    assert unit.hold.id == "verify"
+    unit.hold = None  # independently satisfied verification gate
+    assert campaign_hold.promote_pending(unit) and unit.hold.id == "review"
+
+
+def test_repeated_technical_fault_is_coalesced_but_protected_holds_are_retained(project, tmp_path):
+    _, _, unit = configured(project, tmp_path)
+    unit.hold = Hold("operator", "inspect", id="owner")
+    CampaignRuntime._set_hold(unit, Hold("technical_failure", "first", id="first"))
+    CampaignRuntime._set_hold(unit, Hold("technical_failure", "latest", id="latest"))
+    assert unit.evidence["pending_failure_hold"]["id"] == "latest"
+    CampaignRuntime._set_hold(unit, Hold("owner_stop", "stop one", id="one"))
+    CampaignRuntime._set_hold(unit, Hold("owner_stop", "stop two", id="two"))
+    assert {row["id"] for row in unit.evidence["pending_failure_holds"]} == {"one", "two"}

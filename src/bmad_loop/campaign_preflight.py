@@ -13,6 +13,7 @@ import shutil
 from pathlib import Path
 from typing import Any
 
+from . import platform_util as fs
 from . import policy as policy_mod
 from . import runsetup
 from .adapters.profile import get_profile
@@ -120,8 +121,27 @@ def inspect(
                 "execution",
                 "legacy publication/scheduler command conflicts with campaign ownership",
             )
-    graph = import_sources(project, spec)
-    capabilities["execution"]["observations"]["unit_count"] = len(graph.units)
+    if not fs.HANDLE_ANCHORED_WRITES:
+        for area in ("planning", "execution", "publication"):
+            problem(
+                area,
+                "campaign sessions require platform support for handle-anchored candidate/source reads",
+            )
+    from .campaign_source_freshness import document
+    from .campaign_source_freshness import inspect as inspect_source_freshness
+
+    try:
+        fresh = inspect_source_freshness(project, spec)
+        capabilities["execution"]["observations"]["source_freshness"] = document(fresh)
+        if not fresh.ready:
+            for area in ("planning", "execution", "publication"):
+                problem(area, fresh.reason)
+        else:
+            graph = import_sources(project, spec)
+            capabilities["execution"]["observations"]["unit_count"] = len(graph.units)
+    except (ValueError, OSError) as exc:
+        for area in ("planning", "execution", "publication"):
+            problem(area, "Native source freshness/import failed: " + str(exc))
     capabilities["execution"]["observations"]["limits"] = {
         "execution_workers": spec.max_workers,
         "active_epics": spec.max_active_epics,

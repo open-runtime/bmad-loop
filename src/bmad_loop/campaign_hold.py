@@ -8,6 +8,7 @@ its ordinary Stop/death path. Unreadable or redirected channels fail held.
 from __future__ import annotations
 
 import contextvars
+import dataclasses
 import json
 from pathlib import Path
 from typing import Callable
@@ -17,6 +18,52 @@ from .platform_util import atomic_write_text, is_link_like, safe_segment
 _probe: contextvars.ContextVar[Callable[[], bool] | None] = contextvars.ContextVar(
     "campaign_operator_hold", default=None
 )
+
+PROTECTED_HOLDS = frozenset(
+    {
+        "operator",
+        "owner",
+        "owner_stop",
+        "human_only",
+        "human_action",
+        "product_choice",
+        "design_choice",
+        "decision",
+        "plan_checkpoint",
+        "spec_checkpoint",
+        "checkpoint",
+        "github_review",
+        "required_review",
+    }
+)
+
+
+def defer_failure(unit, hold) -> None:
+    """Retain unrelated pending gates while coalescing a repeated technical fault."""
+    raw = dataclasses.asdict(hold)
+    pending = unit.evidence.get("pending_failure_hold")
+    if pending is None or (pending["kind"] == hold.kind and hold.kind not in PROTECTED_HOLDS):
+        unit.evidence["pending_failure_hold"] = raw
+    elif pending != raw:
+        queue = unit.evidence.setdefault("pending_failure_holds", [])
+        if raw not in queue:
+            queue.append(raw)
+
+
+def promote_pending(unit) -> bool:
+    """A satisfied gate exposes the next independently retained gate."""
+    from .campaign_model import Hold
+
+    if unit.hold is not None or unit.evidence.get("operator_prior_hold"):
+        return False
+    raw = unit.evidence.pop("pending_failure_hold", None)
+    queue = unit.evidence.get("pending_failure_holds", [])
+    if raw is None and queue:
+        raw = queue.pop(0)
+    if raw is None:
+        return False
+    unit.hold = Hold(**raw)
+    return True
 
 
 def channel(directory: Path, unit: str) -> Path:

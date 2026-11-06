@@ -795,6 +795,7 @@ class GithubGateway:
                 "close_issue": {"state", "state_reason"},
                 "close_issue_not_planned": {"state", "state_reason"},
                 "close_pr": {"state"},
+                "retire_provisional_pr": {"state"},
                 "close_milestone": {"state"},
                 "reopen_issue": {"state"},
                 "reopen_milestone": {"state"},
@@ -850,6 +851,20 @@ class GithubGateway:
                     intent,
                     state="sent_unknown",
                     error="Optional intake PR identity/head/draft changed; cancellation retry held",
+                )
+            if intent.kind == "retire_provisional_pr" and (
+                not re.fullmatch(r"[0-9a-f]{64}", str(coordinates.get("adoption_manifest", "")))
+                or not coordinates.get("marker")
+                or coordinates["marker"] not in str(current.get("body", ""))
+                or current.get("head", {}).get("sha") != coordinates.get("head")
+                or current.get("draft") is not True
+                or current.get("merged") is not False
+                or intent.payload != {"state": "closed"}
+            ):
+                return replace(
+                    intent,
+                    state="sent_unknown",
+                    error="Explicit unused-draft retirement preimage or adoption authority changed",
                 )
             return self.execute(replace(intent, state="sent_unknown"), generation=intent.generation)
         return replace(

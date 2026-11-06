@@ -14,7 +14,13 @@ from bmad_loop.campaign_model import (
 )
 from bmad_loop.campaign_scheduler import select_role
 from bmad_loop.campaign_store import CampaignStore, add_action
-from bmad_loop.campaign_usage import admission_reason, apply, legacy_receipt, remaining
+from bmad_loop.campaign_usage import (
+    admission_reason,
+    apply,
+    finalize_stage_usage,
+    legacy_receipt,
+    remaining,
+)
 from bmad_loop.model import RunState, SessionRecord, StoryTask, TokenUsage
 
 
@@ -138,6 +144,63 @@ def test_approved_re_reviews_after_base_changes_do_not_spend_fault_budget():
     assert "fault budget exhausted" in admission_reason(
         snapshot, unit, {"kind": "stage", "role": "publication_review"}
     )
+
+
+def test_publication_usage_waits_for_boundary_validation_without_losing_tokens():
+    snapshot, unit, _, _ = state()
+    receipt = {
+        "outcome": "stage_complete",
+        "launch_id": "review",
+        "accounting": {
+            "schema_version": 1,
+            "kind": "stage",
+            "stream_id": "stage:review",
+            "tokens": {"input_tokens": 37},
+            "usage_complete": True,
+            "session_observed": True,
+        },
+    }
+    apply(snapshot, unit, receipt, role="publication_review")
+    assert unit.review_attempts == 0
+    assert (
+        snapshot.bindings["usage_ledger"]["streams"]["stage:review"]["publication_validation"]
+        == "pending"
+    )
+    assert unit.evidence["usage"]["tokens"]["input_tokens"] == 37
+    approved = {**receipt, "validated": {"verdict": "approved"}}
+    finalize_stage_usage(snapshot, unit, approved)
+    finalize_stage_usage(snapshot, unit, approved)
+    assert unit.review_attempts == 0
+    assert unit.evidence["usage"]["tokens"]["input_tokens"] == 37
+    assert (
+        snapshot.bindings["usage_ledger"]["streams"]["stage:review"]["publication_validation"]
+        == "approved"
+    )
+
+
+def test_administrative_invalidation_refunds_only_its_own_review_fault():
+    snapshot, unit, _, _ = state()
+    receipts = []
+    for identity in ("real-defect", "changed-input"):
+        receipt = {
+            "outcome": "invalid_stage_result",
+            "launch_id": identity,
+            "accounting": {
+                "schema_version": 1,
+                "kind": "stage",
+                "stream_id": "stage:" + identity,
+                "tokens": {"output_tokens": 11},
+                "usage_complete": True,
+                "session_observed": True,
+            },
+        }
+        apply(snapshot, unit, receipt, role="publication_review")
+        receipts.append(receipt)
+    assert unit.review_attempts == 2
+    finalize_stage_usage(snapshot, unit, receipts[-1], administrative=True)
+    assert unit.review_attempts == 1
+    assert snapshot.bindings["usage_ledger"]["publication_faults"][unit.id] == ["stage:real-defect"]
+    assert unit.evidence["usage"]["tokens"]["output_tokens"] == 22
 
 
 def test_missing_actual_counters_are_visible_and_stop_fresh_engine_admission():

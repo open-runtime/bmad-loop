@@ -19,6 +19,7 @@ from bmad_loop.campaign_model import (
     RoleCandidate,
     UnitSpec,
     UnitState,
+    WorkerClaim,
 )
 from bmad_loop.campaign_recovery import Quiescence, RecoveryReceipt
 from bmad_loop.campaign_resolution import CauseCode
@@ -78,6 +79,42 @@ def test_context_collection_is_a_separate_effect_before_model_launch(project):
     prepare(snapshot, "s:project:u", launch.payload)
     assert snapshot.units["s:project:u"].resolution_attempts == 1
     assert proposals(snapshot, project.project, candidate(), now=10) == ()
+
+
+def test_sealed_child_recovery_does_not_admit_a_second_resolver(project):
+    snapshot = state(project, hold="recovery_required")
+    unit = snapshot.units["s:project:u"]
+    unit.claim = WorkerClaim(unit.id, 1, 1, "sealed-child", quiescent=True)
+    assert proposals(snapshot, project.project, candidate(), now=10) == ()
+
+
+def test_context_effect_after_recovery_is_a_confirmed_noop(project, tmp_path):
+    from bmad_loop.campaign_runtime import CampaignRuntime
+    from bmad_loop.campaign_store import CampaignStore, add_action
+
+    snapshot = state(project)
+    unit = snapshot.units["s:project:u"]
+    snapshot.spec = dataclasses.replace(snapshot.spec, units=(unit.spec,))
+    pending = add_action(
+        snapshot,
+        "resolution-context",
+        unit.id,
+        {
+            "mode": "diagnosis",
+            "hold_id": unit.hold.id,
+            "head": unit.bindings["head"],
+        },
+    )
+    stale = snapshot.clone()
+    unit.hold = None
+    store = CampaignStore(tmp_path / "state")
+    current = store.create(snapshot)
+    runtime = CampaignRuntime(project.project, store)
+    receipt = runtime._perform_resolution_context(stale, pending)
+    assert receipt.state == "confirmed" and receipt.data == {"stale_context": True}
+    runtime.apply(current, pending, receipt)
+    assert current.units[unit.id].hold is None
+    assert "resolution_context" not in current.units[unit.id].evidence
 
 
 def diagnosis(packet, **changes):

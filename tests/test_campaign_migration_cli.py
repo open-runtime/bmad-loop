@@ -72,6 +72,18 @@ def test_inventory_returns_complete_cached_native_and_git_observations(project, 
     )
 
 
+def test_same_authenticated_inventory_receipt_can_be_represented_idempotently(project, monkeypatch):
+    from bmad_loop import campaign_migration_cli
+
+    spec, host, gateway = context(project)
+    observed = campaign_migration_cli._context(project.project, spec, host=host, gateway=gateway)
+    monkeypatch.setattr(campaign_migration_cli, "_context", lambda *args, **kwargs: observed)
+    first = inventory_document(project.project, spec)
+    assert (
+        inventory_document(project.project, spec)["inventory_digest"] == first["inventory_digest"]
+    )
+
+
 def test_fresh_identical_objects_keep_original_review_digest_despite_timestamps(project, tmp_path):
     spec, host, gateway = context(project)
     result = inventory_document(project.project, spec, host=host, gateway=gateway)
@@ -156,3 +168,59 @@ def test_missing_daemon_never_qualifies_a_healthy_empty_inventory(project, tmp_p
     host.fail_daemon = True
     with pytest.raises(MigrationError, match="coverage is incomplete"):
         qualify_document(project.project, spec, path, host=host, gateway=gateway, preflight=ready)
+
+
+def test_actual_cli_inventory_review_and_fresh_qualification_one_document(
+    project, tmp_path, monkeypatch, capsys
+):
+    from bmad_loop import campaign_migration_cli, campaign_preflight, cli
+
+    spec_path = tmp_path / "campaign.toml"
+    spec_path.write_text(
+        'schema_version=1\nname="migration"\n[[sources]]\nkind="stories"\n[paradev]\nproject_id="project"\n'
+    )
+    actual_context = campaign_migration_cli._context
+    host, gateway = Host(project.project), Gateway()
+    monkeypatch.setattr(
+        campaign_migration_cli,
+        "_context",
+        lambda project, spec, **kwargs: actual_context(project, spec, host=host, gateway=gateway),
+    )
+    monkeypatch.setattr(campaign_preflight, "inspect", ready)
+    assert (
+        cli.main(
+            [
+                "campaign",
+                "migration-inventory",
+                str(spec_path),
+                "--project",
+                str(project.project),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    output = capsys.readouterr()
+    document = json.loads(output.out)
+    assert output.err == "" and document["command"] == "campaign.migration-inventory"
+    path = manifest(tmp_path, document)
+    assert (
+        cli.main(
+            [
+                "campaign",
+                "migration-qualify",
+                str(spec_path),
+                str(path),
+                "--project",
+                str(project.project),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    output = capsys.readouterr()
+    document = json.loads(output.out)
+    assert output.err == "" and document["command"] == "campaign.migration-qualify"
+    assert document["qualification"]["qualified"] and document["effects"].startswith(
+        "observation only"
+    )

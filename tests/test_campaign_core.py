@@ -65,6 +65,47 @@ def claim(unit, *, resource="execution", quiescent=False):
     return WorkerClaim(unit.id, 1, 1, "launch", pid=None, resource=resource, quiescent=quiescent)
 
 
+def test_resolution_writer_reserves_scope_against_new_execution():
+    snapshot = make_snapshot(
+        scopes=[("src/shared",), ("src/shared",), ("src/disjoint",), ("src/other",)]
+    )
+    first, second, third, _ = snapshot.units.values()
+    first.state = UnitState.REVIEWING
+    first.claim = claim(first, resource="resolution")
+    first.claim.writes = True
+    admitted = admit(snapshot)
+    assert second.id not in admitted.units
+    assert admitted.waits[second.id] == "ownership conflict"
+    assert third.id in admitted.units
+
+
+def test_repair_and_prepared_writer_cannot_enter_executing_scope():
+    from bmad_loop.campaign_scheduler import writer_available
+
+    snapshot = make_snapshot(
+        scopes=[("src/shared",), ("src/shared",), ("src/disjoint",), ("src/other",)]
+    )
+    first, second, third, _ = snapshot.units.values()
+    first.state = UnitState.RUNNING
+    first.claim = claim(first)
+    assert not writer_available(snapshot, second.id)
+    assert writer_available(snapshot, third.id)
+    first.claim.quiescent = True
+    assert not writer_available(snapshot, second.id, provisional=(first.id,))
+
+
+def test_readonly_diagnosis_does_not_claim_product_write_scope():
+    from bmad_loop.campaign_scheduler import writer_available
+
+    snapshot = make_snapshot(
+        scopes=[("src/shared",), ("src/shared",), ("src/disjoint",), ("src/other",)]
+    )
+    first, second, _, _ = snapshot.units.values()
+    first.state = UnitState.REVIEWING
+    first.claim = claim(first, resource="resolution")
+    assert writer_available(snapshot, second.id)
+
+
 def test_spec_snapshot_roundtrip_freezes_roles_and_settings():
     snapshot = make_snapshot()
     raw = spec_to_dict(snapshot.spec)

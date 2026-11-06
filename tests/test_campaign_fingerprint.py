@@ -3,8 +3,24 @@
 import pytest
 from conftest import git
 
+from bmad_loop import platform_util
 from bmad_loop.campaign_fingerprint import FingerprintUnavailable, capture
 from bmad_loop.campaign_resolution import diagnosis_unchanged
+
+
+@pytest.fixture(autouse=True)
+def supported_candidate_reads(request):
+    if (
+        not platform_util.HANDLE_ANCHORED_WRITES
+        and request.node.name != "test_unsupported_candidate_reads_fail_explicitly"
+    ):
+        pytest.skip("handle-anchored candidate reads are unavailable on this platform")
+
+
+def test_unsupported_candidate_reads_fail_explicitly(project, monkeypatch):
+    monkeypatch.setattr(platform_util, "HANDLE_ANCHORED_WRITES", False)
+    with pytest.raises(FingerprintUnavailable, match="handle-anchored file reads"):
+        capture(project.project)
 
 
 def test_unchanged_candidate_fingerprint_is_stable(project):

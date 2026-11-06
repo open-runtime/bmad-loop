@@ -36,7 +36,7 @@ from .campaign_recovery import CheckpointPusher
 from .campaign_sources import source_paths
 from .journal import Journal
 from .platform_util import atomic_write_bytes_confined, atomic_write_text, file_lock, is_link_like
-from .tickettree import TicketTree
+from .tickettree import TicketTree, _tree_id
 
 
 class SourcePublicationHold(RuntimeError):
@@ -306,6 +306,10 @@ class SourceBinding:
     manifests: tuple[tuple[str, str], ...] = ()
     native_ticket: str = ""
     selector_path: str = ""
+    # ref, native leaf, exact leaf revision, native ID, absent plan path.
+    # A missing plan alone never proves a dropped ticket.
+    dropped_children: tuple[tuple[str, str, str, str, str], ...] = ()
+    retrospective: tuple[str, str | None] | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -313,8 +317,10 @@ class SourceBinding:
     @classmethod
     def from_dict(cls, raw: dict) -> SourceBinding:
         data = dict(raw)
-        for field_name in ("children", "manifests"):
+        for field_name in ("children", "manifests", "dropped_children"):
             data[field_name] = tuple(tuple(pair) for pair in data.get(field_name, ()))
+        if data.get("retrospective") is not None:
+            data["retrospective"] = tuple(data["retrospective"])
         return cls(**data)
 
 
@@ -527,6 +533,8 @@ class SourcePublication:
         paths = source_paths(self.project, source)
         native_ticket = ""
         children: list[tuple[str, str]] = []
+        dropped_children: list[tuple[str, str, str, str, str]] = []
+        retrospective: tuple[str, str | None] | None = None
         manifests: list[tuple[str, str]] = []
         topology = ticketstore.assess_store(paths, "worktree") if source.kind == "tickets" else None
         if isinstance(topology, ticketstore.StoreRefusal):
@@ -543,12 +551,44 @@ class SourcePublication:
                 if paths.initiative_folder is None:
                     raise SourcePublicationHold("Closure initiative source identity is missing")
                 path = ticketlayout.epic_file(paths.initiative_folder, unit.selector)
+                retrospective_path = ticketlayout.retrospective_doc(
+                    paths.initiative_folder, unit.selector
+                ).resolve()
+                retrospective = (str(retrospective_path), digest(_bytes(retrospective_path)))
                 for row in board.tickets:
                     if row.epic == unit.selector and row.ref:
                         found = tree.find(row.ref)
-                        children.append((row.ref, found.plan))
+                        if row.state == "dropped" and _bytes(Path(found.plan)) is None:
+                            if not found.story_file:
+                                raise SourcePublicationHold(
+                                    "Dropped unplanned child lacks its native leaf proof"
+                                )
+                            leaf = Path(found.story_file).resolve()
+                            leaf_revision = digest(_bytes(leaf))
+                            if leaf_revision is None:
+                                raise SourcePublicationHold(
+                                    "Dropped unplanned child has no native leaf bytes"
+                                )
+                            dropped_children.append(
+                                (
+                                    row.ref,
+                                    str(leaf),
+                                    leaf_revision,
+                                    _tree_id(row.id) or "",
+                                    found.plan,
+                                )
+                            )
+                        else:
+                            children.append((row.ref, found.plan))
                 manifest = ticketlayout.breakdown_dir(path.parent) / ticketlayout.BREAKDOWN
                 manifests.append((str(manifest.resolve()), digest(_bytes(manifest)) or ""))
+                parent_manifest = (
+                    ticketlayout.breakdown_dir(paths.initiative_folder) / ticketlayout.BREAKDOWN
+                )
+                if parent_manifest != manifest:
+                    manifests.append(
+                        (str(parent_manifest.resolve()), digest(_bytes(parent_manifest)) or "")
+                    )
             else:
                 found = tree.find(unit.selector)
                 native_ticket = str(found.row.id or Path(found.row.file or "").stem)
@@ -645,6 +685,8 @@ class SourcePublication:
             tuple(manifests),
             native_ticket,
             source.path,
+            tuple(dropped_children),
+            retrospective,
         )
 
     def _mapped_story_binding(self, binding: SourceBinding, path: Path, head: str) -> SourceBinding:
@@ -1525,6 +1567,26 @@ class SourcePublication:
                         (str(workspace / Path(manifest).relative_to(self.project)), revision)
                         for manifest, revision in binding.manifests
                     ),
+                    dropped_children=tuple(
+                        (
+                            ref,
+                            str(workspace / Path(leaf).relative_to(self.project)),
+                            revision,
+                            native_id,
+                            str(workspace / Path(plan).relative_to(self.project)),
+                        )
+                        for ref, leaf, revision, native_id, plan in binding.dropped_children
+                    ),
+                    retrospective=(
+                        (
+                            str(
+                                workspace / Path(binding.retrospective[0]).relative_to(self.project)
+                            ),
+                            binding.retrospective[1],
+                        )
+                        if binding.retrospective is not None
+                        else None
+                    ),
                 )
                 local = SourcePublication(
                     workspace,
@@ -1549,9 +1611,31 @@ class SourcePublication:
         return (path,) if _bytes(path) != current else ()
 
     def _closure_ready(self, binding: SourceBinding, head: str) -> None:
+        if binding.retrospective is None:
+            raise SourcePublicationHold("Closure lacks its captured retrospective proof")
+        retrospective, revision = binding.retrospective
+        if digest(self._source_bytes(binding, head, retrospective)) != revision:
+            raise SourcePublicationHold("Closure canonical retrospective changed since capture")
         for manifest, revision in binding.manifests:
             if digest(self._source_bytes(binding, head, manifest)) != revision:
                 raise SourcePublicationHold("Closure source children changed since planning")
+        for ref, leaf, revision, native_id, plan in binding.dropped_children:
+            data = self._source_bytes(binding, head, leaf)
+            manifest = str(Path(leaf).parent / ticketlayout.BREAKDOWN)
+            if (
+                data is None
+                or not revision
+                or digest(data) != revision
+                or manifest not in dict(binding.manifests)
+                or self._source_bytes(binding, head, plan) is not None
+            ):
+                raise SourcePublicationHold("Dropped unplanned child proof changed: " + ref)
+            fm = frontmatter.parse_frontmatter(data.decode("utf-8-sig"))
+            state = fm.get("tracker_status") or frontmatter.status_of(fm)
+            if state != "dropped" or (_tree_id(fm.get("id")) or "") != native_id:
+                raise SourcePublicationHold(
+                    "Dropped unplanned child lacks native dropped state: " + ref
+                )
         for ref, child_plan in binding.children:
             if _status(self._source_bytes(binding, head, child_plan), "tickets", ref) not in (
                 "done",
@@ -1574,6 +1658,15 @@ class SourcePublication:
         store_branch: str,
     ) -> SourcePublicationResult:
         self._closure_ready(binding, head)
+        retrospective = (
+            self._source_bytes(binding, head, binding.retrospective[0])
+            if binding.retrospective
+            else None
+        )
+        if retrospective is None or len(retrospective.strip()) < 40:
+            raise SourcePublicationHold(
+                "Canonical epic completion requires its substantive native retrospective"
+            )
         data = self._source_bytes(binding, head, binding.path)
         if binding.versioning == "code-repo":
             if _status(data, "tickets", binding.selector) == "done":
@@ -1619,13 +1712,16 @@ class SourcePublication:
                 raise SourcePublicationHold("Closure publication action identity reused")
             _save(record_path, record)
             with ExitStack() as locks:
-                for source_file in sorted(
-                    {
-                        binding.path,
-                        *(path for _, path in binding.children),
-                        *(path for path, _ in binding.manifests),
-                    }
-                ):
+                source_files: set[str] = {
+                    binding.path,
+                    *(path for _, path in binding.children),
+                    *(leaf for _, leaf, _, _, _ in binding.dropped_children),
+                    *(plan for _, _, _, _, plan in binding.dropped_children),
+                    *(path for path, _ in binding.manifests),
+                }
+                if binding.retrospective is not None:
+                    source_files.add(binding.retrospective[0])
+                for source_file in sorted(source_files):
                     locks.enter_context(file_lock(runs.lock_path_for(Path(source_file))))
                 self._closure_ready(binding, head)
                 if artifact.check_preimage(_bytes(path), desired):

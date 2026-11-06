@@ -413,6 +413,40 @@ def test_owner_edits_to_bot_comments_are_preserved_as_new_input(snapshot):
     assert not intake._owned_projection(snapshot, quotation)
 
 
+def test_prior_campaign_native_projection_is_deduped_but_owner_edits_remain_input(
+    snapshot, monkeypatch
+):
+    previous = snapshot.clone()
+    previous.id = "prior-campaign"
+    snapshot.common_dir = previous.common_dir = "/repository/.git"
+    managed = observed(body="Managed epic source projection")
+    raw = managed.payload
+    intent = {
+        "kind": "issue",
+        "state": "confirmed",
+        "payload": {"title": raw["title"], "body": raw["body"]},
+        "receipt": {"id": int(managed.object_id), "labels": [], "assignees": []},
+    }
+    previous.outbox.append(
+        OutboxAction("create", "github", "", {}, 0, state="confirmed", receipt={"intent": intent})
+    )
+    current = {"value": managed}
+    monkeypatch.setattr(
+        intake.GithubIntake,
+        "poll",
+        lambda *args, **kwargs: IntakeBatch((current["value"],), managed.updated_at, True, 0),
+    )
+    gateway = GithubGateway(type("Transport", (), {})(), "a/b")
+    result = intake.collect(snapshot, gateway, now=102, prior_projections=(previous,))
+    assert result["batch"]["observations"] == ()
+    assert result["suppressed_versions"] == [managed.version_id]
+    changed = {**raw, "body": raw["body"] + "\nOwner added new acceptance."}
+    current["value"] = dataclasses.replace(managed, payload=changed, digest=intake._digest(changed))
+    result = intake.collect(snapshot, gateway, now=103, prior_projections=(previous,))
+    assert len(result["batch"]["observations"]) == 1
+    assert result["suppressed_versions"] == []
+
+
 def test_external_issue_closure_feedback_is_ignored_only_for_unchanged_content(snapshot):
     original = observed()
     own_close = {

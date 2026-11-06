@@ -37,6 +37,8 @@ review, merge and tracking reconciliation. Each campaign uses exact IDs from
 ```text
 bmad-loop campaign validate SPEC [--json]
 bmad-loop campaign preflight SPEC [--json]
+bmad-loop campaign migration-inventory SPEC [--json]
+bmad-loop campaign migration-qualify SPEC MANIFEST [--json]
 bmad-loop campaign run SPEC [--paradev-reflect] [--paradev-project ID] [--json]
 bmad-loop campaign list [--json]
 bmad-loop campaign status ID [--json]
@@ -46,6 +48,8 @@ bmad-loop campaign hold ID --unit UNIT --reason TEXT [--json]
 bmad-loop campaign release ID --unit UNIT [--json]
 bmad-loop campaign attach ID --unit UNIT [--role ROLE]
 bmad-loop campaign reconcile ID [--json]
+bmad-loop campaign adoption-proposal ID --unit UNIT --pr NUMBER [--observer NAME] [--json]
+bmad-loop campaign adopt ID --unit UNIT --manifest FILE [--observer NAME] [--json]
 ```
 
 `--project PROJECT` is accepted before or after the campaign action. Validation
@@ -54,6 +58,17 @@ publication and reflection verdicts without starting agents or changing rules.
 Run/resume supervise in the foreground; reconcile does not launch workers.
 Controls enqueue durable requests. Stop drains bounded stages unless explicit
 termination is requested. Release only requests removal of an operator hold.
+It observes current process, source and Git identity before clearing that hold
+and invalidates affected acceptance evidence. Hold suppresses automatic input,
+retries and publication while an active actor can finish naturally.
+
+Migration inventory caches an immutable external receipt and returns an owner
+manifest template. Qualification compares fresh authenticated service/object
+revisions with that reviewed receipt and actual replacement preflight. It never
+changes schedules or actors. Adoption proposals leave owner authorization empty;
+adopt queues only a fully qualified handoff with the explicitly selected installed
+observer. The native observer reports unsupported admission/drain fences as
+unavailable evidence.
 
 JSON results contain `schema_version`, `command` and `ok`. Status and execution
 results have a `campaign` projection; list has `campaigns`; controls have `request`.

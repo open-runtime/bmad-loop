@@ -146,7 +146,7 @@ def inventory_document(project, spec, *, gateway=None, host=None) -> dict:
     path = root / "migration-inventory" / (observed.digest + ".json")
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
-        if is_link_like(path) or _read(path) != receipt:
+        if is_link_like(path) or _read(path) != json.loads(encoded):
             raise MigrationError("immutable migration inventory receipt changed")
     else:
         atomic_write_text(path, encoded, follow_symlinks=False)

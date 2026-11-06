@@ -161,9 +161,12 @@ def typed_failure(snapshot: CampaignSnapshot, unit_id: str) -> FailureEvidence:
 
 def _context_current(snapshot: CampaignSnapshot, unit_id: str, packet: Mapping[str, Any]) -> bool:
     hold = snapshot.units[unit_id].hold
-    return packet.get("coordinates") == dataclasses.asdict(
-        _coordinates(snapshot, unit_id)
-    ) and packet.get("hold", {}).get("id") == (hold.id if hold else None)
+    return (
+        packet.get("coordinates") == dataclasses.asdict(_coordinates(snapshot, unit_id))
+        and packet.get("hold", {}).get("id") == (hold.id if hold else None)
+        and packet.get("github_input_revision", "")
+        == snapshot.units[unit_id].evidence.get("github_input_revision", "")
+    )
 
 
 def proposals(
@@ -181,6 +184,8 @@ def proposals(
     for key, unit in snapshot.units.items():
         if not unit.hold or (unit.claim and not unit.claim.quiescent):
             continue
+        if unit.hold.kind == "recovery_required" and unit.claim is not None:
+            continue  # the sealed child handoff owns recovery, never a second resolver
         if unit.retry_at is not None and now < unit.retry_at:
             continue
         mode = (
@@ -240,7 +245,13 @@ def proposals(
             or saved.get("mode") != mode
             or not _context_current(snapshot, key, saved["packet"])
         ):
-            output.append(Proposal("resolution-context", key, {"mode": mode}))
+            output.append(
+                Proposal(
+                    "resolution-context",
+                    key,
+                    {"mode": mode, "hold_id": unit.hold.id, "head": unit.bindings.get("head", "")},
+                )
+            )
             continue
         packet = saved["packet"]
         fingerprint = _digest(packet)
@@ -348,6 +359,10 @@ def collect_context(
                     -64000:
                 ],
             ),
+            (
+                "github-stage-inputs",
+                json.dumps(unit.evidence.get("github_boundary_inputs", {}), sort_keys=True),
+            ),
         )
         prior = tuple(row["fingerprint"] for row in unit.evidence.get("resolution_history", []))
         context = ResolutionContext(
@@ -370,6 +385,7 @@ def collect_context(
         packet["prior_fingerprints"] = list(prior)
     else:
         raise CampaignError("unknown recovery context mode")
+    packet["github_input_revision"] = unit.evidence.get("github_input_revision", "")
     return {"mode": mode, "packet": packet}
 
 

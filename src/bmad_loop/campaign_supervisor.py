@@ -140,7 +140,9 @@ class CampaignSupervisor:
                 # Driver validates receipt coordinates before any state mutation.
                 self.driver.apply(snapshot, action, observation)
                 action.state = "confirmed"
-                action.receipt = observation.data
+                from .campaign_boundary_receipts import project as project_receipt
+
+                action.receipt = project_receipt(snapshot, action, observation.data)
                 action.error = ""
                 add_event(
                     snapshot,
@@ -154,13 +156,18 @@ class CampaignSupervisor:
                 action.error = observation.reason
                 if action.unit in snapshot.units:
                     unit = snapshot.units[action.unit]
-                    unit.hold = Hold(
+                    rejected_hold = Hold(
                         "effect_refused",
                         observation.reason,
                         id=action.id,
                         actor="campaign",
                         created_at=self.clock(),
                     )
+                    setter = getattr(self.driver, "_set_hold", None)
+                    if setter is None:
+                        unit.hold = rejected_hold
+                    else:
+                        setter(unit, rejected_hold)
                 add_event(
                     snapshot,
                     "effect-rejected",
@@ -180,6 +187,11 @@ class CampaignSupervisor:
                     reason=observation.reason,
                     observation=observation.state,
                 )
+            from .campaign_metrics import observe_effect
+
+            observe_effect(
+                snapshot, action, state=observation.state, data=observation.data, now=self.clock()
+            )
             changed = True
         return self._save(snapshot) if changed else snapshot
 
@@ -299,6 +311,10 @@ class CampaignSupervisor:
                         proposals = self.driver.observe_workers(snapshot)
                         if snapshot.phase == "active":
                             proposals += self.driver.proposals(snapshot)
+                        from .campaign_metrics import observe_admission
+
+                        if observe_admission(snapshot, now=self.clock()):
+                            snapshot = self._save(snapshot)
                         snapshot = self._queue(snapshot, proposals)
                         for action in tuple(snapshot.outbox):
                             if len(self._active) >= self.io_workers:

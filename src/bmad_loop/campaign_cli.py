@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import time
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,11 @@ def register(subparsers: Any) -> None:
     for command, help_text in (
         ("validate", "validate a campaign specification offline"),
         ("preflight", "read planning, execution, publication and reflection capabilities"),
+        ("migration-inventory", "inspect current work and cache an exact migration review receipt"),
+        (
+            "migration-qualify",
+            "qualify an owner migration manifest against fresh service observations",
+        ),
         ("run", "create and supervise a campaign in the foreground"),
         ("resume", "reconcile and supervise an existing campaign"),
         ("list", "list repository campaigns"),
@@ -37,19 +43,36 @@ def register(subparsers: Any) -> None:
         ("release", "release an explicit operator hold"),
         ("attach", "attach the existing owned unit terminal"),
         ("reconcile", "refresh an existing campaign without starting workers"),
+        ("adoption-proposal", "inspect exact existing PR and service handoff coordinates"),
+        ("adopt", "queue an owner-authorized, independently fenced existing PR handoff"),
         ("provenance", "verify the currently loaded installation and exact fork commit"),
     ):
         child = commands.add_parser(command, help=help_text)
         child.add_argument("--project", default=argparse.SUPPRESS, help="target project root")
         child.set_defaults(func=dispatch)
-        if command in {"validate", "preflight", "run"}:
+        if command in {"validate", "preflight", "run", "migration-inventory", "migration-qualify"}:
             child.add_argument("spec", metavar="SPEC", help="version 1 campaign TOML")
+            if command == "migration-qualify":
+                child.add_argument(
+                    "manifest", metavar="MANIFEST", help="owner-selected migration JSON"
+                )
         elif command not in {"list", "provenance"}:
             child.add_argument("campaign_id", metavar="ID")
         if command == "provenance":
             child.add_argument("--expected-commit", default="", metavar="SHA")
-        if command in {"hold", "release", "attach"}:
+        if command in {"hold", "release", "attach", "adopt", "adoption-proposal"}:
             child.add_argument("--unit", required=True, metavar="UNIT")
+        if command in {"adopt", "adoption-proposal"}:
+            child.add_argument(
+                "--observer",
+                default="native",
+                metavar="NAME",
+                help="installed trusted handoff observer (default: native)",
+            )
+        if command == "adopt":
+            child.add_argument("--manifest", required=True, metavar="FILE")
+        if command == "adoption-proposal":
+            child.add_argument("--pr", required=True, type=int, metavar="NUMBER")
         if command == "hold":
             child.add_argument("--reason", required=True)
         if command == "stop":
@@ -73,6 +96,8 @@ def _result(command: str, *, ok: bool = True, **fields: Any) -> dict[str, Any]:
 
 def status_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
     """Project execution identities; omit private configuration and evidence."""
+    from .campaign_metrics import document as timing_document
+
     units = []
     public_bindings = {
         "workspace",
@@ -125,6 +150,16 @@ def status_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
                     name: value for name, value in unit.bindings.items() if name in public_bindings
                 },
                 "legacy_outcome": unit.legacy_outcome,
+                "github_sync": (
+                    {
+                        "phase": "after-stage",
+                        "stage": unit.evidence["stage_sync_debt"]["receipt"]["stage"],
+                        "launch_id": unit.evidence["stage_sync_debt"]["receipt"]["launch_id"],
+                        "worker_quiescent": bool(unit.claim and unit.claim.quiescent),
+                    }
+                    if unit.evidence.get("stage_sync_debt")
+                    else None
+                ),
                 "usage": unit.evidence.get("usage", {}),
                 "queue": {
                     "group": unit.evidence.get("queue", {}).get("group"),
@@ -149,6 +184,12 @@ def status_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
         "config_revision": snapshot.config_revision,
         "created_at": snapshot.created_at,
         "updated_at": snapshot.updated_at,
+        "timing": timing_document(
+            snapshot,
+            now=(
+                snapshot.updated_at if snapshot.phase in {"delivered", "stopped"} else time.time()
+            ),
+        ),
         "counts": counts,
         "tracking": {
             "hierarchy_complete": snapshot.bindings.get("hierarchy_finalized_graph")
@@ -226,6 +267,19 @@ def _spec(args: argparse.Namespace) -> CampaignSpec:
 
 def dispatch(args: argparse.Namespace) -> int:
     command = args.campaign_command
+    if command in {"migration-inventory", "migration-qualify"}:
+        from .campaign_migration_cli import inventory_document, qualify_document
+
+        try:
+            project, spec = Path(args.project).expanduser().resolve(), _spec(args)
+            result = (
+                inventory_document(project, spec)
+                if command == "migration-inventory"
+                else qualify_document(project, spec, Path(args.manifest).expanduser())
+            )
+            return _emit(args, _result(command, **result))
+        except (CampaignError, OSError, ValueError, KeyError, TypeError) as exc:
+            return _emit(args, _result(command, ok=False, problems=[str(exc)]))
     if command == "provenance":
         from .campaign_provenance import inspect as installation
 
@@ -275,8 +329,38 @@ def dispatch(args: argparse.Namespace) -> int:
     snapshot = store.load(campaign_id)
     if command == "status":
         return _emit(args, _result(command, campaign=status_document(snapshot)))
-    if command in {"hold", "release", "attach"} and args.unit not in snapshot.units:
+    if (
+        command in {"hold", "release", "attach", "adopt", "adoption-proposal"}
+        and args.unit not in snapshot.units
+    ):
         raise CampaignError(f"unknown campaign unit {args.unit}")
+    if command in {"adopt", "adoption-proposal"}:
+        from .campaign_adoption import prepare_request, propose
+
+        gateway = campaign_runtime.CampaignRuntime(project, store).gateway(snapshot)
+        if command == "adoption-proposal":
+            proposal = propose(
+                project, snapshot, args.unit, args.pr, args.observer, gateway=gateway
+            )
+            return _emit(
+                args,
+                _result(
+                    command,
+                    ok=proposal["ready_for_owner_authorization"],
+                    proposal=proposal,
+                    problems=proposal.get("problems", []),
+                ),
+            )
+        payload = prepare_request(
+            project,
+            snapshot,
+            args.unit,
+            Path(args.manifest).expanduser(),
+            args.observer,
+            gateway=gateway,
+        )
+        request = store.enqueue(campaign_id, "adopt", unit=args.unit, adoption=payload)
+        return _emit(args, _result(command, request=request))
     if command in {"stop", "hold", "release"}:
         request = store.enqueue(
             campaign_id,

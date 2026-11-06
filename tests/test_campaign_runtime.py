@@ -519,6 +519,12 @@ raise SystemExit(workers.child_main(Path(sys.argv[1])))
 
 @pytest.fixture
 def production_case(project, tmp_path, monkeypatch, request):
+    from bmad_loop import platform_util
+
+    if not platform_util.HANDLE_ANCHORED_WRITES:
+        pytest.skip(
+            "campaign runtime requires handle-anchored candidate/source reads; preflight refusal is tested separately"
+        )
     repo = project.project
     config = repo / "_bmad" / "bmm" / "config.yaml"
     config.parent.mkdir(parents=True)

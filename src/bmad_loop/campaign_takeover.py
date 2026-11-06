@@ -122,8 +122,10 @@ def apply(runtime, snapshot, action, data) -> None:
     )
     if data["head"]:
         unit.bindings["head"] = data["head"]
-    pending = unit.evidence.pop("pending_failure_hold", None)
+    prior = unit.evidence.pop("operator_prior_hold", None)
+    pending = prior or unit.evidence.pop("pending_failure_hold", None)
     unit.hold = Hold(**pending) if pending else None
+    campaign_hold.promote_pending(unit)
     unit.bindings.pop("operator_release", None)
     for stale in snapshot.outbox:
         if (

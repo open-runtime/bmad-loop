@@ -75,6 +75,26 @@ def delegates_tracking_slot(snapshot: CampaignSnapshot, original: CampaignUnit) 
     )
 
 
+def is_writer(unit: CampaignUnit) -> bool:
+    claim = unit.claim
+    return bool(claim and not claim.quiescent and (claim.resource == "execution" or claim.writes))
+
+
+def writer_available(
+    snapshot: CampaignSnapshot, unit_id: str, *, provisional: tuple[str, ...] = ()
+) -> bool:
+    selected = snapshot.units[unit_id]
+    for key, unit in snapshot.units.items():
+        if key == unit_id:
+            continue
+        uncertain = unit.state in {UnitState.CLAIMED, UnitState.RUNNING} and unit.claim is None
+        if (is_writer(unit) or uncertain or key in provisional) and scopes_overlap(
+            selected.spec.scopes, unit.spec.scopes
+        ):
+            return False
+    return True
+
+
 def admit(snapshot: CampaignSnapshot, *, now: float = 0) -> Admission:
     waits: dict[str, str] = {}
     if snapshot.phase != "active":
@@ -96,9 +116,7 @@ def admit(snapshot: CampaignSnapshot, *, now: float = 0) -> Admission:
         for unit in snapshot.units.values()
         if unit.state in {UnitState.CLAIMED, UnitState.RUNNING} and not unit.claim
     ]
-    writers = [
-        unit for unit in active if unit.claim and unit.claim.resource == "execution"
-    ] + uncertain
+    writers = [unit for unit in active if is_writer(unit)] + uncertain
     execution = len(writers)
     sessions = sum(unit.claim.resource != "verify" for unit in active if unit.claim) + len(
         uncertain

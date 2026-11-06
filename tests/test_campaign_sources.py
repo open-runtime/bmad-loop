@@ -7,6 +7,7 @@ from conftest import (
     DEFAULT_TREE,
     git,
     install_bmad_config,
+    write_plan,
     write_sprint,
     write_ticket_tree,
 )
@@ -123,6 +124,21 @@ def test_explicit_missing_ticket_dependencies_fail_before_mutation(project_v7):
     with pytest.raises(CampaignError, match="dependencies outside selected graph"):
         import_sources(project_v7.project, spec(source))
     assert verify.rev_parse_head(project_v7.project) == before
+
+
+def test_canonical_done_prerequisite_outside_selection_gets_own_reconciliation_unit(project_v7):
+    write_ticket_tree(project_v7, DEFAULT_TREE)
+    write_plan(project_v7, "epic-cart", "story-cart-model-plan", 1, "done")
+    source = SourceSelector(
+        "tickets", id="tickets", initiative=project_v7.initiative, units=("1.2",)
+    )
+    imported = import_sources(project_v7.project, spec(source))
+    first = qualified(source, "1.1")
+    second = qualified(source, "1.2")
+    units = {unit.id: unit for unit in imported.units}
+    assert first in units and first in units[second].after
+    assert imported.observations[first]["state"] == "done"
+    assert imported.observations[first]["dependency_reconciliation"] is True
 
 
 def test_explicit_unit_graph_needs_no_dummy_source(project):

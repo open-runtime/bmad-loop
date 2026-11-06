@@ -11,6 +11,12 @@ Campaigns are experimental. Run preflight for the target project before starting
 one. A valid TOML file proves the specification can be parsed; it does not prove
 that model routes, GitHub publication or Paradev reflection are ready.
 
+Campaign execution requires handle-anchored candidate and source reads, supplied
+by the POSIX filesystem seam or the existing native Windows handle seam.
+Preflight reports an explicit capability failure when neither is available;
+offline specification validation remains available. This requirement protects
+ignored private plans during verification and independent review.
+
 ## Start with validation and preflight
 
 ```bash
@@ -25,10 +31,24 @@ model-route capacity, merge rules and optional reflection capabilities. Its
 planning, execution, publication and reflection verdicts are separate. A failed
 capability keeps the project from activating.
 
+For configured sources, preflight and creation fetch an isolated observation of
+the current target and compare selected native source, configuration and scheduler
+metadata. Changed, deleted or unmerged planning files require updating the project
+base or delivering the planning PR first. Unrelated implementation changes do not
+require identical checkout heads. Ignored and external stores retain their separate
+source publication and compare-and-swap checks.
+
 Run and resume supervise in the foreground. In JSON mode they emit one terminal
 document; progress belongs on stderr and in durable campaign events. Use status
 from another terminal to observe active work. A returned status must be inspected:
 `locally_complete` and `merged_pending_sync` are not `delivered`.
+
+Status includes observed admission delays, time spent waiting for scheduler
+resources, API readback/retry debt, occupied session resources and worker stage
+durations. Worker durations use actual start/finish receipts; historical receipts
+without both timestamps remain unknown. GitHub waits and tracking debt do not
+consume coding-session capacity. Durable events carry their observation time so
+overlapping work and idle capacity can be inspected after a restart.
 
 ## Specification
 
@@ -84,6 +104,15 @@ Sources select `tickets`, `stories` or `sprint-status`. Ticket sources can name
 an initiative, epic slugs and ticket refs. Stories sources name the spec folder
 and optionally story IDs. Source IDs form part of qualified unit identities;
 a short epic-local number cannot identify work across initiatives.
+
+Already-done sources are reconciled explicitly. An actual earlier campaign
+delivery can be reused only after current source bytes, its merged PR/history
+and closed tracker are independently read back. Other done work gets a new
+verification draft: a deterministic child verifies the selected source and
+existing implementation without starting a development Engine, followed by the
+normal full review, current-main merge and tracking gates. A done prerequisite
+omitted by a selector becomes its own reconciliation unit. Dropped or unproven
+prerequisites retain a visible hold and cannot silently release dependencies.
 
 For ticket projects with scheduler holds, set the source's `scheduler_config`
 to the scheduler TOML file. The importer reads its declarations without executing
@@ -167,6 +196,20 @@ Map each requested stage to an installed BMAD skill in `[planning.skills]`;
 preflight verifies those mappings. Requirements, architecture, decomposition and
 independent planning review produce structured artifacts. Planning and code use
 separate draft PRs, and executable work depends on delivered planning changes.
+
+Every planning and review session receives a durable fresh GitHub input receipt.
+Planning boundaries also observe bounded fresh remote and local branch heads,
+including work without a PR. Exact recorded campaign heads and live owned
+checkpoints are excluded from change detection; a branch-name prefix grants no
+ownership. These immutable ref IDs guide overlap inspection, without checking
+out or running branch code. Canonical target heads are reported separately and
+still pass the ordinary fresh-main integration and publication gates.
+The coordinator rereads mapped issues, PRs, comments, reviews and threads after
+the actor stops. Changed inputs invalidate affected acceptance and preserve the
+prior artifacts. Administrative repeats retain token accounting without charging
+a model defect attempt. Failed post-stage API reads release the session slot and
+remain visible as `github_sync` debt; retrying readback does not launch another
+model. State and stage transitions produce durable interlinked PR/issue comments.
 
 ## GitHub mapping and delivery
 
@@ -315,6 +358,10 @@ Stop closes admissions and drains current bounded stages by default. Explicit
 termination uses owned process controls and retains unresolved claims. Release
 removes an operator hold; it does not approve missing checks or waive another
 kind of hold. Reconcile refreshes observations without launching new workers.
+Hold also reaches the existing worker's automatic input and retry boundaries;
+it permits real completion through the usual Stop/death path. Release first
+observes exact process quiescence, source and Git identity. Changed acceptance
+evidence is retained in history and must pass the normal pipeline again.
 
 Use hold before taking over edits. Resume checks ownership and invalidates
 candidate evidence affected by operator changes. Closing a view is a presentation
@@ -328,6 +375,45 @@ permissions, holds and merge routes. Drain existing admissions and preserve live
 workers and their environments. Qualify the campaign's actual project commands,
 model attribution, source stores, GitHub rules and native terminal bindings.
 A package installation alone does not establish unattended delivery readiness.
+
+```bash
+bmad-loop campaign migration-inventory campaign.toml --project /path/to/project --json
+bmad-loop campaign migration-qualify campaign.toml reviewed-migration.json --project /path/to/project --json
+bmad-loop campaign adoption-proposal CAMPAIGN_ID --unit QUALIFIED_UNIT --pr 42 --observer native --json
+bmad-loop campaign adopt CAMPAIGN_ID --unit QUALIFIED_UNIT --manifest reviewed-adoption.json --observer HANDOFF_PROVIDER --json
+```
+
+Inventory returns exact identities, revisions, a manifest template and an
+external immutable receipt. Fill the owner authorization and explicit
+dispositions in that template. Qualification rereads native services, GitHub,
+worktrees and legacy runs; timestamp changes alone do not invalidate an otherwise
+identical review, while object or ownership changes require a new inventory.
+These commands observe and qualify; they do not disable automations or stop
+processes. A disabled schedule does not prove that admissions are fenced or
+workers drained. The bundled native observer reports those unavailable proofs.
+
+An existing PR can be adopted only through an exact owner-selected manifest and
+a fresh installed service observer proving branch/actor ownership release.
+Adoption keeps its code, draft PR and feedback, and re-establishes independent
+verification and review. Provider names select installed
+`bmad_loop.migration_observers` entry points; manifest text cannot select commands
+or fabricate service responses. Existing registered Paradev workspaces can be
+linked through exact project, UUID and Git identity without rearranging their
+operator layout.
+
+A handoff provider is an installed callable
+`(project: Path, common_dir: Path) -> ServiceInventory`. Explicit observer
+selection freezes its distribution, version and module file hash. Its selected
+actor must identify the exact repository, PR number/node ID, branch, head/base,
+source unit/identity, workspace, binding revision and admission fence revision.
+The provider must independently report `liveness="dead"`, `ownership="unowned"`,
+`preserved_clean=true`, `resumable_binding_verified=true`,
+`admissions_open=false` and `active_workers=0`, with the selected unit in
+`actor.units`. The native provider currently lacks that admission/drain proof.
+`continue` resumes scoped implementation; `verify-existing` starts acceptance on
+the existing candidate. Retiring a provisional draft requires its clean branch
+to contain only the owned execution specification; original references and
+workspaces remain preserved.
 
 Existing source files, `run`/`resume` behavior and serial engines remain supported.
 Campaign state is external to worker editing trees and bound to the repository's

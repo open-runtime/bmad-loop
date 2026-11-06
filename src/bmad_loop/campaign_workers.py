@@ -438,10 +438,13 @@ def _stage(request: dict[str, Any], envelope: CampaignExecution) -> dict[str, An
         'It must be one JSON object with "status":"done" and the requested artifact fields. '
         "Do not change orchestration policy, publish, merge, or start other agents."
     )
+    from .campaign_stage_prompt import instruction, materialize
+
+    input_packet = materialize(envelope.directory, prompt)
     spec = SessionSpec(
         task_id=task_id,
         role=role,
-        prompt=prompt,
+        prompt=instruction(input_packet),
         cwd=workspace,
         env={
             "BMAD_LOOP_MODE": "1",
@@ -472,6 +475,7 @@ def _stage(request: dict[str, Any], envelope: CampaignExecution) -> dict[str, An
     from .campaign_usage import save_stage_usage
 
     save_stage_usage(request, envelope.directory, usage, result)
+    input_packet.verify()
     models = tuple(usage.models or ()) if usage else ()
     observed = models[0] if len(models) == 1 else ""
     actual = result.result_json
@@ -501,6 +505,12 @@ def _stage(request: dict[str, Any], envelope: CampaignExecution) -> dict[str, An
         elif fingerprint.source != after_fingerprint.source:
             raise CampaignError("technical repair changed frozen source or policy content")
     if not request.get("read_only"):
+        if request.get("stage") == "closure":
+            from .campaign_closure import validate as validate_closure
+
+            validate_closure(
+                workspace, UnitSpec(**request["unit"]), request["closure_manifest"], actual
+            )
         artifacts = actual.get("artifacts", actual.get("artifact_paths", []))
         if not isinstance(artifacts, list) or not all(isinstance(path, str) for path in artifacts):
             raise CampaignError("stage product artifacts are invalid")
@@ -524,6 +534,11 @@ def _stage(request: dict[str, Any], envelope: CampaignExecution) -> dict[str, An
         "observed_model": observed,
         "provider_family": family,
         "session_id": result.session_id,
+        "input_packet": {
+            "path": str(input_packet.path),
+            "sha256": input_packet.sha256,
+            "size_bytes": input_packet.size_bytes,
+        },
         "transcript_path": result.transcript_path,
         "usage": dataclasses.asdict(usage) if usage else None,
         "base": before,
@@ -636,6 +651,12 @@ def _queue_verify(request: dict[str, Any], envelope: CampaignExecution) -> dict[
     return run_verification(request, envelope)
 
 
+def _verify_existing(request: dict[str, Any], envelope: CampaignExecution) -> dict[str, Any]:
+    from .campaign_existing import verify_existing
+
+    return verify_existing(request, envelope)
+
+
 def _recover(request: dict[str, Any], envelope: CampaignExecution) -> dict[str, Any]:
     from .campaign_internal_recovery import recover
     from .campaign_recovery import Quiescence
@@ -713,9 +734,10 @@ def child_main(request_path: Path) -> int:
         )
     }
     runs.write_named_pid(envelope.directory / "engine.pid", os.getpid())
+    started_at = time.time()
     atomic_write_text(
         envelope.directory / "startup.json",
-        json.dumps({**binding, "schema_version": 1, "started_at": time.time()}),
+        json.dumps({**binding, "schema_version": 1, "started_at": started_at}),
     )
     base = verify.rev_parse_head(workspace)
     stop_probe = childrun.install_stop_probe(
@@ -739,6 +761,7 @@ def child_main(request_path: Path) -> int:
             "integrate": _integrate,
             "recovery": _recover,
             "queue_verify": _queue_verify,
+            "verify_existing": _verify_existing,
         }.get(request["kind"])
         if action is None:
             raise CampaignError("unsupported campaign worker kind")
@@ -762,6 +785,7 @@ def child_main(request_path: Path) -> int:
         "schema_version": 1,
         "base": result.get("base", base),
         "head": verify.rev_parse_head(workspace),
+        "started_at": started_at,
         "finished_at": time.time(),
         "stage": request.get("stage", ""),
         "result_contract": request.get("result_contract", ""),
@@ -769,7 +793,8 @@ def child_main(request_path: Path) -> int:
     atomic_write_text(envelope.directory / "receipt.json", json.dumps(receipt, default=str))
     return (
         0
-        if result["outcome"] in {"locally_complete", "stage_complete", "verified", "queue_verified"}
+        if result["outcome"]
+        in {"locally_complete", "stage_complete", "verified", "queue_verified", "existing_verified"}
         else 1
     )
 

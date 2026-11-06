@@ -247,6 +247,8 @@ def apply(
     row["unavailable"] = sample.get(
         "unavailable", "" if row["usage_complete"] else "Token telemetry is a lower bound"
     )
+    row["role"] = role
+    row["session_observed"] = sample.get("session_observed", True)
     ledger["streams"][key] = row
     if sample["kind"] == "legacy":
         for unresolved in ledger["streams"].values():
@@ -271,15 +273,10 @@ def apply(
         "legacy_counters_unknown": any(stream.get("legacy_counters_unknown") for stream in streams),
     }
     if role == "publication_review" and sample.get("session_observed", True):
-        approved = (
-            receipt.get("outcome") == "stage_complete"
-            and receipt.get("validated", {}).get("verdict") == "approved"
-        )
-        if not approved:
-            faults = ledger["publication_faults"].setdefault(unit.id, [])
-            if key not in faults:
-                faults.append(key)
-        unit.review_attempts = len(ledger["publication_faults"].get(unit.id, []))
+        if receipt.get("outcome") == "stage_complete" and "validated" not in receipt:
+            row.setdefault("publication_validation", "pending")
+        else:
+            finalize_stage_usage(snapshot, unit, receipt)
     ledger["tokens"] = _sum(stream["tokens"] for stream in ledger["streams"].values())
     ledger["usage_complete"] = all(
         stream["usage_complete"] for stream in ledger["streams"].values()
@@ -308,6 +305,53 @@ def apply(
         dev_attempts=unit.evidence["dev_attempts_spent"],
         review_cycles=unit.evidence["review_cycles_spent"],
     )
+
+
+def finalize_stage_usage(
+    snapshot: CampaignSnapshot,
+    unit: CampaignUnit,
+    receipt: Mapping[str, Any],
+    *,
+    administrative: bool = False,
+) -> None:
+    """Finalize semantic review cost after fresh boundary validation.
+
+    Native telemetry is already charged by ``apply``. Input movement invalidates
+    this review without spending defect budget; actual failed review sessions
+    count once by their immutable stream identity.
+    """
+    ledger = snapshot.bindings.get("usage_ledger")
+    if ledger is None:
+        return
+    sample = receipt.get("accounting") or {}
+    key = sample.get("stream_id") or ("stage:" + str(receipt.get("launch_id", "")))
+    row = ledger["streams"].get(key)
+    if row is None or row.get("role") != "publication_review":
+        return
+    if row["unit"] != unit.id:
+        raise CampaignError("publication accounting stream belongs to another unit")
+    if not row.get("session_observed", True):
+        return
+    if (
+        not administrative
+        and receipt.get("outcome") == "stage_complete"
+        and not receipt.get("validated")
+    ):
+        row.setdefault("publication_validation", "pending")
+        return
+    approved = (
+        receipt.get("outcome") == "stage_complete"
+        and receipt.get("validated", {}).get("verdict") == "approved"
+    )
+    state = "inputs_changed" if administrative else "approved" if approved else "fault"
+    faults = ledger.setdefault("publication_faults", {}).setdefault(unit.id, [])
+    if state != "fault":
+        faults[:] = [item for item in faults if item != key]
+    elif key not in faults:
+        faults.append(key)
+    row["publication_validation"] = state
+    unit.review_attempts = len(faults)
+    add_event(snapshot, "publication-usage-finalized", unit=unit.id, stream=key, disposition=state)
 
 
 def remaining(snapshot: CampaignSnapshot, unit: CampaignUnit) -> tuple[int, int]:

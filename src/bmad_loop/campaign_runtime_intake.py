@@ -172,7 +172,13 @@ def _owned_projection(snapshot: CampaignSnapshot, observation: Mapping[str, Any]
     return False
 
 
-def collect(snapshot: CampaignSnapshot, gateway: GithubGateway, *, now: float) -> dict[str, Any]:
+def collect(
+    snapshot: CampaignSnapshot,
+    gateway: GithubGateway,
+    *,
+    now: float,
+    prior_projections: tuple[CampaignSnapshot, ...] = (),
+) -> dict[str, Any]:
     prior = snapshot.bindings.get("intake", {})
     mapped: set[int] = set()
     for unit in snapshot.units.values():
@@ -194,7 +200,12 @@ def collect(snapshot: CampaignSnapshot, gateway: GithubGateway, *, now: float) -
     )
     keep, suppressed = [], []
     for observation in batch.observations:
-        if _owned_projection(snapshot, observation.to_dict()):
+        if _owned_projection(snapshot, observation.to_dict()) or any(
+            prior.repository == snapshot.repository
+            and prior.common_dir == snapshot.common_dir
+            and _owned_projection(prior, observation.to_dict())
+            for prior in prior_projections
+        ):
             suppressed.append(observation.version_id)
         else:
             keep.append(observation)

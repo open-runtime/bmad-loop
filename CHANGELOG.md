@@ -7,11 +7,24 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+## [0.14.0] — 2026-11-05
+
 ### Added
 
 - Add native development campaigns with parallel unit ownership, draft PR delivery and recoverable GitHub synchronization.
 - Add campaign planning roles, evidence-based decisions and bounded escalation resolution.
 - Bundle optional Paradev workspace and terminal reflection with scoped hcom observations.
+- Qualify existing work and installation provenance before campaign migration.
+
+### Changed
+
+- Preserve campaign checkpoint commits through append-only recovery and merge-only publication.
+- Apply qualified native reasoning effort to fresh and resumed Claude and Codex sessions.
+
+### Fixed
+
+- Retain frozen campaign policy and retry budgets across worker recovery.
+- Reconcile canonical source publication before closing delivered issues and dependencies.
 
 ## [0.13.15] — 2026-11-05
 
@@ -6863,7 +6876,8 @@ enforced in CI.
   implementation phase, driven by a Python control loop with hook-based session transport and
   resumable on-disk run state.
 
-[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.13.15...HEAD
+[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.14.0
 [0.13.15]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.15
 [0.13.14]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.14
 [0.13.13]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.13

@@ -80,6 +80,9 @@ def create(project: Path, spec: CampaignSpec) -> tuple[CampaignStore, CampaignSn
     common = common_directory(project)
     remote_url = git(project, "remote", "get-url", spec.remote)
     repository = spec.github.repository or repository_name(remote_url)
+    from .campaign_source_freshness import require as require_current_sources
+
+    source_freshness = require_current_sources(project, spec)
     graph = import_sources(project, spec)
     campaign_id = "campaign-" + time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:8]
     pol = policy_mod.load(project / policy_mod.POLICY_FILE)
@@ -132,6 +135,7 @@ def create(project: Path, spec: CampaignSpec) -> tuple[CampaignStore, CampaignSn
         config_snapshot={"policy": pol.to_dict(), "configuration_revision": 1},
     )
     snapshot.bindings["source_observations"] = graph.observations
+    snapshot.bindings["source_freshness"] = dataclasses.asdict(source_freshness)
     ownership = dict(spec.ownership)
     unknown = set(ownership) - set(snapshot.units)
     if unknown:
@@ -140,7 +144,17 @@ def create(project: Path, spec: CampaignSpec) -> tuple[CampaignStore, CampaignSn
         if key in ownership:
             unit.spec = dataclasses.replace(unit.spec, scopes=ownership[key])
         original = graph.observations.get(key, {})
-        if original.get("hitl"):
+        from .campaign_existing import terminal_status
+
+        terminal = terminal_status(original)
+        if terminal == "dropped":
+            unit.hold = Hold(
+                "source_dropped",
+                "native source is dropped; current canonical decision must be reconciled before cancellation or dependency release",
+                id="source-dropped:" + key,
+                actor="source",
+            )
+        elif original.get("hitl") and terminal != "done":
             unit.hold = Hold(
                 "human_only",
                 "source HITL requires its configured human action",
@@ -197,11 +211,17 @@ class CampaignRuntime:
         *,
         gateway: GithubGateway | None = None,
         clock=time.time,
+        boundary_clock=time.time,
         capacity_observer=observe_capacity,
         evidence_providers=None,
+        adoption_resolver=None,
     ):
         self.project, self.store, self.clock = project.resolve(), store, clock
+        self.boundary_clock = boundary_clock
         self._gateway = gateway
+        from .campaign_adoption import load_provider
+
+        self.adoption_resolver = adoption_resolver or load_provider
         self.capacity_observer = capacity_observer
         self.evidence_providers = evidence_providers or {}
         self._publication_lock = threading.RLock()
@@ -211,14 +231,10 @@ class CampaignRuntime:
 
     @staticmethod
     def _set_hold(unit, hold: Hold) -> None:
-        if unit.hold and unit.hold.kind in {
-            "operator",
-            "owner",
-            "owner_stop",
-            "human_only",
-            "human_action",
-        }:
-            unit.evidence["pending_failure_hold"] = dataclasses.asdict(hold)
+        from .campaign_hold import PROTECTED_HOLDS, defer_failure
+
+        if unit.hold and unit.hold.kind in PROTECTED_HOLDS:
+            defer_failure(unit, hold)
         else:
             unit.hold = hold
 
@@ -249,6 +265,25 @@ class CampaignRuntime:
             and action.state in {"prepared", "sent_unknown"}
             and (kind is None or action.kind == kind)
             for action in snapshot.outbox
+        )
+
+    @staticmethod
+    def _writes(payload: dict[str, Any]) -> bool:
+        if payload.get("kind") in {"verify", "queue_verify"}:
+            return False
+        if payload.get("kind") != "stage":
+            return True
+        return not payload.get(
+            "read_only",
+            payload.get("stage")
+            in {
+                "planning_review",
+                "publication_review",
+                "admission_review",
+                "triage",
+                "decision_review",
+                "escalation",
+            },
         )
 
     def _role(
@@ -363,6 +398,19 @@ class CampaignRuntime:
         return tuple(proposals)
 
     def proposals(self, snapshot: CampaignSnapshot) -> tuple[Proposal, ...]:
+        if self._units_settled(snapshot) and self.completion_ready(snapshot):
+            # Let already-issued observations/metadata drain. Re-admitting a
+            # periodic observation here can permanently outrun terminality on a
+            # slow state store, even after the final intake watermark is fresh.
+            return tuple(
+                Proposal("lifecycle", key)
+                for key, unit in snapshot.units.items()
+                if snapshot.spec.paradev.reflect
+                and unit.state == UnitState.DELIVERED
+                and unit.bindings.get("native")
+                and "lifecycle" not in unit.bindings
+                and not self._pending(snapshot, key, "lifecycle")
+            )
         proposals: list[Proposal] = []
         now = self.clock()
         inventory = snapshot.bindings.get("inventory")
@@ -450,6 +498,38 @@ class CampaignRuntime:
             for row in snapshot.units.values()
         )
         for key, unit in snapshot.units.items():
+            adoption = unit.bindings.get("adoption")
+            if adoption and adoption["state"] in {
+                "retire_pending",
+                "draft_pending",
+                "draft_confirmed",
+            }:
+                provisional_hold = (
+                    adoption.get("provisional", {}).get("hold_id")
+                    if adoption.get("provisional")
+                    else ""
+                )
+                if (
+                    (
+                        not unit.hold
+                        or unit.hold.kind in {"migration", "overlap", "admission"}
+                        or (
+                            unit.hold.id == provisional_hold
+                            and unit.hold.kind
+                            not in {"operator", "owner", "owner_stop", "human_action", "human_only"}
+                        )
+                    )
+                    and not self._pending(snapshot, key)
+                    and (not unit.claim or unit.claim.quiescent)
+                ):
+                    if adoption["state"] == "retire_pending":
+                        proposals.append(Proposal("adopt-retire", key))
+                    elif adoption["state"] == "draft_pending":
+                        proposals.append(Proposal("adopt-draft", key))
+                    elif workspace_count < snapshot.spec.max_in_flight_units:
+                        proposals.append(Proposal("prepare-unit", key, {"adoption": True}))
+                        workspace_count += 1
+                continue
             release = unit.bindings.get("operator_release")
             if (
                 release
@@ -458,6 +538,20 @@ class CampaignRuntime:
                 and not self._pending(snapshot, key, "release-observation")
             ):
                 proposals.append(Proposal("release-observation", key, release))
+            if unit.evidence.get("stage_sync_debt"):
+                projecting = any(
+                    row.unit == key
+                    and row.kind == "github"
+                    and row.state in {"prepared", "sent_unknown"}
+                    for row in snapshot.outbox
+                )
+                if (
+                    not projecting
+                    and not (unit.hold and unit.hold.kind == "operator")
+                    and not self._pending(snapshot, key, "stage-boundary-after")
+                ):
+                    proposals.append(Proposal("stage-boundary-after", key))
+                continue
             retained = unit.evidence.get("retained_finalization_pending")
             if (
                 retained
@@ -544,6 +638,13 @@ class CampaignRuntime:
                     proposals.append(Proposal("planning-complete", key))
                 continue
             if unit.state == UnitState.PENDING:
+                from .campaign_existing import terminal_status
+
+                if terminal_status(
+                    snapshot.bindings.get("source_observations", {}).get(unit.id, {})
+                ) == "done" and not unit.evidence.get("prior_delivery_checked"):
+                    proposals.append(Proposal("reconcile-existing", key))
+                    continue
                 reservation = 0 if unit.spec.kind == "tracking" else tracking_reservations
                 if workspace_count + reservation < snapshot.spec.max_in_flight_units and all(
                     snapshot.units[key].state == UnitState.DELIVERED for key in unit.spec.after
@@ -560,7 +661,12 @@ class CampaignRuntime:
                 else:
                     proposals.append(Proposal("ready", key))
             elif unit.state == UnitState.READY and key in selected:
-                if unit.spec.kind == "tracking":
+                from .campaign_existing import requires_existing
+
+                if requires_existing(snapshot, unit):
+                    if reserve("execution"):
+                        proposals.append(Proposal("launch", key, {"kind": "verify_existing"}))
+                elif unit.spec.kind == "tracking":
                     if reserve("execution"):
                         proposals.append(Proposal("launch", key, {"kind": "tracking"}))
                 elif unit.spec.kind in {"planning", "closure"}:
@@ -685,6 +791,7 @@ class CampaignRuntime:
             proposals.append(Proposal("hierarchy-close", next(reversed(snapshot.units))))
         admitted = []
         role_reservations = []
+        writer_reservations = []
         for proposal in proposals:
             if proposal.kind == "launch":
                 unit = snapshot.units[proposal.unit]
@@ -694,14 +801,13 @@ class CampaignRuntime:
                 if reason:
                     admitted.append(Proposal("usage-hold", unit.id, {"reason": reason}))
                     continue
-                writes = proposal.payload.get("kind") == "execution" or (
-                    proposal.payload.get("kind") == "stage"
-                    and not proposal.payload.get(
-                        "read_only",
-                        proposal.payload.get("stage")
-                        in {"planning_review", "publication_review", "admission_review", "triage"},
-                    )
-                )
+                from .campaign_scheduler import writer_available
+
+                writes = self._writes(proposal.payload)
+                if writes and not writer_available(
+                    snapshot, unit.id, provisional=tuple(writer_reservations)
+                ):
+                    continue
                 if writes and unit.bindings.get("ready_for_review"):
                     admitted.append(Proposal("prepare-draft", unit.id))
                     continue
@@ -721,8 +827,12 @@ class CampaignRuntime:
                     payload={**proposal.payload, "candidate": dataclasses.asdict(candidate)},
                 )
                 role_reservations.append((role, candidate))
+            if proposal.kind == "launch" and self._writes(proposal.payload):
+                writer_reservations.append(proposal.unit)
             admitted.append(proposal)
-        return tuple(admitted)
+        from .campaign_boundary_sync import before_proposal
+
+        return tuple(before_proposal(self, snapshot, proposal) for proposal in admitted)
 
     def observe_workers(self, snapshot: CampaignSnapshot) -> tuple[Proposal, ...]:
         proposals = []
@@ -767,10 +877,24 @@ class CampaignRuntime:
                 return
             if action["kind"] == "prepare-unit" and unit.state == UnitState.PENDING:
                 transition(snapshot, unit.id, UnitState.PLANNING)
+            elif (
+                action["kind"] == "prepare-unit"
+                and action["payload"].get("adoption")
+                and unit.state in {UnitState.DRAFT, UnitState.READY}
+            ):
+                transition(snapshot, unit.id, UnitState.PLANNING)
             elif action["kind"] == "launch":
                 payload = action["payload"]
                 if unit.claim and not unit.claim.quiescent:
                     raise CampaignError("cannot launch over a live or uncertain worker")
+                from .campaign_scheduler import writer_available
+
+                if self._writes(payload) and not writer_available(snapshot, unit.id):
+                    current = next(row for row in snapshot.outbox if row.id == action["id"])
+                    current.state = "rejected"
+                    current.error = "another actual writer owns overlapping scope"
+                    self._set_hold(unit, Hold("ownership_uncertain", current.error, id=current.id))
+                    return
                 from .campaign_usage import admission_reason
 
                 reason = admission_reason(snapshot, unit, payload)
@@ -826,6 +950,7 @@ class CampaignRuntime:
                     run_id=f"{snapshot.id}-{safe_segment(unit.id)[-24:]}-{unit.attempt}",
                     role=payload.get("role", payload["kind"]),
                     resource=resource,
+                    writes=self._writes(payload),
                 )
                 unit.claim.run_dir = str(
                     self.store.directory(snapshot.id) / "workers" / action["id"]
@@ -857,6 +982,9 @@ class CampaignRuntime:
             unit = snapshot.units[key]
             from . import campaign_hold
 
+            if unit.hold and unit.hold.kind != "operator":
+                unit.evidence["operator_prior_hold"] = dataclasses.asdict(unit.hold)
+
             campaign_hold.write(
                 campaign_hold.channel(self.store.directory(snapshot.id), key),
                 campaign=snapshot.id,
@@ -884,6 +1012,10 @@ class CampaignRuntime:
                 }
         elif kind == "reconcile":
             snapshot.bindings.pop("inventory", None)
+        elif kind == "adopt":
+            from .campaign_adoption import begin
+
+            begin(snapshot, key, command["payload"]["adoption"], command_id=command["id"])
         else:
             raise CampaignError(f"unsupported campaign control: {kind}")
 
@@ -895,6 +1027,7 @@ class CampaignRuntime:
             "observe-worker",
             "reflection",
             "release-observation",
+            "stage-boundary-after",
             "terminate-worker",
         }:
             from . import campaign_hold
@@ -997,6 +1130,7 @@ class CampaignRuntime:
         if action.kind in {
             "inventory",
             "source-observation",
+            "reconcile-existing",
             "capacity",
             "intake",
             "hierarchy",
@@ -1006,8 +1140,12 @@ class CampaignRuntime:
             "prepare-draft",
             "ready",
             "prepare-unit",
+            "adopt-draft",
+            "adopt-retire",
             "observe-worker",
             "release-observation",
+            "stage-boundary-before",
+            "stage-boundary-after",
             "prepare-merge",
             "observe-merge",
             "queue-observe",
@@ -1203,6 +1341,28 @@ class CampaignRuntime:
             archive_roots=tuple(Path(path) for path in snapshot.spec.archive_roots),
         )
         result = {**receipt.to_dict(), "digest": receipt.digest}
+        from .campaign_adoption import AdoptionError, guard_owned
+
+        adoption_fences = {}
+        for key, unit in snapshot.units.items():
+            if (
+                unit.bindings.get("adoption", {}).get("state") != "owned"
+                or unit.state
+                in {
+                    UnitState.MERGE_REQUESTED,
+                    UnitState.MERGED_PENDING_SYNC,
+                    UnitState.DELIVERED,
+                    UnitState.CANCELED,
+                }
+                or (unit.claim and not unit.claim.quiescent)
+            ):
+                continue
+            try:
+                guard_owned(self, snapshot, key)
+                adoption_fences[key] = {"valid": True}
+            except AdoptionError as exc:
+                adoption_fences[key] = {"valid": False, "reason": str(exc)}
+        result["adoption_fences"] = adoption_fences
         if snapshot.spec.paradev.project_id:
             from .campaign_native_inventory import native_inventory
 
@@ -1226,6 +1386,17 @@ class CampaignRuntime:
         imported = import_sources(self.project, dataclasses.replace(snapshot.spec, units=()))
         return Observation(
             "confirmed", {"observations": imported.observations, "observed_at": self.clock()}
+        )
+
+    def _perform_reconcile_existing(self, snapshot, action) -> Observation:
+        from .campaign_existing import ExistingDeliveryHeld, prior_delivery
+
+        try:
+            proof = prior_delivery(self, snapshot, snapshot.units[action.unit])
+        except ExistingDeliveryHeld as exc:
+            return Observation("confirmed", {"existing_hold": str(exc)})
+        return Observation(
+            "confirmed", {"proof": dataclasses.asdict(proof) if proof is not None else None}
         )
 
     def _perform_capacity(self, snapshot, action) -> Observation:
@@ -1258,7 +1429,21 @@ class CampaignRuntime:
     def _perform_intake(self, snapshot, action) -> Observation:
         from .campaign_runtime_intake import collect
 
-        return Observation("confirmed", collect(snapshot, self.gateway(snapshot), now=self.clock()))
+        return Observation(
+            "confirmed",
+            collect(
+                snapshot,
+                self.gateway(snapshot),
+                now=self.clock(),
+                prior_projections=tuple(
+                    prior
+                    for prior in self.store.list()
+                    if prior.id != snapshot.id
+                    and prior.repository == snapshot.repository
+                    and prior.common_dir == snapshot.common_dir
+                ),
+            ),
+        )
 
     def _perform_intake_control(self, snapshot, action) -> Observation:
         return Observation("confirmed", action.payload)
@@ -1311,6 +1496,15 @@ class CampaignRuntime:
 
     def _perform_prepare_unit(self, snapshot, action) -> Observation:
         unit = snapshot.units[action.unit]
+        if action.payload.get("adoption"):
+            from .campaign_adoption import AdoptionError, AdoptionUncertain, prepare
+
+            try:
+                return Observation("confirmed", prepare(self, snapshot, action))
+            except AdoptionUncertain as exc:
+                return Observation("unknown", reason=str(exc), retry_at=self.clock() + 5)
+            except AdoptionError as exc:
+                return Observation("rejected", reason=str(exc))
         branch = f"bmad/{snapshot.id}/{safe_segment(unit.id)}"
         root = Path(
             snapshot.spec.paradev.worktree_root
@@ -1546,6 +1740,32 @@ class CampaignRuntime:
     def _perform_ready(self, snapshot, action) -> Observation:
         return Observation("confirmed")
 
+    def _perform_stage_boundary_before(self, snapshot, action) -> Observation:
+        from .campaign_boundary_sync import before_effect
+
+        return before_effect(self, snapshot, action)
+
+    def _perform_stage_boundary_after(self, snapshot, action) -> Observation:
+        from .campaign_boundary_sync import after_effect
+
+        return after_effect(self, snapshot, action)
+
+    def _perform_adopt_draft(self, snapshot, action) -> Observation:
+        from .campaign_adoption import AdoptionError, perform_draft
+
+        try:
+            return Observation("confirmed", perform_draft(self, snapshot, action))
+        except AdoptionError as exc:
+            return Observation("rejected", reason=str(exc))
+
+    def _perform_adopt_retire(self, snapshot, action) -> Observation:
+        from .campaign_adoption import AdoptionError, perform_retire
+
+        try:
+            return Observation("confirmed", perform_retire(self, snapshot, action))
+        except AdoptionError as exc:
+            return Observation("rejected", reason=str(exc))
+
     def _perform_release_observation(self, snapshot, action) -> Observation:
         from .campaign_takeover import observe as observe_release
 
@@ -1566,9 +1786,18 @@ class CampaignRuntime:
         from .campaign_decision_sources import github_provider
         from .campaign_resolution_flow import collect_context
 
+        current = self.store.load(snapshot.id)
+        unit = current.units[action.unit]
+        if (
+            not unit.hold
+            or (unit.claim and not unit.claim.quiescent)
+            or (action.payload.get("hold_id") and unit.hold.id != action.payload["hold_id"])
+            or (action.payload.get("head") and unit.bindings.get("head") != action.payload["head"])
+        ):
+            return Observation("confirmed", {"stale_context": True})
         result = collect_context(
             self.project,
-            snapshot,
+            current,
             action.unit,
             action.payload["mode"],
             providers={
@@ -1646,6 +1875,14 @@ class CampaignRuntime:
 
     def _perform_github_submission(self, snapshot, action) -> Observation:
         intent = MutationIntent.from_dict(action.payload["intent"])
+        if action.payload.get("purpose") == "adoption-draft":
+            from .campaign_adoption import guard_draft_submission
+
+            guard_draft_submission(self, self.store.load(snapshot.id), action.unit, intent)
+        if action.payload.get("purpose") == "adoption-retire":
+            from .campaign_adoption import guard_retire_submission
+
+            guard_retire_submission(self, self.store.load(snapshot.id), action.unit, intent)
         if intent.kind == "merge":
             current = self.store.load(snapshot.id)
             from . import campaign_hold
@@ -1796,6 +2033,12 @@ class CampaignRuntime:
         claim = unit.claim
         if not claim or claim.launch_id != action.id or claim.generation != action.generation:
             return Observation("rejected", reason="launch does not own the saved worker claim")
+        from .campaign_adoption import AdoptionError, guard_owned
+
+        try:
+            guard_owned(self, snapshot, unit.id)
+        except AdoptionError as exc:
+            return Observation("confirmed", {"not_launched": True, "adoption_refused": str(exc)})
         if action.payload.get("result_contract") == "repair-v1" and unit.evidence.get(
             "remote_feedback"
         ):
@@ -1906,7 +2149,8 @@ class CampaignRuntime:
                 recovery_action="recover-" + request["original_launch"],
                 allowed_paths=list(unit.spec.paths or unit.spec.scopes or (".",)),
             )
-        elif request["kind"] == "verify":
+        elif request["kind"] in {"verify", "verify_existing"}:
+            request["timeout_s"] = template.policy.verify.command_timeout_min * 60
             request["commands"] = request.get("commands") or [
                 list(command) for command in snapshot.spec.verify_commands
             ]
@@ -1914,6 +2158,10 @@ class CampaignRuntime:
                 # Preserve project verification commands, including its shared
                 # verification locks, through the established verifier seam.
                 request["legacy_verify"] = True
+            if request["kind"] == "verify_existing":
+                request["adoption_mode"] = (
+                    unit.bindings.get("adoption", {}).get("manifest", {}).get("mode", "")
+                )
         elif request["kind"] == "stage":
             role = request["role"]
             stage = request.get("stage", role)
@@ -1935,6 +2183,7 @@ class CampaignRuntime:
                 "source_artifact_digest": unit.bindings.get("source_revision", ""),
                 "feedback": unit.evidence.get("required_findings", []),
             }
+            context["github_stage_inputs"] = request["stage_boundary"]["inputs"]
             if stage == "admission_review":
                 from .campaign_discovery import evidence_ids
 
@@ -1961,6 +2210,33 @@ class CampaignRuntime:
                     dataclasses.asdict(row.spec) for row in snapshot.units.values()
                 ]
                 context["planning_control"] = unit.id
+            if stage == "closure":
+                from .campaign_closure import context as closure_context
+                from .campaign_closure import prepare as prepare_closure
+                from .campaign_source_publication import SourceBinding
+
+                binding = SourceBinding.from_dict(unit.bindings["canonical_source"])
+                publisher = self._source_publisher(snapshot, project=Path(binding.project))
+                canonical_head, _ = publisher._canonical(
+                    action.id + ":closure", unit.bindings["base"]
+                )
+                publisher._closure_ready(binding, canonical_head)
+                request["closure_manifest"] = prepare_closure(
+                    workspace,
+                    SourceSelector(**request["source"]),
+                    unit.spec,
+                    canonical=binding.to_dict(),
+                    canonical_head=canonical_head,
+                )
+                import base64
+
+                preimage = publisher._source_bytes(
+                    binding, canonical_head, request["closure_manifest"]["canonical_retrospective"]
+                )
+                request["closure_manifest"]["retrospective_preimage"] = (
+                    base64.b64encode(preimage).decode("ascii") if preimage is not None else None
+                )
+                context.update(closure_context(request["closure_manifest"]))
             if stage == "publication_review":
                 context["diff"] = git(
                     workspace, "diff", "--stat", coordinates.base + "..." + coordinates.head
@@ -1988,6 +2264,12 @@ class CampaignRuntime:
                 context=context,
                 skill=dict(snapshot.spec.planning.skills).get(stage, ""),
             )
+            if request.get("custom_prompt"):
+                from .campaign_boundary_sync import custom_prompt
+
+                request["prompt"] = custom_prompt(
+                    request["custom_prompt"], context["github_stage_inputs"]
+                )
             request["profile_key"] = "campaign:" + request["candidate"]["profile"]
             request["timeout_s"] = snapshot.spec.role(role).timeout_s
             request["max_tokens"] = snapshot.spec.role(role).max_tokens
@@ -2077,7 +2359,11 @@ class CampaignRuntime:
             except CampaignError as exc:
                 receipt["outcome"] = "ownership_uncertain"
                 receipt["error"] = str(exc)
-        if request["kind"] == "stage" and receipt.get("outcome") == "stage_complete":
+        if (
+            request["kind"] == "stage"
+            and receipt.get("outcome") == "stage_complete"
+            and not request.get("stage_boundary")
+        ):
             try:
                 self._validate_stage_receipt(snapshot, unit, request, receipt)
             except (CampaignError, TypeError, ValueError, KeyError) as exc:
@@ -2118,6 +2404,18 @@ class CampaignRuntime:
             from .campaign_planning_publication import bind_mirrors
 
             bind_mirrors(Path(unit.bindings["workspace"]), receipt)
+            if coordinates.stage == "closure":
+                from .campaign_closure import validate as validate_closure
+
+                receipt["validated_closure"] = validate_closure(
+                    Path(unit.bindings["workspace"]),
+                    unit.spec,
+                    request["closure_manifest"],
+                    receipt["artifact"],
+                    mirrors=receipt.get("artifact_mirrors", {}),
+                    committed_head=receipt["head"],
+                )
+                receipt["closure_manifest"] = request["closure_manifest"]
             if unit.spec.kind == "planning" and coordinates.stage in {
                 "requirements",
                 "architecture",
@@ -2186,6 +2484,7 @@ class CampaignRuntime:
             observed_model=review.get("observed_model", ""),
             verification_receipts=(verification.get("launch_id", ""),),
             review_receipt=review.get("launch_id", ""),
+            existing_canonical=bool(unit.evidence.get("existing_source_verified")),
         )
 
     def _perform_prepare_ready(self, snapshot, action) -> Observation:
@@ -2217,8 +2516,22 @@ class CampaignRuntime:
 
     def _perform_prepare_merge(self, snapshot, action) -> Observation:
         unit = snapshot.units[action.unit]
+        if unit.bindings.get("adoption"):
+            from .campaign_adoption import guard_owned
+
+            guard_owned(self, snapshot, unit.id)
         if unit.spec.kind == "planning":
-            from .campaign_planning_publication import drift
+            from .campaign_planning_publication import canonical_drift, drift
+
+            changed_canonical = canonical_drift(unit)
+            if changed_canonical:
+                return Observation(
+                    "confirmed",
+                    {
+                        "source_drift": "canonical planning source edited since capture: "
+                        + ", ".join(changed_canonical)
+                    },
+                )
 
             changed = drift(unit)
             if changed:
@@ -2434,6 +2747,76 @@ class CampaignRuntime:
             accepted_config_revision = review_coordinates.get(
                 "config_revision", snapshot.config_revision
             )
+            if unit.spec.kind == "closure" and unit.evidence.get("closure_manifest"):
+                from .campaign_closure import publish_retrospective, retrospective_change
+
+                retrospective = publish_retrospective(
+                    publisher,
+                    source,
+                    unit,
+                    action.id,
+                    merge={
+                        "head": unit.evidence["integrated"]["head"],
+                        "merged_commit": merge["merge_commit"],
+                        "pr_number": unit.bindings["pr"]["number"],
+                    },
+                    acceptance={
+                        "head": unit.evidence["integrated"]["head"],
+                        "review_id": review.get("session_id") or review.get("launch_id"),
+                        "verdict": "approved",
+                        "graph_revision": accepted_graph_revision,
+                        "config_revision": accepted_config_revision,
+                    },
+                    journal=self._operation_journal(snapshot, action),
+                )
+                if retrospective.state == "tracking_pr_required":
+                    descriptor = prepare_tracking(
+                        snapshot,
+                        unit,
+                        retrospective,
+                        state_dir=self.store.directory(snapshot.id),
+                        publisher_project=publisher.project,
+                        source=source,
+                        changes=(retrospective_change(unit),),
+                        merge={
+                            "head": unit.evidence["integrated"]["head"],
+                            "merged_commit": merge["merge_commit"],
+                            "pr_number": unit.bindings["pr"]["number"],
+                        },
+                        acceptance={
+                            "head": unit.evidence["integrated"]["head"],
+                            "review_id": review.get("session_id") or review.get("launch_id"),
+                            "verdict": "approved",
+                            "graph_revision": accepted_graph_revision,
+                            "config_revision": accepted_config_revision,
+                        },
+                    )
+                    return Observation(
+                        "confirmed",
+                        {
+                            "source_publication": dataclasses.asdict(retrospective),
+                            "tracking_control": descriptor,
+                        },
+                    )
+                if retrospective.state != "confirmed":
+                    return Observation(
+                        "waiting",
+                        {"retrospective_publication": dataclasses.asdict(retrospective)},
+                        retrospective.detail or "canonical retrospective publication pending",
+                        self.clock() + 5,
+                    )
+                accepted_retrospective = next(
+                    row
+                    for row in unit.evidence["source_artifacts"]
+                    if row.get("kind") == "closure-retrospective"
+                )
+                binding = dataclasses.replace(
+                    binding,
+                    retrospective=(
+                        accepted_retrospective["canonical_path"],
+                        accepted_retrospective["sha256"],
+                    ),
+                )
             if artifact is not None and (binding.versioning != "code-repo" or not binding.path):
                 workspace = Path(unit.bindings["workspace"])
                 artifact_bytes = (workspace / artifact["path"]).read_bytes()
@@ -2581,6 +2964,26 @@ class CampaignRuntime:
         )
 
     def apply(self, snapshot, action, observation: Observation) -> None:
+        previous = {key: unit.state for key, unit in snapshot.units.items()}
+        self._apply_effect(snapshot, action, observation)
+        from .campaign_hold import promote_pending
+
+        for unit in snapshot.units.values():
+            if promote_pending(unit):
+                add_event(snapshot, "pending-hold-promoted", unit=unit.id, hold=unit.hold.id)
+        from .campaign_boundary_sync import queue_transition
+
+        for key, unit in snapshot.units.items():
+            if key in previous and previous[key] != unit.state:
+                queue_transition(
+                    self,
+                    snapshot,
+                    unit,
+                    event_id=action.id + "-" + hashlib.sha256(key.encode()).hexdigest()[:8],
+                    message="State: " + str(previous[key]) + " → " + str(unit.state),
+                )
+
+    def _apply_effect(self, snapshot, action, observation: Observation) -> None:
         data = observation.data
         unit = snapshot.units.get(action.unit)
         kind = action.kind
@@ -2589,7 +2992,15 @@ class CampaignRuntime:
                 transition(snapshot, unit.id, UnitState.PENDING)
             add_event(snapshot, "operator-held-effect-suppressed", unit=action.unit, effect=kind)
             return
-        if kind == "release-observation":
+        if kind == "stage-boundary-before":
+            from .campaign_boundary_sync import before_apply
+
+            before_apply(self, snapshot, action, data)
+        elif kind == "stage-boundary-after":
+            from .campaign_boundary_sync import after_apply
+
+            after_apply(self, snapshot, action, data)
+        elif kind == "release-observation":
             if data.get("release_refused"):
                 unit.evidence["operator_release_refused"] = data
                 unit.bindings.pop("operator_release", None)
@@ -2604,6 +3015,23 @@ class CampaignRuntime:
 
                 apply_release(self, snapshot, action, data)
         elif kind == "inventory":
+            for key, fence_observation in data.pop("adoption_fences", {}).items():
+                if key not in snapshot.units:
+                    continue
+                adopted = snapshot.units[key]
+                if not fence_observation["valid"]:
+                    self._set_hold(
+                        adopted, Hold("adoption_fence", fence_observation["reason"], id=action.id)
+                    )
+                    add_event(
+                        snapshot,
+                        "adoption-fence-held",
+                        unit=key,
+                        reason=fence_observation["reason"],
+                    )
+                elif adopted.hold and adopted.hold.kind == "adoption_fence":
+                    adopted.hold = None
+                    add_event(snapshot, "adoption-fence-restored", unit=key)
             ownership = data.pop("external_ownership", None)
             if ownership is not None:
                 snapshot.bindings["external_ownership"] = ownership
@@ -2709,6 +3137,13 @@ class CampaignRuntime:
             create_control(snapshot, data)
         elif kind == "usage-hold":
             self._set_hold(unit, Hold("lifetime_budget", data["reason"], id=action.id))
+        elif kind == "adopt-draft":
+            if data.get("intent"):
+                self._queue_intent(snapshot, unit, data)
+            else:
+                unit.bindings["adoption"]["state"] = "draft_confirmed"
+        elif kind == "adopt-retire":
+            self._queue_intent(snapshot, unit, data)
         elif kind == "intake-refresh":
             if data.get("intent"):
                 self._queue_intent(snapshot, unit, data)
@@ -2718,8 +3153,23 @@ class CampaignRuntime:
                 apply(snapshot, unit, data)
         elif unit is None:
             raise CampaignError("effect names an unknown unit")
+        elif kind == "reconcile-existing":
+            unit.evidence["prior_delivery_checked"] = True
+            if data.get("existing_hold"):
+                self._set_hold(
+                    unit, Hold("approval", data["existing_hold"], id=action.id, actor="github")
+                )
+            elif data.get("proof"):
+                from .campaign_existing import PriorDeliveryProof
+                from .campaign_store import reconcile_prior_delivery
+
+                reconcile_prior_delivery(snapshot, unit.id, PriorDeliveryProof(**data["proof"]))
         elif kind == "prepare-unit":
             unit.bindings.update(data)
+            if action.payload.get("adoption"):
+                unit.bindings["adoption"]["state"] = "owned"
+                if unit.hold and unit.hold.kind in {"migration", "overlap", "admission"}:
+                    unit.hold = None
             transition(snapshot, unit.id, UnitState.DRAFT)
         elif kind == "hierarchy":
             current = snapshot.bindings.setdefault("github_hierarchy", {})
@@ -2786,7 +3236,15 @@ class CampaignRuntime:
             ).hexdigest()
             transition(snapshot, unit.id, UnitState.LOCALLY_COMPLETE)
         elif kind == "resolution-context":
-            from .campaign_resolution_flow import apply_context
+            if data.get("stale_context"):
+                return
+            from .campaign_resolution_flow import _context_current, apply_context
+
+            if not _context_current(snapshot, unit.id, data["packet"]):
+                add_event(
+                    snapshot, "stale-recovery-context-discarded", unit=unit.id, action=action.id
+                )
+                return
 
             apply_context(snapshot, unit.id, data)
         elif kind == "resolution-backoff":
@@ -2847,6 +3305,12 @@ class CampaignRuntime:
                 }
             elif purpose == "ready":
                 unit.bindings["ready_for_review"] = True
+            elif purpose == "adoption-draft":
+                unit.bindings["adoption"]["state"] = "draft_confirmed"
+            elif purpose == "adoption-retire":
+                from .campaign_adoption import apply_retirement
+
+                apply_retirement(snapshot, unit, intent)
             elif purpose == "amendment-draft":
                 unit.bindings["ready_for_review"] = False
             elif purpose == "repair-draft":
@@ -2919,6 +3383,10 @@ class CampaignRuntime:
             if data.get("not_launched") and not data.get("remote_feedback_changed"):
                 unit.claim.quiescent = True
                 unit.claim.status = "not_launched"
+                if data.get("adoption_refused"):
+                    self._set_hold(
+                        unit, Hold("adoption_fence", data["adoption_refused"], id=action.id)
+                    )
                 if unit.state == UnitState.CLAIMED:
                     transition(snapshot, unit.id, UnitState.READY)
                 elif unit.state == UnitState.VERIFYING:
@@ -3081,6 +3549,22 @@ class CampaignRuntime:
 
         apply_usage(snapshot, unit, receipt, role=claim.role)
         outcome = receipt["outcome"]
+        if outcome == "stage_complete":
+            directory = self.store.directory(snapshot.id) / "workers" / claim.launch_id
+            request_path = directory / "request.json"
+            if request_path.exists():
+                request = json.loads(request_path.read_text(encoding="utf-8"))
+                if request.get("stage_boundary"):
+                    unit.evidence["stage_sync_debt"] = {"request": request, "receipt": receipt}
+                    unit.evidence.pop("stage_boundary_ready", None)
+                    add_event(
+                        snapshot,
+                        "stage-sync-pending",
+                        unit=unit.id,
+                        launch=claim.launch_id,
+                        stage=receipt["stage"],
+                    )
+                    return
         if outcome != "stage_complete":
             from .campaign_runtime_intake import control as intake_control
             from .campaign_runtime_intake import fail_stage as fail_intake_stage
@@ -3102,7 +3586,17 @@ class CampaignRuntime:
             unit.legacy_outcome = outcome
             unit.evidence["tracking_artifacts"] = receipt.get("artifacts", [])
             transition(snapshot, unit.id, UnitState.LOCALLY_COMPLETE)
-        elif outcome == "locally_complete":
+        elif outcome in {"locally_complete", "existing_verified"}:
+            if outcome == "existing_verified":
+                if not receipt.get("source_terminal_receipt", {}).get(
+                    "no_development_session"
+                ) or not receipt.get("source_artifacts"):
+                    raise CampaignError(
+                        "existing source verification lacks its selected native source proof"
+                    )
+                unit.evidence["existing_source_verified"] = receipt["source_terminal_receipt"]
+            else:
+                unit.evidence.pop("existing_source_verified", None)
             if receipt.get("retained_finalization"):
                 unit.evidence.pop("retained_finalization_pending", None)
                 if unit.hold and unit.hold.kind == "recovery_required":
@@ -3150,70 +3644,7 @@ class CampaignRuntime:
                 unit.evidence["verification"] = receipt
                 transition(snapshot, unit.id, UnitState.REVIEWING)
         elif outcome == "stage_complete":
-            stage = receipt["stage"]
-            if receipt.get("result_contract") == "intake-triage-v1":
-                from .campaign_runtime_intake import apply_triage
-
-                apply_triage(snapshot, unit.id, receipt, launch_id=claim.launch_id)
-            elif stage == "admission_review":
-                unit.evidence["admission"] = receipt["validated_admission"]
-                transition(snapshot, unit.id, UnitState.READY)
-            elif receipt.get("result_contract") == "repair-v1":
-                unit.evidence["repair_candidate"] = receipt["validated_repair"]
-            elif receipt.get("result_contract") in {"decision-v1", "resolution-v1"}:
-                from .campaign_resolution_flow import apply_diagnosis
-
-                next_step = apply_diagnosis(
-                    snapshot,
-                    unit.id,
-                    receipt,
-                    candidate=self._role(
-                        snapshot,
-                        (
-                            "conflict_repair"
-                            if unit.hold and unit.hold.kind == "integration_conflict"
-                            else "escalation"
-                        ),
-                    ),
-                )
-                if next_step is not None:
-                    unit.evidence["resolution_next_step"] = dataclasses.asdict(next_step)
-            elif unit.spec.kind == "planning" and stage in snapshot.spec.planning.stages:
-                from .campaign_planning_flow import apply_stage
-
-                apply_stage(
-                    snapshot,
-                    unit.id,
-                    stage,
-                    receipt,
-                    launch_id=claim.launch_id,
-                    committed_head=receipt["head"],
-                )
-                if stage != "planning_review":
-                    unit.evidence["developer_family"] = receipt.get("provider_family", "")
-            elif stage == "publication_review":
-                unit.evidence["review"] = receipt
-                if receipt["validated"]["verdict"] == "approved":
-                    transition(snapshot, unit.id, UnitState.READY_TO_PUBLISH)
-                else:
-                    unit.evidence["required_findings"] = receipt["artifact"].get("findings", [])
-                    unit.resume_state = UnitState.SYNCING
-                    self._set_hold(
-                        unit,
-                        Hold(
-                            "review_findings",
-                            "required review findings need same-PR repair",
-                            id=claim.launch_id,
-                        ),
-                    )
-            else:
-                unit.evidence.setdefault("planning_stages", []).append(stage)
-                unit.evidence.setdefault("planning_results", []).append(receipt)
-                unit.hold = Hold(
-                    "planning",
-                    "planning stage completed; graph revision validation pending",
-                    id=claim.launch_id,
-                )
+            self._apply_stage_result(snapshot, unit, receipt)
         else:
             if outcome == "ownership_uncertain":
                 unit.evidence["failure"] = {
@@ -3256,6 +3687,86 @@ class CampaignRuntime:
                     receipt.get("error", receipt.get("reason", outcome)),
                     id=claim.launch_id,
                 ),
+            )
+
+    def _apply_stage_result(self, snapshot, unit, receipt) -> None:
+        claim = unit.claim
+        stage = receipt["stage"]
+        if receipt.get("result_contract") == "intake-triage-v1":
+            from .campaign_runtime_intake import apply_triage
+
+            apply_triage(snapshot, unit.id, receipt, launch_id=claim.launch_id)
+        elif stage == "closure":
+            if not receipt.get("validated_closure"):
+                raise CampaignError("closure lacks exact native artifacts and child reconciliation")
+            unit.evidence["source_artifacts"] = receipt["validated_closure"]
+            unit.evidence["closure_manifest"] = receipt["closure_manifest"]
+            unit.evidence["developer_family"] = receipt.get("provider_family", "")
+            unit.evidence.pop("existing_source_verified", None)
+            unit.bindings["source_revision"] = hashlib.sha256(
+                json.dumps(unit.evidence["source_artifacts"], sort_keys=True).encode()
+            ).hexdigest()
+            transition(snapshot, unit.id, UnitState.LOCALLY_COMPLETE)
+        elif stage == "admission_review":
+            unit.evidence["admission"] = receipt["validated_admission"]
+            transition(snapshot, unit.id, UnitState.READY)
+        elif receipt.get("result_contract") == "repair-v1":
+            unit.evidence["repair_candidate"] = receipt["validated_repair"]
+            unit.evidence.pop("existing_source_verified", None)
+            unit.evidence["developer_family"] = receipt.get("provider_family", "")
+        elif receipt.get("result_contract") in {"decision-v1", "resolution-v1"}:
+            from .campaign_resolution_flow import apply_diagnosis
+
+            next_step = apply_diagnosis(
+                snapshot,
+                unit.id,
+                receipt,
+                candidate=self._role(
+                    snapshot,
+                    (
+                        "conflict_repair"
+                        if unit.hold and unit.hold.kind == "integration_conflict"
+                        else "escalation"
+                    ),
+                ),
+            )
+            if next_step is not None:
+                unit.evidence["resolution_next_step"] = dataclasses.asdict(next_step)
+        elif unit.spec.kind == "planning" and stage in snapshot.spec.planning.stages:
+            from .campaign_planning_flow import apply_stage
+
+            apply_stage(
+                snapshot,
+                unit.id,
+                stage,
+                receipt,
+                launch_id=claim.launch_id,
+                committed_head=receipt["head"],
+            )
+            if stage != "planning_review":
+                unit.evidence["developer_family"] = receipt.get("provider_family", "")
+        elif stage == "publication_review":
+            unit.evidence["review"] = receipt
+            if receipt["validated"]["verdict"] == "approved":
+                transition(snapshot, unit.id, UnitState.READY_TO_PUBLISH)
+            else:
+                unit.evidence["required_findings"] = receipt["artifact"].get("findings", [])
+                unit.resume_state = UnitState.SYNCING
+                self._set_hold(
+                    unit,
+                    Hold(
+                        "review_findings",
+                        "required review findings need same-PR repair",
+                        id=claim.launch_id,
+                    ),
+                )
+        else:
+            unit.evidence.setdefault("planning_stages", []).append(stage)
+            unit.evidence.setdefault("planning_results", []).append(receipt)
+            unit.hold = Hold(
+                "planning",
+                "planning stage completed; graph revision validation pending",
+                id=claim.launch_id,
             )
 
     def attach(self, campaign_id: str, unit_id: str, role: str = "execution") -> int:

@@ -80,6 +80,8 @@ class CampaignStore:
             candidate = snapshot.clone()
             candidate.created_at = candidate.created_at or self.clock()
             candidate.updated_at = candidate.created_at
+            for event in candidate.events:
+                event.setdefault("observed_at", candidate.created_at)
             self._write(directory / "snapshot.json", snapshot_to_dict(candidate))
         self.project_events(candidate)
         return candidate
@@ -152,6 +154,18 @@ class CampaignStore:
                     raise CampaignError(f"uncertain/live claim cannot be removed: {key}")
                 if replacement and replacement.state != unit.state:
                     if (
+                        unit.state == UnitState.PENDING
+                        and replacement.state == UnitState.DELIVERED
+                        and replacement.evidence.get("prior_delivery")
+                    ):
+                        from .campaign_existing import PriorDeliveryProof
+
+                        audit = snapshot.clone()
+                        audit.units[key].state = unit.state
+                        reconcile_prior_delivery(
+                            audit, key, PriorDeliveryProof(**replacement.evidence["prior_delivery"])
+                        )
+                    elif (
                         unit.state == UnitState.READY_TO_PUBLISH
                         and replacement.state == UnitState.MERGED_PENDING_SYNC
                         and replacement.evidence.get("external_merge")
@@ -177,6 +191,8 @@ class CampaignStore:
             candidate = snapshot.clone()
             candidate.revision = expected_revision + 1
             candidate.updated_at = self.clock()
+            for event in candidate.events[len(previous.events) :]:
+                event.setdefault("observed_at", candidate.updated_at)
             self._validate(candidate)
             self._write(directory / "snapshot.json", snapshot_to_dict(candidate))
         self.project_events(candidate)
@@ -252,7 +268,7 @@ class CampaignStore:
         **payload: Any,
     ) -> dict[str, Any]:
         """Append an idempotent command without touching coordinator state."""
-        if kind not in {"stop", "hold", "release", "reconcile", "terminate-workers"}:
+        if kind not in {"stop", "hold", "release", "reconcile", "terminate-workers", "adopt"}:
             raise CampaignError(f"unknown campaign control {kind}")
         self.load(campaign_id)
         request_id = _segment(request_id or uuid.uuid4().hex)
@@ -386,5 +402,53 @@ def reconcile_external_merge(
         unit=unit.id,
         head=proof.head,
         merge_commit=proof.merge_commit,
+        canonical_head=proof.canonical_head,
+    )
+
+
+def reconcile_prior_delivery(snapshot: CampaignSnapshot, unit_id: str, proof) -> None:
+    """Use a typed actual earlier delivery proof, never a source-status shortcut."""
+    from dataclasses import asdict
+
+    from .campaign_existing import PriorDeliveryProof, specification_digest
+    from .statemachine import check_campaign_prior_delivery
+
+    unit = snapshot.units[unit_id]
+    check_campaign_prior_delivery(unit.id, unit.state)
+    if (
+        not isinstance(proof, PriorDeliveryProof)
+        or proof.schema_version != 1
+        or proof.repository != snapshot.repository
+        or proof.unit_id != unit.id
+        or proof.specification_digest != specification_digest(unit.spec)
+        or proof.graph_revision != snapshot.graph_revision
+        or proof.config_revision != snapshot.config_revision
+        or not proof.source_verified
+        or not proof.tracking_verified
+        or not proof.source_sha256
+        or not proof.prior_campaign
+        or proof.prior_campaign == snapshot.id
+        or proof.prior_revision < 0
+        or proof.prior_pr < 1
+        or not proof.head
+        or proof.tracking_issue.get("number", 0) < 1
+        or proof.pull_request.get("number") != proof.prior_pr
+        or not proof.merge_commit
+        or not proof.canonical_head
+        or unit.claim
+        or unit.hold
+    ):
+        raise CampaignError("prior delivery proof is stale, unbound or the unit already owns work")
+    unit.state = UnitState.DELIVERED
+    unit.evidence["prior_delivery"] = asdict(proof)
+    unit.bindings["issue"] = proof.tracking_issue
+    unit.bindings["pr"] = proof.pull_request
+    add_event(
+        snapshot,
+        "prior-delivery-reconciled",
+        unit=unit.id,
+        prior_campaign=proof.prior_campaign,
+        pr=proof.prior_pr,
+        head=proof.head,
         canonical_head=proof.canonical_head,
     )

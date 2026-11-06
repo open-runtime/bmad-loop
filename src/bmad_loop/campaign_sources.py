@@ -42,7 +42,9 @@ def source_paths(project: Path, source: SourceSelector) -> bmadconfig.ProjectPat
     return paths
 
 
-def import_sources(project: Path, spec: CampaignSpec) -> ImportedGraph:
+def import_sources(
+    project: Path, spec: CampaignSpec, *, _expand_terminal_dependencies: bool = True
+) -> ImportedGraph:
     units = list(spec.units)
     observations: dict[str, dict[str, Any]] = {}
     for source in spec.sources:
@@ -143,6 +145,7 @@ def import_sources(project: Path, spec: CampaignSpec) -> ImportedGraph:
                     "kind": "tickets",
                     "path": row.file or "",
                     "status": row.status,
+                    "state": row.state,
                     "tracker_id": row.tracker_id,
                     "hitl": row.hitl,
                     "plan_checkpoint": row.plan_checkpoint,
@@ -202,6 +205,24 @@ def import_sources(project: Path, spec: CampaignSpec) -> ImportedGraph:
     if len(ids) != len(set(ids)):
         raise CampaignError("source selectors overlap: duplicate qualified unit IDs")
     known = set(ids)
+    missing = {dependency for unit in units for dependency in unit.after if dependency not in known}
+    if missing and _expand_terminal_dependencies:
+        from .campaign_existing import dependency_reconciliation
+
+        all_sources = tuple(
+            dataclasses.replace(source, epics=(), units=()) for source in spec.sources
+        )
+        complete = import_sources(
+            project,
+            dataclasses.replace(spec, sources=all_sources),
+            _expand_terminal_dependencies=False,
+        )
+        units = dependency_reconciliation(
+            units, observations, complete.units, complete.observations
+        )
+        known = {unit.id for unit in units}
+    if not _expand_terminal_dependencies:
+        return ImportedGraph(tuple(units), observations)
     for unit in units:
         missing = set(unit.after) - known
         if missing:
@@ -290,7 +311,7 @@ def _shield(workspace: Path, paths: tuple[Path, ...]) -> None:
         raise CampaignError(f"cannot shield private source: {refusal}")
 
 
-def _copy_missing(source: Path, target: Path) -> None:
+def _copy_missing(source: Path, target: Path, *, tracked_project: Path | None = None) -> None:
     """Copy missing private content without overwriting checkout-owned files."""
     _check_source_tree(source)
     target.mkdir(parents=True, exist_ok=True)
@@ -301,11 +322,21 @@ def _copy_missing(source: Path, target: Path) -> None:
             continue
         destination = target / child.name
         if child.is_dir():
-            _copy_missing(child, destination)
+            _copy_missing(child, destination, tracked_project=tracked_project)
         elif destination.exists():
             if is_link_like(destination) or not destination.is_file():
                 raise CampaignError("private source destination conflicts with an existing path")
         else:
+            if (
+                tracked_project is not None
+                and child.is_relative_to(tracked_project)
+                and verify.path_tracked(
+                    tracked_project, child.relative_to(tracked_project).as_posix()
+                )
+            ):
+                raise CampaignError(
+                    "tracked native source is absent from fresh worker main; update the project base instead of restoring deleted planning files"
+                )
             shutil.copyfile(child, destination)
 
 
@@ -420,7 +451,7 @@ def prepare_source_view(project: Path, workspace: Path, source: SourceSelector) 
     for name, origin in values.items():
         destination = mapped[name]
         if origin.is_dir() and origin != destination:
-            _copy_missing(origin, destination)
+            _copy_missing(origin, destination, tracked_project=project)
             if not verify.path_tracked(workspace, destination.relative_to(workspace).as_posix()):
                 _shield(workspace, (destination,))
                 copied.append(destination)
@@ -433,7 +464,7 @@ def prepare_source_view(project: Path, workspace: Path, source: SourceSelector) 
             else mapped["output_folder"] / "campaign-stories" / safe_segment(source.id or "stories")
         )
         if original != destination:
-            _copy_missing(original, destination)
+            _copy_missing(original, destination, tracked_project=project)
             if not verify.path_tracked(workspace, destination.relative_to(workspace).as_posix()):
                 _shield(workspace, (destination,))
                 copied.append(destination)

@@ -218,6 +218,38 @@ def drift(unit: Any) -> list[dict[str, str]]:
     return changed
 
 
+def canonical_drift(unit: Any) -> list[str]:
+    manifest_path = Path(unit.bindings["planning_manifest"])
+    if is_link_like(manifest_path) or manifest_path.stat().st_size > 128 * 1024 * 1024:
+        raise CampaignError("planning canonical preimages are redirected or unbounded")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    workspace = Path(unit.bindings["workspace"])
+    products = {}
+    for receipt in unit.evidence.get("planning_flow", {}).get("stages", {}).values():
+        for artifact in receipt.get("validated", {}).get("artifacts", []):
+            products[artifact["path"]] = artifact
+    changed = []
+    for row in manifest["sources"]:
+        local = Path(row["local_root"])
+        for relative in products:
+            path = (workspace / relative).resolve()
+            if not path.is_relative_to(local):
+                continue
+            suffix = path.relative_to(local).as_posix()
+            canonical = Path(row["root"]) / suffix
+            encoded = row["preimages"].get(suffix)
+            expected = base64.b64decode(encoded, validate=True) if encoded is not None else None
+            if is_link_like(canonical) or (
+                canonical.exists()
+                and (not canonical.is_file() or canonical.stat().st_size > 8 * 1024 * 1024)
+            ):
+                raise CampaignError("canonical planning source is redirected or unbounded")
+            current = canonical.read_bytes() if canonical.exists() else None
+            if current not in (expected, path.read_bytes()):
+                changed.append(relative)
+    return changed
+
+
 def validate_stage_products(
     workspace: Path, receipt: dict[str, Any], sources: tuple[SourceSelector, ...]
 ) -> None:

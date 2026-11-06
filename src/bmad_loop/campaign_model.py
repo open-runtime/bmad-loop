@@ -262,6 +262,7 @@ class WorkerClaim:
     resource: str = "execution"
     started_at: float = 0
     quiescent: bool = False
+    writes: bool = False
 
 
 @dataclass

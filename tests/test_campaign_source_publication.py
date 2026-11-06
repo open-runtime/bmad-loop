@@ -545,6 +545,16 @@ def closure_case(shared):
         selector="epic-cart",
         kind="closure",
     )
+    from bmad_loop import ticketlayout
+    from bmad_loop.campaign_sources import source_paths
+
+    retrospective = ticketlayout.retrospective_doc(
+        source_paths(publication.project, source).initiative_folder, unit.selector
+    )
+    retrospective.write_text(
+        "# Accepted retrospective\n\nRecord the completed children and lessons for the next epic.\n",
+        encoding="utf-8",
+    )
     binding = publication.capture(source, unit)
     return publication, source, unit, binding
 
@@ -595,6 +605,180 @@ def test_unselected_unfinished_child_withholds_parent_closure(shared, tmp_path):
             accepted_plan=accepted,
         )
     assert Path(binding.path).read_bytes() == original
+
+
+def dropped_closure_case(shared):
+    publication, source, unit, binding = closure_case(shared)
+    plan = Path(binding.children[-1][1])
+    plan.unlink()
+    leaf = plan.parent / "story-cart-rules.md"
+    leaf.write_text(
+        "---\nid: 2\ntype: story\ntitle: Cart rules\nstatus: draft\ntracker_status: dropped\n---\nOwner dropped this scope.\n",
+        encoding="utf-8",
+    )
+    binding = publication.capture(source, unit)
+    return publication, source, unit, binding, plan, leaf
+
+
+def test_native_dropped_unplanned_child_allows_actual_epic_publication(shared, tmp_path):
+    publication, source, unit, binding, plan, leaf = dropped_closure_case(shared)
+    assert len(binding.children) == 1
+    assert binding.dropped_children[0][0] == "1.2"
+    artifact = Path(binding.path).read_bytes().replace(b"in-progress", b"done")
+    merge, acceptance = reviewed(publication, artifact)
+    accepted = publication.prepare_artifact(
+        "closure-dropped", binding, artifact, merge=merge, acceptance=acceptance
+    )
+    result = publication.publish(
+        "closure-dropped",
+        source,
+        unit,
+        binding,
+        merged_commit=merge["merged_commit"],
+        journal=Journal(tmp_path / "journal"),
+        accepted_plan=accepted,
+    )
+    assert result.state == "confirmed"
+    assert not plan.exists() and b"tracker_status: dropped" in leaf.read_bytes()
+    from bmad_loop.campaign_source_publication import SourceBinding
+
+    assert SourceBinding.from_dict(binding.to_dict()) == binding
+    legacy = binding.to_dict()
+    legacy.pop("dropped_children")
+    assert SourceBinding.from_dict(legacy).dropped_children == ()
+
+
+def test_epic_publication_cannot_credit_a_captured_missing_retrospective(shared, tmp_path):
+    publication, source, unit, binding = closure_case(shared)
+    Path(binding.retrospective[0]).unlink()
+    binding = publication.capture(source, unit)
+    assert binding.retrospective[1] is None
+    artifact = Path(binding.path).read_bytes().replace(b"in-progress", b"done")
+    merge, acceptance = reviewed(publication, artifact)
+    accepted = publication.prepare_artifact(
+        "missing-retrospective", binding, artifact, merge=merge, acceptance=acceptance
+    )
+    before = Path(binding.path).read_bytes()
+    with pytest.raises(SourcePublicationHold, match="substantive native retrospective"):
+        publication.publish(
+            "missing-retrospective",
+            source,
+            unit,
+            binding,
+            merged_commit=merge["merged_commit"],
+            journal=Journal(tmp_path / "journal"),
+            accepted_plan=accepted,
+        )
+    assert Path(binding.path).read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "mutation", ["plan", "leaf", "identity", "manifest", "parent", "retrospective"]
+)
+def test_dropped_unplanned_child_proof_cannot_hide_new_owner_work(shared, mutation):
+    publication, source, unit, binding, plan, leaf = dropped_closure_case(shared)
+    if mutation == "plan":
+        plan.write_text("---\nticket: 2\nstatus: in-progress\n---\nNew work.\n", encoding="utf-8")
+    elif mutation == "leaf":
+        leaf.write_bytes(
+            leaf.read_bytes().replace(b"tracker_status: dropped", b"tracker_status: backlog")
+        )
+    elif mutation == "identity":
+        leaf.write_bytes(leaf.read_bytes().replace(b"id: 2", b"id: 3"))
+    elif mutation == "retrospective":
+        Path(binding.retrospective[0]).write_bytes(b"Owner replaced retrospective.\n")
+    else:
+        manifest = Path(binding.manifests[mutation == "parent"][0])
+        manifest.write_bytes(manifest.read_bytes() + b"\n# Owner changed scope\n")
+    with pytest.raises(
+        SourcePublicationHold, match="proof changed|children changed|retrospective changed"
+    ):
+        publication._closure_ready(binding, head(publication.project))
+
+
+def test_tracked_dropped_child_proof_uses_immutable_canonical_head(project_v7, tmp_path):
+    configured = configure(project_v7, tmp_path)
+    publication, source, unit, binding, plan, leaf = dropped_closure_case(configured)
+    git(publication.project, "add", "-A")
+    git(publication.project, "commit", "-m", "native dropped scope")
+    canonical = head(publication.project)
+    publication._closure_ready(binding, canonical)
+    leaf.write_bytes(
+        leaf.read_bytes().replace(b"tracker_status: dropped", b"tracker_status: backlog")
+    )
+    publication._closure_ready(binding, canonical)
+    git(publication.project, "add", "-A")
+    git(publication.project, "commit", "-m", "owner reopened scope")
+    with pytest.raises(SourcePublicationHold, match="proof changed"):
+        publication._closure_ready(binding, head(publication.project))
+
+
+def test_retrospective_publishes_reviewed_bytes_with_exact_per_path_preimage(shared, tmp_path):
+    import base64
+    from types import SimpleNamespace
+
+    from bmad_loop.campaign_closure import publish_retrospective
+
+    publication, source, unit, binding = closure_case(shared)
+    retrospective = Path(binding.path).with_name("epic-cart-retrospective.md")
+    prior = b"Owner's existing retrospective.\n"
+    retrospective.write_bytes(prior)
+    accepted = b"Reviewed retrospective documenting completed work and remaining lessons.\n"
+    merge, acceptance = reviewed(publication, accepted)
+    current = SimpleNamespace(
+        spec=unit,
+        bindings={"workspace": str(publication.project)},
+        evidence={
+            "closure_manifest": {
+                "canonical_retrospective": str(retrospective),
+                "canonical_head": head(publication.project),
+                "retrospective_preimage": base64.b64encode(prior).decode("ascii"),
+            },
+            "source_artifacts": [
+                {
+                    "kind": "closure-retrospective",
+                    "path": acceptance["review_path"],
+                    "review_path": acceptance["review_path"],
+                    "sha256": digest(accepted),
+                    "canonical_path": str(retrospective),
+                }
+            ],
+        },
+    )
+    result = publish_retrospective(
+        publication,
+        source,
+        current,
+        "retro",
+        merge=merge,
+        acceptance=acceptance,
+        journal=Journal(tmp_path / "journal"),
+    )
+    assert result.state == "confirmed" and retrospective.read_bytes() == accepted
+    retrospective.write_bytes(b"Owner subsequently revised retrospective.\n")
+    with pytest.raises(SourcePublicationHold, match="edited after capture"):
+        publish_retrospective(
+            publication,
+            source,
+            current,
+            "retro",
+            merge=merge,
+            acceptance=acceptance,
+            journal=Journal(tmp_path / "journal"),
+        )
+    current.evidence["closure_manifest"].pop("retrospective_preimage")
+    from bmad_loop.campaign_model import CampaignError
+
+    with pytest.raises(CampaignError, match="captured canonical preimage"):
+        publish_retrospective(
+            publication,
+            source,
+            current,
+            "retro",
+            merge=merge,
+            acceptance=acceptance,
+            journal=Journal(tmp_path / "journal"),
+        )
 
 
 def test_closure_manifest_or_owner_epic_edit_is_never_overwritten(shared, tmp_path):

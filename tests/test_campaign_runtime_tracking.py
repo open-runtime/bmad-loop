@@ -3,6 +3,7 @@
 import json
 import os
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,7 +14,7 @@ from test_campaign_runtime import production_case as production_case
 from test_campaign_runtime import run_case
 from test_campaign_source_publication import built, configure, reviewed
 
-from bmad_loop import verify
+from bmad_loop import campaign_closure, verify
 from bmad_loop.campaign_model import (
     CampaignError,
     CampaignSnapshot,
@@ -21,6 +22,7 @@ from bmad_loop.campaign_model import (
     CampaignUnit,
     UnitState,
 )
+from bmad_loop.campaign_runtime import CampaignRuntime
 from bmad_loop.campaign_runtime_tracking import (
     admit,
     confirm_tracking,
@@ -28,6 +30,8 @@ from bmad_loop.campaign_runtime_tracking import (
     prepare,
     run_tracking,
 )
+from bmad_loop.campaign_source_publication import ArtifactChange, SourcePublicationResult
+from bmad_loop.campaign_store import CampaignStore, add_action
 from bmad_loop.journal import Journal
 
 
@@ -90,6 +94,50 @@ def test_tracking_control_deduplicates_without_finishing_original(tracking):
     assert original.state == UnitState.MERGED_PENDING_SYNC
     assert unit.state == UnitState.PENDING and unit.spec.kind == "tracking"
     assert unit.spec.parent == original.id and original.id not in unit.spec.after
+
+
+def test_retrospective_tracking_debt_creates_a_real_control_without_finishing_epic(
+    tracking, tmp_path, monkeypatch
+):
+    snapshot, original, prior, publisher, binding, source, plan, _, _ = tracking
+    snapshot.units.pop(prior.id)
+    original.bindings["tracking_units"] = []
+    original.spec = replace(original.spec, kind="closure")
+    original.bindings.update(
+        canonical_source=binding.to_dict(), workspace=str(publisher.project), pr={"number": 42}
+    )
+    original.evidence.update(
+        closure_manifest={"captured": True},
+        merge={"merge_commit": "merged"},
+        integrated={"head": "reviewed"},
+        review={"launch_id": "review-1"},
+    )
+    path = plan.parent / "retrospective.md"
+    before = path.read_bytes() if path.exists() else None
+    debt = SourcePublicationResult(
+        "tracking_pr_required",
+        "current-main",
+        proposal={
+            "kind": "planning-tracking",
+            "artifacts": [{"path": path.relative_to(publisher.project).as_posix()}],
+        },
+    )
+    change = ArtifactChange(str(path), b"# Reviewed retrospective\n", None, "docs/retrospective.md")
+    monkeypatch.setattr(campaign_closure, "publish_retrospective", lambda *args, **kwargs: debt)
+    monkeypatch.setattr(campaign_closure, "retrospective_change", lambda unit: change)
+    runtime = CampaignRuntime(publisher.project, CampaignStore(tmp_path / "runtime-authority"))
+    monkeypatch.setattr(runtime, "source", lambda *args: source)
+    monkeypatch.setattr(runtime, "_source_publisher", lambda *args, **kwargs: publisher)
+    action = add_action(snapshot, "sync-tracking", original.id, {})
+    result = runtime._perform_sync_tracking(snapshot, action)
+    assert result.state == "confirmed"
+    descriptor = result.data["tracking_control"]
+    control = admit(snapshot, descriptor)
+    assert control.spec.kind == "tracking" and control.spec.parent == original.id
+    assert original.state == UnitState.MERGED_PENDING_SYNC
+    request = json.loads(Path(descriptor["request"]).read_text())
+    assert request["changes"][0]["path"] == str(path)
+    assert (path.read_bytes() if path.exists() else None) == before
 
 
 def test_deterministic_tracking_commit_is_reviewable_and_does_not_edit_canonical(

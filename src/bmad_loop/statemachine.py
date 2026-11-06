@@ -415,3 +415,11 @@ def check_campaign_external_merge(unit: str, current: str) -> None:
         raise IllegalTransition(
             f"{unit}: external merge reconciliation requires accepted ready-to-publish work"
         )
+
+
+def check_campaign_prior_delivery(unit: str, current: str) -> None:
+    """Fresh proof may import an actual earlier delivery before new admission."""
+    if current != "pending":
+        raise IllegalTransition(
+            f"{unit}: prior delivery reconciliation requires never-started pending work"
+        )

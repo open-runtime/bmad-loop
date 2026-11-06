@@ -46,6 +46,7 @@ class PublicationEvidence:
     observed_model: str = ""
     verification_receipts: tuple[str, ...] = ()
     review_receipt: str = ""
+    existing_canonical: bool = False
 
 
 @dataclass(frozen=True)
@@ -301,9 +302,14 @@ class PublicationController:
         if evidence.held:
             reasons.append("Unit has an active hold")
         if independent_families and (
-            not evidence.developer_family
-            or not evidence.reviewer_family
-            or evidence.developer_family == evidence.reviewer_family
+            not evidence.reviewer_family
+            or (
+                not evidence.existing_canonical
+                and (
+                    not evidence.developer_family
+                    or evidence.developer_family == evidence.reviewer_family
+                )
+            )
         ):
             reasons.append("Independent provider-family review is required")
         pr = observation.pr
