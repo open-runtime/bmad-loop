@@ -278,6 +278,7 @@ _JOURNAL_ALIAS_FIELDS = {
 # a generic name (`state.source` is a run mode). The producers keep the name for the
 # same correlation reason too — `_replay_unlatched_ledger_carries` keys on it.
 _JOURNAL_KIND_ALIAS_FIELDS: dict[str, dict[str, str]] = {
+    "campaign-review-handoff": {"predecessor": "run", "handoff_id": "operation"},
     # Explicit native recovery correlates through opaque session/task aliases;
     # its profile digest and transcript-derived identity stay local below.
     "stopped-native-armed": {"session_id": "session", "artifact_task_id": "story"},

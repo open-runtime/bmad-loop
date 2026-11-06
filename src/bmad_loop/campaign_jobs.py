@@ -203,10 +203,16 @@ def live(row: Mapping[str, Any]) -> bool:
 
 def current(snapshot: CampaignSnapshot, request: JobRequest) -> bool:
     coordinates = request.coordinates
-    if (
-        coordinates["graph_revision"] != snapshot.graph_revision
-        or coordinates["config_revision"] != snapshot.config_revision
-    ):
+    if coordinates["config_revision"] != snapshot.config_revision:
+        return False
+    if request.purpose in {"handoff_map", "handoff_reduce"} and coordinates.get("handoff_id"):
+        unit = snapshot.units.get(request.unit)
+        handoff = unit.evidence.get("handoff", {}) if unit else {}
+        # Native transcript prefixes and reducer inputs are immutable artifacts.
+        # An unrelated priority/graph edit does not stale their extraction. The
+        # subsequent current-constraint audit still binds the current graph.
+        return handoff.get("id") == coordinates["handoff_id"]
+    if coordinates["graph_revision"] != snapshot.graph_revision:
         return False
     if request.unit:
         unit = snapshot.units[request.unit]

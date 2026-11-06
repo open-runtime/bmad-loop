@@ -39,6 +39,8 @@ ROLES = (
 def resolve_roles(spec: CampaignSpec, policy) -> CampaignSpec:
     roles = dict(spec.roles)
     required = set(ROLES) | set(roles)
+    if "execution_review" in roles:
+        required.add("execution")
     if spec.reasoning.enabled:
         from .campaign_reasoning_plan import ROLES as semantic_roles
 

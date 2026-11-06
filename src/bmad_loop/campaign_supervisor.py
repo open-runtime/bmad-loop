@@ -47,6 +47,10 @@ class CampaignDriver(Protocol):
 
 
 class CampaignSupervisor:
+    _CONTROL_EFFECTS = frozenset(
+        {"observe-worker", "terminate-worker", "reasoning-observe", "reasoning-terminate"}
+    )
+
     def __init__(
         self,
         store: CampaignStore,
@@ -77,6 +81,14 @@ class CampaignSupervisor:
 
     def _save(self, snapshot: CampaignSnapshot) -> CampaignSnapshot:
         return self.store.save(snapshot, snapshot.revision, expected_generation=snapshot.generation)
+
+    def _has_slot(self, snapshot: CampaignSnapshot, action: OutboxAction) -> bool:
+        """Count the independent executor budgets at normal-loop admission too."""
+        controls = {row.id for row in snapshot.outbox if row.kind in self._CONTROL_EFFECTS}
+        control_active = sum(key in controls for key in self._active)
+        if action.kind in self._CONTROL_EFFECTS:
+            return control_active < 2
+        return len(self._active) - control_active < self.io_workers
 
     def _commands(self, snapshot: CampaignSnapshot) -> CampaignSnapshot:
         commands = self.store.commands(snapshot.id, after=snapshot.processed_commands)
@@ -132,12 +144,7 @@ class CampaignSupervisor:
         frozen = snapshot.clone()
         owned_action = next(row for row in frozen.outbox if row.id == action.id)
         operation = self.driver.reconcile_action if reconcile else self.driver.perform
-        if self._control_executor is not None and action.kind in {
-            "observe-worker",
-            "terminate-worker",
-            "reasoning-observe",
-            "reasoning-terminate",
-        }:
+        if self._control_executor is not None and action.kind in self._CONTROL_EFFECTS:
             executor = self._control_executor
         self._active[action.id] = executor.submit(operation, frozen, owned_action)
         return snapshot
@@ -383,8 +390,8 @@ class CampaignSupervisor:
                             snapshot = self._save(snapshot)
                         snapshot = self._queue(snapshot, proposals)
                         for action in tuple(snapshot.outbox):
-                            if len(self._active) >= self.io_workers:
-                                break
+                            if not self._has_slot(snapshot, action):
+                                continue
                             if (
                                 action.state in {"confirmed", "rejected"}
                                 or action.id in self._active
@@ -443,7 +450,13 @@ class CampaignSupervisor:
                             return snapshot
                         self._wake.wait(snapshot.spec.poll_interval_s)
                 except KeyboardInterrupt:
-                    snapshot.phase = "draining"
+                    # A save may have committed before interruption prevented its
+                    # return (for example during disposable event projection).
+                    # Only durable authority can determine what was accepted;
+                    # replaying this caller's old revision loses that boundary.
+                    snapshot = self.store.load(campaign_id)
+                    if snapshot.phase not in {"delivered", "stopped"}:
+                        snapshot.phase = "draining"
                     add_event(snapshot, "coordinator-interrupted")
                     self._save(snapshot)
                     raise

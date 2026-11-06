@@ -495,7 +495,7 @@ class HierarchyCoordinator:
                 raise GithubError(
                     "Imported issue belongs to another milestone; explicit migration required"
                 )
-            bindings[milestone_key] = self._binding(milestone, "milestone")
+            bindings[milestone_key] = {**(existing or {}), **self._binding(milestone, "milestone")}
         child = issue
         # A declared split-story parent maps to its actual parent before the epic.
         for parent_unit in ancestry[1:]:
@@ -506,14 +506,14 @@ class HierarchyCoordinator:
             existing = bindings.get(key)
             if existing and existing["database_id"] != parent["id"]:
                 raise GithubError("Imported story parent conflicts with existing lineage")
-            bindings[key] = self._binding(parent, "issue")
+            bindings[key] = {**(existing or {}), **self._binding(parent, "issue")}
             child = parent
         parent = self._parent(child["number"])
         if parent:
             existing = bindings.get(epic_key)
             if existing and existing["database_id"] != parent["id"]:
                 raise GithubError("Imported epic parent conflicts with existing lineage")
-            bindings[epic_key] = self._binding(parent, "issue")
+            bindings[epic_key] = {**(existing or {}), **self._binding(parent, "issue")}
 
     def _parent(self, number: int) -> JsonObject | None:
         try:

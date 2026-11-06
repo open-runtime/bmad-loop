@@ -258,6 +258,8 @@ REARM_ESCALATION_CALLERS = {
 # outer hold. Exact inventories make a newly added writer fail loudly instead of
 # relying on a reviewer to find it by grep.
 SAVE_STATE_CALLERS = {
+    # Fresh run publication under state_lock; predecessor remains immutable.
+    ("campaign_continuation.py", "compose_review"),
     # Owned accepted-finalization continuation: both publications hold state_lock.
     ("campaign_finalization.py", "resume"),
     ("accepted_review.py", "rearm_for_implemented_review"),
@@ -279,6 +281,7 @@ SAVE_STATE_CALLERS = {
     ("unitreplay.py", "abandon_replay_run"),
 }
 RUN_STATE_TRANSACTIONS = {
+    ("campaign_continuation.py", "compose_review"),
     ("campaign_finalization.py", "resume"),
     ("accepted_review.py", "rearm_for_implemented_review"),
     ("commit_recovery.py", "arm"),
@@ -1498,6 +1501,10 @@ JOURNAL_DYNAMIC_KIND_SPELLINGS = {
 # the scan's, not the tree's.
 JOURNAL_KINDS = frozenset(
     {
+        # Frozen review continuation; predecessor/operation identifiers are
+        # kind-aliased. Actual records covered in test_campaign_continuation.
+        "campaign-review-continuation",
+        "campaign-review-handoff",
         # Finalization's publication boundary; SHA/branch fields use existing
         # diagnostic aliases. Native replay coverage: test_fork_finalize_target.
         "baseline-adopted-from-target",

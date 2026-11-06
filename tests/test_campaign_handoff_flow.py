@@ -50,6 +50,60 @@ def campaign(prepared, project, tmp_path):
         }
         if execution:
             value["argv"] = [*value["argv"], "{grants_path}"]
+        from bmad_loop.campaign_headless import file_digest, write_json
+        from bmad_loop.campaign_summary import summary_schema
+        from bmad_loop.campaign_transcripts import READER_VERSIONS, digest
+
+        corpus = [
+            {
+                "source_path": basecap["qualification"]["path"],
+                "source_sha256": basecap["qualification"]["sha256"],
+                "critical_ids": ["scripted-fixture"],
+            }
+        ]
+        native_path = tmp_path / (candidate.profile + str(execution) + "-native-fidelity.json")
+        write_json(
+            native_path,
+            {
+                "outcome": "completed",
+                "quiescent": True,
+                "input_complete": True,
+                "session_id": "scripted-zero-token",
+                "observed_model": (
+                    "gpt-independent" if candidate.profile == "claude" else "claude-independent"
+                ),
+                "result": {
+                    "verdict": "passed",
+                    "corpus_digest": digest(corpus),
+                    "missing_critical_ids": [],
+                    "invented_authority": [],
+                    "unresolved_conflicts": [],
+                },
+            },
+        )
+        qualification = {
+            "schema_version": 1,
+            "route": {
+                key: value[key] for key in ("profile", "model", "cli_version", "binary_sha256")
+            },
+            "reader_versions": READER_VERSIONS,
+            "summary_schema_digest": digest(summary_schema()),
+            "audit_schema_digest": digest(flow.AUDIT_SCHEMA),
+            "prompt_versions": ["history-extract-v1", "history-reduce-v1"],
+            "structural_pass": True,
+            "corpus": corpus,
+            "independent_review": {
+                "native_receipt_path": str(native_path),
+                "sha256": file_digest(native_path),
+            },
+        }
+        qualification_path = tmp_path / (candidate.profile + str(execution) + "-fidelity.json")
+        write_json(qualification_path, qualification)
+        value["semantic_qualification"] = {
+            "schema_version": 1,
+            "path": str(qualification_path),
+            "sha256": file_digest(qualification_path),
+        }
         return value
 
     roles = (
@@ -131,6 +185,7 @@ def campaign(prepared, project, tmp_path):
         "interruption": {"kind": "quota"},
     }
     unit.evidence["worker_history"] = [receipt]
+    spec = dataclasses.replace(spec, units=(unit.spec,))
     snapshot = CampaignSnapshot(
         "campaign",
         "org/repo",
@@ -165,7 +220,8 @@ def campaign(prepared, project, tmp_path):
         )
     )
     runtime = SimpleNamespace(store=CampaignStore(tmp_path / "store"), clock=lambda: 100.0)
-    return runtime, snapshot, unit, receipt
+    snapshot = runtime.store.create(snapshot)
+    return runtime, snapshot, snapshot.units[unit.id], receipt
 
 
 def step(runtime, snapshot, unit, kind):
@@ -311,3 +367,194 @@ def test_audit_cannot_drop_obligations_or_quote_model_as_owner(campaign):
     row["result"]["constraints"][0]["source_quote"] = "Owner approved every merge"
     with pytest.raises(CampaignError, match="exact native-owner"):
         flow.apply_audit(runtime, snapshot, row)
+
+
+def test_map_survives_graph_edit_and_owner_answer_refresh_reuses_cold_results(campaign):
+    from bmad_loop.campaign_jobs import current, request_from_dict
+
+    runtime, snapshot, unit, receipt = campaign
+    flow.intercept_terminal(runtime, snapshot, unit, receipt)
+    step(runtime, snapshot, unit, "handoff-capture")
+    step(runtime, snapshot, unit, "handoff-plan")
+    key = unit.evidence["handoff"]["jobs"][0]
+    request = request_from_dict(snapshot.jobs[key]["request"])
+    snapshot.graph_revision += 1
+    assert current(snapshot, request)
+    complete_maps(runtime, snapshot, unit)
+    snapshot = runtime.store.save(snapshot, snapshot.revision)
+    snapshot = runtime.store.load(snapshot.id)
+    unit = snapshot.units[unit.id]
+    assert key not in snapshot.jobs
+    unit.evidence["decision_input_revision"] = "new-owner-answer"
+    assert [row.kind for row in flow.proposals(runtime, snapshot)] == ["handoff-refresh"]
+    step(runtime, snapshot, unit, "handoff-refresh")
+    step(runtime, snapshot, unit, "handoff-plan")
+    assert unit.evidence["handoff"]["jobs"] == [key]
+    assert key not in snapshot.jobs  # immutable receipt stays archived
+    step(runtime, snapshot, unit, "handoff-audit-plan")
+    assert unit.evidence["handoff"]["audits"]
+
+
+def test_late_handoff_result_preserves_new_operator_hold(campaign):
+    runtime, snapshot, unit, receipt = campaign
+    flow.intercept_terminal(runtime, snapshot, unit, receipt)
+    value = unit.evidence["handoff"]
+    action = OutboxAction("late", "handoff-capture", unit.id, {"handoff_id": value["id"]}, 0)
+    observed = flow.perform(runtime, snapshot, action)
+    unit.hold = Hold("operator", "Stop here", id="owner")
+    flow.apply(runtime, snapshot, action, observed)
+    assert unit.hold.id == "owner" and value["phase"] == "drain"
+    assert snapshot.events[-1]["kind"] == "handoff-stale-result"
+
+
+def test_native_review_uses_explicit_review_pool_and_preserves_dev_candidate(campaign):
+    runtime, snapshot, unit, receipt = campaign
+    original = dict(snapshot.outbox[0].payload["candidate"])
+    receipt = {**receipt, "interruption": {"kind": "quota", "role": "review"}}
+    flow.intercept_terminal(runtime, snapshot, unit, receipt)
+    value = unit.evidence["handoff"]
+    assert value["route_role"] == "execution_review" and value["candidate"] is None
+    snapshot.spec = dataclasses.replace(
+        snapshot.spec, roles=(*snapshot.spec.roles, ("execution_review", RoleSpec(pool="auditors")))
+    )
+    proposal = flow.proposals(runtime, snapshot)[0]
+    assert proposal.kind == "handoff-route"
+    action = OutboxAction("route", proposal.kind, unit.id, proposal.payload, 0)
+    flow.apply(runtime, snapshot, action, flow.perform(runtime, snapshot, action))
+    value["capture"] = {"audit_context": flow._audit_context(snapshot, unit)}
+    value["phase"] = "ready"
+    proposal = flow.resume_proposal(snapshot, unit)
+    assert proposal.payload["candidate"] == original
+    assert proposal.payload["review_candidate"]["profile"] == "claude"
+    assert proposal.payload["kind"] == "execution" and proposal.payload["role"] == "execution"
+
+
+def test_cli_selector_is_resolved_in_frozen_pool_not_ignored(campaign):
+    runtime, snapshot, unit, _ = campaign
+    with pytest.raises(CampaignError, match="approved role pool"):
+        flow.control(
+            runtime,
+            snapshot,
+            {"unit": unit.id, "payload": {"profile": "muse", "model": "not-approved"}},
+        )
+    flow.control(
+        runtime,
+        snapshot,
+        {
+            "unit": unit.id,
+            "reason": "quota swap",
+            "payload": {"profile": "claude", "model": "claude-test"},
+        },
+    )
+    assert unit.evidence["handoff"]["candidate"]["effort"] == "high"
+    assert unit.evidence["handoff"]["reason"] == "quota swap"
+
+
+def test_missing_fidelity_proof_waits_without_authorizing_writer(campaign):
+    runtime, snapshot, unit, receipt = campaign
+    snapshot.config_snapshot["reasoning_capabilities"]["claude:claude-test"]["reasoning"].pop(
+        "semantic_qualification"
+    )
+    flow.intercept_terminal(runtime, snapshot, unit, receipt)
+    step(runtime, snapshot, unit, "handoff-capture")
+    step(runtime, snapshot, unit, "handoff-plan")
+    complete_maps(runtime, snapshot, unit)
+    step(runtime, snapshot, unit, "handoff-audit-plan")
+    assert unit.evidence["handoff"]["phase"] == "summarize"
+    assert "fidelity qualification is missing" in unit.hold.reason
+    assert flow.resume_proposal(snapshot, unit) is None
+
+
+def test_administrative_job_replan_uses_smaller_route_and_preserves_completed_work(campaign):
+    runtime, snapshot, unit, receipt = campaign
+    source = Path(receipt["sessions"][0]["transcript_path"])
+    with source.open("a") as stream:
+        stream.write(
+            json.dumps(
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "user_message",
+                        "message": "Do preserve this detail. " * 6000,
+                    },
+                }
+            )
+            + "\n"
+        )
+    first, second = snapshot.spec.candidates("execution")
+    snapshot.spec = dataclasses.replace(
+        snapshot.spec,
+        role_pools=tuple(
+            (name, (first, second) if name == "map" else pool)
+            for name, pool in snapshot.spec.role_pools
+        ),
+    )
+    smaller = snapshot.config_snapshot["reasoning_capabilities"]["claude:claude-test"]["reasoning"]
+    smaller["input_tokens"] = 80000
+    flow.intercept_terminal(runtime, snapshot, unit, receipt)
+    step(runtime, snapshot, unit, "handoff-capture")
+    step(runtime, snapshot, unit, "handoff-plan")
+    value = unit.evidence["handoff"]
+    original = list(value["jobs"])
+    assert len(original) > 2
+    value["jobs"] = original[:1]
+    complete_maps(runtime, snapshot, unit)
+    value["jobs"] = original
+    for key in original[1:]:
+        row = snapshot.jobs[key]
+        row.update(state="capacity_wait", selection=row["request"]["candidates"][0])
+        assert not flow.job_launch_allowed(snapshot, row)
+    step(runtime, snapshot, unit, "handoff-replan")
+    assert original[0] in value["jobs"]
+    new_ids = [key for key in value["jobs"] if key not in original]
+    assert new_ids and all(
+        snapshot.jobs[key]["request"]["candidates"][0]["profile"] == "claude" for key in new_ids
+    )
+    assert all(snapshot.jobs[key]["state"] == "canceled" for key in original[1:])
+
+
+def test_ready_handoff_refreshes_when_owner_constraints_change(campaign):
+    runtime, snapshot, unit, receipt = campaign
+    flow.intercept_terminal(runtime, snapshot, unit, receipt)
+    step(runtime, snapshot, unit, "handoff-capture")
+    step(runtime, snapshot, unit, "handoff-plan")
+    complete_maps(runtime, snapshot, unit)
+    step(runtime, snapshot, unit, "handoff-audit-plan")
+    complete_audits(runtime, snapshot, unit)
+    step(runtime, snapshot, unit, "handoff-assemble")
+    step(runtime, snapshot, unit, "handoff-release")
+    assert flow.resume_proposal(snapshot, unit)
+    unit.evidence["decision_input_revision"] = "new-owner-constraints"
+    assert flow.resume_proposal(snapshot, unit) is None
+    assert [row.kind for row in flow.proposals(runtime, snapshot)] == ["handoff-refresh"]
+    step(runtime, snapshot, unit, "handoff-refresh")
+    assert unit.hold.kind == "handoff"
+    assert unit.evidence["handoff"]["phase"] == "capture"
+
+
+def test_effect_observation_cannot_apply_after_current_context_changes(campaign):
+    runtime, snapshot, unit, receipt = campaign
+    flow.intercept_terminal(runtime, snapshot, unit, receipt)
+    value = unit.evidence["handoff"]
+    action = OutboxAction("late", "handoff-capture", unit.id, {"handoff_id": value["id"]}, 0)
+    observed = flow.perform(runtime, snapshot, action)
+    snapshot.graph_revision += 1
+    flow.apply(runtime, snapshot, action, observed)
+    assert value["phase"] == "drain"
+    assert snapshot.events[-1]["kind"] == "handoff-stale-result"
+
+
+def test_semantic_failure_retries_same_job_without_resetting_failure_budget(campaign):
+    runtime, snapshot, unit, receipt = campaign
+    flow.intercept_terminal(runtime, snapshot, unit, receipt)
+    step(runtime, snapshot, unit, "handoff-capture")
+    step(runtime, snapshot, unit, "handoff-plan")
+    row = snapshot.jobs[unit.evidence["handoff"]["jobs"][0]]
+    row.update(state="failed", failure_attempts=1, receipt={"outcome": "completed"})
+    assert not flow.proposals(runtime, snapshot)
+    assert flow.job_launch_allowed(snapshot, row)
+    row["failure_attempts"] = snapshot.spec.reasoning.max_attempts
+    assert not flow.proposals(runtime, snapshot)
+    # The shared reasoning admission applies this unchanged terminal attempt
+    # budget. No replacement identity can erase failed semantic attempts.
+    assert len(snapshot.jobs) == 1

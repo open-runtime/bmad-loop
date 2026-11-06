@@ -420,7 +420,7 @@ class SummaryCache:
             raise CampaignError("summary cache entry is redirected")
         if not path.exists():
             return None
-        value = json.loads(path.read_text())
+        value = json.loads(path.read_text(encoding="utf-8"))
         result = value.get("result", {})
         if (
             value.get("sha256") != digest(result)

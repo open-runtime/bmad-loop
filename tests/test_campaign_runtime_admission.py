@@ -30,7 +30,7 @@ def configured(project, tmp_path, *, sessions=4):
         ],
     }
     return (
-        CampaignRuntime(project.project, CampaignStore(tmp_path / "state")),
+        CampaignRuntime(project.project, CampaignStore(tmp_path / "state"), clock=lambda: 100),
         snapshot,
         astra,
         fable,

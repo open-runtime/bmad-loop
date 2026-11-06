@@ -270,3 +270,91 @@ def test_prepared_action_restart_is_revalidated_and_adopted_before_effect(campai
     assert adopted.state == "confirmed", adopted.error
     assert result.phase == "delivered"
     assert sum(kind == "start" and unit == "s:e:first" for kind, unit in driver.performed) == 1
+
+
+def test_worker_stop_has_reserved_service_while_source_io_is_blocked(campaign_store):
+    store, campaign_id = campaign_store
+    entered, release, stopped = threading.Event(), threading.Event(), threading.Event()
+
+    class SlowSourceDriver(PipelineDriver):
+        def perform(self, snapshot, action):
+            if action.kind == "slow-source":
+                entered.set()
+                assert release.wait(5), "test did not release its source observation"
+            else:
+                assert action.kind == "terminate-worker"
+                stopped.set()
+            return Observation("confirmed")
+
+    supervisor = CampaignSupervisor(store, SlowSourceDriver(store), io_workers=1)
+    snapshot = store.load(campaign_id)
+    add_action(snapshot, "slow-source", "s:e:first", {})
+    add_action(snapshot, "terminate-worker", "s:e:second", {})
+    snapshot = store.save(snapshot, snapshot.revision)
+    with supervisor._executors() as executor:
+        try:
+            snapshot = supervisor._submit(snapshot, snapshot.outbox[0], executor, reconcile=False)
+            assert entered.wait(3)
+            supervisor._submit(snapshot, snapshot.outbox[1], executor, reconcile=False)
+            assert stopped.wait(3), "worker termination queued behind slow source I/O"
+        finally:
+            release.set()
+
+
+def test_run_dispatches_termination_when_regular_effect_pool_is_full(campaign_store):
+    store, campaign_id = campaign_store
+    entered, release, prepared, stopped = (threading.Event() for _ in range(4))
+    failures = []
+
+    class SaturatedDriver(PipelineDriver):
+        def proposals(self, snapshot):
+            return ()
+
+        def observe_workers(self, snapshot):
+            if entered.is_set() and not prepared.is_set():
+                return (Proposal("terminate-worker", "s:e:second"),)
+            return ()
+
+        def perform(self, snapshot, action):
+            if action.kind == "slow-source":
+                entered.set()
+                assert release.wait(10), "test did not release its slow source"
+            elif action.kind == "terminate-worker":
+                stopped.set()
+            return Observation("confirmed")
+
+        def control(self, snapshot, command):
+            if command["kind"] == "prepare-effect":
+                if command["action"]["kind"] == "terminate-worker":
+                    prepared.set()
+            else:
+                super().control(snapshot, command)
+
+        def apply(self, snapshot, action, observation):
+            pass
+
+    snapshot = store.load(campaign_id)
+    add_action(snapshot, "slow-source", "s:e:first", {})
+    store.save(snapshot, snapshot.revision)
+    supervisor = CampaignSupervisor(
+        store, SaturatedDriver(store), io_workers=1, progress=lambda _: None
+    )
+
+    def run():
+        try:
+            supervisor.run(campaign_id)
+        except BaseException as exc:
+            failures.append(exc)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    try:
+        assert entered.wait(3), "source effect never started"
+        assert prepared.wait(3), "worker termination was never prepared"
+        assert stopped.wait(3), "normal run starved the reserved termination executor"
+    finally:
+        release.set()
+        store.enqueue(campaign_id, "stop")
+        thread.join(8)
+    assert not thread.is_alive(), "supervisor failed to drain after releasing source I/O"
+    assert not failures

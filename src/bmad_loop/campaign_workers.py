@@ -316,7 +316,11 @@ def _tracking(request: dict[str, Any], envelope: CampaignExecution) -> dict[str,
 def _execution(request: dict[str, Any], envelope: CampaignExecution) -> dict[str, Any]:
     from .campaign_intake_amendment import validate_initial_source
 
-    validate_initial_source(request)
+    review_handoff = request.get("handoff_state", {}).get("native_role") == "review"
+    # A continuation binds the exact captured post-development private source,
+    # which has legitimately changed since the original ready-for-dev import.
+    if not review_handoff:
+        validate_initial_source(request)
     workspace = Path(request["workspace"])
     source = SourceSelector(**request["source"])
     unit = UnitSpec(**request["unit"])
@@ -328,28 +332,43 @@ def _execution(request: dict[str, Any], envelope: CampaignExecution) -> dict[str
     ):
         raise CampaignError("worker would write a non-private ticket store")
     run_id = request["run_id"]
-    composed = runsetup.compose_run(
-        project=workspace,
-        paths=paths,
-        policy=pol,
-        run_id=run_id,
-        epic_filter=int(unit.epic) if source.kind == "sprint-status" and unit.epic else None,
-        story_filter=unit.selector,
-        max_stories=1,
-        source=source.kind,
-        spec_folder=source.path if source.kind == "stories" else "",
-        sweep_factory=lambda *a, **k: None,
-        make_adapters=lambda project, run_dir, policy, **kwargs: _adapters(
-            request, envelope, project, run_dir, policy, **kwargs
-        ),
-        engine_cls=Engine,
-        stories_engine_cls=StoriesEngine,
-        trusted_config_digest=runsetup.config_digest(pol, workspace, profiles=envelope.profiles),
-        profiles=envelope.profiles,
-        plugin_grants=envelope.grants,
-        ticket_epic_filter=unit.epic if source.kind == "tickets" else "",
-        campaign_execution=envelope,
-    )
+    if review_handoff:
+        from .campaign_continuation import compose_review
+
+        composed = compose_review(
+            request,
+            envelope,
+            make_adapters=lambda project, run_dir, policy, **kwargs: _adapters(
+                request, envelope, project, run_dir, policy, **kwargs
+            ),
+            engine_cls=Engine,
+            stories_engine_cls=StoriesEngine,
+        )
+    else:
+        composed = runsetup.compose_run(
+            project=workspace,
+            paths=paths,
+            policy=pol,
+            run_id=run_id,
+            epic_filter=int(unit.epic) if source.kind == "sprint-status" and unit.epic else None,
+            story_filter=unit.selector,
+            max_stories=1,
+            source=source.kind,
+            spec_folder=source.path if source.kind == "stories" else "",
+            sweep_factory=lambda *a, **k: None,
+            make_adapters=lambda project, run_dir, policy, **kwargs: _adapters(
+                request, envelope, project, run_dir, policy, **kwargs
+            ),
+            engine_cls=Engine,
+            stories_engine_cls=StoriesEngine,
+            trusted_config_digest=runsetup.config_digest(
+                pol, workspace, profiles=envelope.profiles
+            ),
+            profiles=envelope.profiles,
+            plugin_grants=envelope.grants,
+            ticket_epic_filter=unit.epic if source.kind == "tickets" else "",
+            campaign_execution=envelope,
+        )
     atomic_write_text(
         composed.run_dir / "campaign-worker.json",
         json.dumps(
@@ -470,7 +489,11 @@ def _adapters(
             continue
         selected_caps[role] = capability_for(routes, selected.name, selected.model, permission)
         profiles[role] = dataclasses.replace(profiles[role], adapter="bounded-headless")
-    handoff_role = "triage" if request.get("kind") == "stage" else "dev"
+    handoff_role = (
+        "triage"
+        if request.get("kind") == "stage"
+        else "review" if request.get("handoff_state", {}).get("native_role") == "review" else "dev"
+    )
     if request.get("handoff_packet") and handoff_role not in selected_caps:
         raise CampaignError(
             "Handoff requires a qualified execution route with inline input delivery"
@@ -658,6 +681,7 @@ def _stage(request: dict[str, Any], envelope: CampaignExecution) -> dict[str, An
 
     interruption = session_interruption(result)
     if interruption is not None:
+        interruption["role"] = role
         raise CampaignStageInterrupted(role, interruption)
     actual = result.result_json
     if (

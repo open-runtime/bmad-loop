@@ -29,6 +29,8 @@ def register(subparsers: Any) -> None:
     for command, help_text in (
         ("validate", "validate a campaign specification offline"),
         ("preflight", "read planning, execution, publication and reflection capabilities"),
+        ("qualify-headless", "explicitly run a bounded native no-tools canary"),
+        ("trial-handoff", "explicitly qualify sealed history through native summary jobs"),
         ("migration-inventory", "inspect current work and cache an exact migration review receipt"),
         (
             "migration-qualify",
@@ -45,6 +47,7 @@ def register(subparsers: Any) -> None:
         ("stop", "close admissions and drain existing bounded stages"),
         ("hold", "hold one unit at a safe stage boundary"),
         ("release", "release an explicit operator hold"),
+        ("authorize-scope", "authorize exact acceptance reductions in a delivered revised plan"),
         ("attach", "attach the existing owned unit terminal"),
         ("reconcile", "refresh an existing campaign without starting workers"),
         ("adoption-proposal", "inspect exact existing PR and service handoff coordinates"),
@@ -54,7 +57,32 @@ def register(subparsers: Any) -> None:
         child = commands.add_parser(command, help=help_text)
         child.add_argument("--project", default=argparse.SUPPRESS, help="target project root")
         child.set_defaults(func=dispatch)
-        if command in {"validate", "preflight", "run", "migration-inventory", "migration-qualify"}:
+        if command == "trial-handoff":
+            child.add_argument(
+                "snapshots", metavar="SNAPSHOTS", help="sealed native history manifest"
+            )
+            child.add_argument("--capability", required=True, help="earned native route capability")
+            child.add_argument(
+                "--directory", required=True, help="private external evidence directory"
+            )
+            child.add_argument("--parallel", type=int, default=4)
+            child.add_argument("--timeout", type=int, default=600)
+            child.add_argument("--prepare-only", action="store_true")
+        elif command == "qualify-headless":
+            child.add_argument("proposal", metavar="PROPOSAL", help="unqualified native route JSON")
+            child.add_argument(
+                "--directory", required=True, help="private external evidence directory"
+            )
+            child.add_argument("--input-bytes", type=int, default=16384)
+            child.add_argument("--output-tokens", type=int, default=4096)
+            child.add_argument("--timeout", type=int, default=180)
+        elif command in {
+            "validate",
+            "preflight",
+            "run",
+            "migration-inventory",
+            "migration-qualify",
+        }:
             child.add_argument("spec", metavar="SPEC", help="version 1 campaign TOML")
             if command == "migration-qualify":
                 child.add_argument(
@@ -64,7 +92,15 @@ def register(subparsers: Any) -> None:
             child.add_argument("campaign_id", metavar="ID")
         if command == "provenance":
             child.add_argument("--expected-commit", default="", metavar="SHA")
-        if command in {"hold", "release", "attach", "adopt", "adoption-proposal", "handoff"}:
+        if command in {
+            "hold",
+            "release",
+            "attach",
+            "adopt",
+            "adoption-proposal",
+            "handoff",
+            "authorize-scope",
+        }:
             child.add_argument("--unit", required=True, metavar="UNIT")
         if command in {"adopt", "adoption-proposal"}:
             child.add_argument(
@@ -78,6 +114,9 @@ def register(subparsers: Any) -> None:
         if command == "adoption-proposal":
             child.add_argument("--pr", required=True, type=int, metavar="NUMBER")
         if command == "hold":
+            child.add_argument("--reason", required=True)
+        if command == "authorize-scope":
+            child.add_argument("--expected-revision", required=True, type=int)
             child.add_argument("--reason", required=True)
         if command == "stop":
             child.add_argument(
@@ -94,6 +133,9 @@ def register(subparsers: Any) -> None:
             child.add_argument("--role", default="", metavar="ROLE")
             child.add_argument("--after", type=int, default=0)
             child.add_argument("--limit", type=int, default=100)
+            child.add_argument(
+                "--observations", action="store_true", help="read archived superseded observations"
+            )
         if command == "jobs":
             child.add_argument("--unit", default="", metavar="UNIT")
             child.add_argument("--job", default="", metavar="JOB")
@@ -103,6 +145,7 @@ def register(subparsers: Any) -> None:
         if command == "handoff":
             child.add_argument("--profile", default="")
             child.add_argument("--model", default="")
+            child.add_argument("--effort", default="")
             child.add_argument("--reason", default="operator requested continuation")
         if command == "run":
             child.add_argument("--paradev-reflect", action="store_true", default=None)
@@ -157,6 +200,8 @@ def _job_document(row, *, details=False):
                 "reason",
                 "usage",
                 "model",
+                "observed_model",
+                "observed_models",
                 "effort",
                 "native_session_id",
                 "session_id",
@@ -233,9 +278,11 @@ def status_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
     """Project execution identities; omit private configuration and evidence."""
     from .campaign_metrics import document as timing_document
     from .campaign_operator import diagnostics
+    from .campaign_scheduler import admit
     from .sanitize import scrub_json
 
     units = []
+    admission = admit(snapshot)
     public_bindings = {
         "workspace",
         "workspace_id",
@@ -283,6 +330,35 @@ def status_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
                 "hold": hold,
                 "claim": claim,
                 "retry_at": unit.retry_at,
+                "acceptance": scrub_json(
+                    {
+                        "revision": unit.evidence.get("acceptance", {}).get("revision", 0),
+                        "criteria": [
+                            {
+                                name: row[name]
+                                for name in ("id", "text", "required", "status", "reason")
+                                if name in row
+                            }
+                            for row in unit.evidence.get("acceptance", {}).get("criteria", [])
+                        ],
+                    }
+                ),
+                "admission_wait": admission.waits.get(key, ""),
+                "handoff": scrub_json(
+                    {
+                        name: unit.evidence.get("handoff", {}).get(name)
+                        for name in (
+                            "id",
+                            "phase",
+                            "role",
+                            "route_role",
+                            "native_role",
+                            "reason",
+                            "retry_at",
+                        )
+                        if name in unit.evidence.get("handoff", {})
+                    }
+                ),
                 "links": {
                     name: value for name, value in unit.bindings.items() if name in public_bindings
                 },
@@ -311,6 +387,24 @@ def status_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
             }
         )
     counts = dict(Counter(str(unit.state) for unit in snapshot.units.values()))
+    active_claims = [
+        unit.claim for unit in snapshot.units.values() if unit.claim and not unit.claim.quiescent
+    ]
+    active_jobs = [
+        row for row in snapshot.jobs.values() if row.get("claim") and not row["claim"]["quiescent"]
+    ]
+    active_roles = Counter(claim.role for claim in active_claims)
+    active_roles.update(row["request"]["role"] for row in active_jobs)
+    for unit in snapshot.units.values():
+        if (
+            unit.claim
+            and not unit.claim.quiescent
+            and any(
+                action.id == unit.claim.launch_id and action.payload.get("review_candidate")
+                for action in snapshot.outbox
+            )
+        ):
+            active_roles["execution_review"] += 1
     report = snapshot.bindings.get("reasoning_decisions", {}).get("report")
     if report:
         from .campaign_reasoning_plan import fingerprint
@@ -347,6 +441,22 @@ def status_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
             "max_workers": snapshot.spec.max_workers,
             "max_active_epics": snapshot.spec.max_active_epics,
             "max_in_flight_units": snapshot.spec.max_in_flight_units,
+            "max_workers_per_epic": snapshot.spec.max_workers_per_epic,
+            "max_sessions": snapshot.spec.resources.max_sessions,
+            "max_review_sessions": snapshot.spec.max_review_sessions,
+            "active_sessions": sum(claim.resource != "verify" for claim in active_claims)
+            + len(active_jobs),
+            "active_verifications": sum(claim.resource == "verify" for claim in active_claims),
+            "role_limits": {
+                role: {
+                    "max_sessions": configured.max_sessions,
+                    "active_or_reserved": active_roles[role],
+                }
+                for role, configured in snapshot.spec.roles
+            },
+            "provider_routes": scrub_json(
+                snapshot.bindings.get("capacity", {}).get("observations", [])
+            ),
             "verify_slots": snapshot.spec.resources.verify_slots,
             "active_queue_views": sum(
                 bool(unit.claim and not unit.claim.quiescent and unit.claim.role == "queue_verify")
@@ -366,7 +476,12 @@ def status_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
         },
         "units": units,
         "jobs": [_job_document(row) for row in list(snapshot.jobs.values())[:100]],
+        "jobs_truncated": len(snapshot.jobs) > 100,
         "reasoning": {
+            "enabled": snapshot.spec.reasoning.enabled,
+            "max_sessions": snapshot.spec.reasoning.max_sessions,
+            "active_sessions": len(active_jobs),
+            "states": dict(Counter(row["state"] for row in snapshot.jobs.values())),
             "errors": scrub_json(snapshot.bindings.get("semantic_jobs", {}).get("errors", {})),
             "report": scrub_json(report),
         },
@@ -452,6 +567,35 @@ def _spec(args: argparse.Namespace) -> CampaignSpec:
 
 def dispatch(args: argparse.Namespace) -> int:
     command = args.campaign_command
+    if command == "trial-handoff":
+        from .campaign_history_trial import run_trial
+
+        try:
+            report = run_trial(
+                Path(args.snapshots).expanduser(),
+                Path(args.capability).expanduser(),
+                Path(args.directory).expanduser(),
+                parallel=args.parallel,
+                timeout_s=args.timeout,
+                execute=not args.prepare_only,
+            )
+            return _emit(args, _result(command, **report))
+        except (CampaignError, OSError, ValueError, KeyError, TypeError) as exc:
+            return _emit(args, _result(command, ok=False, problems=[str(exc)]))
+    if command == "qualify-headless":
+        from .campaign_qualification import qualify
+
+        try:
+            report = qualify(
+                Path(args.proposal).expanduser(),
+                Path(args.directory).expanduser(),
+                input_bytes=args.input_bytes,
+                output_tokens=args.output_tokens,
+                timeout_s=args.timeout,
+            )
+            return _emit(args, _result(command, **report))
+        except (CampaignError, OSError, ValueError, KeyError, TypeError) as exc:
+            return _emit(args, _result(command, ok=False, problems=[str(exc)]))
     if command in {"migration-inventory", "migration-qualify"}:
         from .campaign_migration_cli import inventory_document, qualify_document
 
@@ -542,6 +686,24 @@ def dispatch(args: argparse.Namespace) -> int:
 
         if args.unit and args.unit not in snapshot.units:
             raise CampaignError(f"unknown campaign unit {args.unit}")
+        if args.observations:
+            from .sanitize import scrub_json
+
+            if args.role:
+                raise CampaignError("observation history does not accept a native session role")
+            rows = store.observations(
+                campaign_id, after=args.after, limit=args.limit, unit=args.unit
+            )
+            return _emit(
+                args,
+                _result(
+                    command,
+                    observations=scrub_json(rows),
+                    next_after=rows[-1]["sequence"] if rows else args.after,
+                    has_more=len(rows) == args.limit,
+                    scope="archived-observations",
+                ),
+            )
         rows = store.history(campaign_id, after=args.after, limit=args.limit, unit=args.unit)
         selected = [
             row
@@ -601,10 +763,17 @@ def dispatch(args: argparse.Namespace) -> int:
             ),
         )
     if (
-        command in {"hold", "release", "attach", "adopt", "adoption-proposal", "handoff"}
+        command
+        in {"hold", "release", "attach", "adopt", "adoption-proposal", "handoff", "authorize-scope"}
         and args.unit not in snapshot.units
     ):
         raise CampaignError(f"unknown campaign unit {args.unit}")
+    if command == "authorize-scope":
+        from .campaign_scope_authority import proposal
+
+        scope = proposal(snapshot, args.unit, args.expected_revision, args.reason)
+        request = store.enqueue(campaign_id, command, unit=args.unit, scope=scope)
+        return _emit(args, _result(command, request=request))
     if command == "handoff":
         request = store.enqueue(
             campaign_id,
@@ -612,6 +781,7 @@ def dispatch(args: argparse.Namespace) -> int:
             unit=args.unit,
             profile=args.profile,
             model=args.model,
+            effort=args.effort,
             reason=args.reason,
         )
         return _emit(args, _result(command, request=request))

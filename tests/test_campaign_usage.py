@@ -390,3 +390,97 @@ def test_interrupted_owned_worker_keeps_native_attempts_before_a_fresh_engine(
     assert unit.claim.quiescent and unit.evidence["dev_attempts_spent"] == 1
     assert unit.evidence["usage"]["tokens"]["input_tokens"] == 120
     assert unit.hold.kind == "technical_failure"
+
+
+def test_quota_review_keeps_tokens_without_spending_semantic_failure():
+    snapshot, unit, _, _ = state()
+    receipt = {
+        "outcome": "failed",
+        "interruption": {"kind": "quota"},
+        "accounting": {
+            "schema_version": 1,
+            "kind": "stage",
+            "stream_id": "stage:quota",
+            "tokens": {"input_tokens": 123, "output_tokens": 7},
+            "usage_complete": True,
+            "session_observed": True,
+        },
+    }
+    apply(snapshot, unit, receipt, role="publication_review")
+    apply(snapshot, unit, receipt, role="publication_review")
+    assert unit.review_attempts == 0
+    assert unit.evidence["usage"]["tokens"]["input_tokens"] == 123
+    assert (
+        snapshot.bindings["usage_ledger"]["streams"]["stage:quota"]["publication_validation"]
+        == "interrupted"
+    )
+
+
+def test_administrative_credit_preserves_prior_faults_and_survives_replayed_receipts(tmp_path):
+    from bmad_loop.campaign_usage import credit_interruption
+    from bmad_loop.journal import Journal
+    from bmad_loop.platform_util import root_identity_record
+
+    snapshot, unit, run, task = state()
+    task.attempt, task.dev_usage_relaunches = 3, 0
+    task.record_session(
+        SessionRecord("failed-first", "dev", "crashed", session_id="actual-failure")
+    )
+    task.record_session(
+        SessionRecord(
+            "quota-third",
+            "dev",
+            "crashed",
+            session_id="quota-session",
+            ended="usage",
+            usage=TokenUsage(input_tokens=10),
+        )
+    )
+    run.run_dir_identity = root_identity_record(tmp_path)
+    journal = Journal(tmp_path, pin=run)
+    journal.set_active_log("quota-third")
+    journal.append("dev-decision", story_key=task.story_key, attempt=3, uncharged=False)
+    receipt = {"interruption": {"kind": "quota"}}
+    sample = legacy_receipt(run)
+    credit_interruption(sample, run, tmp_path, receipt)
+    apply(snapshot, unit, {"accounting": sample}, role="execution")
+    apply(snapshot, unit, {"accounting": sample}, role="execution")
+    assert unit.evidence["dev_attempts_spent"] == 2
+    assert unit.evidence["usage"]["tokens"]["input_tokens"] == 130
+    # A resumed legacy engine later records its own refund for the SAME attempt.
+    task.dev_usage_relaunches = 1
+    journal.append("dev-decision", story_key=task.story_key, attempt=3, uncharged=True)
+    native_refund = legacy_receipt(run)
+    credit_interruption(native_refund, run, tmp_path, receipt)
+    apply(snapshot, unit, {"accounting": native_refund}, role="execution")
+    apply(snapshot, unit, {"accounting": sample}, role="execution")
+    assert unit.evidence["dev_attempts_spent"] == 2
+    task.attempt += 1
+    task.record_session(
+        SessionRecord(
+            "dev-fourth", "dev", "completed", session_id="new", usage=TokenUsage(input_tokens=20)
+        )
+    )
+    apply(snapshot, unit, {"accounting": legacy_receipt(run)}, role="execution")
+    assert unit.evidence["dev_attempts_spent"] == 3
+    assert unit.evidence["usage"]["tokens"]["input_tokens"] == 150
+
+
+def test_exact_review_continuation_can_use_remaining_review_after_dev_budget_spent():
+    snapshot, unit, _, _ = state()
+    unit.evidence["dev_attempts_spent"] = 3
+    candidate = {"profile": "claude", "model": "claude-review"}
+    unit.evidence["handoff"] = {
+        "id": "owned",
+        "phase": "ready",
+        "native_role": "review",
+        "role": "execution",
+        "candidate": candidate,
+    }
+    payload = {"kind": "execution", "handoff_id": "owned", "review_candidate": candidate}
+    assert admission_reason(snapshot, unit, payload) == ""
+    assert "development attempt budget exhausted" in admission_reason(
+        snapshot, unit, {**payload, "handoff_id": "foreign"}
+    )
+    unit.evidence["review_cycles_spent"] = 2
+    assert "child review attempt budget exhausted" in admission_reason(snapshot, unit, payload)

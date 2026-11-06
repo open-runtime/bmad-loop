@@ -81,6 +81,10 @@ def reconcile_requests(controller: PublicationController, intent: MutationIntent
     if intent.kind != "review_request":
         raise GithubError("not a reviewer recruitment intent")
     candidate = Candidate(**(intent.coordinates or {})["candidate"])
+    if _acknowledged(intent, candidate):
+        # A team can satisfy its request before the following GET. The exact
+        # successful POST receipt proves recruitment, not review approval.
+        return replace(intent, state="confirmed", error="")
     observation = _observe(controller, candidate)
     users = {name.casefold() for name in observation.requested_reviewers}
     users |= _answered(observation, candidate.head)
@@ -91,13 +95,54 @@ def reconcile_requests(controller: PublicationController, intent: MutationIntent
         return replace(
             intent,
             state="confirmed",
-            receipt={"head": candidate.head, "users": sorted(users), "teams": sorted(teams)},
+            receipt={
+                "head": candidate.head,
+                "users": sorted(users),
+                "teams": sorted(teams),
+                "recruitment_observation": {
+                    "candidate": asdict(candidate),
+                    "users": sorted(users),
+                    "teams": sorted(teams),
+                },
+            },
             error="",
         )
     return replace(
         intent,
         state="sent_unknown",
         error="review recruitment remains uncertain; no blind duplicate request",
+    )
+
+
+def _acknowledged(intent: MutationIntent, candidate: Candidate) -> bool:
+    receipt = intent.receipt or {}
+    observed = receipt.get("recruitment_observation") or {}
+    if (
+        observed.get("candidate") == asdict(candidate)
+        and {name.casefold() for name in intent.payload["reviewers"]}
+        <= set(observed.get("users", []))
+        and {name.casefold() for name in intent.payload["team_reviewers"]}
+        <= set(observed.get("teams", []))
+    ):
+        return True
+    users = {
+        str(row.get("login", "")).casefold()
+        for row in receipt.get("requested_reviewers", [])
+        if isinstance(row, dict)
+    }
+    teams = {
+        str(row.get("slug", "")).casefold()
+        for row in receipt.get("requested_teams", [])
+        if isinstance(row, dict)
+    }
+    return (
+        receipt.get("http_status") in {200, 201}
+        and receipt.get("number") == candidate.pr_number
+        and receipt.get("head", {}).get("sha") == candidate.head
+        and receipt.get("base", {}).get("ref") == candidate.target
+        and receipt.get("base", {}).get("repo", {}).get("full_name") == candidate.repository
+        and {name.casefold() for name in intent.payload["reviewers"]} <= users
+        and {name.casefold() for name in intent.payload["team_reviewers"]} <= teams
     )
 
 

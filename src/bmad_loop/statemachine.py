@@ -77,6 +77,17 @@ def advance(task: StoryTask, to: Phase) -> None:
     task.phase = to
 
 
+def campaign_review_continuation(task: StoryTask) -> None:
+    """Re-enter a proven stopped review in a newly bound campaign run only.
+
+    The campaign continuation collaborator checks immutable evidence before
+    calling this; ordinary escalation/resume transitions remain unchanged.
+    """
+    if task.phase not in {Phase.REVIEW_RUNNING, Phase.REVIEW_VERIFY, Phase.ESCALATED}:
+        raise IllegalTransition("campaign continuation does not own an interrupted review")
+    task.phase = Phase.REVIEW_VERIFY
+
+
 # The sprint-board regressions `sprintstatus.advance` may perform on explicit
 # opt-in (`allow_regression=True`); every other backward move stays illegal.
 # ("done", "awaiting-operator"): a review pass that finds a `done` story owes

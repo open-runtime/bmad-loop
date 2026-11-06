@@ -163,6 +163,13 @@ an installed CLI alone is insufficient. An unavailable candidate does not delay
 another eligible candidate in the same pool. Exact-model roles permit no model
 substitution.
 
+`roles.execution` optionally selects the child developer from an approved pool;
+`roles.execution_review` selects its legacy review adapter. Unconfigured roles
+preserve the frozen legacy dev/review settings. A configured child review route
+reserves its role slot for that child's lifetime; the child itself remains
+sequential and occupies one global coding-session slot. Publication review is a
+separate role and capacity. Set every relevant limit when increasing concurrency.
+
 ```toml
 [role_pools.reasoning]
 candidates = [
@@ -278,9 +285,19 @@ Configured `github.hold_labels` (default `bmad:hold`) apply to fresh publication
 and merge retries. Read-only reconciliation of an issued merge continues while
 held, without authorizing another merge write.
 
+`github.review_users` and `github.review_teams` recruit reviewers on the exact
+candidate. Requests are durable and reconciled after lost acknowledgements.
+An independent model review does not supply an eligible GitHub approval.
+For `merge_mode = "project-command"`, `merge_command` runs the maintained dry-run
+gate and `merge_executor` performs the actual maintained merge operation.
+The executor receives immutable candidate/evidence paths, must preserve commits
+and is followed by independent GitHub readback. There is no native merge fallback.
+
 Development attribution comes from the latest completed primary dev/fix session's
 observed main model. Clean follow-up reviews and plugin telemetry do not replace
 that identity; explicit planning and repair writers retain their own attribution.
+Every prior writer family, including interrupted contributors, remains in the
+candidate's attribution. A reviewer from any contributing family is ineligible.
 Missing observed development identity remains visible and prevents independent
 publication acceptance. Resume can recover the identity from saved native
 receipts and invalidates a publication review that is no longer independent.
@@ -533,6 +550,28 @@ update, loaded-process provenance and target-project preflight are separate chec
 
 ### Bounded semantic decisions
 
+```toml
+[reasoning]
+enabled = true
+capabilities = "/absolute/path/to/qualified-routes.json"
+max_sessions = 4
+max_attempts = 2
+max_turns = 4
+timeout_s = 1800
+packet_token_limit = 160000
+purposes = ["routing", "triage", "semantic_sync", "priority", "graph_review", "report", "handoff_map", "handoff_reduce", "handoff_audit"]
+```
+
+Reasoning defaults to disabled. The route manifest pins the installed binary,
+wrapper, supported effort and measured input/output limits; it distinguishes
+no-tools reasoning from scoped execution. Preflight checks qualification and
+campaign creation freezes the manifest. Route installation alone is insufficient.
+Configure `routing`, `reasoning`, `graph_review`, `reporting`, `summarization` and
+`handoff_audit` role pools as needed, alongside the ordinary triage/execution
+roles. Each job also respects total campaign, role and current provider capacity.
+The packet limit is an initial context ceiling, not an aggregate history limit;
+retained exact sources and obligation indexes remain available for retrieval.
+
 When reasoning is enabled, changed campaign facts trigger qualified jobs for model
 routing, bulk triage, priority, graph review, GitHub/source reconciliation and
 reports. `campaign status --json` includes unavailable-route/input-bound errors and
@@ -546,3 +585,37 @@ activate before reviewed delivery. Report narratives are advisory; typed unit-st
 and commit claims are checked against current campaign facts. Missing native route
 qualification is reported explicitly. Fixture tests do not qualify native models or
 semantic handoff fidelity.
+
+Native route qualification is an explicit operator action. A route proposal pins
+its installed executable and dependencies, native protocol, model and effort,
+no-tools arguments, input transport and conservative context bounds. Run
+`bmad-loop campaign qualify-headless PROPOSAL --directory PRIVATE_DIRECTORY --json`
+to submit a fixed nonce/marker canary through the ordinary owned terminal runner.
+Use `--input-bytes`, `--output-tokens` and `--timeout` to select bounded canary
+coverage. Normal campaign admission never launches an unqualified route. Successful
+qualification records the observed input/output envelope, native model identity
+and process quiescence; it does not establish a provider's advertised maximum or
+semantic summary fidelity. Larger inputs need a larger successful qualification.
+Native selected aliases and served model names remain separate in receipts.
+
+For Grok, large prompt files require its native `--verbatim` option to avoid
+abbreviated input that would require a later tool read. For Muse, the qualified
+recipe uses the empty preset and disables web, reminders, shell, writes and user
+input; the runner disables launcher updates so the pinned executable remains
+stable. A changed executable, dependency or native output schema requires renewed
+qualification. Claude's native rate-limit telemetry remains a quota outcome even
+when its final result only reports a generic error. Provider exhaustion does not
+justify changing accounts or loosening a route's permissions.
+
+`bmad-loop campaign trial-handoff SNAPSHOTS --capability CAPABILITY --directory PRIVATE_DIRECTORY --parallel 4 --json`
+exercises sealed history through qualified native map/reduce jobs and production
+citation/coverage validators. The snapshots explicitly name archived prefixes;
+verified native lineage deduplicates inherited copies without deleting their
+source archives. `--prepare-only` writes the bounded job plan without inference.
+Completed job receipts and validated results allow the same command to resume;
+changed sources, route or limits require a new trial directory. Failure stops new
+admissions while existing bounded jobs drain. The report distinguishes structural
+completion from semantic qualification: automatic handoff additionally requires a
+separately recorded review from an independent provider that verifies critical
+obligations, conflicts and authority against the source records. Tests for these
+commands use scripted native processes and consume no model tokens.

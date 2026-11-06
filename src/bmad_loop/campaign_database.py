@@ -93,6 +93,9 @@ class CampaignDatabase:
                     "CREATE TABLE jobs (id TEXT PRIMARY KEY, state TEXT NOT NULL, "
                     "unit TEXT NOT NULL, payload TEXT NOT NULL);"
                     "CREATE INDEX job_state ON jobs(state, id);"
+                    "CREATE TABLE observations (sequence INTEGER PRIMARY KEY, id TEXT UNIQUE NOT NULL, "
+                    "kind TEXT NOT NULL, unit TEXT NOT NULL, payload TEXT NOT NULL);"
+                    "CREATE INDEX observation_unit ON observations(unit, sequence);"
                     "PRAGMA user_version=2;"
                 )
                 with connection:
@@ -159,7 +162,9 @@ class CampaignDatabase:
             ),
         )
 
-    def read(self, *, max_bytes: int | None = None) -> tuple[dict[str, Any], int]:
+    def read(
+        self, *, max_bytes: int | None = None, include_terminal_jobs: bool = False
+    ) -> tuple[dict[str, Any], int]:
         with self.connect() as connection:
             connection.execute("BEGIN")
             if max_bytes is not None:
@@ -176,7 +181,8 @@ class CampaignDatabase:
             state["jobs"] = {
                 job[0]: json.loads(job[1])
                 for job in connection.execute(
-                    "SELECT id,payload FROM jobs WHERE state NOT IN ('applied','stale','canceled')"
+                    "SELECT id,payload FROM jobs WHERE ? OR state NOT IN ('applied','stale','canceled')",
+                    (include_terminal_jobs,),
                 )
             }
             return state, count
@@ -188,7 +194,7 @@ class CampaignDatabase:
         revision: int,
         event_count: int,
         events: list[dict[str, Any]],
-    ) -> None:
+    ) -> set[str]:
         with self.connect(write=True) as connection:
             with connection:
                 connection.execute("BEGIN IMMEDIATE")
@@ -200,11 +206,60 @@ class CampaignDatabase:
                     raise CampaignError("campaign database authority changed during commit")
                 self._append(connection, count, events)
                 hot, jobs = self._split_jobs(state)
+                # The additive table keeps older schema-2 campaigns readable;
+                # only pure observation history leaves their hot authority.
+                connection.execute(
+                    "CREATE TABLE IF NOT EXISTS observations (sequence INTEGER PRIMARY KEY, "
+                    "id TEXT UNIQUE NOT NULL, kind TEXT NOT NULL, unit TEXT NOT NULL, payload TEXT NOT NULL)"
+                )
+                connection.execute(
+                    "CREATE INDEX IF NOT EXISTS observation_unit ON observations(unit, sequence)"
+                )
+                from .campaign_observation_archive import split
+
+                hot["outbox"], archived = split(hot.get("outbox", []))
+                self._archive_observations(connection, state.get("outbox", []), archived)
                 self._write_jobs(connection, jobs)
                 connection.execute(
                     "UPDATE authority SET revision=?, generation=?, payload=? WHERE id=1",
                     (state["revision"], state["generation"], encode(hot)),
                 )
+        return {row["id"] for row in archived}
+
+    @staticmethod
+    def _archive_observations(connection, incoming, archived) -> None:
+        # An old ID cannot be resurrected as an active effect after compaction.
+        identities = [row["id"] for row in incoming]
+        for offset in range(0, len(identities), 256):
+            batch = identities[offset : offset + 256]
+            if connection.execute(
+                "SELECT id FROM observations WHERE id IN ("  # nosec B608: placeholders only.
+                + ",".join("?" for _ in batch)
+                + ") LIMIT 1",
+                batch,
+            ).fetchone():
+                raise CampaignError("cannot reactivate an archived observation ID")
+        connection.executemany(
+            "INSERT INTO observations(id,kind,unit,payload) VALUES(?,?,?,?)",
+            ((row["id"], row["kind"], row["unit"], encode(row)) for row in archived),
+        )
+
+    def observations(
+        self, *, after: int = 0, limit: int = 100, unit: str = ""
+    ) -> list[dict[str, Any]]:
+        if after < 0 or not 1 <= limit <= 1000:
+            raise CampaignError("invalid observation history pagination")
+        with self.connect() as connection:
+            if not connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='observations'"
+            ).fetchone():
+                return []
+            rows = connection.execute(
+                "SELECT sequence,payload FROM observations WHERE sequence>? "
+                "AND (?='' OR unit=?) ORDER BY sequence LIMIT ?",
+                (after, unit, unit, limit),
+            ).fetchall()
+        return [{"sequence": sequence, **json.loads(payload)} for sequence, payload in rows]
 
     def jobs(
         self, *, after: str = "", limit: int = 100, unit: str = "", job_id: str = ""

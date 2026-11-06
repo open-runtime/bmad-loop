@@ -40,13 +40,14 @@ _NATIVE_ACTOR_KEYS = frozenset(
         "CODEX_THREAD_ID",
         "CODEX_SESSION_ID",
         "CLAUDE_CODE_SESSION_ID",
+        "CLAUDECODE",
+        "CLAUDE_CODE_ENTRYPOINT",
         "CLAUDE_SESSION_ID",
         "GEMINI_SESSION_ID",
         "OPENCODE_SESSION_ID",
         "BMAD_FACTORY_PARADEV_VERIFIED",
     }
 )
-_HCOM_CONFIGURATION = frozenset({"HCOM_DIR", "HCOM_BIN", "HCOM_CONFIG", "HCOM_DEV_ROOT"})
 
 
 def reflection_policy(policy: Policy, enabled: bool) -> Policy:
@@ -105,7 +106,7 @@ def sanitized_actor_env(
     for key, value in source.items():
         if key.startswith("SUPERSET_") or key in _NATIVE_ACTOR_KEYS:
             continue
-        if key.startswith("HCOM_") and key not in _HCOM_CONFIGURATION:
+        if key.startswith("HCOM_"):
             continue
         if key.startswith("BMAD_LOOP_") and key != envvars.STATE_DIR:
             continue

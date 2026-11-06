@@ -264,12 +264,13 @@ class CampaignStore:
                 event.setdefault("observed_at", candidate.updated_at)
             self._validate(candidate)
             if database is not None:
-                database.commit(
+                archived = database.commit(
                     snapshot_to_dict(candidate, include_events=False),
                     revision=expected_revision,
                     event_count=len(previous.events),
                     events=list(candidate.events[len(previous.events) :]),
                 )
+                candidate.outbox = [row for row in candidate.outbox if row.id not in archived]
                 candidate.events = EventJournal(database, len(candidate.events))
             else:
                 self._write(directory / "snapshot.json", snapshot_to_dict(candidate))
@@ -360,6 +361,7 @@ class CampaignStore:
             "terminate-workers",
             "adopt",
             "handoff",
+            "authorize-scope",
         }:
             raise CampaignError(f"unknown campaign control {kind}")
         self.load(campaign_id)
@@ -485,6 +487,16 @@ class CampaignStore:
             raise CampaignError("reasoning job history requires campaign migrate-state")
         return []
 
+    def observations(
+        self, campaign_id: str, *, after: int = 0, limit: int = 100, unit: str = ""
+    ) -> list[dict[str, Any]]:
+        snapshot = self.load(campaign_id)
+        if after < 0 or not 1 <= limit <= 1000:
+            raise CampaignError("invalid observation history pagination")
+        if isinstance(snapshot.events, EventJournal):
+            return snapshot.events.database.observations(after=after, limit=limit, unit=unit)
+        return []
+
     def migrate_state(self, campaign_id: str) -> CampaignSnapshot:
         """Switch quiescent v1 authority atomically; old binaries reject the marker."""
         initial = self.load(campaign_id)
@@ -500,6 +512,11 @@ class CampaignStore:
                     return snapshot
                 if any(unit.claim and not unit.claim.quiescent for unit in snapshot.units.values()):
                     raise CampaignError("state migration requires quiescent workers")
+                if any(
+                    job.get("claim") and not job["claim"]["quiescent"]
+                    for job in snapshot.jobs.values()
+                ):
+                    raise CampaignError("state migration requires quiescent reasoning jobs")
                 if any(action.state in {"prepared", "sent_unknown"} for action in snapshot.outbox):
                     raise CampaignError("state migration requires reconciled external effects")
                 directory = self.directory(campaign_id)
@@ -518,7 +535,7 @@ class CampaignStore:
                 expected = json.loads(_json(snapshot_to_dict(snapshot, include_events=False)))
                 if not database.path.exists():
                     database.initialize(expected, list(snapshot.events))
-                observed, count = database.read()
+                observed, count = database.read(include_terminal_jobs=True)
                 if observed != expected or count != len(snapshot.events):
                     raise CampaignError("state migration database does not match v1 authority")
                 existing = EventJournal(database, count)

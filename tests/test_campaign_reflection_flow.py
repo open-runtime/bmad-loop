@@ -99,7 +99,7 @@ def flow(project, tmp_path):
     return snapshot, unit, claim, binding, run_dir, mux
 
 
-def test_sanitizes_parent_identity_preserving_accounts_and_room(flow, tmp_path):
+def test_sanitizes_parent_identity_preserving_accounts_and_explicit_room(flow, tmp_path):
     _, _, _, binding, _, _ = flow
     env = sanitized_worker_env(
         {
@@ -114,7 +114,7 @@ def test_sanitizes_parent_identity_preserving_accounts_and_room(flow, tmp_path):
         },
         binding=binding,
         state_dir=tmp_path / "native",
-        communication=CommunicationSpec(),
+        communication=CommunicationSpec(room="/room"),
     )
     assert env["CODEX_HOME"] == "/account" and env["TEAMROUTER_ACCOUNT"] == "authorized"
     assert env["HCOM_DIR"] == "/room"
@@ -494,3 +494,21 @@ def test_hcom_off_never_queries_supplied_observer(flow):
         _read=lambda _: (_ for _ in ()).throw(AssertionError("unexpected hcom read"))
     )
     assert discover_peer_binding(snapshot, unit, claim, {}, observer=observer) is None
+
+
+def test_nonreflecting_actor_drops_parent_room_and_claude_nesting_flags():
+    from bmad_loop.campaign_reflection_flow import sanitized_actor_env
+
+    env = sanitized_actor_env(
+        {
+            "HCOM_DIR": "/parent",
+            "HCOM_NAME": "parent",
+            "HCOM_CONFIG": "/parent/config",
+            "CLAUDECODE": "1",
+            "CLAUDE_CODE_ENTRYPOINT": "sdk",
+            "CLAUDE_CONFIG_DIR": "/account",
+            "CODEX_SESSION_ID": "parent",
+        },
+        communication=CommunicationSpec(),
+    )
+    assert env == {"CLAUDE_CONFIG_DIR": "/account"}

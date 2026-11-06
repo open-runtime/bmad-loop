@@ -78,6 +78,11 @@ def proposals(runtime, snapshot) -> tuple[Proposal, ...]:
         if not current(snapshot, request):
             result.append(Proposal("reasoning-stale", request.unit, {"job_id": job_id}))
             continue
+        if request.purpose.startswith("handoff_") and request.coordinates.get("handoff_id"):
+            from .campaign_handoff_flow import job_launch_allowed
+
+            if not job_launch_allowed(snapshot, row):
+                continue
         dependencies = []
         for dependency in request.dependencies:
             known = snapshot.jobs.get(dependency)
@@ -257,7 +262,28 @@ def apply(runtime, snapshot, action, observation) -> None:
         row["state"], row["reason"] = "failed", data["reason"]
         row["failure_attempts"] = snapshot.spec.reasoning.max_attempts
     elif data.get("state") == "finished":
+        first_receipt = row.get("receipt") is None
         accept_receipt(snapshot, row["id"], data["receipt"], now=runtime.clock())
+        if first_receipt:
+            usage = data["receipt"].get("usage") or {}
+            ledger = snapshot.bindings.setdefault(
+                "reasoning_usage", {"totals": {}, "complete_cost": True}
+            )
+            for name, value in usage.items():
+                ledger["totals"][name] = ledger["totals"].get(name, 0) + value
+            cost = usage.get("cost_usd")
+            role_spend = snapshot.bindings.setdefault("role_spend", {})
+            if cost is None:
+                ledger["complete_cost"] = False
+                snapshot.bindings["spend_usd"] = None
+                role_spend[request.role] = None
+            else:
+                # Unknown earlier currency usage remains unknown. A later
+                # priced receipt cannot reconstruct another harness's cost.
+                spent = snapshot.bindings.get("spend_usd", 0)
+                role_total = role_spend.get(request.role, 0)
+                snapshot.bindings["spend_usd"] = None if spent is None else spent + cost
+                role_spend[request.role] = None if role_total is None else role_total + cost
         if row["state"] == "failed":
             row["failure_attempts"] = row.get("failure_attempts", 0) + 1
             row["retry_at"] = runtime.clock() + 15

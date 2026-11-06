@@ -24,11 +24,39 @@ from .campaign_transcripts import (
     digest,
     encoded,
     load_events,
+    merge_lineage_events,
     snapshot_history,
 )
 
 PREFIX = "handoff-"
-ACTIVE = {"drain", "capture", "summarize", "audit", "assemble", "ready"}
+ACTIVE = {
+    "drain",
+    "capture",
+    "summarize",
+    "audit",
+    "assemble",
+    "ready",
+    "constraint_reduce",
+    "constraint_audit",
+}
+EXPECTED_PHASE = {
+    "handoff-capture": "drain",
+    "handoff-plan": "capture",
+    "handoff-replan": "summarize",
+    "handoff-audit-plan": "summarize",
+    "handoff-audit-replan": "audit",
+    "handoff-assemble": "audit",
+    "handoff-release": "assemble",
+    "handoff-constraint-audit": "constraint_reduce",
+}
+
+
+class HandoffRouteWait(CampaignError):
+    """No currently available qualified route; retain progress and retry admission."""
+
+
+class ConstraintReductionNeeded(CampaignError):
+    """Audited constraints need another bounded reduction before writer admission."""
 
 
 def _candidate(raw):
@@ -49,9 +77,21 @@ def _cap(snapshot, candidate, mode="workspace-tools"):
 def _fallback(snapshot, role, previous, requested=None):
     candidates = snapshot.spec.candidates(role)
     if requested is not None:
-        candidate = _candidate(requested)
-        if candidate not in candidates:
+        selectors = {
+            key: requested[key] for key in ("profile", "model", "effort") if requested.get(key)
+        }
+        matching = [
+            candidate
+            for candidate in candidates
+            if all(getattr(candidate, key) == value for key, value in selectors.items())
+        ]
+        if not selectors or not matching:
             raise CampaignError("Handoff target is not in the frozen approved role pool")
+        if len(matching) != 1:
+            raise CampaignError(
+                "Handoff target is ambiguous; specify the exact approved profile/model/effort"
+            )
+        candidate = matching[0]
         _cap(snapshot, candidate)
         return candidate
     for candidate in candidates:
@@ -65,17 +105,49 @@ def _fallback(snapshot, role, previous, requested=None):
     return None
 
 
+def _available_alternative(runtime, snapshot, value):
+    """Use fresh shared admission observations without changing an explicit choice."""
+    if (
+        value.get("requested_candidate")
+        or not value.get("candidate")
+        or not hasattr(runtime, "_role")
+    ):
+        return None
+    role = value.get("route_role", value["role"])
+    selected = _candidate(value["candidate"])
+    if runtime._role(snapshot, role, allowed_candidates=(selected,)) is not None:
+        return None
+    allowed = []
+    for candidate in snapshot.spec.candidates(role):
+        if candidate == selected or (candidate.profile, candidate.model) == tuple(
+            value["previous_route"]
+        ):
+            continue
+        try:
+            _cap(snapshot, candidate)
+        except CampaignError:
+            continue
+        allowed.append(candidate)
+    return runtime._role(snapshot, role, allowed_candidates=tuple(allowed)) if allowed else None
+
+
 def control(runtime, snapshot, command) -> None:
     unit_id = command.get("unit") or command.get("payload", {}).get("unit")
     if unit_id not in snapshot.units:
         raise CampaignError("Handoff requires an existing unit")
     unit = snapshot.units[unit_id]
+    payload = command.get("payload", {})
+    requested = payload.get("candidate")
+    if requested is None and any(payload.get(key) for key in ("profile", "model", "effort")):
+        requested = {
+            key: payload[key] for key in ("profile", "model", "effort") if payload.get(key)
+        }
     begin(
         runtime,
         snapshot,
         unit,
-        requested=command.get("payload", {}).get("candidate"),
-        reason="operator requested continuation",
+        requested=requested,
+        reason=command.get("reason") or "operator requested continuation",
     )
 
 
@@ -102,9 +174,21 @@ def begin(runtime, snapshot, unit, *, requested=None, reason, receipt=None):
     if launch is None:
         raise CampaignError("Handoff predecessor has no durable launch intent")
     role = claim.role
-    selected = launch.payload.get("candidate") or unit.bindings.get("execution_candidate") or {}
+    native_role = ((receipt or {}).get("interruption") or {}).get("role", "")
+    if not native_role and role == "execution":
+        sessions = (receipt or {}).get("sessions", [])
+        native_role = sessions[-1].get("role", "dev") if sessions else "dev"
+    route_role = "execution_review" if role == "execution" and native_role == "review" else role
+    selected = (
+        launch.payload.get("review_candidate" if route_role == "execution_review" else "candidate")
+        or unit.bindings.get("execution_candidate")
+        or {}
+    )
     previous = (selected.get("profile", ""), selected.get("model", ""))
-    target = _fallback(snapshot, role, previous, requested)
+    if route_role == "execution_review" and route_role not in dict(snapshot.spec.roles):
+        target = None
+    else:
+        target = _fallback(snapshot, route_role, previous, requested)
     identifier = (
         "handoff-" + digest([snapshot.id, unit.id, claim.launch_id, snapshot.generation])[:24]
     )
@@ -113,10 +197,13 @@ def begin(runtime, snapshot, unit, *, requested=None, reason, receipt=None):
         "id": identifier,
         "phase": "drain",
         "role": role,
+        "route_role": route_role,
+        "native_role": native_role,
         "predecessor": dataclasses.asdict(claim),
         "original_payload": launch.payload,
         "candidate": dataclasses.asdict(target) if target else None,
         "previous_route": list(previous),
+        "requested_candidate": requested,
         "reason": reason,
         "graph_revision": snapshot.graph_revision,
         "config_revision": snapshot.config_revision,
@@ -171,6 +258,31 @@ def intercept_terminal(runtime, snapshot, unit, receipt) -> bool:
     return True
 
 
+def _job(runtime, snapshot, key):
+    """Read archived receipts without restoring immutable jobs to hot state."""
+    if key in snapshot.jobs:
+        return snapshot.jobs[key]
+    from collections import OrderedDict
+
+    cache = getattr(runtime, "_handoff_job_cache", None)
+    if cache is None:
+        cache = OrderedDict()
+        runtime._handoff_job_cache = cache
+    identity = (snapshot.id, key)
+    if identity in cache:
+        cache.move_to_end(identity)
+        return cache[identity]
+    rows = runtime.store.jobs(snapshot.id, job_id=key, limit=1)
+    if not rows:
+        raise CampaignError("Handoff reasoning job is unavailable: " + key)
+    row = rows[0]
+    if row["state"] in {"applied", "canceled", "stale"}:
+        cache[identity] = row
+        while len(cache) > 256:
+            cache.popitem(last=False)
+    return row
+
+
 def _pending(snapshot, unit, kind=None):
     return any(
         row.unit == unit.id
@@ -194,17 +306,44 @@ def _debt(snapshot, unit):
     )
 
 
+def _requires_replan(row):
+    return row["state"] in {"capacity_wait", "stale", "canceled"} or (
+        row["state"] == "failed"
+        and (row.get("receipt") or {}).get("outcome") in {"quota", "transport", "limit"}
+    )
+
+
 def proposals(runtime, snapshot):
     result = []
     for unit in snapshot.units.values():
         value = unit.evidence.get("handoff") or {}
         phase = value.get("phase")
-        if phase not in ACTIVE or phase == "ready" or snapshot.phase != "active":
+        if phase not in ACTIVE or snapshot.phase != "active":
+            continue
+        alternate = _available_alternative(runtime, snapshot, value)
+        if alternate is not None and (not unit.hold or unit.hold.id == value["id"]):
+            if not _pending(snapshot, unit, "handoff-route"):
+                result.append(
+                    Proposal(
+                        "handoff-route",
+                        unit.id,
+                        {"handoff_id": value["id"], "candidate": dataclasses.asdict(alternate)},
+                    )
+                )
+            continue
+        if phase == "ready":
+            if unit.hold:
+                continue
+            if value["capture"].get("audit_context") != _audit_context(snapshot, unit):
+                if not _pending(snapshot, unit, "handoff-refresh"):
+                    result.append(Proposal("handoff-refresh", unit.id, {"handoff_id": value["id"]}))
             continue
         if not unit.hold or unit.hold.id != value["id"]:
             continue  # an operator hold remains authoritative
         if not value.get("candidate"):
-            target = _fallback(snapshot, value["role"], tuple(value["previous_route"]))
+            target = _fallback(
+                snapshot, value.get("route_role", value["role"]), tuple(value["previous_route"])
+            )
             if target and not _pending(snapshot, unit, "handoff-route"):
                 result.append(
                     Proposal("handoff-route", unit.id, {"candidate": dataclasses.asdict(target)})
@@ -222,23 +361,66 @@ def proposals(runtime, snapshot):
             continue
         if _debt(snapshot, unit):
             continue
+        if value.get("retry_at", 0) > runtime.clock():
+            continue
+        live_jobs = any(
+            row.get("claim") and not row["claim"].get("quiescent")
+            for row in snapshot.jobs.values()
+            if row["request"].get("coordinates", {}).get("handoff_id") == value["id"]
+        )
+        if value.get("capture") and value["capture"].get("audit_context") != _audit_context(
+            snapshot, unit
+        ):
+            if not live_jobs and not _pending(snapshot, unit, "handoff-refresh"):
+                result.append(Proposal("handoff-refresh", unit.id, {"handoff_id": value["id"]}))
+            continue
+        if (
+            phase in {"summarize", "audit"}
+            and not live_jobs
+            and any(
+                _requires_replan(_job(runtime, snapshot, key))
+                for key in value["jobs" if phase == "summarize" else "audits"]
+            )
+        ):
+            retry_kind = "handoff-replan" if phase == "summarize" else "handoff-audit-replan"
+            if not _pending(snapshot, unit, retry_kind):
+                result.append(Proposal(retry_kind, unit.id, {"handoff_id": value["id"]}))
+            continue
         action = (
-            "handoff-capture"
-            if phase == "drain"
+            "handoff-constraint-audit"
+            if phase == "constraint_reduce"
             else (
-                "handoff-plan"
-                if phase == "capture"
+                "handoff-assemble"
+                if phase == "constraint_audit"
                 else (
-                    "handoff-audit-plan"
-                    if phase == "summarize"
-                    else "handoff-assemble" if phase == "audit" else "handoff-release"
+                    "handoff-capture"
+                    if phase == "drain"
+                    else (
+                        "handoff-plan"
+                        if phase == "capture"
+                        else (
+                            "handoff-audit-plan"
+                            if phase == "summarize"
+                            else "handoff-assemble" if phase == "audit" else "handoff-release"
+                        )
+                    )
                 )
             )
         )
         job_ids = (
-            value["jobs"] if phase == "summarize" else value["audits"] if phase == "audit" else []
+            value.get("constraint_jobs", [])
+            if phase == "constraint_reduce"
+            else (
+                value.get("constraint_audits", [])
+                if phase == "constraint_audit"
+                else (
+                    value["jobs"]
+                    if phase == "summarize"
+                    else value["audits"] if phase == "audit" else []
+                )
+            )
         )
-        if any(snapshot.jobs.get(key, {}).get("state") != "applied" for key in job_ids):
+        if any(_job(runtime, snapshot, key).get("state") != "applied" for key in job_ids):
             continue
         if not _pending(snapshot, unit, action):
             result.append(Proposal(action, unit.id, {"handoff_id": value["id"]}))
@@ -256,7 +438,47 @@ def _capture(runtime, snapshot, unit, value):
 
     workspace = Path(unit.bindings["workspace"])
     root = _root(runtime, snapshot, value)
-    fingerprint = capture(workspace).to_dict()
+    from . import bmadconfig, runs
+    from .journal import load_state
+
+    original_run_dir = value.get("receipt", {}).get("run_dir")
+    if not original_run_dir and value["predecessor"].get("run_id"):
+        candidate_dir = runs.run_dir_for(workspace, value["predecessor"]["run_id"])
+        if candidate_dir.exists():
+            original_run_dir = str(candidate_dir)
+    original_run = load_state(Path(original_run_dir)) if original_run_dir else None
+    native_role = value.get("native_role", "")
+    if original_run is not None and value["role"] == "execution":
+        if any(
+            task.phase.value in {"review-running", "review-verify"}
+            for task in original_run.tasks.values()
+        ):
+            native_role = "review"
+        else:
+            sessions = [
+                session for task in original_run.tasks.values() for session in task.sessions
+            ]
+            if sessions and sessions[-1].status != "completed":
+                native_role = sessions[-1].role
+    source_roots = tuple(Path(path) for path in unit.bindings.get("private_paths", []))
+    if original_run is not None:
+        from .campaign_finalization import _source_roots
+
+        source_roots = tuple(
+            dict.fromkeys(
+                [
+                    *source_roots,
+                    *_source_roots(
+                        workspace,
+                        bmadconfig.load_paths(
+                            workspace, want_tickets=original_run.source == "tickets"
+                        ),
+                        original_run,
+                    ),
+                ]
+            )
+        )
+    fingerprint = capture(workspace, source_roots=source_roots).to_dict()
     sources, gaps, seen = [], [], set()
     history = [*unit.evidence.get("worker_history", []), value.get("receipt", {})]
     for receipt in history:
@@ -327,7 +549,19 @@ def _capture(runtime, snapshot, unit, value):
     obligations = (unit.evidence.get("acceptance") or {}).get("criteria") or criteria(
         unit.id, unit.spec.acceptance
     )
+    original_state = original_run.to_dict() if original_run is not None else None
+    predecessor_data = encoded(value.get("receipt", {}))
+    predecessor_path = blob(root / "predecessor", predecessor_data)
+    state_data = encoded(original_state)
+    state_path = blob(root / "predecessor", state_data)
     current = {
+        "original_run_dir": original_run_dir,
+        "original_run_id": original_run.run_id if original_run else None,
+        "source_roots": [str(path.relative_to(workspace)) for path in source_roots],
+        "original_state_path": str(state_path),
+        "original_state_sha256": hashlib.sha256(state_data).hexdigest(),
+        "predecessor_receipt_path": str(predecessor_path),
+        "predecessor_receipt_sha256": hashlib.sha256(predecessor_data).hexdigest(),
         "unit": dataclasses.asdict(unit.spec),
         "workspace": str(workspace),
         "branch": git(workspace, "symbolic-ref", "--short", "HEAD"),
@@ -348,14 +582,25 @@ def _capture(runtime, snapshot, unit, value):
         "predecessor": value["predecessor"],
         "coverage_gaps": gaps,
     }
-    if capture(workspace).to_dict() != fingerprint:
+    if capture(workspace, source_roots=source_roots).to_dict() != fingerprint:
         raise CampaignError("Working state changed while capturing the drained predecessor")
     return {
+        "audit_context": _audit_context(snapshot, unit),
+        "native_role": native_role,
         "sources": sources,
         "gaps": gaps,
         "current": current,
         "obligations": obligations,
         "capture_digest": digest([current, sources, obligations]),
+    }
+
+
+def _audit_context(snapshot, unit):
+    return {
+        "graph_revision": snapshot.graph_revision,
+        "config_revision": snapshot.config_revision,
+        "decision_input_revision": unit.evidence.get("decision_input_revision", ""),
+        "acceptance_revision": (unit.evidence.get("acceptance") or {}).get("revision", 0),
     }
 
 
@@ -367,17 +612,38 @@ def _coordinates(snapshot, unit, value):
         "config_revision": snapshot.config_revision,
         "handoff_id": value["id"],
         "capture_digest": value["capture"]["capture_digest"],
+        "plan_epoch": value.get("plan_epoch", 0),
     }
 
 
-def _summary_route(snapshot, role):
+def _summary_route(runtime, snapshot, role, value=None, excluded_families=()):
+    from .campaign_headless import provider_family
+
+    allowed = []
+    excluded = {
+        route
+        for route, until in (value or {}).get("route_cooldowns", {}).items()
+        if until > runtime.clock()
+    }
     for candidate in snapshot.spec.candidates(role):
+        if (
+            candidate.profile + ":" + candidate.model in excluded
+            or provider_family(candidate.model) in excluded_families
+        ):
+            continue
         try:
-            cap = _cap(snapshot, candidate, "no-tools")
+            _cap(snapshot, candidate, "no-tools")
         except CampaignError:
             continue
-        return candidate, cap
-    raise CampaignError("No qualified headless route for " + role)
+        allowed.append(candidate)
+    selected = (
+        runtime._role(snapshot, role, allowed_candidates=tuple(allowed))
+        if allowed and hasattr(runtime, "_role")
+        else allowed[0] if allowed else None
+    )
+    if selected is None:
+        raise HandoffRouteWait("No currently available qualified headless route for " + role)
+    return selected, _cap(snapshot, selected, "no-tools")
 
 
 def _budget(candidate, cap):
@@ -396,15 +662,40 @@ def _budget(candidate, cap):
 
 
 def _maps(runtime, snapshot, unit, value):
-    from .campaign_summary import plan_maps, summary_prompt, summary_schema
+    from .campaign_summary import (
+        SummaryJobSpec,
+        plan_remaining_maps,
+        summary_prompt,
+        summary_schema,
+    )
 
-    candidate, cap = _summary_route(snapshot, "summarization")
+    candidate, cap = _summary_route(runtime, snapshot, "summarization", value)
     histories = tuple(HistorySnapshot(**row) for row in value["capture"]["sources"])
-    events = tuple(event for history in histories for event in load_events(history))
-    planned = plan_maps(events, _budget(candidate, cap), _root(runtime, snapshot, value) / "maps")
+    events = merge_lineage_events(histories)
+    completed = tuple(
+        (
+            SummaryJobSpec(
+                **_job(runtime, snapshot, key)["request"]["coordinates"]["summary_spec"]
+            ),
+            _applied(_job(runtime, snapshot, key)),
+        )
+        for key in value.get("all_jobs", [])
+        if _job(runtime, snapshot, key)["state"] == "applied"
+        and _job(runtime, snapshot, key)["request"]["purpose"] == "handoff_map"
+        and _job(runtime, snapshot, key)["request"]["coordinates"]["config_revision"]
+        == snapshot.config_revision
+    )
+    planned = plan_remaining_maps(
+        events, completed, _budget(candidate, cap), _root(runtime, snapshot, value) / "maps"
+    )
     jobs = []
     for planned_spec in planned:
-        spec = dataclasses.replace(planned_spec, id=digest([value["id"], planned_spec.id]))
+        spec = dataclasses.replace(
+            planned_spec,
+            id=digest(
+                [value["id"], planned_spec.id, value.get("plan_epoch", 0), snapshot.config_revision]
+            ),
+        )
         coordinates = {
             **_coordinates(snapshot, unit, value),
             "summary_spec": dataclasses.asdict(spec),
@@ -439,7 +730,7 @@ def _maps(runtime, snapshot, unit, value):
                 )
             )
         )
-    return {"requests": jobs}
+    return {"requests": jobs, "reuse_jobs": [job.id for job, _ in completed]}
 
 
 AUDIT_SCHEMA = {
@@ -480,8 +771,10 @@ def _reduce(runtime, snapshot, unit, value):
 
     children = tuple(
         (
-            SummaryJobSpec(**snapshot.jobs[key]["request"]["coordinates"]["summary_spec"]),
-            _applied(snapshot.jobs[key]),
+            SummaryJobSpec(
+                **_job(runtime, snapshot, key)["request"]["coordinates"]["summary_spec"]
+            ),
+            _applied(_job(runtime, snapshot, key)),
         )
         for key in value["jobs"]
     )
@@ -494,7 +787,7 @@ def _reduce(runtime, snapshot, unit, value):
         return None
     if value.get("reduction_level", 0) >= 8:
         raise CampaignError("History reduction failed to converge within eight qualified rounds")
-    candidate, cap = _summary_route(snapshot, "summarization")
+    candidate, cap = _summary_route(runtime, snapshot, "summarization", value)
     budget = _budget(candidate, cap)
     budget = dataclasses.replace(
         budget, output_tokens=min(budget.output_tokens, max(1024, ceiling // 8))
@@ -502,7 +795,12 @@ def _reduce(runtime, snapshot, unit, value):
     planned = plan_reduction(children, budget, _root(runtime, snapshot, value) / "reductions")
     jobs = []
     for planned_spec in planned:
-        spec = dataclasses.replace(planned_spec, id=digest([value["id"], planned_spec.id]))
+        spec = dataclasses.replace(
+            planned_spec,
+            id=digest(
+                [value["id"], planned_spec.id, value.get("plan_epoch", 0), snapshot.config_revision]
+            ),
+        )
         coordinates = {
             **_coordinates(snapshot, unit, value),
             "summary_spec": dataclasses.asdict(spec),
@@ -541,30 +839,94 @@ def _reduce(runtime, snapshot, unit, value):
     return {"requests": jobs, "reduction": True}
 
 
+def validate_fidelity_qualification(cap, *, contract=""):
+    """Require a corpus-bound independent native proof, not native transport success."""
+    from .campaign_headless import file_digest, provider_family
+    from .campaign_summary import summary_schema
+    from .campaign_transcripts import READER_VERSIONS
+
+    binding = cap.get("semantic_qualification") or {}
+    if binding.get("schema_version") != 1 or not binding.get("path"):
+        raise HandoffRouteWait("Semantic handoff fidelity qualification is missing")
+    path = Path(binding["path"])
+    if file_digest(path) != binding.get("sha256"):
+        raise HandoffRouteWait("Semantic handoff qualification artifact changed")
+    evidence = read_json(path)
+    expected = {
+        "schema_version": 1,
+        "route": {key: cap[key] for key in ("profile", "model", "cli_version", "binary_sha256")},
+        "reader_versions": READER_VERSIONS,
+        "summary_schema_digest": digest(summary_schema()),
+        "audit_schema_digest": digest(AUDIT_SCHEMA),
+        "prompt_versions": ["history-extract-v1", "history-reduce-v1"],
+        "structural_pass": True,  # nosec B105: qualification verdict, not a credential.
+    }
+    if contract == "constraints-v1":
+        from .campaign_handoff_constraints import AUDIT_SCHEMA as CONSTRAINT_AUDIT_SCHEMA
+        from .campaign_handoff_constraints import (
+            REDUCTION_SCHEMA,
+        )
+
+        expected["constraint_schemas_digest"] = digest([REDUCTION_SCHEMA, CONSTRAINT_AUDIT_SCHEMA])
+    if any(evidence.get(key) != value for key, value in expected.items()):
+        raise HandoffRouteWait(
+            "Semantic fidelity proof does not match current readers/templates/schema/route"
+        )
+    corpus = evidence.get("corpus")
+    if not isinstance(corpus, list) or not corpus:
+        raise HandoffRouteWait("Semantic fidelity corpus is missing")
+    for source in corpus:
+        if not source.get("critical_ids") or file_digest(Path(source["source_path"])) != source.get(
+            "source_sha256"
+        ):
+            raise HandoffRouteWait("Semantic fidelity corpus changed or lacks critical obligations")
+    independent = evidence.get("independent_review") or {}
+    if not independent.get("native_receipt_path") or file_digest(
+        Path(independent["native_receipt_path"])
+    ) != independent.get("sha256"):
+        raise HandoffRouteWait("Independent native fidelity receipt is missing or changed")
+    receipt = read_json(Path(independent["native_receipt_path"]))
+    observed = provider_family(receipt.get("observed_model", ""))
+    result = receipt.get("result") or {}
+    if (
+        receipt.get("outcome") != "completed"
+        or receipt.get("quiescent") is not True
+        or receipt.get("input_complete") is not True
+        or not receipt.get("session_id")
+        or not observed
+        or observed == provider_family(cap["model"])
+        or result.get("verdict") != "passed"
+        or result.get("corpus_digest") != digest(corpus)
+        or any(
+            result.get(key) != []
+            for key in ("missing_critical_ids", "invented_authority", "unresolved_conflicts")
+        )
+    ):
+        raise HandoffRouteWait("Independent native fidelity validation has not passed")
+    return binding
+
+
 def _audit_plan(runtime, snapshot, unit, value):
     from .campaign_summary import SummaryJobSpec, load_input
 
     reduced = _reduce(runtime, snapshot, unit, value)
     if reduced is not None:
         return reduced
-    candidate, cap = _summary_route(snapshot, "handoff_audit")
     map_families = {
-        snapshot.jobs[key].get("receipt", {}).get("provider_family")
+        (_job(runtime, snapshot, key).get("receipt") or {}).get("provider_family")
         for key in value.get("all_jobs", value["jobs"])
     }
+    candidate, cap = _summary_route(runtime, snapshot, "handoff_audit", value, map_families)
     from .campaign_headless import provider_family
 
     if provider_family(candidate.model) in map_families:
         raise CampaignError("Handoff constraint audit requires an independent model family")
-    if "handoff_fidelity" not in cap["qualification"]["checks"]:
-        raise CampaignError(
-            "Automatic historical handoff needs independent semantic fidelity qualification"
-        )
+    validate_fidelity_qualification(cap)
     histories = tuple(HistorySnapshot(**row) for row in value["capture"]["sources"])
     events = {event.id: event for history in histories for event in load_events(history)}
     jobs = []
     for key in value.get("map_jobs", value["jobs"]) or [None]:
-        summary = snapshot.jobs[key] if key else None
+        summary = _job(runtime, snapshot, key) if key else None
         source = (
             load_input(SummaryJobSpec(**summary["request"]["coordinates"]["summary_spec"]))
             if summary
@@ -646,6 +1008,22 @@ def apply_audit(runtime, snapshot, row):
         or value["capture"]["capture_digest"] != coordinates["capture_digest"]
     ):
         raise CampaignError("Handoff audit coordinates changed")
+    contract = coordinates.get("contract", "")
+    if contract in {"constraint-reduce-v1", "constraint-audit-v1"}:
+        from .campaign_handoff_constraints import validate
+
+        source = row["request"]["inputs"][0]
+        content = Path(source["path"]).read_bytes()
+        if hashlib.sha256(content).hexdigest() != source["sha256"]:
+            raise CampaignError("Constraint job input changed")
+        validated = validate(result, json.loads(content), audit=contract == "constraint-audit-v1")
+        data = encoded(validated)
+        path = blob(_root(runtime, snapshot, value) / "constraint-results", data)
+        row["applied_result"] = {
+            "artifact_path": str(path),
+            "artifact_sha256": hashlib.sha256(data).hexdigest(),
+        }
+        return
     if (
         result.get("handoff_id") != value["id"]
         or result.get("capture_digest") != coordinates["capture_digest"]
@@ -705,13 +1083,170 @@ def _applied(row):
     return read_json(path)
 
 
+def _contract_job(
+    runtime,
+    snapshot,
+    unit,
+    value,
+    *,
+    candidate,
+    cap,
+    contract,
+    content,
+    schema,
+    prompt,
+    field,
+    dependencies=(),
+    output_tokens=None,
+):
+    data = encoded(content)
+    path = blob(_root(runtime, snapshot, value) / "contract-inputs", data)
+    coordinates = {
+        **_coordinates(snapshot, unit, value),
+        "contract": contract,
+        "handoff_job_field": field,
+    }
+    identifier = (
+        "context-" + digest([coordinates, data.decode(), candidate.profile, candidate.model])[:32]
+    )
+    return dataclasses.asdict(
+        JobRequest(
+            identifier,
+            "handoff_audit",
+            "summarization" if contract == "constraint-reduce-v1" else "handoff_audit",
+            coordinates,
+            (
+                {
+                    "source_id": identifier,
+                    "path": str(path),
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                    "tokens": len(data),
+                },
+            ),
+            prompt,
+            schema,
+            JobLimits(
+                cap["input_tokens"],
+                output_tokens or cap["output_tokens"],
+                1,
+                snapshot.spec.reasoning.timeout_s,
+            ),
+            unit=unit.id,
+            dependencies=tuple(dependencies),
+            candidates=(candidate,),
+            created_at=runtime.clock(),
+        )
+    )
+
+
+def _constraint_plan(runtime, snapshot, unit, value):
+    from .campaign_handoff_constraints import REDUCTION_SCHEMA, original_nodes, partition
+
+    if value.get("constraint_level", 0) >= 8:
+        raise HandoffRouteWait(
+            "Current constraint reduction did not converge within its bounded rounds"
+        )
+    candidate, cap = _summary_route(runtime, snapshot, "summarization", value)
+    if value.get("constraint_jobs"):
+        nodes = [
+            node
+            for key in value["constraint_jobs"]
+            for node in _applied(_job(runtime, snapshot, key))["groups"]
+        ]
+        dependencies = value["constraint_audits"]
+    else:
+        nodes = original_nodes([_applied(_job(runtime, snapshot, key)) for key in value["audits"]])
+        dependencies = value["audits"]
+    target = _candidate(value["candidate"])
+    ceiling = min(
+        snapshot.spec.reasoning.packet_token_limit,
+        _budget(target, _cap(snapshot, target)).payload_tokens,
+    )
+    output = min(cap["output_tokens"], max(512, ceiling // 16))
+    jobs = []
+    for batch in partition(nodes, _budget(candidate, cap).payload_tokens // 2):
+        content = {
+            "handoff_id": value["id"],
+            "capture_digest": value["capture"]["capture_digest"],
+            "nodes": batch,
+        }
+        jobs.append(
+            _contract_job(
+                runtime,
+                snapshot,
+                unit,
+                value,
+                candidate=candidate,
+                cap=cap,
+                contract="constraint-reduce-v1",
+                content=content,
+                schema=REDUCTION_SCHEMA,
+                prompt="Compress these already audited current constraints into a concise working brief. Preserve every requirement, exception, correction and unresolved tension. Group redundant wording with refs to every input node. Never invent approval, waive acceptance, change scope or discard a constraint to fit. Exact original quotes remain in the immutable source tree. Return ambiguity when faithful compression cannot be established.",
+                field="constraint_jobs",
+                dependencies=dependencies,
+                output_tokens=output,
+            )
+        )
+    if not jobs:
+        raise HandoffRouteWait(
+            "Destination capacity cannot fit canonical state; no compressible constraints remain"
+        )
+    return {
+        "requests": jobs,
+        "constraint_reduction": True,
+        "constraint_level": value.get("constraint_level", 0) + 1,
+    }
+
+
+def _constraint_audit_plan(runtime, snapshot, unit, value):
+    from .campaign_handoff_constraints import AUDIT_SCHEMA as CONSTRAINT_AUDIT_SCHEMA
+
+    families = {
+        (_job(runtime, snapshot, key).get("receipt") or {}).get("provider_family")
+        for key in value["constraint_jobs"]
+    }
+    candidate, cap = _summary_route(runtime, snapshot, "handoff_audit", value, families)
+    validate_fidelity_qualification(cap, contract="constraints-v1")
+    jobs = []
+    for key in value["constraint_jobs"]:
+        row = _job(runtime, snapshot, key)
+        source = row["request"]["inputs"][0]
+        data = Path(source["path"]).read_bytes()
+        if hashlib.sha256(data).hexdigest() != source["sha256"]:
+            raise CampaignError("Constraint reduction source changed")
+        content = {**json.loads(data), "proposed": _applied(row)}
+        jobs.append(
+            _contract_job(
+                runtime,
+                snapshot,
+                unit,
+                value,
+                candidate=candidate,
+                cap=cap,
+                contract="constraint-audit-v1",
+                content=content,
+                schema=CONSTRAINT_AUDIT_SCHEMA,
+                prompt="Independently compare the proposed compressed constraints with every complete input node. Require preservation of all current requirements, nuances, corrections and conflicts. No summary can grant authority or waive acceptance. Return faithful only when the successor can understand every requirement from the compressed groups and source references; otherwise return insufficient with precise ambiguities. Cover every input node ID.",
+                field="constraint_audits",
+                dependencies=(key,),
+            )
+        )
+    return {"requests": jobs, "constraint_audit": True}
+
+
 def _assemble(runtime, snapshot, unit, value):
     from .campaign_handoff_context import assemble_packet
 
+    if not value.get("audits") or any(
+        _job(runtime, snapshot, key)["state"] != "applied" for key in value["audits"]
+    ):
+        raise CampaignError(
+            "Current constraints require completed independent audits before packet release"
+        )
     target = _candidate(value["candidate"])
     cap = _cap(snapshot, target)
-    summaries = tuple(_applied(snapshot.jobs[key]) for key in value["jobs"])
-    audits = [_applied(snapshot.jobs[key]) for key in value["audits"]]
+    summaries = tuple(_applied(_job(runtime, snapshot, key)) for key in value["jobs"])
+    audits = [_applied(_job(runtime, snapshot, key)) for key in value["audits"]]
     packet = assemble_packet(
         tuple(HistorySnapshot(**row) for row in value["capture"]["sources"]),
         tuple(value["capture"]["obligations"]),
@@ -724,8 +1259,8 @@ def _assemble(runtime, snapshot, unit, value):
     payload = read_json(Path(packet.path))
     payload["current_constraint_audits"] = [
         {
-            "path": snapshot.jobs[key]["applied_result"]["artifact_path"],
-            "sha256": snapshot.jobs[key]["applied_result"]["artifact_sha256"],
+            "path": _job(runtime, snapshot, key)["applied_result"]["artifact_path"],
+            "sha256": _job(runtime, snapshot, key)["applied_result"]["artifact_sha256"],
         }
         for key in value["audits"]
     ]
@@ -737,13 +1272,42 @@ def _assemble(runtime, snapshot, unit, value):
             if item["relevance"] == "current"
         }.values()
     )
+    if value.get("constraint_jobs"):
+        if not value.get("constraint_audits") or any(
+            _job(runtime, snapshot, key)["state"] != "applied" for key in value["constraint_audits"]
+        ):
+            raise CampaignError("Reduced current constraints need independent fidelity audits")
+        original = encoded(payload["resolved_constraints"])
+        original_path = blob(_root(runtime, snapshot, value) / "constraint-index", original)
+        payload["exact_current_constraint_index"] = {
+            "path": str(original_path),
+            "sha256": hashlib.sha256(original).hexdigest(),
+        }
+        payload["resolved_constraints"] = [
+            node
+            for key in value["constraint_jobs"]
+            for node in _applied(_job(runtime, snapshot, key))["groups"]
+        ]
+        payload["constraint_tree"] = [
+            _job(runtime, snapshot, key)["applied_result"]
+            for key in value.get("constraint_all_jobs", [])
+        ]
+        payload["constraint_audit_receipts"] = value["constraint_audits"]
     payload["read_only"] = False
     payload["history_omissions_resolved_by"] = value["audits"]
+    # Audits have established the current constraints. Do not duplicate the
+    # same historical owner quotations and complete summaries in the initial
+    # working context; their immutable indexes remain available for retrieval.
+    # This is deterministic removal of redundant context, never clipping a
+    # current constraint or canonical obligation.
+    ceiling = min(snapshot.spec.reasoning.packet_token_limit, _budget(target, cap).payload_tokens)
+    if len(encoded(payload)) > ceiling:
+        payload["latest_owner_direction"] = []
+    if len(encoded(payload)) > ceiling:
+        payload["summaries"] = []
     data = encoded(payload)
-    if len(data) > min(
-        snapshot.spec.reasoning.packet_token_limit, _budget(target, cap).payload_tokens
-    ):
-        raise CampaignError(
+    if len(data) > ceiling:
+        raise ConstraintReductionNeeded(
             "Resolved current constraints exceed successor context; further bounded reduction required"
         )
     path = blob(_root(runtime, snapshot, value) / "packet", data)
@@ -758,29 +1322,89 @@ def _assemble(runtime, snapshot, unit, value):
     }
 
 
-def perform(runtime, snapshot, action, *, reconcile=False):
+def _perform(runtime, snapshot, action, *, reconcile=False):
     del reconcile
     unit = snapshot.units[action.unit]
     value = unit.evidence["handoff"]
     if action.payload.get("handoff_id", value["id"]) != value["id"]:
         raise CampaignError("Handoff action no longer owns its continuation")
+    expected_phase = EXPECTED_PHASE.get(action.kind)
+    if (
+        expected_phase
+        and value["phase"] != expected_phase
+        and not (action.kind == "handoff-assemble" and value["phase"] == "constraint_audit")
+    ):
+        return Observation("confirmed", {"superseded": True})
     if action.kind == "handoff-route":
-        return Observation("confirmed", {"candidate": action.payload["candidate"]})
+        candidate = _candidate(action.payload["candidate"])
+        cap = _cap(snapshot, candidate)
+        if candidate not in snapshot.spec.candidates(value.get("route_role", value["role"])):
+            raise CampaignError("Refreshed handoff route left its approved role pool")
+        packet = value.get("packet")
+        fits = not packet or packet["tokens"] <= min(
+            snapshot.spec.reasoning.packet_token_limit, _budget(candidate, cap).payload_tokens
+        )
+        return Observation(
+            "confirmed",
+            {
+                "candidate": action.payload["candidate"],
+                "packet_fits": fits,
+                "effect_phase": value["phase"],
+                "effect_context": _audit_context(snapshot, unit),
+            },
+        )
     if unit.claim and not unit.claim.quiescent or _debt(snapshot, unit):
         return Observation("unknown", reason="Predecessor or external writes still draining")
-    if action.kind == "handoff-capture":
+    if action.kind == "handoff-refresh":
+        data = _capture(runtime, snapshot, unit, value)
+    elif action.kind in {"handoff-replan", "handoff-audit-replan"}:
+        value = dict(value)
+        value["plan_epoch"] = value.get("plan_epoch", 0) + 1
+        failed_routes = {
+            _job(runtime, snapshot, key)["selection"]["profile"]
+            + ":"
+            + _job(runtime, snapshot, key)["selection"]["model"]
+            for key in value["jobs" if action.kind == "handoff-replan" else "audits"]
+            if _job(runtime, snapshot, key).get("selection")
+            and _job(runtime, snapshot, key)["state"] in {"capacity_wait", "failed"}
+        }
+        value["route_cooldowns"] = {
+            **value.get("route_cooldowns", {}),
+            **{route: runtime.clock() + 60 for route in failed_routes},
+        }
+        data = {
+            **(
+                _maps(runtime, snapshot, unit, value)
+                if action.kind == "handoff-replan"
+                else _audit_plan(runtime, snapshot, unit, value)
+            ),
+            "plan_epoch": value["plan_epoch"],
+            "route_cooldowns": value["route_cooldowns"],
+        }
+    elif action.kind == "handoff-capture":
         data = _capture(runtime, snapshot, unit, value)
     elif action.kind == "handoff-plan":
         data = _maps(runtime, snapshot, unit, value)
     elif action.kind == "handoff-audit-plan":
         data = _audit_plan(runtime, snapshot, unit, value)
     elif action.kind == "handoff-assemble":
-        data = _assemble(runtime, snapshot, unit, value)
+        try:
+            data = _assemble(runtime, snapshot, unit, value)
+        except ConstraintReductionNeeded:
+            data = _constraint_plan(runtime, snapshot, unit, value)
+    elif action.kind == "handoff-constraint-audit":
+        data = _constraint_audit_plan(runtime, snapshot, unit, value)
     elif action.kind == "handoff-release":
         from .campaign_fingerprint import capture
 
         if (
-            capture(Path(unit.bindings["workspace"])).to_dict()
+            capture(
+                Path(unit.bindings["workspace"]),
+                source_roots=tuple(
+                    Path(unit.bindings["workspace"]) / path
+                    for path in value["capture"]["current"]["source_roots"]
+                ),
+            ).to_dict()
             != value["capture"]["current"]["fingerprint"]
         ):
             raise CampaignError("Working state changed after handoff capture")
@@ -788,7 +1412,17 @@ def perform(runtime, snapshot, action, *, reconcile=False):
         data = {"ready": True}
     else:
         raise CampaignError("Unsupported handoff effect")
-    return Observation("confirmed", data)
+    return Observation(
+        "confirmed",
+        {**data, "effect_context": _audit_context(snapshot, unit), "effect_phase": value["phase"]},
+    )
+
+
+def perform(runtime, snapshot, action, *, reconcile=False):
+    try:
+        return _perform(runtime, snapshot, action, reconcile=reconcile)
+    except HandoffRouteWait as exc:
+        return Observation("confirmed", {"wait_reason": str(exc), "retry_at": runtime.clock() + 30})
 
 
 def apply(runtime, snapshot, action, observation):
@@ -797,29 +1431,149 @@ def apply(runtime, snapshot, action, observation):
     unit = snapshot.units[action.unit]
     value = unit.evidence["handoff"]
     if action.payload.get("handoff_id", value["id"]) != value["id"]:
-        raise CampaignError("Handoff result belongs to another continuation")
+        add_event(
+            snapshot,
+            "handoff-stale-result",
+            unit=unit.id,
+            action=action.id,
+            reason="continuation changed",
+        )
+        return
     data = observation.data
+    if (
+        data.get("superseded")
+        or data.get("effect_phase", value["phase"]) != value["phase"]
+        or data.get("effect_context", _audit_context(snapshot, unit))
+        != _audit_context(snapshot, unit)
+    ):
+        add_event(
+            snapshot, "handoff-stale-result", unit=unit.id, action=action.id, reason="phase changed"
+        )
+        return
+    if (
+        action.kind in {"handoff-refresh", "handoff-route"}
+        and value["phase"] == "ready"
+        and not unit.hold
+    ):
+        unit.hold = Hold(
+            "handoff",
+            "Current constraints changed; refreshing continuation evidence",
+            id=value["id"],
+        )
     if not unit.hold or unit.hold.kind != "handoff" or unit.hold.id != value["id"]:
-        raise CampaignError("Another authority replaced the handoff hold")
-    if action.kind == "handoff-route":
-        value["candidate"] = data["candidate"]
-    elif action.kind == "handoff-capture":
-        value["capture"], value["phase"] = data, "capture"
-    elif action.kind in {"handoff-plan", "handoff-audit-plan"}:
+        add_event(
+            snapshot,
+            "handoff-stale-result",
+            unit=unit.id,
+            action=action.id,
+            reason="another authority replaced the hold",
+        )
+        return
+    if data.get("wait_reason"):
+        value["retry_at"] = data["retry_at"]
+        unit.hold.reason = data["wait_reason"]
+        add_event(snapshot, "handoff-capacity-wait", unit=unit.id, reason=data["wait_reason"])
+        return
+    value.pop("retry_at", None)
+    if data.get("constraint_reduction") or data.get("constraint_audit"):
         ids = []
+        for raw in data["requests"]:
+            request = request_from_dict(raw)
+            prepare(snapshot, request)
+            ids.append(request.id)
+        if data.get("constraint_reduction"):
+            value["constraint_level"] = data["constraint_level"]
+            value["constraint_jobs"], value["phase"] = ids, "constraint_reduce"
+            value["constraint_audits"] = []
+        else:
+            value["constraint_audits"], value["phase"] = ids, "constraint_audit"
+        value["constraint_all_jobs"] = list(
+            dict.fromkeys([*value.get("constraint_all_jobs", []), *ids])
+        )
+    elif action.kind == "handoff-route":
+        value["candidate"] = data["candidate"]
+        if value["phase"] in {"ready", "assemble"}:
+            if data.get("packet_fits", True):
+                if value["phase"] == "ready":
+                    unit.hold = None
+            else:
+                value["phase"] = "audit"
+                value.pop("packet", None)
+                unit.bindings.pop("handoff_ready", None)
+    elif action.kind in {"handoff-capture", "handoff-refresh"}:
+        if action.kind == "handoff-refresh":
+            value["plan_epoch"] = value.get("plan_epoch", 0) + 1
+            for key in [
+                *value["audits"],
+                *value.get("constraint_jobs", []),
+                *value.get("constraint_audits", []),
+            ]:
+                row = snapshot.jobs.get(key)
+                if row is None:
+                    continue
+                if row.get("claim") and not row["claim"].get("quiescent"):
+                    raise CampaignError("Cannot refresh a live handoff audit")
+                if row["state"] != "applied":
+                    row["state"] = "canceled"
+            for field in (
+                "constraint_jobs",
+                "constraint_audits",
+                "constraint_all_jobs",
+                "constraint_level",
+            ):
+                value.pop(field, None)
+        if value["role"] == "execution" and data.get("native_role") != value.get("native_role"):
+            value["native_role"] = data["native_role"]
+            value["route_role"] = (
+                "execution_review" if data["native_role"] == "review" else "execution"
+            )
+            previous = value["original_payload"].get(
+                "review_candidate" if data["native_role"] == "review" else "candidate", {}
+            )
+            value["previous_route"] = [previous.get("profile", ""), previous.get("model", "")]
+            target = (
+                _fallback(
+                    snapshot,
+                    value["route_role"],
+                    tuple(value["previous_route"]),
+                    value.get("requested_candidate"),
+                )
+                if value["route_role"] in dict(snapshot.spec.roles)
+                else None
+            )
+            value["candidate"] = dataclasses.asdict(target) if target else None
+        value["capture"], value["phase"] = data, "capture"
+    elif action.kind in {
+        "handoff-plan",
+        "handoff-audit-plan",
+        "handoff-replan",
+        "handoff-audit-replan",
+    }:
+        ids = list(data.get("reuse_jobs", []))
+        if action.kind in {"handoff-replan", "handoff-audit-replan"}:
+            value["plan_epoch"] = data["plan_epoch"]
+            value["route_cooldowns"] = data.get("route_cooldowns", {})
+            for key in value["jobs" if action.kind == "handoff-replan" else "audits"]:
+                row = snapshot.jobs.get(key)
+                if row is None:
+                    continue
+                if row.get("claim") and not row["claim"].get("quiescent"):
+                    raise CampaignError("Cannot replan a live historical extraction")
+                if row["state"] != "applied":
+                    row["state"] = "canceled"
         for raw in data["requests"]:
             request = request_from_dict(raw)
             prepare(snapshot, request)
             ids.append(request.id)
         field, phase = (
             ("jobs", "summarize")
-            if action.kind == "handoff-plan" or data.get("reduction")
+            if action.kind in {"handoff-plan", "handoff-replan"} or data.get("reduction")
             else ("audits", "audit")
         )
-        if action.kind == "handoff-plan":
+        if action.kind in {"handoff-plan", "handoff-replan"}:
             value["map_jobs"] = ids
         if field == "jobs":
-            value.setdefault("all_jobs", []).extend(ids)
+            value["all_jobs"] = list(dict.fromkeys([*value.get("all_jobs", []), *ids]))
         if data.get("reduction"):
             value["reduction_level"] = value.get("reduction_level", 0) + 1
         value[field], value["phase"] = ids, phase
@@ -838,14 +1592,24 @@ def apply(runtime, snapshot, action, observation):
     )
 
 
-def resume_proposal(snapshot, unit):
+def resume_proposal(snapshot, unit, runtime=None):
     value = unit.evidence.get("handoff") or {}
-    if value.get("phase") != "ready" or (
-        unit.claim and unit.claim.launch_id != value["predecessor"]["launch_id"]
+    if (
+        value.get("phase") != "ready"
+        or value["capture"].get("audit_context") != _audit_context(snapshot, unit)
+        or (unit.claim and unit.claim.launch_id != value["predecessor"]["launch_id"])
+    ):
+        return None
+    if _pending(snapshot, unit, "handoff-route") or (
+        runtime is not None and _available_alternative(runtime, snapshot, value) is not None
     ):
         return None
     payload = dict(value["original_payload"])
-    payload["candidate"] = value["candidate"]
+    target_key = (
+        "review_candidate" if value.get("route_role") == "execution_review" else "candidate"
+    )
+    payload[target_key] = value["candidate"]
+    payload["role"] = value["role"]
     payload["handoff_id"] = value["id"]
     return Proposal("launch", unit.id, payload)
 
@@ -854,10 +1618,14 @@ def decorate_launch(snapshot, unit, request):
     value = unit.evidence.get("handoff") or {}
     if value.get("phase") not in {"ready", "continuing"}:
         return
+    if value["phase"] == "continuing" and not request.get("handoff_id"):
+        return  # later verification/review/publication stages use ordinary fresh input
     if value["phase"] == "continuing" and request.get("launch_id") != value.get(
         "successor", {}
     ).get("launch_id"):
         raise CampaignError("Only the adopted successor may consume the continuation packet")
+    if value["capture"].get("audit_context") != _audit_context(snapshot, unit):
+        raise CampaignError("Current continuation constraints changed before launch")
     if request.get("handoff_id") != value["id"]:
         raise CampaignError("Replacement launch must explicitly claim its ready handoff")
     if request.get("role", value["role"]) != value["role"]:
@@ -869,8 +1637,47 @@ def decorate_launch(snapshot, unit, request):
     ):
         raise CampaignError("Predecessor still owns the writer lease")
     request["handoff_packet"] = value["packet"]
+    packet_path = Path(value["packet"]["path"])
+    root = packet_path.parent.parent
+    from .platform_util import is_link_like
+
+    if root.name != value["id"] or is_link_like(root) or is_link_like(packet_path):
+        raise CampaignError("Handoff retrieval root is not bound to the owned continuation")
+    if hashlib.sha256(packet_path.read_bytes()).hexdigest() != value["packet"]["sha256"]:
+        raise CampaignError("Handoff packet changed before launch")
+    grants = request.get("headless_grants")
+    if grants is not None:
+        grants["read_only_paths"] = [
+            *grants.get("read_only_paths", []),
+            {
+                "path": str(root.resolve()),
+                "capture_digest": value["capture"]["capture_digest"],
+                "packet_sha256": value["packet"]["sha256"],
+            },
+        ]
     request["native_predecessor"] = value["predecessor"]
-    request["candidate"] = value["candidate"]
+    target_key = (
+        "review_candidate" if value.get("route_role") == "execution_review" else "candidate"
+    )
+    request[target_key] = value["candidate"]
+    current = value["capture"]["current"]
+    request["handoff_state"] = {
+        "capture_digest": value["capture"]["capture_digest"],
+        "fingerprint": current["fingerprint"],
+        "native_role": value.get("native_role", ""),
+        **{
+            key: current.get(key)
+            for key in (
+                "original_run_dir",
+                "original_run_id",
+                "source_roots",
+                "original_state_path",
+                "original_state_sha256",
+                "predecessor_receipt_path",
+                "predecessor_receipt_sha256",
+            )
+        },
+    }
     request["headless_capabilities"] = snapshot.config_snapshot.get("reasoning_capabilities", {})
     # Claim adoption marks continuation after the durable replacement launch,
     # not while merely constructing a launch request.
@@ -883,7 +1690,14 @@ def adopt_launch(snapshot, unit, payload, claim):
         return
     if value.get("phase") != "ready" or payload["handoff_id"] != value["id"]:
         raise CampaignError("Replacement launch does not own a ready continuation")
-    if payload.get("candidate") != value["candidate"]:
+    if value["capture"].get("audit_context") != _audit_context(snapshot, unit):
+        raise CampaignError("Current continuation constraints changed before claim adoption")
+    target_key = (
+        "review_candidate" if value.get("route_role") == "execution_review" else "candidate"
+    )
+    if not payload.get(target_key) or _candidate(payload[target_key]) != _candidate(
+        value["candidate"]
+    ):
         raise CampaignError("Replacement candidate differs from approved handoff route")
     if claim.launch_id == value["predecessor"]["launch_id"] or claim.role != value["role"]:
         raise CampaignError("Replacement must own a fresh launch with the original role")
@@ -907,3 +1721,23 @@ def adopt_launch(snapshot, unit, payload, claim):
         predecessor=value["predecessor"]["launch_id"],
         successor=claim.launch_id,
     )
+
+
+def job_launch_allowed(snapshot, row):
+    """Avoid relaunching obsolete geometry during quota replan/current-context refresh."""
+    coordinates = row["request"].get("coordinates", {})
+    if not coordinates.get("handoff_id"):
+        return True
+    unit = snapshot.units.get(row["request"]["unit"])
+    value = unit.evidence.get("handoff", {}) if unit else {}
+    if value.get("id") != coordinates["handoff_id"] or _requires_replan(row):
+        return False
+    if value.get("capture", {}).get("audit_context") != _audit_context(snapshot, unit):
+        return False
+    field = coordinates.get("handoff_job_field") or (
+        "audits" if row["request"]["purpose"] == "handoff_audit" else "jobs"
+    )
+    phase = {"constraint_jobs": "constraint_reduce", "constraint_audits": "constraint_audit"}.get(
+        field, "audit" if field == "audits" else "summarize"
+    )
+    return row["id"] in value.get(field, ()) and value.get("phase") == (phase)

@@ -222,9 +222,23 @@ class ScriptedGithub:
                         ]
                     return self._response(rows)
                 if route == "pulls":
+                    # A GitHub list request reads one server-side snapshot, not
+                    # two separate Git subprocesses per returned pull request.
+                    refs = dict(
+                        row.split(" ", 1)
+                        for row in git(
+                            self.remote,
+                            "for-each-ref",
+                            "--format=%(refname:short) %(objectname)",
+                            "refs/heads",
+                        ).splitlines()
+                    )
+                    for row in self.pulls.values():
+                        row["head"]["sha"] = refs[row["head"]["ref"]]
+                        row["base"]["sha"] = refs["main"]
                     return self._response(
                         [
-                            self._pull(number)
+                            self.pulls[number]
                             for number in self.pulls
                             if query.get("state", ["open"])[0] == "all"
                             or self.pulls[number]["state"] == query.get("state", ["open"])[0]
@@ -684,7 +698,9 @@ def production_case(project, tmp_path, monkeypatch, request):
         repo,
         store,
         gateway=gateway,
-        clock=lambda: time.monotonic() * 100,
+        # Accelerate short waits without turning 15s inventory refreshes into
+        # continuous 150ms Git/process storms under xdist.
+        clock=lambda: time.monotonic() * 10,
         capacity_observer=lambda *a, **k: CapacityObservation(True, slots=8, model_access=True),
     )
     script = tmp_path / "scripted-coding-cli.py"

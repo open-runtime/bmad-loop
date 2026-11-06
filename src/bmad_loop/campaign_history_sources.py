@@ -108,6 +108,9 @@ class TranscriptEvidenceProvider:
                         or metadata is not None
                     ):
                         raise CampaignError("native transcript session binding differs")
+                    source = payload.get("source")
+                    if isinstance(source, dict) and source.get("subagent"):
+                        raise CampaignError("subagent task messages cannot grant owner authority")
                     metadata = payload
                 digest = hashlib.sha256(raw).hexdigest()
                 native_id = (
@@ -138,10 +141,12 @@ class TranscriptEvidenceProvider:
                 else:
                     if metadata is None or not isinstance(payload, dict):
                         raise CampaignError("Codex native session metadata is missing")
-                    # response_item/user also includes harness-injected context;
-                    # only the native input event establishes original user input.
+                    # Current Codex records attest per-content provenance. The
+                    # versioned reader rejects unknown, mixed and harness blocks.
                     if row.get("type") == "event_msg" and payload.get("type") == "user_message":
                         content = payload.get("message")
+                    elif row.get("type") == "response_item" and payload.get("role") == "user":
+                        content = payload.get("content")
                     else:
                         raise CampaignError("transcript selection is not an owner message")
                 if isinstance(content, list):

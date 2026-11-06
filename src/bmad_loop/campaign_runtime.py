@@ -340,17 +340,32 @@ class CampaignRuntime:
         observed_at = rows.get("observed_at", 0)
         for unit in snapshot.units.values():
             claim = unit.claim
-            if (
-                not claim
-                or claim.quiescent
-                or (claim.started_at is not None and claim.started_at < observed_at)
-            ):
+            if not claim or claim.quiescent:
                 continue
             launch = next(
                 (action for action in snapshot.outbox if action.id == claim.launch_id), None
             )
             candidate = launch.payload.get("candidate") if launch else None
-            if candidate:
+            review_candidate = launch.payload.get("review_candidate") if launch else None
+            handoff = unit.evidence.get("handoff", {})
+            review_only = (
+                handoff.get("phase") == "continuing" and handoff.get("native_role") == "review"
+            )
+            # A configured legacy review can start later in this same child.
+            # Reserve its advertised provider slot until the child is drained;
+            # unknown provider concurrency continues to use campaign limits.
+            if review_candidate:
+                unobserved[(review_candidate["profile"], review_candidate.get("model", ""))] += 1
+            if (
+                candidate
+                and not review_only
+                and (claim.started_at is None or claim.started_at >= observed_at)
+                and (
+                    not review_candidate
+                    or (candidate["profile"], candidate.get("model", ""))
+                    != (review_candidate["profile"], review_candidate.get("model", ""))
+                )
+            ):
                 unobserved[(candidate["profile"], candidate.get("model", ""))] += 1
         for identity, count in unobserved.items():
             if identity in capacities:
@@ -391,6 +406,18 @@ class CampaignRuntime:
             bool(unit.claim and not unit.claim.quiescent and unit.claim.role == role)
             for unit in snapshot.units.values()
         )
+        if role == "execution_review":
+            active_role += sum(
+                bool(
+                    unit.claim
+                    and not unit.claim.quiescent
+                    and any(
+                        action.id == unit.claim.launch_id and action.payload.get("review_candidate")
+                        for action in snapshot.outbox
+                    )
+                )
+                for unit in snapshot.units.values()
+            )
         active_role += sum(
             bool(
                 job.get("claim")
@@ -724,7 +751,7 @@ class CampaignRuntime:
                 continue
             from .campaign_handoff_flow import resume_proposal
 
-            continuation = resume_proposal(snapshot, unit)
+            continuation = resume_proposal(snapshot, unit, runtime=self)
             if continuation is not None:
                 resource = (
                     "execution" if continuation.payload["kind"] == "execution" else "planning"
@@ -956,8 +983,16 @@ class CampaignRuntime:
         role_reservations = []
         writer_reservations = []
         for proposal in proposals:
+            resuming_review = False
             if proposal.kind == "launch":
                 unit = snapshot.units[proposal.unit]
+                handoff = unit.evidence.get("handoff", {})
+                resuming_review = (
+                    bool(handoff.get("id"))
+                    and proposal.payload.get("handoff_id") == handoff["id"]
+                    and handoff.get("native_role") == "review"
+                    and proposal.payload.get("kind") == "execution"
+                )
                 from .campaign_usage import admission_reason
 
                 reason = admission_reason(snapshot, unit, proposal.payload)
@@ -974,7 +1009,11 @@ class CampaignRuntime:
                 if writes and unit.bindings.get("ready_for_review"):
                     admitted.append(Proposal("prepare-draft", unit.id))
                     continue
-            if proposal.kind == "launch" and proposal.payload.get("candidate"):
+            if (
+                proposal.kind == "launch"
+                and proposal.payload.get("candidate")
+                and not resuming_review
+            ):
                 unit = snapshot.units[proposal.unit]
                 role = proposal.payload["role"]
                 candidate = self._role(
@@ -1005,6 +1044,44 @@ class CampaignRuntime:
                     payload={**proposal.payload, "candidate": dataclasses.asdict(candidate)},
                 )
                 role_reservations.append((role, candidate))
+            if (
+                proposal.kind == "launch"
+                and proposal.payload.get("kind") == "execution"
+                and "execution_review" in dict(snapshot.spec.roles)
+            ):
+                fixed_review = (
+                    proposal.payload.get("review_candidate")
+                    if proposal.payload.get("handoff_id")
+                    else None
+                )
+                allowed_review = (
+                    (
+                        RoleCandidate(
+                            **{
+                                **fixed_review,
+                                "capacity_command": tuple(fixed_review.get("capacity_command", ())),
+                            }
+                        ),
+                    )
+                    if fixed_review
+                    else None
+                )
+                review_candidate = self._role(
+                    snapshot,
+                    "execution_review",
+                    provisional=tuple(role_reservations),
+                    allowed_candidates=allowed_review,
+                )
+                if review_candidate is None:
+                    continue
+                proposal = dataclasses.replace(
+                    proposal,
+                    payload={
+                        **proposal.payload,
+                        "review_candidate": dataclasses.asdict(review_candidate),
+                    },
+                )
+                role_reservations.append(("execution_review", review_candidate))
             if proposal.kind == "launch" and self._writes(proposal.payload):
                 writer_reservations.append(proposal.unit)
             admitted.append(proposal)
@@ -1108,6 +1185,11 @@ class CampaignRuntime:
 
     def control(self, snapshot: CampaignSnapshot, command: dict[str, Any]) -> None:
         kind, key = command["kind"], command.get("unit", "")
+        if kind == "authorize-scope":
+            from .campaign_scope_authority import apply
+
+            apply(snapshot, command)
+            return
         if kind == "handoff":
             from .campaign_handoff_flow import control
 
@@ -1205,6 +1287,11 @@ class CampaignRuntime:
                 unit.attempt += 1
                 if payload.get("candidate"):
                     candidate = payload["candidate"]
+                    identity = candidate["profile"] + "\0" + candidate.get("model", "")
+                    selections = snapshot.bindings.setdefault("role_selections", {})
+                    selections[identity] = selections.get(identity, 0) + 1
+                if payload.get("review_candidate"):
+                    candidate = payload["review_candidate"]
                     identity = candidate["profile"] + "\0" + candidate.get("model", "")
                     selections = snapshot.bindings.setdefault("role_selections", {})
                     selections[identity] = selections.get(identity, 0) + 1
@@ -2214,7 +2301,9 @@ class CampaignRuntime:
             source_metadata=snapshot.bindings.get("source_observations", {}),
             receipts=receipts,
         )
-        return Observation("confirmed", dataclasses.asdict(result))
+        from .campaign_tracking_delta import observation
+
+        return Observation("confirmed", observation(snapshot, result, action.unit))
 
     def _perform_hierarchy_close(self, snapshot, action) -> Observation:
         if not self._units_settled(snapshot):
@@ -2227,9 +2316,9 @@ class CampaignRuntime:
         result = HierarchyCoordinator(self.gateway(snapshot)).close_parents(
             snapshot, receipts=receipts
         )
-        return Observation(
-            "confirmed", {**dataclasses.asdict(result), "graph_revision": snapshot.graph_revision}
-        )
+        from .campaign_tracking_delta import observation
+
+        return Observation("confirmed", observation(snapshot, result))
 
     def _perform_prepare_pr(self, snapshot, action) -> Observation:
         unit = snapshot.units[action.unit]
@@ -2801,7 +2890,15 @@ class CampaignRuntime:
             from .campaign_usage import remaining
 
             remaining_dev, remaining_review = remaining(snapshot, unit)
-            if remaining_dev <= 0:
+            handoff = unit.evidence.get("handoff", {})
+            resuming_review = (
+                action.payload.get("handoff_id") == handoff.get("id")
+                and bool(handoff.get("id"))
+                and handoff.get("native_role") == "review"
+            )
+            if (not resuming_review and remaining_dev <= 0) or (
+                resuming_review and remaining_review <= 0
+            ):
                 return Observation(
                     "rejected", reason="campaign lifetime child attempt budget exhausted"
                 )
@@ -2834,6 +2931,27 @@ class CampaignRuntime:
                         adapter=dataclasses.replace(
                             envelope.policy.adapter,
                             dev=selection,
+                        ),
+                    ),
+                )
+            if action.payload.get("review_candidate"):
+                candidate = action.payload["review_candidate"]
+                selection = dataclasses.replace(
+                    envelope.policy.adapter.review,
+                    name=candidate["profile"],
+                    model=candidate.get("model", ""),
+                    effort=candidate.get("effort", ""),
+                )
+                profiles = dict(envelope.profiles)
+                profiles["review"] = profiles["campaign:" + candidate["profile"]]
+                envelope = dataclasses.replace(
+                    envelope,
+                    profiles=profiles,
+                    policy=dataclasses.replace(
+                        envelope.policy,
+                        adapter=dataclasses.replace(
+                            envelope.policy.adapter,
+                            review=selection,
                         ),
                     ),
                 )
@@ -2872,6 +2990,9 @@ class CampaignRuntime:
             "schema_version": 1,
             "workspace": str(workspace.resolve()),
             "scopes": list(unit.spec.scopes or unit.spec.paths or (".",)),
+            "write_paths": list(request["private_paths"]),
+            "git_branch": request["branch"],
+            "protected_branches": list(dict.fromkeys((snapshot.spec.target, "main", "master"))),
             "config_digest": configuration_digest(snapshot.config_snapshot),
             "generation": claim.generation,
             "plugin_grants": json.loads(
@@ -3896,6 +4017,24 @@ class CampaignRuntime:
                 transition(snapshot, unit.id, UnitState.PENDING)
             add_event(snapshot, "operator-held-effect-suppressed", unit=action.unit, effect=kind)
             return
+        if kind in {"hierarchy", "hierarchy-close"}:
+            from .campaign_tracking_delta import apply as apply_hierarchy
+
+            try:
+                current = apply_hierarchy(snapshot, data, unit.id if kind == "hierarchy" else "")
+            except CampaignError as exc:
+                self._set_hold(unit, Hold("tracking", str(exc), id=action.id))
+                add_event(
+                    snapshot,
+                    "hierarchy-identity-conflict",
+                    unit=unit.id,
+                    action=action.id,
+                    reason=str(exc),
+                )
+                return
+            if not current:
+                add_event(snapshot, "hierarchy-stale-observation", unit=unit.id, action=action.id)
+                return
         if kind == "stage-boundary-before":
             from .campaign_boundary_sync import before_apply
 
@@ -4100,14 +4239,6 @@ class CampaignRuntime:
                     unit.hold = None
             transition(snapshot, unit.id, UnitState.DRAFT)
         elif kind == "hierarchy":
-            current = snapshot.bindings.setdefault("github_hierarchy", {})
-            for key, binding in data["bindings"].items():
-                if key in current and current[key].get("number") != binding.get("number"):
-                    raise CampaignError(
-                        "GitHub hierarchy identity changed during concurrent projection"
-                    )
-                current[key] = binding
-            unit.bindings.update(data["unit_bindings"])
             unit.bindings["hierarchy_ready"] = data["complete"]
             if data.get("reason"):
                 unit.hold = Hold("tracking", data["reason"], id=action.id)
@@ -4118,7 +4249,6 @@ class CampaignRuntime:
         elif kind == "hierarchy-close":
             if data.get("stale_scope") or data.get("graph_revision") != snapshot.graph_revision:
                 return
-            snapshot.bindings["github_hierarchy"] = data["bindings"]
             if data.get("intent"):
                 self._queue_intent(
                     snapshot,

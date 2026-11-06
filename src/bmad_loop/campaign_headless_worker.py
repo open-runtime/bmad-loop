@@ -13,10 +13,10 @@ import subprocess
 import time
 from pathlib import Path
 
-from .campaign_headless import read_json, validate_capability, write_json
+from .campaign_headless import read_json, validate_capability, validate_probe_capability, write_json
 from .campaign_headless_protocol import parse_output
 from .campaign_jobs import digest, request_from_dict
-from .campaign_model import CampaignError, RoleCandidate
+from .campaign_model import CampaignError, CommunicationSpec, RoleCandidate
 from .childrun import kill_tree
 from .process_host import get_process_host
 
@@ -78,7 +78,13 @@ def child_main(path: Path) -> int:
         )
 
     try:
-        validate_capability(capability, candidate, permissions=envelope["permissions"])
+        if envelope.get("probe") is not None:
+            from .campaign_qualification import validate_probe_envelope
+
+            validate_probe_envelope(envelope)
+            validate_probe_capability(capability, candidate)
+        else:
+            validate_capability(capability, candidate, permissions=envelope["permissions"])
         if (
             digest(envelope.get("grants")) != envelope["grants_digest"]
             or digest(read_json(directory / "grants.json")) != envelope["grants_digest"]
@@ -116,13 +122,21 @@ def child_main(path: Path) -> int:
             for key, value in replacements.items():
                 argument = argument.replace("{" + key + "}", value)
             argv.append(argument)
-        environment = {
-            key: value
-            for key, value in os.environ.items()
-            if not key.startswith(("GH_", "GITHUB_"))
-            and key not in {"HCOM_NAME", "HCOM_SESSION_ID"}
-        }
+        from .campaign_reflection_flow import sanitized_actor_env
+
+        environment = sanitized_actor_env(
+            {
+                key: value
+                for key, value in os.environ.items()
+                if not key.startswith(("GH_", "GITHUB_"))
+            },
+            communication=CommunicationSpec(),
+        )
         environment.update(envelope.get("environment", {}))
+        if capability["protocol"] == "muse-json":
+            # The launcher can otherwise replace the pinned native executable
+            # after qualification and before exec. Account routing is unchanged.
+            environment["MUSE_NO_AUTO_UPDATE"] = "1"
         with (
             (directory / "input.txt").open("rb") as source,
             (directory / "stdout.jsonl").open("wb") as stdout,
@@ -177,6 +191,7 @@ def child_main(path: Path) -> int:
                 (directory / "stdout.jsonl").read_text(encoding="utf-8"),
                 protocol=capability["protocol"],
                 selected_model=candidate.model,
+                served_model_aliases=tuple(capability.get("served_model_aliases", ())),
             )
             receipt.update(native)
             if process.returncode and receipt["outcome"] == "completed":

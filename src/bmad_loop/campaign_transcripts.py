@@ -12,14 +12,14 @@ import hashlib
 import json
 import os
 import stat
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
 from .campaign_model import CampaignError
 from .platform_util import atomic_write_bytes, is_link_like
 
-READER_VERSIONS = {"codex": 1, "claude": 1, "grok": 1, "antigravity": 1, "muse": 1}
+READER_VERSIONS = {"codex": 3, "claude": 1, "grok": 1, "antigravity": 1, "muse": 1}
 
 
 def encoded(value: Any) -> bytes:
@@ -92,6 +92,26 @@ def read_record(harness: str, row: dict[str, Any], session_id: str) -> Normalize
         elif row.get("type") == "response_item":
             role = str(payload.get("role", "tool" if "output" in kind else "assistant"))
             content = payload.get("content", payload)
+            provenance = payload.get("internal_chat_message_metadata_passthrough") or {}
+            kinds = provenance.get("content_item_kinds", [])
+            metadata = provenance.get("content_item_metadata", [])
+            owner = (
+                kind == "message"
+                and role == "user"
+                and isinstance(content, list)
+                and bool(content)
+                and isinstance(kinds, list)
+                and isinstance(metadata, list)
+                and len(content) == len(kinds) == len(metadata)
+                and all(
+                    tag == "user.text"
+                    and isinstance(block, dict)
+                    and block.get("type") in {"input_text", "text"}
+                    and isinstance(origin, dict)
+                    and (origin.get("provenance") or {}).get("type") == "user"
+                    for block, tag, origin in zip(content, kinds, metadata, strict=True)
+                )
+            )
         else:
             content = payload
     elif harness == "claude":
@@ -208,6 +228,8 @@ class HistorySnapshot:
     event_count: int
     owner_event_ids: tuple[str, ...]
     warnings: tuple[str, ...] = ()
+    parent_session_id: str = ""
+    lineage_verified: bool = False
 
 
 def _records(row: dict[str, Any], harness: str) -> list[dict[str, Any]]:
@@ -233,6 +255,7 @@ def snapshot_history(
     *,
     max_bytes: int = 1024 * 1024 * 1024,
     max_record_bytes: int = 64 * 1024 * 1024,
+    prefix_bytes: int | None = None,
 ) -> HistorySnapshot:
     """Seal an append-only prefix, validating the same bytes again before publishing."""
     if harness not in READER_VERSIONS or not session_id or max_bytes < 1 or is_link_like(path):
@@ -240,14 +263,18 @@ def snapshot_history(
     descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     with os.fdopen(descriptor, "rb") as stream:
         initial = os.fstat(stream.fileno())
-        if not stat.S_ISREG(initial.st_mode) or initial.st_size > max_bytes:
-            raise CampaignError("native history is not regular or exceeds capture bound")
-        raw = stream.read(initial.st_size)
-        stream.seek(0)
+        selected = initial.st_size if prefix_bytes is None else prefix_bytes
         if (
-            stream.read(initial.st_size) != raw
-            or os.fstat(stream.fileno()).st_size < initial.st_size
+            not stat.S_ISREG(initial.st_mode)
+            or type(selected) is not int
+            or selected < 1
+            or selected > initial.st_size
+            or selected > max_bytes
         ):
+            raise CampaignError("native history is not regular or exceeds capture bound")
+        raw = stream.read(selected)
+        stream.seek(0)
+        if stream.read(selected) != raw or os.fstat(stream.fileno()).st_size < selected:
             raise CampaignError("native history prefix changed while sealing")
     current = path.stat()
     if (current.st_dev, current.st_ino) != (initial.st_dev, initial.st_ino):
@@ -255,6 +282,9 @@ def snapshot_history(
     source_id = digest([harness, session_id, str(path.resolve()), READER_VERSIONS[harness]])
     raw_path = blob(artifact_root, raw, suffix=".jsonl")
     rows, owners, seen, warnings = [], [], {}, []
+    parent_session = ""
+    declared_ancestors = set()
+    lineage_verified = False
     offset = complete = 0
     for line_number, line in enumerate(raw.splitlines(keepends=True), 1):
         end = offset + len(line)
@@ -270,7 +300,55 @@ def snapshot_history(
         if not isinstance(row, dict):
             raise CampaignError("native history record is not an object")
         for subindex, item in enumerate(_records(row, harness)):
-            record = read_record(harness, item, session_id)
+            bound_session = session_id
+            if harness == "codex" and item.get("type") == "session_meta":
+                metadata = item.get("payload") or {}
+                identity = metadata.get("id")
+                if not isinstance(identity, str) or not identity:
+                    raise CampaignError("Codex session metadata lacks an identity")
+                origin = metadata.get("source") or {}
+                subagent = origin.get("subagent", {}) if isinstance(origin, dict) else {}
+                spawn = subagent.get("thread_spawn", {}) if isinstance(subagent, dict) else {}
+                declared_parent = (
+                    metadata.get("forked_from_id") or spawn.get("parent_thread_id") or ""
+                )
+                if (
+                    metadata.get("forked_from_id")
+                    and spawn.get("parent_thread_id")
+                    and metadata["forked_from_id"] != spawn["parent_thread_id"]
+                ):
+                    raise CampaignError("Codex fork metadata has conflicting parent identity")
+                if identity == session_id:
+                    if lineage_verified and declared_parent != parent_session:
+                        raise CampaignError("Codex session lineage changed within archive")
+                    lineage_verified = True
+                    parent_session = declared_parent
+                elif not lineage_verified or identity not in declared_ancestors:
+                    raise CampaignError("Codex inherited metadata lacks declared ancestor binding")
+                if declared_parent:
+                    if declared_parent == session_id or not isinstance(declared_parent, str):
+                        raise CampaignError("invalid Codex fork ancestry")
+                    declared_ancestors.add(declared_parent)
+                bound_session = identity
+            record = read_record(harness, item, bound_session)
+            if harness == "codex":
+                record = replace(
+                    record,
+                    metadata={
+                        **(record.metadata or {}),
+                        "native_payload_sha256": digest(item.get("payload", {})),
+                    },
+                )
+            if parent_session:
+                record = replace(
+                    record,
+                    owner_input=False,
+                    metadata={
+                        **(record.metadata or {}),
+                        "parent_session_id": parent_session,
+                        "input_origin": "subagent-context",
+                    },
+                )
             sha = digest(item)
             event_id = digest([source_id, offset, subindex, sha])
             key = (record.kind, record.native_id, sha)
@@ -300,6 +378,8 @@ def snapshot_history(
         len(rows),
         tuple(owners),
         tuple(warnings),
+        parent_session,
+        lineage_verified,
     )
     blob(artifact_root, encoded(asdict(result)))
     return result
@@ -318,6 +398,57 @@ def load_events(snapshot: HistorySnapshot) -> tuple[HistoryEvent, ...]:
         row["record"] = NormalizedRecord(**row["record"])
         events.append(HistoryEvent(**row))
     return tuple(events)
+
+
+def merge_lineage_events(snapshots: tuple[HistorySnapshot, ...]) -> tuple[HistoryEvent, ...]:
+    """Deduplicate verified ancestor copies while retaining every native source.
+
+    Text equality is never identity. Named records require the same native ID
+    and complete payload hash; unnamed records require both original timestamp
+    and complete record hash. Unrelated sessions are never deduplicated.
+    """
+    by_session = {(snapshot.harness, snapshot.session_id): snapshot for snapshot in snapshots}
+    if len(by_session) != len(snapshots):
+        raise CampaignError("history lineage contains duplicate session manifests")
+    loaded = {key: load_events(value) for key, value in by_session.items()}
+
+    def identity(event):
+        metadata = event.record.metadata or {}
+        payload_hash = metadata.get("native_payload_sha256", event.payload_sha256)
+        if event.record.native_id:
+            return ("id", event.record.native_id, payload_hash)
+        if event.record.tool_id and event.record.kind in {"function_call", "function_call_output"}:
+            return (event.record.kind, event.record.tool_id, payload_hash)
+        timestamp = metadata.get("timestamp")
+        return ("timestamp", timestamp, event.payload_sha256) if timestamp else None
+
+    result = []
+    for snapshot in snapshots:
+        ancestors = []
+        parent = snapshot.parent_session_id if snapshot.lineage_verified else ""
+        seen = {snapshot.session_id}
+        while parent:
+            if parent in seen:
+                raise CampaignError("history lineage contains a cycle")
+            seen.add(parent)
+            ancestor = by_session.get((snapshot.harness, parent))
+            if ancestor is None or not ancestor.lineage_verified:
+                break
+            ancestors.extend(loaded[(ancestor.harness, parent)])
+            parent = ancestor.parent_session_id
+        identities = {}
+        for event in ancestors:
+            key = identity(event)
+            if key is not None:
+                identities.setdefault(
+                    key,
+                    event.duplicate_of or event.id,
+                )
+        for event in loaded[(snapshot.harness, snapshot.session_id)]:
+            key = identity(event)
+            duplicate = identities.get(key, "") if key is not None else ""
+            result.append(replace(event, duplicate_of=duplicate) if duplicate else event)
+    return tuple(result)
 
 
 def source_record(snapshot: HistorySnapshot, event: HistoryEvent) -> bytes:

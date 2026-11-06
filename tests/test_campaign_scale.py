@@ -7,6 +7,7 @@ The artifacts retain observed utilization, useful delivery and recovery latency.
 import json
 import sys
 import time
+from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 
@@ -101,6 +102,7 @@ def test_48_stories_24_epics_verify8_and_reasoning_drain_resume(
         github=replace(case.snapshot.spec.github, max_base_refreshes=128),
     )
     _, case.snapshot = campaign_runtime.create(case.repo, spec)
+    case.runtime.clock = time.monotonic
     case.runtime.reasoning_runner = runner
     case.runtime.capacity_observer = lambda *a, **k: CapacityObservation(
         True, slots=64, model_access=True
@@ -122,8 +124,10 @@ def test_48_stories_24_epics_verify8_and_reasoning_drain_resume(
         "first_launch_epics": [],
     }
     observed_launches = set()
+    sampled_at = started
 
     def proposals(snapshot):
+        nonlocal sampled_at
         live = [unit for unit in snapshot.units.values() if unit.claim and not unit.claim.quiescent]
         metrics["max_live"] = max(metrics["max_live"], len(live))
         for resource in ("execution", "verify", "review"):
@@ -149,9 +153,38 @@ def test_48_stories_24_epics_verify8_and_reasoning_drain_resume(
             case.store.enqueue(snapshot.id, "stop", reason="scale drain/restart qualification")
         if snapshot.phase == "draining" and metrics["control_ack_seconds"] is None:
             metrics["control_ack_seconds"] = time.monotonic() - metrics["stop_requested_at"]
+        if time.monotonic() - sampled_at >= 5:
+            sampled_at = time.monotonic()
+            (tmp_path / "scale-metrics-live.json").write_text(
+                json.dumps(
+                    {
+                        **metrics,
+                        "elapsed_s": sampled_at - started,
+                        "phase": snapshot.phase,
+                        "units": dict(
+                            Counter(unit.state.value for unit in snapshot.units.values())
+                        ),
+                        "holds": {
+                            unit.id: unit.hold.kind for unit in snapshot.units.values() if unit.hold
+                        },
+                        "outbox_hot": len(snapshot.outbox),
+                        "events": len(snapshot.events),
+                    },
+                    indent=2,
+                )
+            )
         return original(snapshot)
 
     case.runtime.proposals = proposals
+    original_control = case.runtime.control
+
+    def control(snapshot, request):
+        result = original_control(snapshot, request)
+        if request.get("kind") == "stop" and metrics["stop_requested_at"] is not None:
+            metrics["control_ack_seconds"] = time.monotonic() - metrics["stop_requested_at"]
+        return result
+
+    case.runtime.control = control
     stopped = run_case(case, timeout_s=1200)
     assert stopped.phase == "stopped"
     assert all(not unit.claim or unit.claim.quiescent for unit in stopped.units.values())

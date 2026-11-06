@@ -44,12 +44,20 @@ def ensure(unit) -> dict[str, Any]:
         "acceptance",
         {"schema_version": 1, "revision": 0, "criteria": [], "amendments": [], "history": []},
     )
-    known = {row["id"] for row in ledger["criteria"]}
+    known = {row["id"]: row for row in ledger["criteria"]}
     for row in criteria(unit.id, unit.spec.acceptance):
         if row["id"] not in known:
             ledger["criteria"].append(
                 {**row, "status": "not_run", "reason": "required proof not recorded"}
             )
+            ledger["revision"] += 1
+        elif not known[row["id"]]["required"]:
+            # A newly accepted plan can restore an earlier waived obligation.
+            # Old proof/waivers must not silently discharge the new requirement.
+            known[row["id"]].update(
+                required=True, status="not_run", reason="criterion restored by current plan"
+            )
+            known[row["id"]].pop("amendment", None)
             ledger["revision"] += 1
     return ledger
 

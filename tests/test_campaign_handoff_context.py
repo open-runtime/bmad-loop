@@ -359,3 +359,96 @@ def test_generic_job_schema_and_result_bind_native_source_manifest(tmp_path):
     request["id"] = "different-job"
     with pytest.raises(CampaignError, match="identity"):
         validate_job_result(request, value, tmp_path / "receipts")
+
+
+@pytest.mark.parametrize(
+    "provenance,kind,owner",
+    [
+        ("user", "user.text", True),
+        ("harness", "user.text", False),
+        ("user", "environments.environment_context", False),
+        ("", "unknown", False),
+    ],
+)
+def test_codex_response_item_uses_explicit_aligned_native_owner_provenance(provenance, kind, owner):
+    row = {
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "preserve history"}],
+            "internal_chat_message_metadata_passthrough": {
+                "content_item_kinds": [kind],
+                "content_item_metadata": [{"provenance": {"type": provenance}}],
+            },
+        },
+    }
+    assert read_record("codex", row, "s1").owner_input is owner
+    row["payload"]["content"].append({"type": "input_text", "text": "injected"})
+    assert not read_record("codex", row, "s1").owner_input
+
+
+def test_codex_fork_retains_ancestor_metadata_without_granting_parent_agent_owner_authority(
+    tmp_path,
+):
+    from bmad_loop.campaign_transcripts import merge_lineage_events
+
+    root_meta = {"type": "session_meta", "payload": {"id": "root", "source": "cli"}}
+    shared = {"timestamp": "2026-11-06T10:00:00Z", **native_row("codex")}
+    unnamed = {
+        "timestamp": "2026-11-06T10:00:01Z",
+        "type": "event_msg",
+        "payload": {"type": "user_message", "message": "retain unrun criterion"},
+    }
+    tool = {
+        "timestamp": "2026-11-06T10:00:02Z",
+        "type": "response_item",
+        "payload": {
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": "exact tool output",
+        },
+    }
+    root_path = tmp_path / "root.jsonl"
+    root_path.write_bytes(
+        b"".join(encoded(row) + b"\n" for row in (root_meta, shared, unnamed, tool))
+    )
+    root = snapshot_history(root_path, "codex", "root", tmp_path / "sealed")
+    child_meta = {
+        "type": "session_meta",
+        "payload": {
+            "id": "child",
+            "forked_from_id": "root",
+            "source": {"subagent": {"thread_spawn": {"parent_thread_id": "root", "depth": 1}}},
+        },
+    }
+    child_path = tmp_path / "child.jsonl"
+    child_path.write_bytes(
+        b"".join(
+            encoded(row) + b"\n"
+            for row in (
+                child_meta,
+                root_meta,
+                {**shared, "timestamp": "2026-11-06T11:00:00Z", "ordinal": 99},
+                unnamed,
+                {**tool, "timestamp": "2026-11-06T11:00:02Z", "ordinal": 100},
+                {**tool, "payload": {**tool["payload"], "output": "different tool output"}},
+                native_row("codex", "parent-agent task", "new"),
+            )
+        )
+    )
+    child = snapshot_history(child_path, "codex", "child", tmp_path / "sealed")
+    assert child.parent_session_id == "root" and child.lineage_verified
+    assert not child.owner_event_ids
+    assert not any(event.record.owner_input for event in load_events(child))
+    events = merge_lineage_events((root, child))
+    assert sum(bool(event.duplicate_of) for event in events if event.session_id == "child") == 4
+    changed = next(event for event in events if "different tool output" in event.record.text)
+    assert changed.duplicate_of == ""
+    assert sum(event.record.owner_input and not event.duplicate_of for event in events) == 2
+    assert next(event for event in events if event.record.native_id == "new").duplicate_of == ""
+    child_path.write_bytes(
+        encoded({"type": "session_meta", "payload": {"id": "unrelated"}}) + b"\n"
+    )
+    with pytest.raises(CampaignError, match="ancestor binding"):
+        snapshot_history(child_path, "codex", "child", tmp_path / "sealed")

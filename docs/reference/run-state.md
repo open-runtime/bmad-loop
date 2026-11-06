@@ -37,6 +37,28 @@ Each project gets a subtree keyed by the first 16 hex characters of the SHA-256 
     └── plugin-grants.json      project-plugin trust grants (`bmad-loop plugins`)
 ```
 
+## Campaign authority
+
+Campaigns use `<state root>/campaigns/<common-directory hash>/<campaign ID>/`.
+The hash binds all worktrees of a repository to the same canonical Git common
+directory; a repository-wide coordinator lock prevents competing local owners.
+Workers and independent reasoning jobs do not hold that coordinator lock.
+
+New campaigns store authority, outbound intents, jobs and append-only events in
+`campaign.sqlite`. `snapshot.json` is a versioned storage marker. `events.jsonl`
+is a recoverable projection, not an additional authority. Immutable worker
+envelopes, transcript snapshots, inputs, results and terminal-history projections
+remain separate files beneath the campaign directory. Finished jobs leave the hot
+snapshot and remain accessible through paginated `campaign jobs` queries.
+
+Legacy JSON campaigns remain readable and writable. `campaign migrate-state ID`
+requires quiescent workers and reconciled effects, preserves the byte-exact
+`snapshot.v1.backup.json`, commits the new database and atomically switches the
+marker. Older binaries reject that marker. Copying only a live SQLite main file
+does not include its write-ahead log; use SQLite's consistent backup mechanism
+when copying authority. Keep original transcript and worktree evidence until its retention rules
+permit removal.
+
 ## Project `.bmad-loop/` directory
 
 | Path                                 | Contents                                                                                                | Gitignored by `init` |
@@ -248,3 +270,9 @@ Both stop modes write `stop-request.json` (`{"requested_at": …, "mode": "hard"
 - `[cleanup] auto_clean_on_finish` makes each `run` and `sweep` start by tearing down worktrees left under finished runs.
 
 See the [`[cleanup]` settings](configuration.md#cleanup).
+
+Completed, superseded read-only campaign observations move transactionally into
+an indexed SQLite archive. The latest observation per unit/kind and all uncertain
+operations remain in hot state. Mutation/launch/checkpoint receipts remain hot
+because synchronization and recovery use their historical identities. Polling
+history is bounded in memory; total mutation-history growth is not yet bounded.

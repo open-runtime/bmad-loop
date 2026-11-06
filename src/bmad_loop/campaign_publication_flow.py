@@ -41,8 +41,12 @@ def controller(runtime, snapshot):
 
 
 def proposals(runtime, snapshot, unit, reserve):
-    candidate = runtime._candidate(snapshot, unit)
     spec = snapshot.spec.github
+    if not (spec.review_users or spec.review_teams) and (
+        spec.merge_mode != "queue" or spec.candidate_publish != "native"
+    ):
+        return (Proposal("prepare-merge", unit.id),)
+    candidate = runtime._candidate(snapshot, unit)
     if (spec.review_users or spec.review_teams) and unit.bindings.get(
         "recruited_head"
     ) != candidate.head:

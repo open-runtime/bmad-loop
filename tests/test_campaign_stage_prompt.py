@@ -42,11 +42,10 @@ def test_packet_redirect_and_unbounded_inputs_are_refused(tmp_path):
 def test_stage_worker_delivers_large_packet_through_short_adapter_prompt(
     project, tmp_path, monkeypatch
 ):
-    from types import SimpleNamespace
-
     from test_campaign_workers import envelope, worker_request
 
     from bmad_loop import campaign_workers as workers
+    from bmad_loop.adapters.base import SessionResult
 
     context = envelope(project.project, tmp_path / "execution")
     context.directory.mkdir()
@@ -58,7 +57,7 @@ def test_stage_worker_delivers_large_packet_through_short_adapter_prompt(
             assert len(spec.prompt.encode()) < 2048
             assert str(context.directory / "stage-packet.md") in spec.prompt
             assert "complete inventory" in (context.directory / "stage-packet.md").read_text()
-            return SimpleNamespace(
+            return SessionResult(
                 status="completed",
                 result_json={"status": "done"},
                 session_id="scripted",

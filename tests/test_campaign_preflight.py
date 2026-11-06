@@ -14,6 +14,7 @@ from bmad_loop.campaign_model import (
     CommunicationSpec,
     GitHubSpec,
     ParadevSpec,
+    ReasoningSpec,
     ResourceSpec,
     RoleSpec,
     UnitSpec,
@@ -71,6 +72,16 @@ def test_role_currency_budget_has_explicit_readiness_failure(project, tmp_path, 
     assert any(
         "escalation: USD" in item for item in result["capabilities"]["execution"]["problems"]
     )
+
+
+def test_reasoning_requires_qualification_even_when_binary_and_capacity_are_available(
+    project, tmp_path, monkeypatch
+):
+    selected = replace(spec(tmp_path), reasoning=ReasoningSpec(enabled=True))
+    result = inspect(project, tmp_path, monkeypatch, selected)
+    planning = result["capabilities"]["planning"]
+    assert not planning["ready"]
+    assert "reasoning requires a qualified capabilities manifest" in planning["problems"]
 
 
 def test_unsupported_candidate_read_confinement_is_visible_before_execution(

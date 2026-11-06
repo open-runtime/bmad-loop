@@ -230,7 +230,7 @@ def test_production_campaign_queue_checks_exact_g_and_preserves_h_on_lost_ack(
     script.write_text(source())
     probe = tmp_path / "authenticated-app-producer.py"
     probe.write_text(
-        "import json,time\nprint(json.dumps({'schema_version':1,'repository':'a/b','context':'CI','app_id':7,'mode':'native','authenticated':True,'producer':'scripted-github-app','checks_write':True,'observed_at':time.monotonic()*100}))\n"
+        "import json,time\nprint(json.dumps({'schema_version':1,'repository':'a/b','context':'CI','app_id':7,'mode':'native','authenticated':True,'producer':'scripted-github-app','checks_write':True,'observed_at':time.monotonic()*10}))\n"
     )
     settings = GitHubSpec(
         repository="a/b",

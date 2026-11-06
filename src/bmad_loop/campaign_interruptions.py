@@ -68,6 +68,8 @@ def execution_interruption(sessions: list[dict[str, Any]]) -> dict[str, Any] | N
         "schema_version": 1,
         "kind": kind,
         "session_id": last.get("session_id"),
+        "role": last.get("role", ""),
+        "task_id": last.get("task_id", ""),
         "status": last.get("status", ""),
         "reason": last.get("ended", ""),
         "native_binding": binding,

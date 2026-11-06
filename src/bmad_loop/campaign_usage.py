@@ -463,7 +463,20 @@ def admission_reason(
     if payload.get("kind") == "execution":
         if unit.evidence.get("usage", {}).get("legacy_counters_unknown"):
             return "native lifetime attempt accounting is unavailable; reconcile original run first"
-        if remaining(snapshot, unit)[0] <= 0:
+        handoff = unit.evidence.get("handoff") or {}
+        review_only = bool(
+            payload.get("handoff_id")
+            and payload["handoff_id"] == handoff.get("id")
+            and handoff.get("native_role") == "review"
+            and handoff.get("role") == "execution"
+            and handoff.get("phase") in {"ready", "continuing"}
+            and payload.get("review_candidate") == handoff.get("candidate")
+        )
+        dev, review = remaining(snapshot, unit)
+        if review_only:
+            if review <= 0:
+                return "campaign lifetime child review attempt budget exhausted"
+        elif dev <= 0:
             return "campaign lifetime development attempt budget exhausted"
     if payload.get("role") == "publication_review":
         limit = int(

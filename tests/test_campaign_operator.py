@@ -180,3 +180,56 @@ def test_group_identity_separates_sources_and_initiatives():
     assert group_identity(left, "epic") == group_identity(
         dataclasses.replace(left, id="sibling"), "epic"
     )
+
+
+def test_current_codex_provenance_distinguishes_owner_and_harness_input(tmp_path):
+    path = tmp_path / "native.jsonl"
+    meta = {"type": "session_meta", "payload": {"id": "session", "source": "cli"}}
+    row = {
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "id": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Keep required acceptance."}],
+            "internal_chat_message_metadata_passthrough": {
+                "content_item_kinds": ["user.text"],
+                "content_item_metadata": [{"provenance": {"type": "user"}}],
+            },
+        },
+    }
+    provider = TranscriptEvidenceProvider(roots={"codex": (tmp_path,)})
+    location = EvidenceLocation(
+        "owner", "transcript", f"codex:{path}#session:message", authority="owner"
+    )
+    path.write_text(json.dumps(meta) + "\n" + json.dumps(row) + "\n")
+    assert provider(location).content == "Keep required acceptance."
+    row["payload"]["internal_chat_message_metadata_passthrough"]["content_item_metadata"][0][
+        "provenance"
+    ]["type"] = "harness"
+    path.write_text(json.dumps(meta) + "\n" + json.dumps(row) + "\n")
+    with pytest.raises(CampaignError, match="not an owner"):
+        provider(location)
+
+
+def test_parent_agent_task_cannot_be_owner_evidence(tmp_path):
+    path = tmp_path / "native.jsonl"
+    rows = [
+        {
+            "type": "session_meta",
+            "payload": {
+                "id": "child",
+                "source": {"subagent": {"thread_spawn": {"parent_thread_id": "root"}}},
+            },
+        },
+        {
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "Delegated task, not owner approval"},
+        },
+    ]
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    provider = TranscriptEvidenceProvider(roots={"codex": (tmp_path,)})
+    with pytest.raises(CampaignError, match="subagent"):
+        provider(
+            EvidenceLocation("owner", "transcript", f"codex:{path}#child:line-2", authority="owner")
+        )

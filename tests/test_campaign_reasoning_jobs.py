@@ -229,3 +229,35 @@ def test_schema_validation_rejects_type_confusion_and_invented_fields(value):
                 "required": ["answer"],
             },
         )
+
+
+@pytest.mark.parametrize("known_first", [False, True])
+def test_runtime_reasoning_cost_is_idempotent_and_missing_cost_stays_unknown(
+    tmp_path, prepared, known_first
+):
+    from bmad_loop import campaign_reasoning_flow
+    from bmad_loop.campaign_supervisor import Observation
+
+    snapshot, driver, supervisor, _ = case(tmp_path, prepared, count=2)
+    snapshot = supervisor._queue(snapshot, driver.observe_workers(snapshot))
+    for index, action in enumerate(snapshot.outbox):
+        row = snapshot.jobs[action.payload["job_id"]]
+        usage = {"input_tokens": 17}
+        if known_first or index == 1:
+            usage["cost_usd"] = 0.25
+        receipt = {
+            "job_id": row["id"],
+            "request_digest": row["request_digest"],
+            "launch_id": row["claim"]["launch_id"],
+            "generation": row["claim"]["generation"],
+            "quiescent": True,
+            "outcome": "quota",
+            "usage": usage,
+        }
+        observation = Observation("confirmed", {"state": "finished", "receipt": receipt})
+        campaign_reasoning_flow.apply(driver, snapshot, action, observation)
+        campaign_reasoning_flow.apply(driver, snapshot, action, observation)
+    assert snapshot.bindings["reasoning_usage"]["totals"]["input_tokens"] == 34
+    assert snapshot.bindings["reasoning_usage"]["complete_cost"] is known_first
+    assert snapshot.bindings["spend_usd"] == (0.5 if known_first else None)
+    assert snapshot.bindings["role_spend"]["summarization"] == (0.5 if known_first else None)

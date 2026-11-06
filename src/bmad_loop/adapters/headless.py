@@ -49,6 +49,20 @@ class HeadlessAdapter(CodingCLIAdapter):
     def set_capability(self, capability, grants, coordinates, handoff_packet=None):
         self.capability = copy.deepcopy(capability)
         self.grants = copy.deepcopy(grants)
+        if capability.get("permissions") == "workspace-tools" and self.grants:
+            from ..campaign_execution_sandbox import _path
+
+            workspace = Path(self.grants["workspace"]).resolve()
+            approved = []
+            for raw in capability.get("runtime_write_paths", []):
+                path = _path(raw)
+                if path.is_relative_to(workspace) or workspace.is_relative_to(path):
+                    raise CampaignError("Native runtime write grant overlaps product ownership")
+                approved.append(str(path))
+            if approved:
+                self.grants["runtime_write_paths"] = list(
+                    dict.fromkeys([*self.grants.get("runtime_write_paths", []), *approved])
+                )
         self.coordinates = copy.deepcopy(coordinates)
         self.handoff_packet = copy.deepcopy(handoff_packet)
 
@@ -177,6 +191,7 @@ class HeadlessAdapter(CodingCLIAdapter):
                 "observed_model": receipt.get("observed_model", ""),
                 "observed_models": receipt.get("observed_models", []),
                 "reasoning_receipt": str(path.parent / "receipt.json"),
+                "headless_request": str(path),
                 "outcome": outcome,
                 "quiescent": True,
                 "input_delivery": receipt.get("input_delivery", {}),

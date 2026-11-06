@@ -42,6 +42,10 @@ bmad-loop campaign migration-qualify SPEC MANIFEST [--json]
 bmad-loop campaign run SPEC [--paradev-reflect] [--paradev-project ID] [--json]
 bmad-loop campaign list [--json]
 bmad-loop campaign status ID [--json]
+bmad-loop campaign history ID [--unit UNIT] [--role ROLE] [--after SEQUENCE] [--limit N] [--json]
+bmad-loop campaign jobs ID [--unit UNIT] [--job JOB] [--after JOB_ID] [--limit N] [--details] [--json]
+bmad-loop campaign handoff ID --unit UNIT [--profile PROFILE] [--model MODEL] [--effort EFFORT] [--reason TEXT] [--json]
+bmad-loop campaign migrate-state ID [--json]
 bmad-loop campaign resume ID [--json]
 bmad-loop campaign stop ID [--terminate-workers] [--json]
 bmad-loop campaign hold ID --unit UNIT --reason TEXT [--json]
@@ -61,6 +65,16 @@ termination is requested. Release only requests removal of an operator hold.
 It observes current process, source and Git identity before clearing that hold
 and invalidates affected acceptance evidence. Hold suppresses automatic input,
 retries and publication while an active actor can finish naturally.
+
+History uses an integer event sequence cursor; jobs use a string job-ID cursor.
+Both paginate durable records, including completed jobs outside the hot state.
+`--details` exposes sanitized lifecycle fields, not raw prompts or model results.
+Attach selects the requested role and returns retained file history when its
+terminal has finished. Handoff requests continuation through a frozen approved
+route; it does not move a live native session. Uncertain predecessor ownership,
+missing route qualification or incomplete constraint recovery remains visible.
+Storage migration requires drained workers and reconciled effects, preserves
+the exact old snapshot and makes the new authority unreadable to older binaries.
 
 Migration inventory caches an immutable external receipt and returns an owner
 manifest template. Qualification compares fresh authenticated service/object
@@ -789,3 +803,24 @@ Every finding's `check` is one of these ids. Severity is `ok`, `warning` or `pro
 | `tickets.capability-not-run`           | ok                     | tickets mode without `--probes`: the capability probe did not run                                                                                       |
 
 The set is closed (`checks.VALIDATE_CHECKS`); plugins cannot add check ids.
+
+`bmad-loop campaign authorize-scope ID --unit UNIT --expected-revision N --reason TEXT`
+queues explicit operator authorization for acceptance reductions already present in a
+delivered revised planning PR. Inspect the current acceptance ledger first. The
+coordinator rechecks the exact scope and graph revision; stale authorization fails.
+This command preserves unrelated holds and required GitHub reviews.
+
+### Native campaign qualification
+
+- `bmad-loop campaign qualify-headless PROPOSAL --directory DIRECTORY [--input-bytes N] [--output-tokens N] [--timeout SECONDS] [--json]`: explicitly run a fixed native no-tools canary and write observed route qualification. The default input is 16,384 bytes, requested output ceiling is 4,096 tokens and timeout is 180 seconds. Successful coverage is limited to measured input and output; no normal campaign launch bypasses qualification.
+- `bmad-loop campaign trial-handoff SNAPSHOTS --capability CAPABILITY --directory DIRECTORY [--parallel N] [--timeout SECONDS] [--prepare-only] [--json]`: qualify sealed history using durable native map/reduce jobs. Parallelism defaults to four and is bounded to 1–16; each job defaults to 600 seconds. Preparation sends no prompt. Structural completion does not grant semantic handoff qualification. Resume with identical source/capability hashes and bounds to reuse validated work.
+
+These explicit operator commands may use the selected provider. Their automated
+regression tests always use scripted zero-token processes. Keep qualification
+artifacts in a private directory outside tracked source files.
+
+`bmad-loop campaign history ID --observations --after N --limit N [--unit UNIT]`
+reads archived, superseded observations with a separate sequence cursor. The
+latest completed observation per unit/kind remains hot, as do all uncertain
+operations, launches, checkpoints and mutation receipts. These pages preserve
+polling history without replaying it; they are not the full mutation archive.

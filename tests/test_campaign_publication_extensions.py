@@ -342,3 +342,82 @@ def test_project_executor_intent_cannot_fall_back_to_native_submission(
     with pytest.raises(GithubError, match="cannot use native"):
         controller.gateway.execute(replace(intent, state="sent_unknown"), generation=1)
     assert not controller.gateway.transport.calls
+
+
+def test_acknowledged_team_recruitment_survives_immediate_fulfillment(publishable, monkeypatch):
+    from bmad_loop.campaign_github import ApiResponse
+
+    controller, candidate, _, observation = publishable
+    monkeypatch.setattr(controller, "inspect", lambda _: observation)
+    intent = prepare_requests(
+        controller, candidate, teams=("security",), action_id="r1", generation=1
+    )
+    calls = []
+
+    def request(method, path, payload):
+        calls.append((method, path))
+        return ApiResponse(201, {**observation.pr, "requested_teams": [{"slug": "security"}]}, {})
+
+    monkeypatch.setattr(controller.gateway.transport, "request", request)
+    result = execute_requests(controller, replace(intent, state="sent_unknown"), generation=1)
+    assert not observation.requested_teams
+    assert result.state == "confirmed"
+    assert reconcile_requests(controller, result).state == "confirmed"
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("change", ["head", "repository", "number", "teams", "status"])
+def test_unrelated_ack_cannot_confirm_absent_recruitment(publishable, monkeypatch, change):
+    controller, candidate, _, observation = publishable
+    monkeypatch.setattr(controller, "inspect", lambda _: observation)
+    intent = prepare_requests(
+        controller, candidate, teams=("security",), action_id="r1", generation=1
+    )
+    receipt = {**observation.pr, "http_status": 201, "requested_teams": [{"slug": "security"}]}
+    if change == "head":
+        receipt["head"] = {"sha": "different"}
+    elif change == "repository":
+        receipt["base"] = {"ref": candidate.target, "repo": {"full_name": "other/repo"}}
+    elif change == "number":
+        receipt["number"] = candidate.pr_number + 1
+    elif change == "teams":
+        receipt["requested_teams"] = [{"slug": "other"}]
+    else:
+        receipt["http_status"] = 409
+    result = reconcile_requests(controller, replace(intent, state="sent_unknown", receipt=receipt))
+    assert result.state == "sent_unknown"
+    assert not controller.gateway.transport.calls
+
+
+def test_observed_recruitment_remains_confirmed_after_team_answers(publishable, monkeypatch):
+    controller, candidate, _, observation = publishable
+    current = [observation]
+    monkeypatch.setattr(controller, "inspect", lambda _: current[0])
+    intent = prepare_requests(
+        controller, candidate, teams=("security",), action_id="r1", generation=1
+    )
+    current[0] = replace(observation, requested_teams=("security",))
+    observed = reconcile_requests(controller, replace(intent, state="sent_unknown"))
+    current[0] = observation
+    assert reconcile_requests(controller, observed).state == "confirmed"
+
+
+def test_successful_recruitment_does_not_depend_on_another_get(publishable, monkeypatch):
+    from bmad_loop.campaign_github import ApiResponse
+
+    controller, candidate, _, observation = publishable
+    monkeypatch.setattr(controller, "inspect", lambda _: observation)
+    intent = prepare_requests(
+        controller, candidate, teams=("security",), action_id="r1", generation=1
+    )
+
+    def unavailable(_):
+        raise GithubError("readback temporarily unavailable")
+
+    def request(*args):
+        monkeypatch.setattr(controller, "inspect", unavailable)
+        return ApiResponse(201, {**observation.pr, "requested_teams": [{"slug": "security"}]}, {})
+
+    monkeypatch.setattr(controller.gateway.transport, "request", request)
+    result = execute_requests(controller, replace(intent, state="sent_unknown"), generation=1)
+    assert result.state == "confirmed"

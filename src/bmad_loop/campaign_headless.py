@@ -65,18 +65,20 @@ def provider_family(model: str) -> str:
     return ""
 
 
-def validate_capability(
+def _validate_capability(
     raw: dict[str, Any],
     candidate: RoleCandidate,
     *,
     verify_files: bool = True,
     permissions: str = "no-tools",
+    qualification_required: bool = True,
 ) -> None:
     """Validate a frozen route qualification, never infer capability from PATH.
 
     The qualification evidence is operator-owned, versioned test output. Its
-    measured input/output ceiling bounds this manifest; a tiny sentinel run
-    cannot qualify a million-token route.
+    measured input coverage bounds this manifest; a tiny sentinel run cannot
+    qualify a million-token route. Configured output ceilings and their enforcement
+    mechanism remain distinct from the observed canary output volume.
     """
     if raw.get("platform") != sys.platform:
         raise CampaignError("Headless native route is not qualified on this platform")
@@ -90,6 +92,19 @@ def validate_capability(
         raise CampaignError("Headless route requires the exact versioned permission qualification")
     if permissions not in {"no-tools", "workspace-tools"}:
         raise CampaignError("Unsupported headless tool grant")
+    runtime_paths = raw.get("runtime_write_paths", [])
+    if not isinstance(runtime_paths, list) or any(
+        not isinstance(value, str)
+        or not value
+        or not Path(value).is_absolute()
+        or Path(value) in {Path(Path(value).anchor), Path.home()}
+        or Path(value).resolve() != Path(value)
+        or is_link_like(Path(value))
+        for value in runtime_paths
+    ):
+        raise CampaignError("Headless runtime write paths must be explicit non-root native paths")
+    if permissions == "no-tools" and runtime_paths:
+        raise CampaignError("No-tools routes cannot carry execution write grants")
     if raw.get("process_containment") != "foreground-contained":
         raise CampaignError("Reasoning requires qualified foreground process containment")
     if raw.get("input_mode") not in {"text-stdin", "claude-stream-stdin", "prompt-file"}:
@@ -110,34 +125,62 @@ def validate_capability(
     binary = Path(raw.get("binary", ""))
     if not binary.is_absolute() or raw["argv"][0] != str(binary):
         raise CampaignError("Qualified argv must name its exact absolute executable")
-    evidence = raw.get("qualification", {})
-    if not isinstance(evidence, dict) or evidence.get("status") != "passed":
-        raise CampaignError("Native headless qualification has not passed")
-    required = {
-        "full_input",
-        "no_tools" if permissions == "no-tools" else "scoped_tools",
-        "window_completion",
-        "quiescence",
-        "model_attribution",
-        "structured_output",
-        "turn_bound",
-        "output_bound",
-    }
-    if not required <= set(evidence.get("checks", [])):
-        raise CampaignError("Native headless qualification omits required checks")
+    aliases = raw.get("served_model_aliases", [])
     if (
-        evidence.get("input_tokens", 0) < raw["input_tokens"]
-        or evidence.get("output_tokens", 0) < raw["output_tokens"]
+        not isinstance(aliases, list)
+        or len(set(aliases)) != len(aliases)
+        or any(not isinstance(alias, str) or not alias for alias in aliases)
     ):
-        raise CampaignError("Advertised limits exceed qualified coverage")
+        raise CampaignError("Native served model aliases must be explicit unique identities")
+    if aliases:
+        from .campaign_qualification import validate_alias_evidence
+
+        validate_alias_evidence(raw)
+    evidence = raw.get("qualification", {})
+    if qualification_required:
+        if not isinstance(evidence, dict) or evidence.get("status") != "passed":
+            raise CampaignError("Native headless qualification has not passed")
+        if not set(aliases) <= set(evidence.get("served_models", [])):
+            raise CampaignError("Served model alias lacks earned qualification evidence")
+        required = {
+            "full_input",
+            "no_tools" if permissions == "no-tools" else "scoped_tools",
+            "window_completion",
+            "quiescence",
+            "model_attribution",
+            "structured_output",
+            "turn_bound",
+            "output_bound",
+        }
+        if not required <= set(evidence.get("checks", [])):
+            raise CampaignError("Native headless qualification omits required checks")
+        if (
+            evidence.get("input_tokens", 0) < raw["input_tokens"]
+            or evidence.get("output_tokens", 0) < raw["output_tokens"]
+        ):
+            raise CampaignError("Advertised limits exceed qualified coverage")
     if verify_files:
         if file_digest(binary) != raw.get("binary_sha256"):
             raise CampaignError("Qualified executable changed")
         for item in raw.get("dependencies", []):
             if file_digest(Path(item["path"])) != item["sha256"]:
                 raise CampaignError("Qualified wrapper/native dependency changed")
-        if file_digest(Path(evidence.get("path", ""))) != evidence.get("sha256"):
+        if qualification_required and file_digest(Path(evidence.get("path", ""))) != evidence.get(
+            "sha256"
+        ):
             raise CampaignError("Native qualification evidence changed")
+
+
+def validate_capability(raw, candidate, *, verify_files=True, permissions="no-tools") -> None:
+    """Normal campaign launches always require earned native qualification."""
+    _validate_capability(raw, candidate, verify_files=verify_files, permissions=permissions)
+
+
+def validate_probe_capability(raw, candidate) -> None:
+    """Operator canaries validate exact binaries but cannot claim qualification."""
+    if raw.get("qualification", {}).get("status") == "passed":
+        raise CampaignError("Probe proposals must not claim already-passed qualification")
+    _validate_capability(raw, candidate, permissions="no-tools", qualification_required=False)
 
 
 def load_capabilities(path: Path) -> dict[str, Any]:
@@ -232,6 +275,63 @@ class HeadlessRunner:
 
     def prepare(
         self,
+        directory,
+        request,
+        selection,
+        capability,
+        *,
+        launch_id,
+        generation,
+        permissions="no-tools",
+        grants=None,
+        environment=None,
+    ) -> Path:
+        return self._prepare(
+            directory,
+            request,
+            selection,
+            capability,
+            launch_id=launch_id,
+            generation=generation,
+            permissions=permissions,
+            grants=grants,
+            environment=environment,
+        )
+
+    def prepare_probe(
+        self,
+        directory,
+        selection,
+        capability,
+        *,
+        input_bytes=16384,
+        output_tokens=4096,
+        timeout_s=180,
+    ) -> Path:
+        """Prepare only the fixed operator qualification canary, never arbitrary work."""
+        from .campaign_qualification import build_probe
+
+        validate_probe_capability(capability, selection)
+        request, probe = build_probe(
+            directory,
+            selection,
+            capability,
+            input_bytes=input_bytes,
+            output_tokens=output_tokens,
+            timeout_s=timeout_s,
+        )
+        return self._prepare(
+            directory,
+            request,
+            selection,
+            capability,
+            launch_id="probe-" + probe["nonce"],
+            generation=1,
+            probe=probe,
+        )
+
+    def _prepare(
+        self,
         directory: Path,
         request: JobRequest,
         selection: RoleCandidate,
@@ -242,6 +342,7 @@ class HeadlessRunner:
         permissions: str = "no-tools",
         grants: dict[str, Any] | None = None,
         environment: dict[str, str] | None = None,
+        probe: dict[str, Any] | None = None,
     ) -> Path:
         request.validate()
         if environment and any(
@@ -251,7 +352,17 @@ class HeadlessRunner:
             raise CampaignError("Headless environment contains an unsupported override")
         if selection not in request.candidates:
             raise CampaignError("Selected headless route is not authorized by the request")
-        validate_capability(capability, selection, permissions=permissions)
+        if probe is None:
+            validate_capability(capability, selection, permissions=permissions)
+        else:
+            from .campaign_qualification import validate_probe_request
+
+            if permissions != "no-tools" or grants or environment:
+                raise CampaignError(
+                    "Qualification canaries cannot grant tools or environment overrides"
+                )
+            validate_probe_capability(capability, selection)
+            validate_probe_request(request, probe)
         if permissions == "workspace-tools" and (
             not grants
             or grants.get("schema_version") != 1
@@ -298,6 +409,8 @@ class HeadlessRunner:
             + hashlib.sha256(str(directory.parent).encode()).hexdigest()[:16],
             "window_name": "job-" + hashlib.sha256(launch_id.encode()).hexdigest()[:24],
         }
+        if probe is not None:
+            envelope.update(probe=probe, probe_digest=digest(probe))
         path = directory / "request.json"
         with file_lock(directory / "prepare.lock"):
             if path.exists():
@@ -316,7 +429,15 @@ class HeadlessRunner:
         envelope = read_json(request_path)
         directory = request_path.parent
         candidate = RoleCandidate(**envelope["selection"])
-        validate_capability(envelope["capability"], candidate, permissions=envelope["permissions"])
+        if envelope.get("probe") is not None:
+            from .campaign_qualification import validate_probe_envelope
+
+            validate_probe_envelope(envelope)
+            validate_probe_capability(envelope["capability"], candidate)
+        else:
+            validate_capability(
+                envelope["capability"], candidate, permissions=envelope["permissions"]
+            )
         with file_lock(directory / "launch.lock"):
             intent = directory / "launch-intent.json"
             if intent.exists():

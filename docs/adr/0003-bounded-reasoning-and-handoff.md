@@ -1,6 +1,6 @@
 # ADR 0003: Bounded reasoning jobs and portable session handoff
 
-- **Status:** Accepted implementation contract; implementation and qualification pending
+- **Status:** Implemented in the development PR; native qualification and review gates remain incomplete
 - **Date:** 2026-11-06
 - **Extends:** [ADR 0002](0002-native-sdlc-campaign.md) and its [implementation contract](0002-campaign-implementation.md)
 - **Delivery:** The same campaign implementation PR, before autonomous project activation
@@ -414,6 +414,44 @@ plus operator task/history/communication paths. They establish wiring and determ
 guards. Native route, sidebar/session and semantic-fidelity qualifications remain
 separate gates; these fixture results do not establish autonomous REM readiness.
 
+## Current storage, continuation and qualification boundaries
+
+SQLite stores the durable job/outbox transaction and indexed event history.
+Terminal reasoning jobs leave hot authority while remaining queryable. Coordinator
+interruption reloads committed authority before recording drain; an interrupted
+save acknowledgement is never permission to replay an old revision. Observation
+and termination have independently admitted executor slots, including when regular
+I/O is saturated. Concurrent GitHub hierarchy observations apply field deltas with
+preimages and identity/state fences rather than replacing a stale full projection.
+
+Execution pools select both development and ordinary child-review routes. A
+cross-harness continuation preserves the same worktree, draft PR, partial product,
+source obligations and all contributor families. Interrupted ordinary review uses
+a fresh run with an exact predecessor permit, preserving the remaining review and
+development counters without replaying completed development. Accepted-review and
+stopped-native reservations remain fenced; they are not ordinary-review permits.
+
+Headless write-capable execution requires a qualified native route and an OS
+confinement wrapper. The shipped macOS wrapper enforces frozen product/private-source,
+owned Git branch and explicitly granted harness-runtime paths for descendants.
+Read-only history cannot overlap writable grants. Other operating systems currently
+refuse this execution wrapper; their existing legacy transports are unaffected.
+No route becomes qualified merely because a profile or this wrapper exists.
+
+`qualify-headless` records exact input-canary coverage, native outcome/identity,
+usage and owned quiescence. `trial-handoff` operates on sealed explicit histories
+outside the repository test suite. Transport qualification is distinct from the
+independent semantic-fidelity receipt required for automatic summarized handoff.
+Native account exhaustion is a retained failed probe or capacity wait, never a
+reason to manufacture qualification or silently omit history. Current full-history
+and independent-fidelity qualification remain incomplete.
+
+A delivered revised plan does not itself waive prior acceptance. The explicit
+`authorize-scope` control binds the operator's reason to the exact ledger revision,
+before/after scope and delivered planning revision; changed coordinates refuse it.
+Reintroducing a waived criterion makes it required again. This operation never
+clears another owner hold or supplies a GitHub review approval.
+
 ## Capability evidence and limits
 
 These references inform qualification; public API limits are not proof of the
@@ -436,3 +474,25 @@ effective installed CLI route or its automatic compaction boundary.
 Native wrappers can perform registration or updates even for capability commands.
 Use reviewed, version-pinned probe paths with those effects disabled through
 supported controls; capability discovery must not start a coding session.
+
+### Native qualification and full-history trial implementation
+
+The operator qualification path uses a fixed canary and the same owned terminal
+runner as normal jobs. Its narrowly scoped bootstrap cannot accept an arbitrary
+prompt, source grammar, tool grant or changed result schema. Successful receipts
+bound qualified coverage to observed input and output and retain selected versus
+served model identities. The normal launch path continues to require earned
+qualification. Grok prompt-file recipes must preserve full input with its native
+verbatim option; Muse recipes pin the native binary and suppress launcher updates.
+Native protocol decoders preserve structured quota failures and provider usage.
+
+The separate `campaign trial-handoff` command reads explicitly sealed prefixes,
+checks their immutable source hashes, deduplicates only verified inherited native
+records, plans bounded maps and reducers, and persists each native receipt and
+source-cited result. Jobs use the production validators. A failed job stops new
+admissions while admitted jobs drain; rerunning the same frozen trial reuses its
+validated results. Its structural-completion report cannot grant semantic
+qualification. A separate independent-provider review must establish critical
+constraint fidelity and absence of invented authority before automatic handoff.
+The real whole-thread trial remains a qualification gate; a successful fixed
+transport canary and scripted regression coverage do not satisfy it.
