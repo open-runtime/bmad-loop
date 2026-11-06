@@ -287,6 +287,29 @@ def apply_stage(
         not artifacts or any(not row.get("path") or not row.get("sha256") for row in artifacts)
     ):
         raise CampaignError("planning stage has no independently verified durable artifacts")
+    from .campaign_planning_skill import decisions
+
+    unresolved = decisions(raw)
+    if unresolved:
+        unit.evidence.setdefault("planning_decisions", []).append(
+            {"stage": stage, "head": head, "launch_id": launch_id, "decisions": unresolved}
+        )
+    if any(row["blocking"] for row in unresolved):
+        launches[0].update(state="awaiting_decision", head=head)
+        state["head"] = head
+        state["state"] = "planning"
+        unit.evidence["planning_flow"] = state
+        unit.hold = Hold(
+            "planning_decision",
+            "Planning requires an unresolved product decision",
+            id=launch_id,
+            actor="planning",
+            evidence={"stage": stage, "head": head, "decisions": unresolved},
+        )
+        add_event(
+            snapshot, "planning-decision-pending", unit=unit_id, stage=stage, launch=launch_id
+        )
+        return
     if stage == "planning_review":
         proposal = state.get("proposal")
         if not proposal or raw.get("graph_digest") != proposal["digest"]:
@@ -318,7 +341,7 @@ def apply_stage(
             state["stages"][stage] = dict(receipt)
             state["findings"] = []
         elif verdict == "hold":
-            state["state"] = "held"
+            state["state"] = "planning"
             unit.hold = Hold(
                 "planning_decision",
                 "Planning review requires an unresolved decision",

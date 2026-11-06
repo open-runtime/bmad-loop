@@ -17,7 +17,7 @@ from typing import Any, Callable, Mapping
 
 from . import verify
 from .campaign_model import CampaignError, CampaignSnapshot, EvidenceCoordinates, Hold
-from .campaign_store import add_event
+from .campaign_store import add_action, add_event
 from .platform_util import atomic_write_text
 
 _DISPOSITIONS = frozenset(
@@ -270,6 +270,8 @@ def validate_decision(
     disposition = raw.get("disposition")
     if disposition not in _DISPOSITIONS:
         raise CampaignError("unknown decision disposition")
+    if disposition in _AUTONOMOUS and context.unavailable:
+        raise CampaignError("decision evidence coverage is incomplete")
     answer = raw.get("answer", "")
     action = raw.get("action", "")
     if not isinstance(answer, str) or not isinstance(action, str):
@@ -406,7 +408,7 @@ def validate_decision(
                 "allow_prior_approval", False
             ):
                 raise CampaignError("checkpoint does not permit prior approval")
-        elif hold.kind not in {"product_choice", "design_choice", "decision"}:
+        elif hold.kind not in {"product_choice", "planning_decision", "design_choice", "decision"}:
             # CI, tracking, ownership and capacity waits use deterministic
             # producer-specific reconciliation, never model-issued approval.
             raise CampaignError("this hold is not clearable by decision evidence review")
@@ -469,6 +471,11 @@ def apply_decision(snapshot: CampaignSnapshot, unit_id: str, receipt: DecisionRe
         raise CampaignError("decision candidate head changed")
     receipts = snapshot.bindings.setdefault("decision_receipts", {})
     receipts[receipt.id] = asdict(receipt)
+    projection = "decision-project:" + receipt.id
+    if not any(action.id == projection for action in snapshot.outbox):
+        add_action(
+            snapshot, "decision-project", unit_id, {"decision_id": receipt.id}, action_id=projection
+        )
     if receipt.clear_hold:
         previous = asdict(unit.hold)
         unit.hold = None

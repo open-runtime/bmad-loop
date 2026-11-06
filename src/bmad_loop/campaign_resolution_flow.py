@@ -59,6 +59,7 @@ _DECISION_HOLDS = frozenset(
         "operator",
         "owner_stop",
         "product_choice",
+        "planning_decision",
         "design_choice",
         "decision",
         "plan_checkpoint",
@@ -301,6 +302,7 @@ def collect_context(
     providers: Mapping[str, Callable[[EvidenceLocation], EvidenceSource]] | None = None,
     mapped_sources: tuple[EvidenceSource, ...] = (),
     facts: tuple[ObservedFact, ...] = (),
+    mapped_unavailable: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Bounded read-only I/O effect. Save its returned packet before dispatch."""
     unit = snapshot.units[unit_id]
@@ -336,6 +338,7 @@ def collect_context(
             unavailable=(
                 *collection.unavailable,
                 *(f"{source}: truncated" for source in collection.truncated),
+                *mapped_unavailable,
             ),
         )
         packet = decision_packet(context)
@@ -464,6 +467,7 @@ def validate_stage_result(
     providers: Mapping[str, Callable[[EvidenceLocation], EvidenceSource]] | None = None,
     mapped_sources: tuple[EvidenceSource, ...] = (),
     facts: tuple[ObservedFact, ...] | None = None,
+    mapped_unavailable: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """I/O executor validates fresh source/head bindings after read-only session."""
     unit = snapshot.units[unit_id]
@@ -497,8 +501,14 @@ def validate_stage_result(
             providers=providers,
             mapped_sources=mapped_sources,
             facts=facts or (),
+            mapped_unavailable=mapped_unavailable,
         )
-        fresh_sources = {source.id: source for source in decision_context(fresh["packet"]).sources}
+        refreshed = decision_context(fresh["packet"])
+        fresh_sources = {source.id: source for source in refreshed.sources}
+        if fresh_sources != {source.id: source for source in context.sources}:
+            raise CampaignError("decision evidence changed or was revoked after evidence review")
+        if refreshed.unavailable:
+            context = dataclasses.replace(context, unavailable=refreshed.unavailable)
         accepted = validate_decision(receipt["artifact"], context, current_sources=fresh_sources)
         return {"kind": "decision", "accepted": dataclasses.asdict(accepted)}
     context = resolution_context(packet)

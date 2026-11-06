@@ -1028,6 +1028,7 @@ class CampaignRuntime:
             "release-observation",
             "stage-boundary-after",
             "terminate-worker",
+            "decision-project",
         }:
             from . import campaign_hold
 
@@ -1040,6 +1041,12 @@ class CampaignRuntime:
                 campaign=snapshot.id,
                 unit=action.unit,
             ):
+                if action.kind == "github" and action.payload.get("purpose") == "decision-summary":
+                    return Observation(
+                        "waiting",
+                        reason="operator hold delays decision summary publication",
+                        retry_at=self.clock() + 5,
+                    )
                 return Observation("confirmed", {"operator_suppressed": True})
         handler = getattr(self, "_perform_" + action.kind.replace("-", "_"), None)
         if handler is None:
@@ -1163,6 +1170,7 @@ class CampaignRuntime:
             "intake-completion-note",
             "usage-hold",
             "resolution-context",
+            "decision-project",
             "resolution-backoff",
             "resolution-reprobe",
             "resolution-accept",
@@ -1335,12 +1343,31 @@ class CampaignRuntime:
             .isoformat()
             .replace("+00:00", "Z")
         )
-        receipt = RepositoryDiscovery(self.gateway(snapshot), self.project).collect(
+        scope_sets = [
+            tuple(
+                path.replace("\\", "/")
+                for path in (*unit.spec.scopes, *unit.spec.paths)
+                if path and not Path(path).is_absolute() and ":" not in path
+            )
+            for unit in snapshot.units.values()
+        ]
+        relevant_paths = (
+            tuple(sorted({path for paths in scope_sets for path in paths}))
+            if all(scope_sets)
+            else ()
+        )
+        receipt = RepositoryDiscovery(
+            self.gateway(snapshot),
+            self.project,
+            cache=self.__dict__.setdefault("_discovery_objects", {}),
+        ).collect(
             remote=snapshot.spec.remote,
             recent_since=since,
             mapped_prs=mapped,
             detailed_prs=None,
             archive_roots=tuple(Path(path) for path in snapshot.spec.archive_roots),
+            target=snapshot.spec.target,
+            relevant_paths=relevant_paths,
         )
         result = {**receipt.to_dict(), "digest": receipt.digest}
         from .campaign_adoption import AdoptionError, guard_owned
@@ -1803,6 +1830,8 @@ class CampaignRuntime:
     def _perform_resolution_context(self, snapshot, action) -> Observation:
         from .campaign_decision_sources import github_provider
         from .campaign_resolution_flow import collect_context
+        from .campaign_runtime_decisions import MappedEvidence
+        from .campaign_runtime_decisions import collect as collect_mapped
 
         current = self.store.load(snapshot.id)
         unit = current.units[action.unit]
@@ -1813,6 +1842,11 @@ class CampaignRuntime:
             or (action.payload.get("head") and unit.bindings.get("head") != action.payload["head"])
         ):
             return Observation("confirmed", {"stale_context": True})
+        mapped = (
+            collect_mapped(self, current, unit)
+            if action.payload["mode"] == "decision"
+            else MappedEvidence()
+        )
         result = collect_context(
             self.project,
             current,
@@ -1822,8 +1856,16 @@ class CampaignRuntime:
                 "github": github_provider(self.gateway(snapshot)),
                 **self.evidence_providers,
             },
+            mapped_sources=mapped.sources,
+            facts=mapped.facts,
+            mapped_unavailable=mapped.unavailable,
         )
         return Observation("confirmed", result)
+
+    def _perform_decision_project(self, snapshot, action) -> Observation:
+        from .campaign_runtime_decisions import project
+
+        return Observation("confirmed", project(self, snapshot, action))
 
     def _perform_resolution_backoff(self, snapshot, action) -> Observation:
         return Observation("confirmed")
@@ -2288,6 +2330,12 @@ class CampaignRuntime:
                 request["prompt"] = custom_prompt(
                     request["custom_prompt"], context["github_stage_inputs"]
                 )
+            if unit.spec.kind == "planning" and stage in snapshot.spec.planning.stages:
+                from .campaign_planning_skill import packet as planning_packet
+
+                request["prompt"], request["native_planning_skill"] = planning_packet(
+                    workspace, snapshot.spec.planning, stage, request["prompt"]
+                )
             request["profile_key"] = "campaign:" + request["candidate"]["profile"]
             request["timeout_s"] = snapshot.spec.role(role).timeout_s
             request["max_tokens"] = snapshot.spec.role(role).max_tokens
@@ -2397,6 +2445,14 @@ class CampaignRuntime:
         if request.get("result_contract") in {"decision-v1", "resolution-v1"}:
             from .campaign_decision_sources import github_provider
             from .campaign_resolution_flow import validate_stage_result
+            from .campaign_runtime_decisions import MappedEvidence
+            from .campaign_runtime_decisions import collect as collect_mapped
+
+            mapped = (
+                collect_mapped(self, snapshot, unit)
+                if request.get("result_contract") == "decision-v1"
+                else MappedEvidence()
+            )
 
             receipt["validated_resolution"] = validate_stage_result(
                 self.project,
@@ -2407,6 +2463,9 @@ class CampaignRuntime:
                     "github": github_provider(self.gateway(snapshot)),
                     **self.evidence_providers,
                 },
+                mapped_sources=mapped.sources,
+                facts=mapped.facts,
+                mapped_unavailable=mapped.unavailable,
             )
         elif request.get("result_contract") == "repair-v1":
             from .campaign_resolution_delivery import validate_repair
@@ -3253,6 +3312,15 @@ class CampaignRuntime:
                 json.dumps(unit.evidence["source_artifacts"], sort_keys=True).encode()
             ).hexdigest()
             transition(snapshot, unit.id, UnitState.LOCALLY_COMPLETE)
+        elif kind == "decision-project":
+            for intent in data["intents"]:
+                self._queue_intent(
+                    snapshot, unit, {"intent": intent, "purpose": "decision-summary"}
+                )
+            unit.bindings.setdefault("decision_projections", {})[data["decision_id"]] = {
+                "ledger": data["ledger"],
+                "summary_actions": [row["action_id"] for row in data["intents"]],
+            }
         elif kind == "resolution-context":
             if data.get("stale_context"):
                 return

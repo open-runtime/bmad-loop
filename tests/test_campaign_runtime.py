@@ -553,6 +553,14 @@ def production_case(project, tmp_path, monkeypatch, request):
     )
     install_build_auto_skill(repo)
     install_build_auto_skill(repo, tree=".agents/skills")
+    planning_skills = tuple(
+        (stage, "fixture-" + stage.replace("_", "-"))
+        for stage in ("requirements", "architecture", "decomposition", "planning_review")
+    )
+    for stage, name in planning_skills:
+        native = repo / ".agents" / "skills" / name / "SKILL.md"
+        native.parent.mkdir(parents=True)
+        native.write_text(f"# Scripted {stage}\nUse the approved packet in unattended mode.\n")
     planning = bool(getattr(request, "param", {}).get("planning"))
     if planning:
         (repo / "docs").mkdir(exist_ok=True)
@@ -636,7 +644,9 @@ def production_case(project, tmp_path, monkeypatch, request):
             allow_new_units=bool(getattr(request, "param", {}).get("intake")),
             allowed_scopes=("src",),
         ),
-        planning=PlanningSpec(enabled=planning, brief="docs/brief.md" if planning else ""),
+        planning=PlanningSpec(
+            enabled=planning, brief="docs/brief.md" if planning else "", skills=planning_skills
+        ),
         checkpoints=CheckpointSpec(target_interval_s=10**12),
         verify_commands=(
             (
@@ -881,6 +891,21 @@ def test_brief_to_reviewed_planning_pr_activates_new_story_then_parallel_deliver
         "planning-decomposition",
         "planning-planning_review",
     ]
+    stage_requests = [
+        json.loads(path.read_text())
+        for path in case.store.directory(result.id).rglob("request.json")
+    ]
+    native_requests = [row for row in stage_requests if row.get("native_planning_skill")]
+    assert {row["stage"] for row in native_requests} == {
+        "requirements",
+        "architecture",
+        "decomposition",
+        "planning_review",
+    }
+    for row in native_requests:
+        assert row["native_planning_skill"]["name"] == "fixture-" + row["stage"].replace("_", "-")
+        assert "# Campaign planning" in row["prompt"]
+        assert "Never invent CLI flags" in row["prompt"]
     assert len([row for row in rows if row["event"] == "execution-start"]) == 4
     planned_source = git(case.remote, "show", "refs/heads/main:specs/epic/stories/planned-story.md")
     assert verify.status_of(verify.parse_frontmatter(planned_source)) == "done"

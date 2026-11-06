@@ -10,13 +10,14 @@ plus the orchestrator that invokes them. Standard BMAD installs are never
 modified; the skills are bmad-loop-owned, standalone or bmad-loop-native (see
 the table below).
 
-| Component           | Forked from          | Role                                                                                                                                              |
-| ------------------- | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `bmad-loop`         | — (this repo, Git)   | the orchestrator: ralph-loop, hooks, tmux adapters, TUI. CLI `bmad-loop`. Installed by `bmad-loop-setup` from Git.                                |
-| `bmad-loop-resolve` | — (bmad-loop-native) | interactive CRITICAL-escalation resolution: a human disambiguates a frozen spec so a paused story can be re-driven (`/bmad-loop-resolve <story>`) |
-| `bmad-loop-sweep`   | — (bmad-loop-native) | read-only deferred-work ledger triage; owns the canonical `deferred-work-format.md`                                                               |
-| `bmad-loop-setup`   | — (scaffolded)       | **installs the orchestrator tool from Git**, runs `bmad-loop init` + `validate`, refreshes `_bmad/bmad-loop/module-help.csv`                      |
-| `bmod-bmad-loop`    | — (module record)    | the BMAD v7 module record (`bmod.toml`, `help/help.md`) that `bmad setup` discovers; metadata only, never invoked                                 |
+| Component                 | Forked from          | Role                                                                                                                                              |
+| ------------------------- | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `bmad-loop`               | — (this repo, Git)   | the orchestrator: ralph-loop, hooks, tmux adapters, TUI. CLI `bmad-loop`. Installed by `bmad-loop-setup` from Git.                                |
+| `bmad-loop-resolve`       | — (bmad-loop-native) | interactive CRITICAL-escalation resolution: a human disambiguates a frozen spec so a paused story can be re-driven (`/bmad-loop-resolve <story>`) |
+| `bmad-loop-sweep`         | — (bmad-loop-native) | read-only deferred-work ledger triage; owns the canonical `deferred-work-format.md`                                                               |
+| `bmad-loop-campaign-plan` | — (bmad-loop-native) | unattended campaign planning wrapper for explicitly mapped installed BMAD workflows; records unresolved product decisions                         |
+| `bmad-loop-setup`         | — (scaffolded)       | **installs the orchestrator tool from Git**, runs `bmad-loop init` + `validate`, refreshes `_bmad/bmad-loop/module-help.csv`                      |
+| `bmod-bmad-loop`          | — (module record)    | the BMAD v7 module record (`bmod.toml`, `help/help.md`) that `bmad setup` discovers; metadata only, never invoked                                 |
 
 The **inner dev primitive is the upstream `bmad-build-auto` skill** (BMAD-METHOD's
 generic unattended dev session; `bmad-dev-auto` on pre-rename releases, resolved

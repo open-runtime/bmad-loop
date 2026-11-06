@@ -76,6 +76,11 @@ def validate_result(
         raise CampaignError("stage result identity/revision/candidate mismatch")
     if raw.get("status") != "done":
         raise CampaignError("stage result is not complete")
+    blocking_decision = False
+    if coordinates.stage in {"requirements", "architecture", "decomposition", "planning_review"}:
+        from .campaign_planning_skill import decisions
+
+        blocking_decision = any(row["blocking"] for row in decisions(raw))
     paths = raw.get("artifacts", [])
     if not isinstance(paths, list) or not all(isinstance(path, str) for path in paths):
         raise CampaignError("stage artifact paths must be a list of strings")
@@ -117,7 +122,7 @@ def validate_result(
             raise CampaignError(
                 "publication review does not cover the exact private source artifacts"
             )
-    if coordinates.stage == "decomposition":
+    if coordinates.stage == "decomposition" and not blocking_decision:
         proposed = raw.get("units")
         if not isinstance(proposed, list) or not proposed:
             raise CampaignError("decomposition requires executable units")

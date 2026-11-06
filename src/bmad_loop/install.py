@@ -77,6 +77,7 @@ ANTIGRAVITY_HOOK_GROUP = "bmad-loop"
 # the module record BMAD v7 `bmad setup` discovers (its `bmod.toml`); it is never
 # invoked, so on v6 it is an inert skill folder.
 MODULE_SKILLS = (
+    "bmad-loop-campaign-plan",
     "bmad-loop-resolve",
     "bmad-loop-sweep",
     "bmad-loop-setup",

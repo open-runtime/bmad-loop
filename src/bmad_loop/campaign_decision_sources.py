@@ -75,6 +75,7 @@ def github_provider(gateway: GithubGateway) -> Callable[[EvidenceLocation], Evid
         if location.expected_author != pinned_author:
             raise CampaignError("GitHub decision author pin differs from configured binding")
         try:
+            parent_is_pull = False
             repository = gateway.get(gateway.root)
             if not isinstance(repository, dict) or type(repository.get("id")) is not int:
                 raise CampaignError("GitHub repository evidence lacks native identity")
@@ -89,6 +90,7 @@ def github_provider(gateway: GithubGateway) -> Callable[[EvidenceLocation], Evid
                     or not parent.get("id")
                 ):
                     raise CampaignError("GitHub comment parent identity missing")
+                parent_is_pull = bool(parent.get("pull_request"))
                 item = gateway.get(f"{gateway.root}/issues/comments/{comment_id}")
                 if not isinstance(item, dict):
                     raise CampaignError("GitHub comment evidence is not an object")
@@ -188,7 +190,7 @@ def github_provider(gateway: GithubGateway) -> Callable[[EvidenceLocation], Evid
             revision = hashlib.sha256(
                 json.dumps(revision_fields, sort_keys=True, separators=(",", ":")).encode()
             ).hexdigest()
-            base = f"https://github.com/{gateway.repository}/{'pull' if kind == 'pull' else 'issues'}/{number}"
+            base = f"https://github.com/{gateway.repository}/{'pull' if kind == 'pull' or parent_is_pull else 'issues'}/{number}"
             url = base + (f"#issuecomment-{item['id']}" if kind == "comment" else "")
             if str(item.get("html_url", "")).lower() != url.lower():
                 raise CampaignError("GitHub decision source URL differs from its native binding")

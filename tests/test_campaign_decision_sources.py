@@ -143,6 +143,30 @@ def test_pull_evidence_uses_exact_pull_endpoint(project):
     assert ("GET", "repos/org/repo/pulls/7") in service.calls
 
 
+def test_pull_discussion_comment_uses_native_pull_parent_url(project):
+    service = Service()
+    service.item.update(
+        id=400,
+        issue_url="https://api.github.com/repos/org/repo/issues/7",
+        html_url="https://github.com/org/repo/pull/7#issuecomment-400",
+    )
+    original = service.request
+
+    def request(method, path, payload=None):
+        response = original(method, path, payload)
+        if path == "repos/org/repo/issues/7":
+            return dataclasses.replace(
+                response, data={**response.data, "pull_request": {"url": "native-pull"}}
+            )
+        return response
+
+    service.request = request
+    observed = collect(project, service, "gh:comment:7:400")
+    assert not observed.unavailable
+    assert observed.sources[0].url == service.item["html_url"]
+    assert observed.sources[0].origin_verified
+
+
 def test_permission_or_body_edits_change_revision_even_timestamp_is_unchanged(project):
     service = Service()
     original = collect(project, service).sources[0]

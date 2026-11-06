@@ -19,7 +19,7 @@ from . import runsetup
 from .adapters.profile import get_profile
 from .campaign_capacity import observe
 from .campaign_github import GhTransport, GithubGateway
-from .campaign_model import CampaignSpec, RoleSpec
+from .campaign_model import CampaignError, CampaignSpec, RoleSpec
 from .campaign_publication import read_rules
 from .campaign_sources import import_sources
 from .campaign_workers import common_directory, git
@@ -191,17 +191,17 @@ def inspect(
         capabilities["planning"]["observations"][role] = choices
         if not any(choice["eligible"] for choice in choices):
             problem("planning", f"{role}: no available authorized model route")
-    if spec.planning.enabled:
-        skills = dict(spec.planning.skills)
+    if spec.planning.enabled or spec.intake.allow_new_units:
+        from .campaign_planning_skill import resolve as resolve_planning_skill
+
         for stage in spec.planning.stages:
-            if stage == "planning_review":
-                continue
-            skill = skills.get(stage)
-            if not skill or not any(
-                (project / folder / skill / "SKILL.md").is_file()
-                for folder in (".agents/skills", ".claude/skills")
-            ):
-                problem("planning", f"{stage}: qualify an installed BMAD skill mapping")
+            try:
+                resolved = resolve_planning_skill(project, spec.planning, stage)
+                capabilities["planning"]["observations"].setdefault("native_skills", {})[
+                    stage
+                ] = resolved
+            except (CampaignError, OSError, ValueError) as exc:
+                problem("planning", str(exc))
     if spec.github.enabled:
         gateway = gateway or GithubGateway(GhTransport(), repository)
         try:
@@ -258,19 +258,58 @@ def inspect(
         )
     if spec.paradev.reflect:
         try:
+            from . import runs
+            from .adapters.paradev_backend import ParadevMultiplexer
+            from .campaign_lifecycle import CampaignLifecycle, LifecyclePolicy
+
+            reflection_root = runs.state_root() / "campaign-reflection-preflight"
             if reflection_provider is None:
-                from . import runs
                 from .campaign_paradev import ParadevWorkspaceProvider
 
                 reflection_provider = ParadevWorkspaceProvider(
                     project_id=spec.paradev.project_id,
                     allowed_root=Path(root),
                     repository=project,
-                    state_dir=runs.state_root() / "campaign-reflection-preflight",
+                    state_dir=reflection_root,
                 )
             capabilities["reflection"]["observations"] = reflection_provider.preflight()
+            mux = ParadevMultiplexer(
+                host=getattr(reflection_provider, "host", None),
+                state_dir=reflection_root / "native-transport",
+            )
+            transport_available = mux.available()
+            capabilities["reflection"]["observations"]["transport_available"] = transport_available
+            if not transport_available:
+                problem(
+                    "reflection",
+                    "Bundled Paradev transport or its optional dependency is unavailable",
+                )
+            lifecycle = CampaignLifecycle(
+                reflection_root / "lifecycle", mux=mux, provider=reflection_provider
+            ).preflight(LifecyclePolicy(retention=spec.paradev.retention))
+            capabilities["reflection"]["observations"]["lifecycle"] = lifecycle
+            if not lifecycle["qualified"]:
+                problem("reflection", lifecycle["detail"])
         except Exception as exc:
             problem("reflection", f"Paradev capability read failed: {type(exc).__name__}: {exc}")
+    if spec.communication.mode == "observe":
+        from .campaign_communication import HcomObserver
+
+        try:
+            communication = HcomObserver(
+                room=Path(spec.communication.room), observer_name="bmad"
+            ).preflight()
+        except (RuntimeError, ValueError, OSError) as exc:
+            communication = {
+                "available": False,
+                "mode": "observe",
+                "sends": False,
+                "subscriptions": False,
+                "automatic_peer_delivery": False,
+                "incoming_hooks_muted": False,
+                "detail": "hcom observation unavailable: " + str(exc),
+            }
+        capabilities["reflection"]["observations"]["communication"] = communication
     if spec.paradev.project_id:
         try:
             from .campaign_native_inventory import NativeServiceObserver

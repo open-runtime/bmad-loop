@@ -196,6 +196,10 @@ Map each requested stage to an installed BMAD skill in `[planning.skills]`;
 preflight verifies those mappings. Requirements, architecture, decomposition and
 independent planning review produce structured artifacts. Planning and code use
 separate draft PRs, and executable work depends on delivered planning changes.
+The packaged `bmad-loop-campaign-plan` wrapper pins each mapped skill's installed
+path, hash and BMAD era, then follows its documented unattended or fast path.
+It does not guess v6/v7 command names or install workflows. Unresolved material
+questions become recorded `planning_decision` holds on the same draft PR.
 
 Every planning and review session receives a durable fresh GitHub input receipt.
 Planning boundaries also observe bounded fresh remote and local branch heads,

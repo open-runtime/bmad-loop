@@ -27,6 +27,7 @@ PROTECTED_HOLDS = frozenset(
         "human_only",
         "human_action",
         "product_choice",
+        "planning_decision",
         "design_choice",
         "decision",
         "plan_checkpoint",
