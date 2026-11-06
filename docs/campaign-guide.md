@@ -244,6 +244,7 @@ frequent coherent backups; it does not authorize another process to edit a live
 index. The worker's monitor only observes committed, dirty and private source
 progress; it never stages or commits the live tree. Status reports progress and
 dirty ages, unbacked commits, pending backup identities and failure counts.
+
 Unissued progress can coalesce to the latest worker commit. Once a push is issued,
 its original exact SHA must reconcile before replacement. After
 `checkpoints.max_backup_failures` attempts (default 5), backup remains visibly
