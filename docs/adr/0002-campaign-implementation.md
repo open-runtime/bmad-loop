@@ -10,8 +10,53 @@ campaign targets these boundaries above the existing serial engines; audit found
 runtime integration and recovery gaps that must be repaired before activation. The
 [campaign guide](../campaign-guide.md) describes its current commands. Repository
 policy, migration and installation qualification remain activation prerequisites.
-The proposed [reasoning-job and handoff contract](0003-bounded-reasoning-and-handoff.md)
+The accepted [reasoning-job and handoff contract](0003-bounded-reasoning-and-handoff.md)
 extends this work without weakening its acceptance or publication gates.
+
+## Implementation goals and traceability
+
+The next milestone is review-ready PR 18. Ultimate delivery additionally requires
+accepted reviews, synchronization with main, history-preserving merge, exact-commit
+installation, canonical-base update and qualified REM activation. Do not mark the
+ultimate objective complete at the review-ready boundary.
+
+The matrix identifies implementation responsibilities, production entry points
+and acceptance evidence. Paths are existing integration seams unless marked new;
+they are not claims that the extension is wired. Pending means the complete
+normal-runtime scenario or qualification remains to be demonstrated. Update each
+row from concrete evidence, keeping implementation, runtime-tested, native-qualified,
+review-ready and activated states distinct. Qualification artifacts remain outside
+tracked documentation; durable behavior and test references belong here.
+
+| Goal / responsibility                   | Production path                                                                                  | Required regression or qualification                                                                                                                                   | Native qualification                                                       | Status                                                  |
+| --------------------------------------- | ------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- | ------------------------------------------------------- |
+| G0 — Upstream integration and contracts | Sanitizer, adapter/probe/mux seams; ADR 0002/0003                                                | Incoming security and reliability changes preserve fork behavior; all requirements have code/test ownership                                                            | Recheck affected installed transport behavior                              | Pending integration evidence                            |
+| G1 — Autonomous progress                | `campaign_runtime`, `campaign_remote_feedback`, `campaign_runtime_decisions`, scheduler/capacity | Temporary wait clears and reaches merge; new owner evidence re-arms resolution; mixed-model receipts pass; allocation, fairness and expiry use real runtime state      | Served-model and structured quota receipts                                 | Existing infrastructure; audited repairs pending        |
+| G2 — Acceptance and publication         | Planning/source flows, `campaign_publication`, queue runtime and merge adapter                   | Criterion proof/amendments; reviewer recruitment; H/G checks; actual executor submission; uncertain writes and tracking recovery                                       | Eligible GitHub identity, required App identity and project executor       | Existing gates; ledger and runtime integrations pending |
+| G3 — Durable reasoning jobs             | Store/supervisor/worker seams and new job model                                                  | Parallel job claims, asynchronous lifecycle, typed outcomes, bounded limits, restart and drain/terminate                                                               | Qualified context delivery and completion for each advertised route        | Pending implementation                                  |
+| G4 — Harnesses and execution routing    | Profile registry, adapters and campaign worker dispatch                                          | Claude/Codex/Grok Build/AGY/Muse capability contracts; approved development pools; selected/served/auxiliary attribution                                               | Launch, context, native identity, effort, usage, stop and supported resume | Existing adapters; five-harness qualification pending   |
+| G5 — Portable handoff                   | New history readers, source indexes, reducer and handoff flow                                    | Coverage/citations, incremental caching, destination budget, worker fencing, dirty-work and pending-effect preservation                                                | Controlled corpus and sealed full-conversation trial                       | Pending implementation and fidelity qualification       |
+| G6 — Semantic decisions                 | Intake/planning/decision flows plus reasoning jobs                                               | Event-triggered routing, triage, semantic sync, priority, graph review and reporting; stale/unauthorized proposals rejected                                            | Approved Astra/Fable roles; Astra-only conflict repair                     | Existing stages; shared-job integration pending         |
+| G7 — Operator integration               | CLI projections, `campaign_paradev`, `campaign_communication`, decision evidence provider        | Tasks, role attach, completed history, nested diagnostics, qualified grouping, bounded hcom cursors and normal-CLI transcript binding                                  | Sidebar/tab/session identity and supported wrapper enrollment              | Helpers exist; complete runtime wiring pending          |
+| G8 — Scale and review readiness         | Coordinator, discovery/store, packaging and operator surface                                     | At least 48 stories/24 active epics/eight verification slots plus reasoning jobs; responsive controls; bounded hot state/context; final checks and independent reviews | Actual harness operation; explicit unrun platform/activation gates         | Pending qualification                                   |
+
+The nine earlier review repairs remain mandatory regressions, not newly missing
+features: unknown provider concurrency uses configured limits; attribution excludes
+unrelated review sessions; stop consumes terminate-workers; merge retry preserves
+hold labels; configured checks and outstanding review requests block publication;
+rename validation checks both paths; multiple ticket selectors preserve private
+store identity; hierarchy completion waits for asynchronous effects. Preserve
+checkpoint-safe append-only recovery, frozen-policy reload suppression and ordinary
+macOS temporary-path socket coverage. An isolated rerun does not resolve an xdist
+failure.
+
+Use root integration plus three concurrent native workers, rotating specialists
+across waves: contracts/upstream, runtime/GitHub/operator repairs, harness/history/
+handoff, semantic integration/qualification/docs, then independent reviews.
+Assign shared runtime/model/store/CLI edits explicitly and give workers disjoint
+leaf-module/test ownership. Native subagents stay in this workspace; this does
+not create Paradev side tasks. Push coherent commits to the same PR without
+squashing history. Documentation status follows evidence, not agent completion.
 
 ## Command and configuration contract
 
@@ -23,6 +68,10 @@ bmad-loop campaign preflight SPEC --json
 bmad-loop campaign run SPEC [--paradev-reflect] [--paradev-project ID] [--json]
 bmad-loop campaign list --json
 bmad-loop campaign status ID --json
+bmad-loop campaign jobs ID [--unit UNIT] [--job JOB] [--json]
+bmad-loop campaign history ID [--unit UNIT] [--role ROLE] [--json]
+bmad-loop campaign handoff ID --unit UNIT [--json]
+bmad-loop campaign migrate-state ID --json
 bmad-loop campaign resume ID [--json]
 bmad-loop campaign stop ID [--terminate-workers] --json
 bmad-loop campaign hold ID --unit UNIT --reason TEXT --json
@@ -44,6 +93,15 @@ uses owned process/session controls and retains uncertain claims. Exit codes
 remain 0, 1, 2 and 130; blocked/held details are fields, not new exit codes.
 Follow machine.py for failures: a verdict command can emit a failing verdict;
 an operational error outside that contract leaves stdout empty and uses stderr.
+
+The jobs/history/handoff/migrate-state commands are required extension interfaces,
+pending implementation. Jobs and history paginate, returning bounded receipts and
+source references rather than entire transcripts. Handoff queues an idempotent
+request for the coordinator using approved candidates; the CLI never launches a
+replacement directly. Status exposes effective capacity, jobs, handoff coverage,
+wait reason and next automatic action. Attach honors role selection; quiescent
+sessions expose retained history. State migration is distinct from the existing
+automation migration-inventory and migration-qualify commands.
 
 Validate is offline and mutation-free. Preflight reads capabilities, reports
 planning/execution/publication/reflection readiness separately, and never starts
@@ -146,7 +204,8 @@ configuration trust/digest machinery; do not invent document-hash ceremonies.
 
 Campaign roles are planning, planning_review, triage, escalation, decision_review,
 conflict_repair and publication_review, with independently resolved profiles and budgets.
-Execution retains the existing dev/review stage settings. Generic defaults
+Legacy execution retains the existing dev/review stage settings; the extension
+adds approved execution/recovery pools without changing that default. Generic defaults
 inherit project settings; the rollout preset permits Astra through Codex or Fable
 through Claude for planning, planning review, semantic triage, escalation diagnosis
 and decision evidence review. The example's high effort is configurable. A role
@@ -175,9 +234,10 @@ Conflict repair is explicitly pinned to Astra for this rollout. If Astra is
 unavailable, retain that candidate's repair wait and continue unrelated work;
 the planning pool's Fable alternative does not override this exact-model role.
 
-The current generic mux adapter ignores SessionSpec.effort; setting that field
-alone would not configure Codex. Qualify additive native CLI/profile arguments
-for model_reasoning_effort while preserving permission, hook and resume arguments.
+The generic mux adapter already renders SessionSpec.effort additively for Codex
+through model_reasoning_effort and for Claude through --effort. Characterize that
+behavior and qualify additional native CLI/profile arguments while preserving
+permission, hook and resume arguments.
 Do not use extra_args in a way that replaces the profile's permission flags.
 Honor client-advertised effort levels rather than assuming API and CLI catalogs
 are identical. Test fresh and resumed argv and effective configuration without
@@ -232,6 +292,13 @@ worker claims, resource reservations, external bindings, holds and outbox rows.
 Persist a transition and its outbound intents atomically before side effects.
 Audit events carry revision/sequence IDs and are recoverably emitted from the
 snapshot; a crash between snapshot and journal append must not lose authority.
+
+The reasoning extension migrates this snapshot/journal authority behind the same
+store boundary to transactional SQLite, moving events and job records out of the
+hot snapshot. Its [migration contract](0003-bounded-reasoning-and-handoff.md#storage-and-compatibility)
+preserves outbox semantics, old-format read access, identity protections and crash
+recovery. No live or uncertain claim may be migrated, and an older binary must
+reject migrated state rather than resume a stale snapshot.
 
 The coordinator lock is a singleton ownership guard, not a semaphore acquired
 by workers. Its event loop must not call a blocking engine, coding session,
@@ -303,6 +370,13 @@ epic are allowed and always use different branches/worktrees. A parent completes
 only after its children and any required closure/retrospective unit are delivered.
 Represent closure work explicitly so several children cannot each run the same
 epic retrospective or shared completion writer.
+
+Select ownership-compatible ready work before reserving scarce workspaces, and
+persist the fairness cursor with admission. An overlapping sibling cannot occupy
+the final slot while disjoint work waits. Preserve source hierarchy and GitHub
+mapping; add no calendar/date or sprint-capacity subsystem. Expire observations
+at admission for both native and custom capacity observers. Unknown concurrency
+uses configured limits; stale positive capacity is not fresh authorization.
 
 Separate active execution workers, review sessions, verification slots, active
 epics and total in-flight units/workspaces. CI waits, merge waits and tracking
@@ -825,6 +899,14 @@ classic branch protection. Local evidence never masquerades as a GitHub check.
 
 ## Sync, final review and merge
 
+Acceptance evidence is criterion-level: stable ID, original source, required
+proof, exact candidate, environment, reproducible preparation recipe and outcome.
+Distinguish passed, failed, not run and stale. Existing text criteria migrate
+without fabricated passes. Preserve authorized scope amendments with provenance;
+creating a follow-up issue cannot discharge a required row or close its parent.
+Record actual review receipts and invalidate affected proof when the candidate,
+recipe, environment or applicable requirements change.
+
 For final integration, freeze the unit's writer, confirm teardown and require a
 clean tracked tree. Fetch canonical target B; merge B into unit head H without
 rewriting published history. If conflicted, run a bounded Astra conflict-repair
@@ -872,6 +954,20 @@ reviewer identity/permissions and respect GitHub's last-push/self-review rules.
 Return to draft during substantive repair where supported. Any human hold,
 unresolved required review or unknown rule observation prevents publication.
 
+Recruit configured users/teams through durable review-request intents and remote
+readback. Preserve human-added requests; rerequest after a candidate change only
+when policy requires it. Eligible approval submissions name GitHub review ID,
+reviewer identity and exact reviewed head; credentials stay outside snapshots.
+Missing eligible actors produce an external review wait while unrelated work
+continues. Local cross-family review cannot manufacture GitHub approval.
+
+Keep remote check/review/label/queue waits typed and automatically reobserved.
+A queue removal cannot convert a temporary wait into an unreleasable generic
+approval hold. Relevant new owner answers, review changes and document revisions
+invalidate the corresponding decision context. Unchanged evidence does not
+consume repeated reasoning attempts. Operator release still clears only explicit
+operator holds, never missing evidence or required remote conditions.
+
 Direct-strict requires server-enforced up-to-date protection that applies to the
 actual merge actor, expected-head H, and a fresh read of B/rules/holds immediately
 before submission. Do not use admin bypass or silently weaken this contract.
@@ -901,6 +997,20 @@ requires a configured, required evidence producer on C. Provide an invocation
 contract/example for that producer and refuse queue activation without it.
 Requeued candidates invalidate old evidence. Do not claim PR-head review alone
 proves the contents GitHub's queue eventually merges.
+
+Qualify and produce required evidence on both PR head H before enqueue and
+synthetic merge-group head G after admission. Bind each receipt to candidate kind,
+SHA/base, policy and source evidence. Read back the same required App/context
+identity for both; a G-only producer cannot satisfy an H enqueue prerequisite.
+Reconcile uncertain check writes before retrying, with no fabricated green check.
+
+Keep the existing project gate-command contract and add a separate actual merge
+executor. Its durable request binds repository, PR, H/B, rules fingerprint,
+method and bypass policy. Submission may be pending or uncertain; reconcile the
+remote state before retry. When configured, this executor performs publication,
+with no independent native submission fallback. The campaign still verifies
+GitHub merge, canonical ancestry and tracking. A successful dry-run gate is not
+proof that the required project merge route executed.
 
 On confirmed merge, fetch canonical target and prove the reported merged commit
 is reachable. Squash/rebase need method-aware reconciliation; H need not itself
@@ -939,6 +1049,13 @@ Titles name unit, phase, attempt and agent; use a separate display-title method
 so renaming cannot break window identity. Preserve focus and user-customized
 layout. Reflection tasks remain optional; the campaign owns all identities.
 
+Wire task projection into normal runtime reconciliation when enabled, including
+held/blocked/merged-tracking-pending states. Expose nested transport, reflection
+and native-registration failures in public status. Grouping identities include
+source and initiative as well as epic; equal slugs from different initiatives
+must not share a managed group accidentally. Tests must observe actual runtime
+calls rather than invoking projection helpers directly.
+
 Keep existing unconditional adapter teardown. Once owned execution is confirmed
 stopped, retain its durable terminal log/transcript and offer the native Paradev
 file view for completed/failed output. Close only BMAD-owned views by policy;
@@ -963,6 +1080,12 @@ existing qualified nudge behavior, plus structured sibling context generated by
 the campaign even when hcom is absent. It does not enable automatic new peer
 wakeups by default. Persist room, actor/process generation and native binding;
 use exact recipients, not a room broadcast. Names, tags and threads are not ACLs.
+
+Bind the transcript-evidence provider in the normal CLI. Wire bounded event and
+transcript observations, durable cursors and configured context limits separately
+from Paradev reflection; disabling reflection does not disable requested hcom
+observation. Scope sibling context to relevant active work and dependencies,
+excluding unrelated or delivered history unless explicitly retrieved.
 
 Observation mode sends no messages or subscriptions. Existing TeamRouter/hcom
 enrollment can still receive mail; the installed hcom has no per-actor mute.
@@ -994,6 +1117,12 @@ Strict mode also requires the command to honor the server's current-base gate;
 an administrative fallback that bypasses it is incompatible. The current REM
 route includes administrative exceptions, so activation must resolve that
 contract explicitly rather than merely invoking the old command unchanged.
+
+REM's working agreement also forbids changing GitHub rulesets. Implement BMAD's
+executor contract, rejection fixtures and actionable preflight in this PR;
+changing REM policy/tooling or enabling a different publication guarantee requires
+its separate explicit activation decision. The generic integration cannot be
+called REM-qualified merely because it invokes that script.
 
 Live rules inspected on 2026-11-05 expose required checks with
 strict_required_status_checks_policy=false and no merge_queue rule. Classic
@@ -1047,6 +1176,14 @@ automations only after their responsibilities are covered and existing workers
 are accounted for. Passing bmad-loop tests or installing the wheel alone does
 not establish REM readiness; an unresolved activation prerequisite leaves the
 overall outcome incomplete.
+
+The present implementation milestone stops before those deployment actions:
+review-ready means committed and pushed code/docs, normal-path qualification and
+two fresh independent reviews against the same candidate. One review covers
+completion/authority/publication; the other covers runtime wiring, harness/handoff
+and throughput. Substantive later changes invalidate affected evidence. Report
+disabled hosted Actions and unrun platform gates accurately; do not enable
+repository settings or claim CI success implicitly.
 
 ## Required qualification matrix
 
@@ -1102,6 +1239,22 @@ advances; hold a tracking retry and prove another ready PR can publish; fill
 verification slots and prove coding capacity still makes progress. Instrument
 admission, stage and resource-wait durations so a serialized I/O path or idle
 capacity is visible during REM qualification.
+
+Scale qualification uses at least 48 stories across 24 active epics, eight
+verification slots and concurrent reasoning jobs. Exercise ownership contention,
+quota waits, parked reviews, moving main, tracking retries and restarts. Measure
+eligible idle capacity, fairness, control responsiveness and confirmed delivery,
+not merely started agents. Slow source/Git/inventory reads must leave controls
+responsive; hot-state growth and prompt context must remain bounded. Retained
+worktrees are accounted separately from active workers, without deleting dirty,
+live, uncertain or required evidence-bearing work.
+
+Run final exact-head pytest with the supported parallel runner and ordinary
+temporary paths, pyright, Trunk, documentation/version checks and wheel/sdist
+install smoke tests. Use targeted checks during iteration; do not replace final
+integrated coverage with isolated passing reruns. Actual model/native-fidelity
+qualification remains separate from zero-token repository tests and follows
+[ADR 0003](0003-bounded-reasoning-and-handoff.md#implementation-sequence-and-qualification).
 
 ## Fact-check references
 

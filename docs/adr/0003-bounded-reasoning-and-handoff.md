@@ -1,6 +1,6 @@
 # ADR 0003: Bounded reasoning jobs and portable session handoff
 
-- **Status:** Proposed; implementation and qualification pending
+- **Status:** Accepted implementation contract; implementation and qualification pending
 - **Date:** 2026-11-06
 - **Extends:** [ADR 0002](0002-native-sdlc-campaign.md) and its [implementation contract](0002-campaign-implementation.md)
 - **Delivery:** The same campaign implementation PR, before autonomous project activation
@@ -27,6 +27,16 @@ replaces the accepted contract, actual repository state or publication receipts.
 This decision extends the original campaign work; it does not defer its unresolved
 correctness, GitHub, Paradev or activation requirements.
 
+Implement this extension in PR 18 alongside the original audit repairs. Follow
+the [G0–G8 traceability matrix](0002-campaign-implementation.md#implementation-goals-and-traceability)
+and keep implementation, normal-runtime coverage, native qualification and
+activation separate. The immediate milestone is readiness for the next reviews;
+merge, exact installation and qualified REM delivery remain subsequent gates.
+
+Optimize sequencing and useful parallelism through dependencies, ownership and
+token/session capacity. Preserve existing source initiatives/sprints and their
+GitHub mapping; introduce no calendar, dates, velocity or sprint-capacity model.
+
 ## Reasoning responsibilities
 
 | Purpose                           | Model proposal                                                                               | Deterministic application boundary                                                                                       |
@@ -52,6 +62,26 @@ future selections; it cannot recursively launch another router to select itself.
 If no routing recommendation is available, use that policy fallback or report a
 capacity wait. Do not fabricate availability or downgrade an explicit model rule.
 
+### Approved route selection
+
+The rollout planning, triage and decision pools retain Astra/Fable availability;
+conflict repair remains Astra-only. These are independent of the summarization
+pool and of this chat's selected model. Extend approved route pools to development
+and recovery while preserving existing legacy dev/review settings by default.
+
+Summarization prefers qualified Grok Build or AGY CLI routes; use Flash for maps
+and Argon for reductions when qualified. Fall back to Opus 5.5, then Codex
+Terra/Sol through existing CLI accounts. Resolve actual model IDs, effort support
+and context/output limits from the qualified route snapshot, never a guessed
+alias or advertised API limit. On fallback, replan unfinished chunks for the
+destination's payload budget while retaining valid completed results.
+
+Preserve TeamRouter/account policy and use supported deployment routes. A consumer
+CLI whose integration terms or protocol do not support the application is not
+qualified merely because its binary exists. Use an eligible configured fallback
+or expose a capacity/capability wait; this work does not authorize new paid API
+accounts, subscriptions or undocumented authentication changes.
+
 ## Job identity, concurrency and persistence
 
 The existing unit claim and pending-action deduplication by unit/kind cannot
@@ -71,6 +101,10 @@ Each immutable request contains:
 
 The receipt contains actual native identity and observed model/effort, lifecycle
 evidence, usage, context-delivery observations, output hash and validation result.
+Distinguish requested/served primary models from auxiliary calls and contributor
+roles. A legitimate auxiliary model does not invalidate the primary-role receipt;
+all actual writers remain part of review-independence attribution. Normalize
+families for all supported harnesses instead of relying only on GPT/Claude names.
 Keep proposed, running, awaiting reconciliation, validated, applied, stale,
 failed and canceled states distinct. Persist intent before launch; reconcile a
 lost acknowledgement before starting another attempt. Queue deduplication includes
@@ -97,6 +131,41 @@ job through its transport. Required jobs gate their parent operation. Optional
 background reports may be explicitly canceled and journaled, but a campaign cannot
 report stopped or fully drained while a job remains live or ownership is unknown.
 Parent cancellation cannot leave untracked orphan workers.
+
+Use a dedicated reasoning-worker mode with immutable input manifests, not a
+development stage that assumes its whole working tree stays unchanged. Concurrent
+snapshot readers must tolerate legitimate unit edits elsewhere without accepting
+changed input as their original context. Results apply only against matching
+source/graph/configuration revisions and the required head/base coordinates.
+
+## Storage and compatibility
+
+Put one local SQLite database per campaign behind CampaignStore. Preserve the
+repository coordinator lock, revision/generation comparison, immutable identity
+validation and atomic intent-before-effect. Move append-only events and new
+reasoning jobs out of the hot snapshot. Retain current outbox semantics and
+introduce indexed historical access before pruning anything needed for adoption,
+reconciliation or checkpoint proofs. Large artifacts remain content-addressed files.
+
+Use short transactions and per-thread or short-lived connections; perform no Git,
+network or model operation inside a transaction. Preserve permissions and symlink
+protections. Use SQLite's consistent backup mechanism, not a bare database-file
+copy while a WAL may contain authoritative writes.
+
+Separate state-format versioning from configuration and machine JSON schemas.
+Provide campaign migrate-state under the coordinator lock only when no live or
+uncertain claims exist. Validate the new database before switching authority:
+a pre-switch crash leaves v1 authoritative, a post-switch crash leaves SQLite
+authoritative. Preserve the original under a backup name and replace its old
+location with a versioned marker that old binaries reject. Never leave a readable
+stale snapshot that an old binary could resume.
+
+New read-only commands understand both formats. Update automation migration
+inventory's direct snapshot readers so migrated active campaigns remain visible.
+Migration is idempotent, with no live conversion or automatic downgrade. Commands
+jobs/history paginate receipts and references; handoff queues an idempotent request
+for the coordinator rather than spawning from the CLI. Existing status exposes
+job/handoff summaries, effective resource limits, coverage and exact next actions.
 
 ## Headless transport contract
 
@@ -231,6 +300,11 @@ owned subprocesses are quiescent. Reconcile uncertain pushes/API writes and
 preserve committed, staged, unstaged and untracked work without resetting history.
 Only then grant the replacement generation a write lease.
 
+Quota waits do not consume semantic repair attempts or reset lifetime counters.
+After Claude and Codex both write a candidate, neither family becomes independent
+because the other was the latest writer. Select another qualified review family
+or expose the review-capacity wait; never erase earlier contributions.
+
 The successor retains campaign/unit/worktree/branch/PR and gets a new native
 session identity with predecessor and handoff-digest links. Apply only current
 configured permissions, not imported approvals. Preserve contribution lineage
@@ -273,16 +347,36 @@ writer and preserved work at every handoff boundary. Ablate refusal gates before
 trusting their negative tests.
 
 Qualify actual harness input/lifecycle behavior separately from fixture success.
-A bounded, explicitly scoped model-quality evaluation must report lost obligations,
-contradiction handling and recall of critical details against a known corpus; fake
-outputs do not prove summarization fidelity. Never add token-consuming live calls
-to the repository test suite. Enable automatic semantic handoff only after the
-finite qualification corpus retains every designated critical obligation and
-owner hold, preserves unresolved contradictions, and yields no invented approval
-or completion. Passing that corpus does not promise lossless compression of
-arbitrary histories. Measure total input/output work, latency, failure
-recovery, delivered throughput and working-context size before advertising scale.
-Original merge, exact-install and selected REM-delivery gates still apply.
+For each advertised Claude, Codex, Grok Build, AGY and Muse capability, record the
+qualified version and evidence for launch, explicit context delivery, native
+identity, effort, usage, completion, stop and supported resume. Native-import
+directions qualify separately; packet continuation does not promise a universal
+native transcript converter. Unsupported interfaces fail visibly at preflight.
+
+First evaluate a controlled corpus with designated critical requests, holds,
+corrections and unfinished proof. Then run the full-history qualification on a
+sealed snapshot of the owner-selected BMAD planning/implementation conversation,
+including attributable child lineage. Snapshot at trial start without stopping,
+moving or replacing the live source session. Record source boundary, byte/event
+coverage, hashes and measured unique token size; do not substitute usage totals.
+Source records and qualification artifacts remain outside tracked documentation.
+
+The owner authorized completing that sealed full-history trial regardless of
+size through existing CLI accounts, with no aggregate token ceiling. Enforce
+per-job context/output/thinking/turn/time/retry/concurrency limits and report exact
+observed usage, with unknown fields remaining unknown. Quota exhaustion preserves
+completed chunks and permits an approved fallback or resumable capacity wait;
+it does not silently truncate the corpus. No new paid API account is implied.
+
+Report lost obligations, contradictions and critical-detail recall against exact
+sources. Fake outputs do not prove semantic fidelity. Never add token-consuming
+calls to the repository test suite. Enable automatic semantic handoff only after
+qualification retains every designated critical obligation and owner hold,
+preserves unresolved contradictions, and yields no invented approval or completion.
+Passing this finite corpus does not promise lossless compression of arbitrary
+histories. Measure input/output work, latency, failure recovery, delivered
+throughput and working-context size before advertising scale. Original merge,
+exact-install and selected REM-delivery gates still apply.
 
 ## Capability evidence and limits
 

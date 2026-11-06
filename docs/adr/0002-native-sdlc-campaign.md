@@ -26,9 +26,30 @@ one implementation PR; current usage is in the [campaign guide](../campaign-guid
 Capability and repository-policy prerequisites remain explicit; implementation
 tests do not establish that a target project has been activated.
 
-The proposed [bounded reasoning and handoff extension](0003-bounded-reasoning-and-handoff.md)
+The accepted [bounded reasoning and handoff extension](0003-bounded-reasoning-and-handoff.md)
 adds semantic routing, graph/priority review and portable cross-harness continuity.
 It preserves this record's delivery contract and does not replace outstanding repairs.
+
+### Implementation and delivery milestones
+
+The next milestone is a review-ready PR containing the audited repairs and the
+reasoning/handoff extension. The implementation contract's
+[G0–G8 traceability matrix](0002-campaign-implementation.md#implementation-goals-and-traceability)
+is the shared acceptance map. A helper test is not evidence that the normal
+campaign path invokes that helper. Record implementation, runtime coverage,
+native qualification, review readiness and activation separately.
+
+Review readiness requires the integrated candidate, updated documentation,
+production-path regression coverage, native qualification and independent reviews.
+Merge, exact-commit installation, canonical-base update and qualified REM delivery
+remain later gates of the original objective. A green suite, disabled automations
+or a locally completed story cannot substitute for those gates.
+
+Optimize useful parallel work through dependencies, ownership and token/session
+capacity. Preserve initiatives and sprints as existing source structure and GitHub
+hierarchy, without adding calendar, date, velocity or sprint-capacity machinery.
+The coordinator lock protects state; it must not serialize independent workers,
+reasoning jobs, verification or candidate preparation.
 
 Add a deterministic Python campaign supervisor above the existing serial story
 engine. Planning, implementation, conflict repair and review run in coding-CLI
