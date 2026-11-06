@@ -15,6 +15,7 @@ from bmad_loop.campaign_github import (
     GithubError,
     GithubGateway,
     MutationIntent,
+    OptionalIntakeCancellation,
     UncertainMutation,
     managed_body,
     managed_marker,
@@ -32,6 +33,53 @@ class FakeTransport:
         if isinstance(response, Exception):
             raise response
         return response
+
+
+def test_optional_intake_issue_cancellation_uses_owned_native_identity_and_not_planned():
+    transport = FakeTransport()
+    gateway = GithubGateway(transport, "a/b")
+    marker = managed_marker("campaign", "story:control", "issue")
+    issue = {"id": 17, "number": 7, "state": "open", "updated_at": "v1", "body": marker}
+    transport.responses["GET", "repos/a/b/issues/7"] = ApiResponse(200, issue, {})
+    cap = OptionalIntakeCancellation("campaign", "control", 17, "accepted-triage")
+    intent = gateway.close_issue_not_planned_intent(
+        7, capability=cap, action_id="cancel", generation=4
+    )
+    assert intent.payload == {"state": "closed", "state_reason": "not_planned"}
+    transport.responses["PATCH", intent.path] = ApiResponse(200, {**issue, **intent.payload}, {})
+    confirmed = gateway.reconcile_update(
+        replace(intent, state="sent_unknown"), allow_retry=True, generation=4
+    )
+    assert confirmed.state == "confirmed" and confirmed.receipt["state_reason"] == "not_planned"
+    transport.responses["GET", intent.path] = ApiResponse(200, {**issue, **intent.payload}, {})
+    before = len(transport.calls)
+    assert gateway.reconcile_update(replace(intent, state="sent_unknown")).state == "confirmed"
+    assert all(method == "GET" for method, _, _ in transport.calls[before:])
+    transport.responses["GET", intent.path] = ApiResponse(200, {**issue, "id": 18}, {})
+    with pytest.raises(GithubError, match="exact owned internal"):
+        gateway.close_issue_not_planned_intent(7, capability=cap, action_id="cancel", generation=4)
+
+
+def test_optional_cancellation_cannot_close_owner_issue_or_retry_over_new_human_text():
+    transport = FakeTransport()
+    gateway = GithubGateway(transport, "a/b")
+    cap = OptionalIntakeCancellation("campaign", "control", 17, "accepted-triage")
+    issue = {"id": 17, "number": 7, "state": "open", "updated_at": "v1", "body": "Owner issue"}
+    transport.responses["GET", "repos/a/b/issues/7"] = ApiResponse(200, issue, {})
+    with pytest.raises(GithubError, match="exact owned internal"):
+        gateway.close_issue_not_planned_intent(7, capability=cap, action_id="cancel", generation=4)
+    issue["body"] = managed_marker("campaign", "story:control", "issue")
+    intent = gateway.close_issue_not_planned_intent(
+        7, capability=cap, action_id="cancel", generation=4
+    )
+    transport.responses["GET", intent.path] = ApiResponse(
+        200, {**issue, "updated_at": "v2", "body": "New human intent"}, {}
+    )
+    result = gateway.reconcile_update(
+        replace(intent, state="sent_unknown"), allow_retry=True, generation=4
+    )
+    assert result.state == "sent_unknown"
+    assert not any(method == "PATCH" for method, _, _ in transport.calls)
 
 
 def test_cli_uses_json_stdin_and_pinned_api(monkeypatch):
@@ -335,3 +383,212 @@ def test_ready_mutation_requires_native_id_and_expected_state():
         {},
     )
     assert gateway.execute(intent, generation=1).state == "sent_unknown"
+
+
+def test_unknown_milestone_patch_reconciles_semantic_number_without_second_write():
+    transport = FakeTransport()
+    gateway = GithubGateway(transport, "a/b")
+    intent = MutationIntent(
+        "a",
+        "milestone_assignment",
+        "PATCH",
+        "repos/a/b/issues/7",
+        {"milestone": 3},
+        state="sent_unknown",
+        coordinates={"id": 777},
+    )
+    transport.responses["GET", intent.path] = ApiResponse(
+        200, {"id": 777, "milestone": {"id": 9003, "number": 3}}, {}
+    )
+    assert gateway.reconcile_update(intent).state == "confirmed"
+    assert all(method == "GET" for method, _, _ in transport.calls)
+
+
+def test_unknown_subissue_and_ready_transitions_use_read_back_only():
+    transport = FakeTransport()
+    gateway = GithubGateway(transport, "a/b")
+    intent = MutationIntent(
+        "a",
+        "subissue",
+        "POST",
+        "repos/a/b/issues/3/sub_issues",
+        {"sub_issue_id": 777},
+        state="sent_unknown",
+    )
+    transport.responses["GET", intent.path + "?per_page=100"] = ApiResponse(
+        200, [{"id": 777, "number": 7}], {}
+    )
+    assert gateway.reconcile_update(intent).state == "confirmed"
+    ready = replace(
+        gateway.prepare_ready("PR_node", action_id="ready", generation=0), state="sent_unknown"
+    )
+    transport.responses["POST", "graphql"] = ApiResponse(
+        200, {"data": {"node": {"id": "PR_node", "isDraft": False}}}, {}
+    )
+    assert gateway.reconcile_update(ready).state == "confirmed"
+    calls = [(method, payload) for method, _, payload in transport.calls if method == "POST"]
+    assert len(calls) == 1
+    assert calls[0][1]["query"].startswith("query(")
+    transport.responses["POST", "graphql"] = ApiResponse(
+        200, {"data": {"node": {"id": "foreign", "isDraft": False}}}, {}
+    )
+    assert gateway.reconcile_update(ready).state == "sent_unknown"
+
+
+def test_unapplied_absolute_update_retries_only_with_budget_and_unchanged_native_preimage():
+    transport = FakeTransport()
+    gateway = GithubGateway(transport, "a/b")
+    original = {
+        "id": 777,
+        "number": 7,
+        "updated_at": "t1",
+        "state": "open",
+        "labels": [{"name": "human-label"}],
+    }
+    transport.responses["GET", "repos/a/b/issues/7"] = ApiResponse(200, original, {})
+    intent = replace(
+        gateway.close_issue_intent(7, action_id="close", generation=2, source_confirmed=True),
+        state="sent_unknown",
+    )
+    transport.responses["PATCH", intent.path] = ApiResponse(
+        200, {**original, "state": "closed", "state_reason": "completed"}, {}
+    )
+    assert gateway.reconcile_update(intent).state == "sent_unknown"
+    assert all(method != "PATCH" for method, _, _ in transport.calls)
+    confirmed = gateway.reconcile_update(intent, allow_retry=True, generation=2)
+    assert confirmed.state == "confirmed"
+    assert [payload for method, _, payload in transport.calls if method == "PATCH"] == [
+        {"state": "closed", "state_reason": "completed"}
+    ]
+    transport.responses["GET", intent.path] = ApiResponse(
+        200, {**original, "updated_at": "owner-edited", "body": "Owner added decision"}, {}
+    )
+    held = gateway.reconcile_update(intent, allow_retry=True, generation=2)
+    assert held.state == "sent_unknown"
+    assert "preimage changed" in held.error
+    assert sum(method == "PATCH" for method, _, _ in transport.calls) == 1
+    with pytest.raises(GithubError, match="generation"):
+        gateway.reconcile_update(intent, allow_retry=True, generation=3)
+
+
+def test_unknown_already_applied_update_reads_back_without_spending_another_write():
+    transport = FakeTransport()
+    gateway = GithubGateway(transport, "a/b")
+    intent = MutationIntent(
+        "close",
+        "close_issue",
+        "PATCH",
+        "repos/a/b/issues/7",
+        {"state": "closed", "state_reason": "completed"},
+        state="sent_unknown",
+        generation=2,
+        coordinates={"id": 777, "updated_at": "old", "source_confirmed": True},
+    )
+    transport.responses["GET", intent.path] = ApiResponse(
+        200,
+        {
+            "id": 777,
+            "state": "closed",
+            "state_reason": "completed",
+            "updated_at": "new",
+            "body": "Preserve human edits",
+        },
+        {},
+    )
+    assert gateway.reconcile_update(intent, allow_retry=True, generation=2).state == "confirmed"
+    assert all(method == "GET" for method, _, _ in transport.calls)
+
+
+def test_native_relationship_retry_refuses_new_human_parent():
+    transport = FakeTransport()
+    gateway = GithubGateway(transport, "a/b")
+    intent = MutationIntent(
+        "link",
+        "subissue",
+        "POST",
+        "repos/a/b/issues/3/sub_issues",
+        {"sub_issue_id": 777},
+        state="sent_unknown",
+        coordinates={
+            "child_number": 7,
+            "child_id": 777,
+            "parent_number": 3,
+            "child_updated_at": "t1",
+        },
+    )
+    transport.responses["GET", intent.path + "?per_page=100"] = ApiResponse(200, [], {})
+    transport.responses["GET", "repos/a/b/issues/7"] = ApiResponse(
+        200, {"id": 777, "updated_at": "t1"}, {}
+    )
+    transport.responses["GET", "repos/a/b/issues/7/parent"] = ApiResponse(200, {"number": 9}, {})
+    assert gateway.reconcile_update(intent, allow_retry=True, generation=0).state == "sent_unknown"
+    assert all(method == "GET" for method, _, _ in transport.calls)
+
+
+def test_unapplied_ready_retry_requires_same_native_head_revision_and_draft_preimage():
+    class ReadyTransport:
+        def __init__(self):
+            self.node = {"id": "PR_node", "isDraft": True, "updatedAt": "t1", "headRefOid": "head"}
+            self.mutations = 0
+
+        def request(self, method, path, payload=None):
+            assert method == "POST" and path == "graphql"
+            if payload["query"].startswith("query("):
+                return ApiResponse(200, {"data": {"node": dict(self.node)}}, {})
+            self.mutations += 1
+            self.node["isDraft"] = False
+            return ApiResponse(
+                200,
+                {"data": {"markPullRequestReadyForReview": {"pullRequest": dict(self.node)}}},
+                {},
+            )
+
+    transport = ReadyTransport()
+    gateway = GithubGateway(transport, "a/b")
+    intent = replace(
+        gateway.prepare_ready(
+            "PR_node",
+            action_id="ready",
+            generation=2,
+            expected_head="head",
+            expected_updated_at="t1",
+            expected_draft=True,
+        ),
+        state="sent_unknown",
+    )
+    assert gateway.reconcile_update(intent, allow_retry=True, generation=2).state == "confirmed"
+    assert transport.mutations == 1
+    transport.node.update(isDraft=True, headRefOid="owner-pushed", updatedAt="t2")
+    held = gateway.reconcile_update(intent, allow_retry=True, generation=2)
+    assert held.state == "sent_unknown"
+    assert "preimage/head changed" in held.error
+    assert transport.mutations == 1
+
+
+def test_unapplied_subissue_retry_preserves_database_identity_and_parent_preimage():
+    transport = FakeTransport()
+    gateway = GithubGateway(transport, "a/b")
+    intent = MutationIntent(
+        "link",
+        "subissue",
+        "POST",
+        "repos/a/b/issues/3/sub_issues",
+        {"sub_issue_id": 777},
+        state="sent_unknown",
+        coordinates={
+            "child_number": 7,
+            "child_id": 777,
+            "parent_number": 3,
+            "child_updated_at": "t1",
+        },
+    )
+    transport.responses["GET", intent.path + "?per_page=100"] = ApiResponse(200, [], {})
+    transport.responses["GET", "repos/a/b/issues/7"] = ApiResponse(
+        200, {"id": 777, "number": 7, "updated_at": "t1"}, {}
+    )
+    transport.responses["GET", "repos/a/b/issues/7/parent"] = GithubError("No parent", status=404)
+    transport.responses["POST", intent.path] = ApiResponse(201, {"id": 777, "number": 7}, {})
+    assert gateway.reconcile_update(intent, allow_retry=True, generation=0).state == "confirmed"
+    assert [payload for method, _, payload in transport.calls if method == "POST"] == [
+        {"sub_issue_id": 777}
+    ]

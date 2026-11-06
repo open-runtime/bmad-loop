@@ -258,6 +258,8 @@ REARM_ESCALATION_CALLERS = {
 # outer hold. Exact inventories make a newly added writer fail loudly instead of
 # relying on a reviewer to find it by grep.
 SAVE_STATE_CALLERS = {
+    # Owned accepted-finalization continuation: both publications hold state_lock.
+    ("campaign_finalization.py", "resume"),
     ("accepted_review.py", "rearm_for_implemented_review"),
     ("commit_recovery.py", "arm"),
     ("cli.py", "_prepare_resume_locked"),
@@ -277,6 +279,7 @@ SAVE_STATE_CALLERS = {
     ("unitreplay.py", "abandon_replay_run"),
 }
 RUN_STATE_TRANSACTIONS = {
+    ("campaign_finalization.py", "resume"),
     ("accepted_review.py", "rearm_for_implemented_review"),
     ("commit_recovery.py", "arm"),
     ("cli.py", "_resume_paused_run"),
@@ -553,6 +556,8 @@ for _routing_table in JOURNAL_KIND_ROUTING_TABLES:
 # which would also wave through a branch-carrying ``target`` on a kind nobody has
 # looked at — exactly the hole the flattening left.
 JOURNAL_KIND_BENIGN_FIELDS = {
+    "campaign-config-frozen": frozenset({"config_revision"}),
+    "campaign-retained-reverified": frozenset({"command_count"}),
     # `items` is the parser's own malformed-item notes on one harvest kind and the
     # stale DW ids on the other; on `spec-deferrals-severity-unrecognized` it carries
     # the dev session's summary text and is reduced to a count (#913).
@@ -1779,6 +1784,11 @@ JOURNAL_KINDS = frozenset(
         "session-resume",
         "policy-reloaded",
         "policy-reload-deferred",
+        "campaign-recovery-requested",
+        "campaign-hook-suppressed",
+        "campaign-config-frozen",
+        "campaign-retained-reverified",
+        "campaign-session-withheld",
         # DW-389: the headless epic-boundary retrospective
         # (`gates.retrospective = "auto"`). `epic`, `count` and the closed `reason`
         # / check-`errors` lines are benign or dropped; `paths` / `docs` are

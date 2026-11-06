@@ -436,7 +436,11 @@ def activate(
             snapshot.units[value.id].spec = value
         else:
             snapshot.units[value.id] = CampaignUnit(value)
-        source_observations[value.id] = dict(source_bindings[value.id])
+        previous = source_observations.get(value.id, {})
+        source_observations[value.id] = {
+            **dict(source_bindings[value.id]),
+            **({"tracker_id": previous["tracker_id"]} if previous.get("tracker_id") else {}),
+        }
         snapshot.units[value.id].bindings["planning_unit"] = unit_id
     if changed:
         snapshot.graph_revision += 1

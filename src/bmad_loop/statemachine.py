@@ -407,3 +407,11 @@ def check_campaign_transition(unit: str, current: str, target: str) -> None:
     allowed = CAMPAIGN_TRANSITIONS.get(current)
     if allowed is None or target not in allowed:
         raise IllegalTransition(f"{unit}: campaign {current} -> {target}")
+
+
+def check_campaign_external_merge(unit: str, current: str) -> None:
+    """An independently proven external merge has its own truthful state path."""
+    if current != "ready_to_publish":
+        raise IllegalTransition(
+            f"{unit}: external merge reconciliation requires accepted ready-to-publish work"
+        )

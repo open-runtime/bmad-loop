@@ -29,6 +29,7 @@ class Candidate:
     source_revision: str
     graph_revision: int
     config_revision: str
+    target: str = "main"
 
 
 @dataclass(frozen=True)
@@ -248,6 +249,8 @@ class PublicationController:
         independent_families: bool = False,
         queue_evidence_context: str = "",
         hold_labels: tuple[str, ...] = ("hold", "owner-hold", "blocked", "approval-required"),
+        queued_base: str = "",
+        canonical_merge: MergeReceipt | None = None,
     ) -> GateResult:
         reasons: list[str] = []
         if candidate != evidence.candidate:
@@ -261,10 +264,25 @@ class PublicationController:
             reasons.append("PR identity changed")
         if observation.pr.get("head", {}).get("sha") != candidate.head:
             reasons.append("PR head changed; repeat acceptance")
-        if observation.base_head != candidate.base:
+        reconciled_merge = bool(
+            canonical_merge
+            and canonical_merge.state == "merged_pending_sync"
+            and bool(canonical_merge.canonical_head)
+            and canonical_merge.merge_commit == observation.pr.get("merge_commit_sha")
+            and observation.pr.get("merged") is True
+        )
+        if canonical_merge is not None and not reconciled_merge:
+            reasons.append("Canonical merged-PR proof does not match the current observation")
+        if (
+            observation.base_head != candidate.base
+            and not reconciled_merge
+            and not (merge_mode == "queue" and queued_base == observation.base_head)
+        ):
             reasons.append("Canonical target moved; synchronize and repeat acceptance")
         if observation.pr.get("base", {}).get("repo", {}).get("full_name") != candidate.repository:
             reasons.append("PR targets another repository")
+        if observation.pr.get("base", {}).get("ref") != candidate.target:
+            reasons.append("PR target branch changed; repeat acceptance for the intended target")
         age = self.clock() - observation.observed_at
         if age < 0 or age > self.max_observation_age_s:
             reasons.append("Remote observation expired")
@@ -289,15 +307,19 @@ class PublicationController:
         ):
             reasons.append("Independent provider-family review is required")
         pr = observation.pr
-        if pr.get("state") != "open" or pr.get("draft") is not False:
+        if not reconciled_merge and (pr.get("state") != "open" or pr.get("draft") is not False):
             reasons.append("PR must be open and ready for review")
-        if pr.get("merged"):
+        if pr.get("merged") and not reconciled_merge:
             reasons.append("Already merged; reconcile tracking instead of resubmitting")
-        if pr.get("mergeable") is not True or pr.get("mergeable_state") not in {
-            "clean",
-            "unstable",
-            "has_hooks",
-        }:
+        if not reconciled_merge and (
+            pr.get("mergeable") is not True
+            or pr.get("mergeable_state")
+            not in {
+                "clean",
+                "unstable",
+                "has_hooks",
+            }
+        ):
             reasons.append("GitHub mergeability is not confirmed")
         labels = {str(row.get("name", "")).lower() for row in observation.issue.get("labels", [])}
         if labels.intersection(label.lower() for label in hold_labels):
@@ -307,7 +329,7 @@ class PublicationController:
             reasons.append("Effective rules are incomplete")
         if not rules.merge_commits_allowed:
             reasons.append("Target policy forbids history-preserving merge commits")
-        if merge_mode == "direct-strict":
+        if merge_mode in {"direct-strict", "project-command"}:
             if not rules.strict or not rules.checks:
                 reasons.append("Server-enforced up-to-date required checks are missing")
             if rules.queue:

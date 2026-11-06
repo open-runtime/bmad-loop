@@ -1441,6 +1441,7 @@ def compose_run(
     plugin_grants: GrantSet = GrantSet.empty(),
     ticket_epic_filter: str = "",
     parent_initiative: str | None = None,
+    campaign_execution: Any = None,
 ) -> ComposedRun:
     """Stand up a run: allocate the run dir, persist state + pid, build the
     adapters, and wire the engine — everything ``cmd_run`` did inline between its
@@ -1530,6 +1531,10 @@ def compose_run(
             parent_initiative=parent_initiative,
         )
         journal = Journal(run_dir, pin=state)
+        if campaign_execution is not None:
+            from .campaign_execution import bind_run
+
+            state.campaign_binding = bind_run(project, run_dir, campaign_execution)
         # State becoming resumable and the pid making this process live are one
         # publication.  An explicit-id resume waits for the pid rather than entering
         # between these writes and double-driving the freshly composed run.
@@ -1564,6 +1569,8 @@ def compose_run(
             sweep_factory=sweep_factory,
             plugin_grants=plugin_grants,
         )
+        if campaign_execution is not None:
+            common["campaign_execution"] = campaign_execution
         cls, extra = _engine_cls_for(
             source,
             spec_folder,
@@ -1820,6 +1827,10 @@ def compose_resume(
     A story run whose persisted ``source`` this version cannot drive — unknown to
     the registry, or registered but not runnable yet — raises before any side
     effect (:func:`_engine_cls_for`)."""
+    from .campaign_execution import legacy_control_refusal
+
+    if refusal := legacy_control_refusal(run_dir):
+        raise ValueError(refusal)
     if state.run_type == "sweep":
         validate_sweep_options_version(state.sweep_options_version)
         # `paths` are the run's own: re-rooted on a chained sweep's child

@@ -6563,6 +6563,10 @@ def rearm_escalation(
     project_root: Path | None = None,
 ) -> RearmOutcome:
     """Run the complete spec/git/state re-arm transaction under the run lock."""
+    from .campaign_execution import legacy_control_refusal
+
+    if refusal := legacy_control_refusal(run_dir):
+        raise ValueError(refusal)
     with state_lock(run_dir):
         return _rearm_escalation_locked(
             run_dir,

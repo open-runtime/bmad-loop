@@ -51,7 +51,12 @@ def from_teamrouter(
         return CapacityObservation(
             False, reason="model blocked by router policy", model_access=False
         )
-    return CapacityObservation(True, slots=len(eligible), model_access=True)
+    return CapacityObservation(
+        True,
+        model_access=True,
+        concurrency_known=False,
+        reason="route eligible; provider concurrency unadvertised, explicit campaign limits apply",
+    )
 
 
 def observe(

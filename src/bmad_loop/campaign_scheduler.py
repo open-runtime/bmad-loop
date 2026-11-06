@@ -11,7 +11,14 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from typing import Mapping
 
-from .campaign_model import CampaignSnapshot, CampaignSpec, RoleCandidate, UnitState, scopes_overlap
+from .campaign_model import (
+    CampaignSnapshot,
+    CampaignSpec,
+    CampaignUnit,
+    RoleCandidate,
+    UnitState,
+    scopes_overlap,
+)
 
 _IN_FLIGHT = frozenset(
     {
@@ -50,10 +57,22 @@ class CapacityObservation:
     model_access: bool = False
     budget_remaining: float | None = None
     known: bool = True
+    concurrency_known: bool = True
 
 
 def epic_key(source: str, initiative: str, epic: str) -> str:
     return f"{source}:{initiative}:{epic}"
+
+
+def delegates_tracking_slot(snapshot: CampaignSnapshot, original: CampaignUnit) -> bool:
+    """A merged original hands its active slot to its actual source repair child."""
+    return original.state == UnitState.MERGED_PENDING_SYNC and any(
+        key in snapshot.units
+        and snapshot.units[key].spec.kind == "tracking"
+        and snapshot.units[key].spec.parent == original.id
+        and snapshot.units[key].state not in (UnitState.DELIVERED, UnitState.CANCELED)
+        for key in original.bindings.get("tracking_units", ())
+    )
 
 
 def admit(snapshot: CampaignSnapshot, *, now: float = 0) -> Admission:
@@ -84,7 +103,13 @@ def admit(snapshot: CampaignSnapshot, *, now: float = 0) -> Admission:
     sessions = sum(unit.claim.resource != "verify" for unit in active if unit.claim) + len(
         uncertain
     )
-    inflight = [unit for unit in snapshot.units.values() if unit.state in _IN_FLIGHT]
+    # Code already merged; the real source-repair child inherits its original's
+    # slot. Counting both would deadlock a campaign whose configured limit is 1.
+    inflight = [
+        unit
+        for unit in snapshot.units.values()
+        if unit.state in _IN_FLIGHT and not delegates_tracking_slot(snapshot, unit)
+    ]
     active_epics = {
         epic_key(unit.spec.source, unit.spec.initiative, unit.spec.epic) for unit in inflight
     }
@@ -202,7 +227,7 @@ def select_role(
         elif (
             not observation.available
             or not observation.model_access
-            or observation.active >= observation.slots
+            or (observation.concurrency_known and observation.active >= observation.slots)
         ):
             reasons.append(
                 f"{candidate.profile}/{candidate.model}: {observation.reason or 'route/model/quota unavailable'}"

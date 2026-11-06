@@ -102,6 +102,7 @@ def publishable():
         ("base", "Canonical target moved"),
         ("age", "expired"),
         ("repo", "another repository"),
+        ("target", "target branch changed"),
         ("dirty", "quiescent"),
         ("writer", "quiescent"),
         ("verification", "verification is missing"),
@@ -131,6 +132,8 @@ def test_single_missing_gate_blocks_otherwise_valid_candidate(publishable, chang
         observation = replace(observation, observed_at=60)
     elif change == "repo":
         pr["base"]["repo"]["full_name"] = "foreign/repo"
+    elif change == "target":
+        pr["base"]["ref"] = "other-target-with-the-same-sha"
     elif change == "dirty":
         evidence = replace(evidence, clean=False)
     elif change == "writer":

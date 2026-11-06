@@ -140,6 +140,14 @@ class MutationIntent:
         return cls(**value)
 
 
+@dataclass(frozen=True)
+class OptionalIntakeCancellation:
+    campaign_id: str
+    unit_id: str
+    issue_id: int
+    disposition_id: str
+
+
 def managed_marker(campaign_id: str, unit_id: str, kind: str) -> str:
     """Stable opaque marker; user-supplied identities never become HTML."""
     key = json.dumps([campaign_id, unit_id, kind], separators=(",", ":"))
@@ -336,7 +344,7 @@ class GithubGateway:
             raise GithubError("Stale coordinator generation cannot mutate GitHub")
         if intent.state != "sent_unknown":
             raise GithubError("Persist sent_unknown before executing an outbound action")
-        if intent.coordinates and "updated_at" in intent.coordinates:
+        if intent.coordinates and "updated_at" in intent.coordinates and intent.path != "graphql":
             current = self.get(intent.path)
             if (
                 current.get("id") != intent.coordinates.get("id")
@@ -410,6 +418,29 @@ class GithubGateway:
                 return replace(
                     intent, error="Pending merge acknowledgement lacks a UUID", receipt=receipt
                 )
+        if intent.kind == "queue_check":
+            from .campaign_queue import validate_check_response
+
+            if not validate_check_response(intent, receipt):
+                return replace(
+                    intent,
+                    error="Queue check acknowledgement has conflicting producer/head/context",
+                    receipt=receipt,
+                )
+        if intent.kind == "queue_dequeue":
+            expected = intent.coordinates or {}
+            pr = (receipt.get("data") or {}).get("dequeuePullRequest", {}).get("pullRequest") or {}
+            candidate = expected.get("candidate", {})
+            if (
+                pr.get("id") != expected.get("node_id")
+                or pr.get("headRefOid") != candidate.get("head")
+                or pr.get("baseRefName") != candidate.get("target")
+            ):
+                return replace(
+                    intent,
+                    error="queue removal acknowledgement is unbound; read-back required",
+                    receipt=receipt,
+                )
         return replace(
             intent, state="confirmed", receipt={"http_status": response.status, **receipt}, error=""
         )
@@ -417,6 +448,10 @@ class GithubGateway:
     def reconcile_create(self, intent: MutationIntent) -> MutationIntent:
         if intent.state == "confirmed":
             return intent
+        if intent.kind == "queue_check":
+            from .campaign_queue import reconcile_check
+
+            return reconcile_check(self, intent)
         if intent.kind == "issue":
             candidates = self.issues(state="all")
         elif intent.kind == "pr":
@@ -485,7 +520,8 @@ class GithubGateway:
         child_database_id: int,
         generation: int = 0,
     ) -> MutationIntent:
-        if self.issue(child_number).get("id") != child_database_id:
+        child = self.issue(child_number)
+        if child.get("id") != child_database_id:
             raise GithubError("Subissue database identity changed")
         try:
             parent = self.get(f"{self.root}/issues/{child_number}/parent")
@@ -515,11 +551,24 @@ class GithubGateway:
             f"{self.root}/issues/{parent_number}/sub_issues",
             {"sub_issue_id": child_database_id},
             generation=generation,
-            coordinates={"child_number": child_number},
+            coordinates={
+                "child_number": child_number,
+                "child_id": child_database_id,
+                "parent_number": parent_number,
+                "child_updated_at": child.get("updated_at", ""),
+            },
         )
 
     def prepare_ready(
-        self, node_id: str, *, action_id: str, generation: int, draft: bool = False
+        self,
+        node_id: str,
+        *,
+        action_id: str,
+        generation: int,
+        draft: bool = False,
+        expected_head: str = "",
+        expected_updated_at: str = "",
+        expected_draft: bool | None = None,
     ) -> MutationIntent:
         operation = "convertPullRequestToDraft" if draft else "markPullRequestReadyForReview"
         field = "ConvertPullRequestToDraftInput" if draft else "MarkPullRequestReadyForReviewInput"
@@ -533,7 +582,13 @@ class GithubGateway:
             "graphql",
             {"query": query, "variables": {"input": {"pullRequestId": node_id}}},
             generation=generation,
-            coordinates={"node_id": node_id, "draft": draft},
+            coordinates={
+                "node_id": node_id,
+                "draft": draft,
+                "head": expected_head,
+                "updated_at": expected_updated_at,
+                "was_draft": expected_draft,
+            },
         )
 
     def ready(self, node_id: str, *, draft: bool = False) -> JsonObject:
@@ -573,20 +628,230 @@ class GithubGateway:
             f"{self.root}/issues/{number}",
             {"state": "closed", "state_reason": "completed"},
             generation=generation,
-            coordinates={"id": issue["id"], "updated_at": issue["updated_at"]},
+            coordinates={
+                "id": issue["id"],
+                "updated_at": issue["updated_at"],
+                "source_confirmed": True,
+            },
         )
 
-    def reconcile_update(self, intent: MutationIntent) -> MutationIntent:
+    def close_issue_not_planned_intent(
+        self,
+        number: int,
+        *,
+        capability: OptionalIntakeCancellation,
+        action_id: str,
+        generation: int,
+    ) -> MutationIntent:
+        """Cancel an owned optional triage issue; original owner intent stays open."""
+        issue = self.issue(number)
+        marker = managed_marker(capability.campaign_id, "story:" + capability.unit_id, "issue")
+        if (
+            not capability.disposition_id
+            or issue.get("id") != capability.issue_id
+            or marker not in str(issue.get("body", ""))
+        ):
+            raise GithubError(
+                "Optional triage cancellation requires its exact owned internal issue"
+            )
+        if issue.get("state") == "closed":
+            if issue.get("state_reason") != "not_planned":
+                raise GithubError(
+                    "Internal triage issue was closed outside its optional disposition"
+                )
+            return MutationIntent(
+                action_id,
+                "close_issue_not_planned",
+                "PATCH",
+                "",
+                {},
+                state="confirmed",
+                receipt=issue,
+                generation=generation,
+            )
+        return MutationIntent(
+            action_id,
+            "close_issue_not_planned",
+            "PATCH",
+            f"{self.root}/issues/{number}",
+            {"state": "closed", "state_reason": "not_planned"},
+            generation=generation,
+            coordinates={
+                "id": issue["id"],
+                "updated_at": issue["updated_at"],
+                "optional_intake_cancel": True,
+                "marker": marker,
+                "disposition_id": capability.disposition_id,
+            },
+        )
+
+    def reconcile_update(
+        self, intent: MutationIntent, *, allow_retry: bool = False, generation: int | None = None
+    ) -> MutationIntent:
         """Read desired fields back; unknown outcomes never erase human changes."""
         if intent.state == "confirmed":
             return intent
+        if intent.kind == "queue_dequeue":
+            from .campaign_queue import reconcile_dequeue
+
+            return reconcile_dequeue(self, intent, allow_retry=allow_retry, generation=generation)
+        if allow_retry and (generation is None or generation != intent.generation):
+            raise GithubError(
+                "A bounded update retry requires current coordinator generation authorization"
+            )
+        if intent.kind in {"ready", "draft"}:
+            expected = intent.coordinates or {}
+            query = (
+                "query($id:ID!){node(id:$id){... on PullRequest{id isDraft updatedAt headRefOid}}}"
+            )
+            response = self.transport.request(
+                "POST", "graphql", {"query": query, "variables": {"id": expected.get("node_id")}}
+            )
+            if response.status != 200 or response.data.get("errors"):
+                raise GithubError("Draft state read-back failed")
+            node = (response.data.get("data") or {}).get("node") or {}
+            if node.get("id") == expected.get("node_id") and node.get("isDraft") is expected.get(
+                "draft"
+            ):
+                return replace(intent, state="confirmed", receipt=node, error="")
+            if allow_retry:
+                if (
+                    not expected.get("head")
+                    or not expected.get("updated_at")
+                    or type(expected.get("was_draft")) is not bool
+                    or node.get("id") != expected.get("node_id")
+                    or node.get("headRefOid") != expected["head"]
+                    or node.get("updatedAt") != expected["updated_at"]
+                    or node.get("isDraft") != expected["was_draft"]
+                ):
+                    return replace(
+                        intent,
+                        state="sent_unknown",
+                        error="Native PR preimage/head changed or is unproven; retry held",
+                    )
+                return self.execute(
+                    replace(intent, state="sent_unknown"), generation=intent.generation
+                )
+            return replace(
+                intent,
+                state="sent_unknown",
+                error="Expected native draft transition is not observed",
+            )
+        if intent.kind == "subissue":
+            children = self.pages(intent.path)
+            matches = [
+                child for child in children if child.get("id") == intent.payload.get("sub_issue_id")
+            ]
+            if len(matches) == 1:
+                return replace(intent, state="confirmed", receipt=matches[0], error="")
+            if allow_retry:
+                coordinates = intent.coordinates or {}
+                child_number = coordinates.get("child_number")
+                child = self.issue(int(child_number)) if child_number else None
+                if child is None or child.get("id") != coordinates.get("child_id"):
+                    return replace(intent, error="Native child identity changed; retry held")
+                try:
+                    parent = self.get(f"{self.root}/issues/{child_number}/parent")
+                except GithubError as exc:
+                    if exc.status != 404:
+                        raise
+                    parent = None
+                if parent and parent.get("number") == coordinates.get("parent_number"):
+                    return replace(intent, state="confirmed", receipt=child, error="")
+                if (
+                    parent
+                    or not coordinates.get("child_updated_at")
+                    or child.get("updated_at") != coordinates["child_updated_at"]
+                    or len(children) >= 100
+                ):
+                    return replace(
+                        intent,
+                        error="Native lineage/preimage changed or hierarchy limit reached; retry held",
+                    )
+                return self.execute(
+                    replace(intent, state="sent_unknown"), generation=intent.generation
+                )
+            return replace(
+                intent,
+                state="sent_unknown",
+                error="Native subissue relationship is not uniquely observed",
+            )
         current = self.get(intent.path)
         if intent.coordinates and current.get("id") != intent.coordinates.get(
             "id", current.get("id")
         ):
             return replace(intent, state="sent_unknown", error="Remote object identity changed")
-        if all(current.get(key) == value for key, value in intent.payload.items()):
+
+        def field_matches(key: str, value: Any) -> bool:
+            observed = current.get(key)
+            if key == "milestone" and isinstance(observed, dict):
+                return observed.get("number") == value
+            return observed == value
+
+        if all(field_matches(key, value) for key, value in intent.payload.items()):
             return replace(intent, state="confirmed", receipt=current, error="")
+        if allow_retry:
+            allowed = {
+                "close_issue": {"state", "state_reason"},
+                "close_issue_not_planned": {"state", "state_reason"},
+                "close_pr": {"state"},
+                "close_milestone": {"state"},
+                "reopen_issue": {"state"},
+                "reopen_milestone": {"state"},
+                "milestone_assignment": {"milestone"},
+            }
+            coordinates = intent.coordinates or {}
+            if (
+                intent.kind not in allowed
+                or set(intent.payload) - allowed[intent.kind]
+                or not coordinates.get("updated_at")
+                or not coordinates.get("id")
+                or current.get("updated_at") != coordinates["updated_at"]
+            ):
+                return replace(
+                    intent,
+                    state="sent_unknown",
+                    error="Remote object preimage changed or update is not safely retryable",
+                )
+            if intent.kind == "close_issue" and coordinates.get("source_confirmed") is not True:
+                return replace(
+                    intent,
+                    state="sent_unknown",
+                    error="Issue closure retry lacks canonical source confirmation",
+                )
+            if intent.kind.startswith("reopen_") and not all(
+                coordinates.get("approved_scope", {}).get(key)
+                for key in ("planning_pr", "source_revision", "graph_revision")
+            ):
+                return replace(
+                    intent,
+                    state="sent_unknown",
+                    error="Reopening retry lacks reviewed scope authority",
+                )
+            if intent.kind == "close_issue_not_planned" and (
+                coordinates.get("optional_intake_cancel") is not True
+                or not coordinates.get("disposition_id")
+                or not coordinates.get("marker")
+                or coordinates["marker"] not in str(current.get("body", ""))
+                or intent.payload != {"state": "closed", "state_reason": "not_planned"}
+            ):
+                return replace(
+                    intent,
+                    state="sent_unknown",
+                    error="Optional internal triage issue cancellation authority changed",
+                )
+            if intent.kind == "close_pr" and (
+                coordinates.get("optional_intake_cancel") is not True
+                or current.get("head", {}).get("sha") != coordinates.get("head")
+                or current.get("merged") is not False
+                or current.get("draft") is not True
+            ):
+                return replace(
+                    intent,
+                    state="sent_unknown",
+                    error="Optional intake PR identity/head/draft changed; cancellation retry held",
+                )
+            return self.execute(replace(intent, state="sent_unknown"), generation=intent.generation)
         return replace(
             intent,
             state="sent_unknown",
@@ -638,4 +903,39 @@ class GithubGateway:
             {"state": "closed"},
             generation=generation,
             coordinates={"id": milestone["id"], "updated_at": milestone["updated_at"]},
+        )
+
+    def reopen_intent(
+        self, kind: str, number: int, *, action_id: str, generation: int, approved_scope: JsonObject
+    ) -> MutationIntent:
+        if (
+            kind not in {"issue", "milestone"}
+            or not approved_scope.get("planning_pr")
+            or not approved_scope.get("source_revision")
+            or not approved_scope.get("graph_revision")
+        ):
+            raise GithubError("Reopening requires its reviewed canonical scope extension")
+        route = "issues" if kind == "issue" else "milestones"
+        path = f"{self.root}/{route}/{number}"
+        current = self.get(path)
+        if (
+            current.get("state") not in {"open", "closed"}
+            or not current.get("updated_at")
+            or not current.get("id")
+        ):
+            raise GithubError("Reopening requires a complete native parent preimage")
+        return MutationIntent(
+            action_id,
+            "reopen_" + kind,
+            "PATCH",
+            path,
+            {"state": "open"},
+            generation=generation,
+            state="confirmed" if current.get("state") == "open" else "prepared",
+            receipt=current if current.get("state") == "open" else None,
+            coordinates={
+                "id": current["id"],
+                "updated_at": current["updated_at"],
+                "approved_scope": approved_scope,
+            },
         )

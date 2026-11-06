@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from bmad_loop import verify
 from bmad_loop.campaign_paradev import ParadevWorkspaceProvider, ReflectionError
 
 
@@ -110,6 +111,47 @@ def test_preflight_has_no_mutations(provider):
     assert not host.calls
 
 
+def test_explicit_registered_workspace_link_preserves_native_layout(provider):
+    p, host = provider
+    allocated = p.allocate("unit", "campaign-unit", "unit", "allocate")
+    host.workspaces[0]["name"] = "owner name"
+    host.workspaces[0]["tags"] = "aaa-owner,factory-desk-side-tasks"
+    host.calls.clear()
+    adopted = p.adopt(
+        "new-unit", allocated.branch, allocated.workspace_id, allocated.path, "adopt", group="story"
+    )
+    assert adopted.workspace_id == allocated.workspace_id and adopted.git_dir == allocated.git_dir
+    assert adopted.unit_id == "new-unit" and adopted.group == "story"
+    assert (
+        p.adopt(
+            "new-unit",
+            allocated.branch,
+            allocated.workspace_id,
+            allocated.path,
+            "adopt",
+            group="story",
+        )
+        == adopted
+    )
+    assert p.reconcile("adopt") == adopted
+    assert not host.calls
+    assert host.workspaces[0]["tags"] == "aaa-owner,factory-desk-side-tasks"
+
+
+def test_registered_adoption_refuses_foreign_uuid_path_or_reused_action(provider):
+    p, host = provider
+    allocated = p.allocate("unit", "campaign-unit", "unit", "allocate")
+    host.calls.clear()
+    with pytest.raises(ReflectionError, match="registration differs"):
+        p.adopt("unit", allocated.branch, "foreign", allocated.path, "adopt")
+    with pytest.raises(ReflectionError, match="registration differs"):
+        p.adopt("unit", allocated.branch, allocated.workspace_id, p.allowed_root / "other", "adopt")
+    p.adopt("unit", allocated.branch, allocated.workspace_id, allocated.path, "adopt")
+    with pytest.raises(ReflectionError, match="action/Git identity changed"):
+        p.adopt("other-unit", allocated.branch, allocated.workspace_id, allocated.path, "adopt")
+    assert not host.calls
+
+
 def test_allocate_registered_isolated_workspace_before_agent(provider):
     p, host = provider
     binding = p.allocate("source/epic/unit", "campaign-unit", "unit", "action")
@@ -118,7 +160,7 @@ def test_allocate_registered_isolated_workspace_before_agent(provider):
     assert binding.git_dir != binding.common_dir
     assert all("--agent" not in args and "--command" not in args for args in host.calls)
     assert p.allocate("source/epic/unit", "campaign-unit", "unit", "action") == binding
-    assert len(host.calls) == 1
+    assert sum(call[:2] == ["workspaces", "create"] for call in host.calls) == 1
 
 
 def test_lost_create_response_reconciles_without_duplicate(provider):
@@ -129,7 +171,7 @@ def test_lost_create_response_reconciles_without_duplicate(provider):
     host.lose_reply = False
     binding = p.allocate("unit", "campaign-unit", "unit", "action")
     assert binding.workspace_id == host.workspaces[0]["id"]
-    assert len(host.calls) == 1
+    assert sum(call[:2] == ["workspaces", "create"] for call in host.calls) == 1
 
 
 def test_no_search_match_is_not_proof_create_failed(provider):
@@ -140,7 +182,7 @@ def test_no_search_match_is_not_proof_create_failed(provider):
     for _ in range(2):
         with pytest.raises(ReflectionError, match="uncertain"):
             p.allocate("unit", "campaign-unit", "unit", "action")
-    assert len(host.calls) == 1
+    assert sum(call[:2] == ["workspaces", "create"] for call in host.calls) == 1
 
 
 def test_unapproved_root_and_foreign_repository_refuse_before_create(provider, tmp_path):
@@ -156,7 +198,7 @@ def test_rewritten_branch_refuses_adoption(provider):
     host.rewrite_branch = True
     with pytest.raises(ReflectionError, match="returned branch"):
         p.allocate("unit", "campaign-unit", "unit", "action")
-    assert len(host.calls) == 1
+    assert sum(call[:2] == ["workspaces", "create"] for call in host.calls) == 1
 
 
 def test_reflection_retains_operator_tags_and_reports_precedence(provider):
@@ -206,6 +248,13 @@ def test_history_view_opens_file_without_terminal(provider, tmp_path):
     assert p.history_view(binding, log)["opened"]
     assert host.calls[-1][:3] == ["panes", "open", "file"]
     assert "--background" in host.calls[-1]
+    target = Path(host.calls[-1][3])
+    assert target.is_relative_to(Path(binding.path)) and target.read_text() == "completed output"
+    assert verify.worktree_clean(Path(binding.path))
+    target.write_text("Owner annotated history", encoding="utf-8")
+    with pytest.raises(ReflectionError, match="Owner edited"):
+        p.history_view(binding, log)
+    assert target.read_text() == "Owner annotated history"
 
 
 def test_allocation_action_cannot_be_reused_for_different_unit(provider):
@@ -213,7 +262,7 @@ def test_allocation_action_cannot_be_reused_for_different_unit(provider):
     p.allocate("unit", "campaign-unit", "unit", "action")
     with pytest.raises(ReflectionError, match="identity reused"):
         p.allocate("another-unit", "campaign-unit", "unit", "action")
-    assert len(host.calls) == 1
+    assert sum(call[:2] == ["workspaces", "create"] for call in host.calls) == 1
 
 
 def test_native_registration_window_expires_without_duplicate_actor(provider):
@@ -239,4 +288,41 @@ def test_native_registration_window_expires_without_duplicate_actor(provider):
     result = p.bind_terminal(binding, mux, "terminal", phase="dev", attempt=1, agent="codex")
     assert result["attribution"] == "unknown"
     assert "bounded window" in result["detail"]
-    assert len(host.calls) == 1
+    assert sum(call[:2] == ["workspaces", "create"] for call in host.calls) == 1
+
+
+def test_confirmed_allocation_drops_internal_folder_and_reconciles_pinned_uuid(provider):
+    p, host = provider
+    binding = p.allocate("unit", "campaign-unit", "Story", "action")
+    assert not any(
+        tag.startswith("zz-bmad-action-") for tag in host.workspaces[0]["tags"].split(",")
+    )
+    host.workspaces[0].update(name="Owner rename", tags="factory-desk-side-tasks,owner-folder")
+    assert p.reconcile("action") == binding
+    assert host.workspaces[0]["name"] == "Owner rename"
+    assert host.workspaces[0]["tags"] == "factory-desk-side-tasks,owner-folder"
+
+
+def test_lost_ack_keeps_marker_until_exact_identity_is_saved(provider):
+    p, host = provider
+    host.lose_reply = True
+    with pytest.raises(ReflectionError):
+        p.allocate("unit", "campaign-unit", "Story", "action")
+    assert "zz-bmad-action-" in host.workspaces[0]["tags"]
+    host.workspaces[0]["tags"] += ",factory-desk-side-tasks,owner-folder"
+    host.lose_reply = False
+    binding = p.reconcile("action")
+    assert binding.workspace_id == host.workspaces[0]["id"]
+    assert host.workspaces[0]["tags"] == "factory-desk-side-tasks,owner-folder"
+
+
+def test_pinned_uuid_cannot_be_replaced_by_foreign_row_with_old_marker(provider):
+    from bmad_loop.adapters.paradev_runtime import read_private_json
+
+    p, host = provider
+    binding = p.allocate("unit", "campaign-unit", "Story", "action")
+    host.workspaces[0]["id"] = "foreign-replacement"
+    host.workspaces[0]["tags"] = read_private_json(p._path("action"))["tag"]
+    with pytest.raises(ReflectionError, match="uncertain"):
+        p.reconcile("action")
+    assert binding.workspace_id != host.workspaces[0]["id"]

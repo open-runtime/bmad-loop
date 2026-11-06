@@ -300,12 +300,9 @@ def collect_context(
     if verify.rev_parse_head(workspace) != coordinates.head:
         raise CampaignError("recovery candidate moved before context collection")
     if mode == "decision":
-        locations = tuple(
-            EvidenceLocation(
-                f"document:{path}", "document", path, authority="adopted_policy", scope=(unit_id,)
-            )
-            for path in snapshot.spec.decisions.sources
-        )
+        from .campaign_decision_sources import configured_locations
+
+        locations = configured_locations(snapshot.spec.decisions.sources, scope=(unit_id,))
         locations += tuple(
             EvidenceLocation(
                 f"transcript:{identity}",
@@ -344,6 +341,12 @@ def collect_context(
             (
                 "required-findings",
                 json.dumps(unit.evidence.get("required_findings", []), sort_keys=True),
+            ),
+            (
+                "remote-feedback",
+                json.dumps(_redact(unit.evidence.get("remote_feedback", {})), sort_keys=True)[
+                    -64000:
+                ],
             ),
         )
         prior = tuple(row["fingerprint"] for row in unit.evidence.get("resolution_history", []))

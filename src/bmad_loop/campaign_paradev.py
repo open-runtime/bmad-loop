@@ -203,6 +203,58 @@ class ParadevWorkspaceProvider:
             intent["group"],
         )
 
+    def adopt(
+        self,
+        unit_id: str,
+        branch: str,
+        workspace_id: str,
+        path: str | Path,
+        action_id: str,
+        *,
+        group: str = "",
+    ) -> WorkspaceBinding:
+        """Link an explicitly qualified existing workspace without native writes.
+
+        The caller separately proves ownership release through its trusted handoff
+        observer. Registration/Git identity alone is never that permission.
+        """
+        self.preflight()
+        requested = Path(path)
+        if not requested.is_absolute() or not workspace_id:
+            raise ReflectionError("Workspace adoption requires exact UUID and absolute path")
+        intent = {
+            "schema_version": 1,
+            "mode": "adopt",
+            "state": "confirmed",
+            "unit_id": unit_id,
+            "branch": branch,
+            "workspace_id": workspace_id,
+            "path": str(requested.resolve()),
+            "action_id": action_id,
+            "project_id": self.project_id,
+            "group": group or unit_id,
+            "tag": "",
+        }
+        rows = [
+            row
+            for row in self._rows("workspace.list")
+            if row.get("id") == workspace_id and row.get("projectId") == self.project_id
+        ]
+        if (
+            len(rows) != 1
+            or not isinstance(rows[0].get("worktreePath"), str)
+            or Path(rows[0]["worktreePath"]).resolve() != requested.resolve()
+        ):
+            raise ReflectionError("Explicit workspace UUID/project/path registration differs")
+        binding = self._verify(rows[0], intent)
+        record = {**intent, "binding": asdict(binding)}
+        with file_lock(self.root / "allocation.lock"):
+            target = self._path(action_id)
+            if target.exists() and read_private_json(target) != record:
+                raise ReflectionError("Workspace adoption action/Git identity changed")
+            private_json(target, record)
+        return binding
+
     def allocate(
         self,
         unit_id: str,
@@ -289,18 +341,45 @@ class ParadevWorkspaceProvider:
     def reconcile(self, action_id: str) -> WorkspaceBinding:
         path = self._path(action_id)
         intent = read_private_json(path)
+        pinned = intent.get("binding") if intent.get("state") == "confirmed" else None
         matches = [
             r
             for r in self._rows("workspace.list")
-            if r.get("projectId") == self.project_id and intent["tag"] in _tags(r)
+            if r.get("projectId") == self.project_id
+            and (r.get("id") == pinned["workspace_id"] if pinned else intent["tag"] in _tags(r))
         ]
         if len(matches) != 1:
             raise ReflectionError(
                 "Workspace create remains uncertain or has conflicting matches; no replacement launched"
             )
         binding = self._verify(matches[0], intent)
+        if pinned and asdict(binding) != pinned:
+            raise ReflectionError("Pinned workspace UUID has a different Git/worktree identity")
         intent.update(state="confirmed", binding=asdict(binding))
         private_json(path, intent)
+        # The temporary create marker is needed only until this exact UUID and
+        # per-worktree Git identity are durable. Native tags are visible sidebar
+        # folders; internal action IDs must not remain as product navigation.
+        row = matches[0]
+        if intent["tag"] in _tags(row):
+            tags = [tag for tag in _tags(row) if tag != intent["tag"]]
+            fresh = [r for r in self._rows("workspace.list") if r.get("id") == binding.workspace_id]
+            if len(fresh) != 1 or _tags(fresh[0]) != _tags(row):
+                raise ReflectionError("Workspace tags changed before temporary marker removal")
+            args = ["workspaces", "update", binding.workspace_id, "--local"]
+            for tag in tags or [""]:
+                args += ["--tag", tag]
+            failure = None
+            try:
+                self.host.cli(args)
+            except Exception as exc:
+                failure = type(exc).__name__
+            after = [r for r in self._rows("workspace.list") if r.get("id") == binding.workspace_id]
+            if len(after) != 1 or set(_tags(after[0])) != set(tags):
+                raise ReflectionError(
+                    "Temporary create marker removal unconfirmed"
+                    + (": " + failure if failure else "")
+                )
         return binding
 
     def reflect(
@@ -424,15 +503,99 @@ class ParadevWorkspaceProvider:
         return result
 
     def history_view(self, binding: WorkspaceBinding, log: Path) -> dict:
-        """Open retained output without creating a PTY, agent or changing focus."""
+        """Project retained output into the native editor's workspace confinement.
+
+        The durable source log remains untouched. The native editor cannot open
+        external run state, so its full bounded copy is ignored locally and can
+        never enter the product PR. No PTY or coding agent is created.
+        """
+        from .install import _worktree_local_exclude
+        from .platform_util import atomic_write_bytes_confined, is_link_like
+
         if not log.is_file():
             raise ReflectionError("Retained output is unavailable")
+        if is_link_like(log) or log.stat().st_size > 16 * 1024 * 1024:
+            raise ReflectionError("Retained output is redirected or exceeds native view bound")
+        rows = [
+            row for row in self._rows("workspace.list") if row.get("id") == binding.workspace_id
+        ]
+        if len(rows) != 1:
+            raise ReflectionError("History workspace is missing or ambiguous")
+        actual = self._verify(
+            rows[0],
+            {
+                "unit_id": binding.unit_id,
+                "action_id": binding.action_id,
+                "branch": binding.branch,
+                "group": binding.group,
+            },
+        )
+        if actual.path != binding.path or actual.git_dir != binding.git_dir:
+            raise ReflectionError("History workspace Git identity changed")
+        workspace = Path(binding.path)
+        relative = (
+            ".bmad-loop/campaign-history/"
+            + hashlib.sha256(str(log.resolve()).encode()).hexdigest()
+            + ".log"
+        )
+        tracked = git_bytes(workspace, "ls-files", "-z", "--", ":(literal)" + relative)
+        if tracked.returncode or tracked.stdout:
+            raise ReflectionError(
+                "Native history projection cannot overwrite tracked product content"
+            )
+        refusal = _worktree_local_exclude(workspace, ["/.bmad-loop/campaign-history/"])
+        if refusal:
+            raise ReflectionError("Cannot exclude native history projection: " + refusal)
+        target = workspace / relative
+        for ancestor in (workspace / ".bmad-loop", target.parent):
+            if is_link_like(ancestor) or (ancestor.exists() and not ancestor.is_dir()):
+                raise ReflectionError(
+                    "Native history projection parent is redirected or non-directory"
+                )
+        data = log.read_bytes()
+        projection = (
+            self.root
+            / "history-views"
+            / (hashlib.sha256((binding.workspace_id + relative).encode()).hexdigest() + ".json")
+        )
+        if projection.exists():
+            receipt = read_private_json(projection)
+            if (
+                receipt["workspace_id"] != binding.workspace_id
+                or receipt["source"] != str(log.resolve())
+                or receipt["sha256"] != hashlib.sha256(data).hexdigest()
+            ):
+                raise ReflectionError(
+                    "Native history projection authority or completed source changed"
+                )
+            if (
+                target.exists()
+                and hashlib.sha256(target.read_bytes()).hexdigest() != receipt["sha256"]
+            ):
+                raise ReflectionError("Owner edited native history projection; preserve its bytes")
+        else:
+            if target.exists():
+                raise ReflectionError("Native history projection already exists without ownership")
+            private_json(
+                projection,
+                {
+                    "schema_version": 1,
+                    "workspace_id": binding.workspace_id,
+                    "source": str(log.resolve()),
+                    "target": relative,
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                },
+            )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_bytes_confined(
+            target, data, confine_root=workspace, require_writable_target=True
+        )
         return self.host.cli(
             [
                 "panes",
                 "open",
                 "file",
-                str(log.resolve()),
+                str(target),
                 "--workspace",
                 binding.workspace_id,
                 "--background",

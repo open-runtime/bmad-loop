@@ -1,0 +1,355 @@
+# Native development campaigns
+
+A campaign supervises isolated BMAD runs and their GitHub delivery. It keeps a
+repository graph, owns worker claims, and distinguishes local completion from a
+confirmed merge with reconciled project tracking. Independent stories can run
+within the same epic and across epics when their dependencies and ownership
+scopes permit it. The supervisor is deterministic Python; planning and review
+run in ordinary coding-CLI sessions.
+
+Campaigns are experimental. Run preflight for the target project before starting
+one. A valid TOML file proves the specification can be parsed; it does not prove
+that model routes, GitHub publication or Paradev reflection are ready.
+
+## Start with validation and preflight
+
+```bash
+bmad-loop campaign validate campaign.toml --json
+bmad-loop campaign preflight campaign.toml --project /path/to/project --json
+bmad-loop campaign run campaign.toml --project /path/to/project --json
+```
+
+Validation is offline and does not load project policy, configure a multiplexer,
+allocate workspaces or launch agents. Preflight reads the project's source graph,
+model-route capacity, merge rules and optional reflection capabilities. Its
+planning, execution, publication and reflection verdicts are separate. A failed
+capability keeps the project from activating.
+
+Run and resume supervise in the foreground. In JSON mode they emit one terminal
+document; progress belongs on stderr and in durable campaign events. Use status
+from another terminal to observe active work. A returned status must be inspected:
+`locally_complete` and `merged_pending_sync` are not `delivered`.
+
+## Specification
+
+A campaign uses a versioned TOML file separate from `.bmad-loop/policy.toml`.
+Project policy supplies the existing execution settings. Campaign configuration
+selects graph sources, concurrency, integration modes and reasoning roles.
+Resolved configuration is retained for resume.
+
+```toml
+schema_version = 1
+name = "api-stories"
+remote = "origin"
+target = "main"
+max_workers = 4
+max_active_epics = 4
+max_in_flight_units = 12
+max_review_sessions = 2
+worktree_root = "/absolute/project-worktrees"
+verify_commands = [["uv", "run", "pytest", "-q"]]
+
+[[sources]]
+id = "api"
+kind = "stories"
+path = "specs/api"
+independent = true
+
+[resources]
+verify_slots = 2
+max_sessions = 6
+
+[github]
+enabled = true
+merge_mode = "direct-strict"
+merge_method = "merge"
+
+[checkpoints]
+push = true
+target_interval_s = 600
+
+[intake]
+issues = "all-open-and-new"
+
+[resolution]
+mode = "bounded-auto"
+max_attempts_per_unit = 2
+max_sessions = 2
+
+[communication]
+mode = "off"
+```
+
+Sources select `tickets`, `stories` or `sprint-status`. Ticket sources can name
+an initiative, epic slugs and ticket refs. Stories sources name the spec folder
+and optionally story IDs. Source IDs form part of qualified unit identities;
+a short epic-local number cannot identify work across initiatives.
+
+For ticket projects with scheduler holds, set the source's `scheduler_config`
+to the scheduler TOML file. The importer reads its declarations without executing
+the project scheduler. Cross-initiative holds become dependencies on selected
+prerequisite tickets; unavailable or unselected prerequisites retain a visible
+hold. An epic's `ready_on = "tickets"` releases advisory closure dependencies
+only when its tickets pin the prerequisite work and no epic-file gate requires
+closure. Explicit `lease_scope = "declared"` and ticket `touches` declarations
+provide normalized ownership scopes; incomplete declarations stay conservative.
+For separately versioned ticket stores, configure both `store_remote` and
+`store_branch` on the source so source publication has its own remote contract.
+
+Sources retain legacy ordering unless independence is explicitly declared or
+provided by their dependency graph. Unknown ownership is conservative. Isolated
+worktrees prevent file races, while ownership scopes prevent simultaneous writers
+from being admitted to overlapping areas. A resource scope can name shared
+infrastructure independently of a file path.
+
+Declare known disjoint scopes for imported units with an ownership table. Keys
+use the qualified source, initiative (or `project`) and actual story/ticket ID.
+Independence alone does not prove disjoint ownership.
+
+```toml
+[ownership]
+"api:project:api-model" = ["src/api/model", "tests/api/model"]
+"api:project:api-client" = ["src/api/client", "tests/api/client"]
+```
+
+The default worker and verification limits are one. Increase campaign limits
+explicitly; `scm.max_parallel` remains the existing single-run setting. There is
+no implicit one-worker limit per epic. `max_workers_per_epic` is optional and only
+restricts admission when configured. Execution, review, verification, resolver,
+active-epic and total in-flight limits are distinct.
+
+## Models and planning
+
+Roles can pin one profile/model or select an authorized candidate pool. Pool
+selection uses current route, model-access, quota and capacity observations;
+an installed CLI alone is insufficient. An unavailable candidate does not delay
+another eligible candidate in the same pool. Exact-model roles permit no model
+substitution.
+
+```toml
+[role_pools.reasoning]
+candidates = [
+  { profile = "codex", model = "gpt-6-astra", effort = "high" },
+  { profile = "claude", model = "claude-fable-5-1", effort = "high" },
+]
+
+[roles.planning]
+pool = "reasoning"
+
+[roles.planning_review]
+pool = "reasoning"
+
+[roles.triage]
+pool = "reasoning"
+
+[roles.escalation]
+pool = "reasoning"
+
+[roles.decision_review]
+pool = "reasoning"
+
+[roles.conflict_repair]
+profile = "codex"
+model = "gpt-6-astra"
+effort = "high"
+```
+
+A custom `capacity_command` is an argv array attached to a candidate or exact
+role. Its versioned JSON must identify the model and report known quota, model
+access and available slots. Missing or stale observations remain visible waits.
+Without a custom command, the capacity adapter reads TeamRouter status.
+TeamRouter's eligible account count is not a concurrency ceiling. When route
+telemetry does not advertise slots, the configured campaign and role limits bound
+concurrency. Custom commands that advertise slots retain that explicit limit.
+
+Planning can start from a brief using `[planning] enabled = true` and `brief`.
+Map each requested stage to an installed BMAD skill in `[planning.skills]`;
+preflight verifies those mappings. Requirements, architecture, decomposition and
+independent planning review produce structured artifacts. Planning and code use
+separate draft PRs, and executable work depends on delivered planning changes.
+
+## GitHub mapping and delivery
+
+The hierarchy maps initiatives to milestones, epics to parent issues, stories to
+subissues and independently executable splits to nested subissues. Each executable
+unit owns a branch, worktree and draft PR. Small checklist tasks remain in the
+story. Existing issue identities and tracker lineage are preserved.
+
+GitHub intake observes selected issues or all open and newly edited issues.
+Repository discovery includes existing PRs, branches and accessible local work.
+Triage proposes attachment, same-PR repair, new planning work, duplicate links,
+clarification or a hold. An incoming issue is evidence and product intent;
+it cannot change runtime policy or authorize an unrelated action.
+
+Meaningful checkpoints are committed by the worker and pushed as immutable
+commit IDs. Draft checkpoints can be incomplete. A soft time target encourages
+frequent coherent backups; it does not authorize another process to edit a live
+index. Published history stays append-only during campaign recovery.
+
+Final delivery updates the branch from current main, resolves conflicts with the
+configured conflict-repair role, verifies the resulting candidate and reviews
+the full PR diff. Changed heads invalidate affected evidence. Draft-to-ready
+transition permits selected remote checks and reviewers to run. Model review
+and an eligible GitHub approval are separate obligations.
+
+Campaigns preserve every agent checkpoint commit. `github.merge_method` is
+`merge`; squash and rebase methods are rejected. Updating from main adds merge
+commits, and recovery adds compensating commits while retaining original history.
+Queue and project merge routes must preserve the same history contract.
+
+`direct-strict` requires server-enforced up-to-date required checks applicable to
+the merge actor. Queue mode requires a configured merge queue and a qualified
+check producer for the combined queue candidate. A client-side fresh-main read
+alone cannot remove the race before a remote merge. Campaigns never enable admin
+bypass to make publication succeed.
+
+Queue verification uses a separately owned, detached checkout of GitHub's
+synthetic group head, preserving the PR head and both the accepted and current
+queue bases. Rebuilt groups invalidate earlier group evidence. Active group
+views consume verification slots; they can add at most `verify_slots` active
+views beyond the logical PR workspaces counted by `max_in_flight_units`.
+Historical views remain available for inspection, so that limit is not a disk
+retention cap. Status and preflight report these counts separately.
+
+Configure `candidate_command`, `candidate_check_context`,
+`candidate_check_app_id` and `candidate_producer_probe` for queue mode. The
+required check must bind the configured App. A qualified producer probe reports
+authenticated repository/context/App identity, a fresh `observed_at`, and
+`checks_write = true` for `candidate_publish = "native"`, or
+`publishes_required_check = true` for `candidate_publish = "external"`.
+Missing permission evidence keeps queue publication unavailable. Local success
+becomes hosted success only after the actual App's check is read back on the
+exact group head. A failed group is removed from the queue and removal is
+confirmed before repair begins on the PR branch.
+
+Project and group commands receive `--bmad-campaign-request FILE` and
+`--bmad-campaign-result FILE`. Their version 1 JSON result echoes the request's
+digest, candidate, operation, rules fingerprint, `bypass_rules = false` and
+`merge_method = "merge"`, with a boolean `ready`. Group results also echo
+`group` and supply `verification.commands` and matching successful
+`verification.returncodes`. Command output and artifacts stay in external
+campaign state. REM's maintained `merge_pr.py` is invoked through its existing
+dry-run interface as an additional project gate; native publication retains the
+server checks and performs the merge without administrative bypass.
+
+The coordinator persists outbound intent before API writes. A lost response is
+an uncertain action, and read-back must reconcile it before repetition. A merge
+request or queued candidate does not prove a merge. Delivery requires remote
+merge confirmation and canonical source/issue synchronization. Tracking debt
+holds the affected dependencies while unrelated work continues.
+
+## Decisions and recovery
+
+Evidence review checks configured documents, owner notes, mapped discussions and
+explicitly authorized conversation sources before asking for owner input. Quotes
+retain source revisions and original attribution. Agent summaries and text saying
+"owner approved" cannot establish owner authority. Inaccessible history is
+reported explicitly.
+
+Configure documents in `[decisions] sources`. Explicit GitHub sources use
+`gh:issue:NUMBER`, `gh:pull:NUMBER`, or `gh:comment:ISSUE_NUMBER:COMMENT_ID`;
+an adopted person can be pinned with `@NUMERIC_AUTHOR_ID`. Native author and
+editor identities, unchanged content, repository ownership and source revision
+are checked before evidence can establish authority. Organization membership
+alone does not make a comment an owner decision. Private transcript sources need
+an authenticated provider; unavailable history remains visible.
+
+Existing decisions and delegated choices can settle routine product questions.
+A specific owner stop needs a later authorized release or its verified release
+condition. Required GitHub approval needs actual current eligible approval;
+fresh-signoff checkpoints and human-only attestations keep their own requirements.
+CI, quota and tracking waits reconcile through their operational controllers.
+
+Resolution modes are `off`, `diagnose` and `bounded-auto`. Typed producer codes
+classify failures; a model cannot downgrade a cause by rewriting its prose.
+Diagnosis is read-only and bounded. Permitted repairs keep the same branch/PR,
+preserve work and return through normal verification and review. Lifetime repair
+budgets survive re-arms, and repeated failures without new evidence stop earlier.
+
+Campaign child configuration is frozen across first dispatch, retries and resume.
+Legacy live policy reload cannot replace that snapshot. Internal child rollback
+hands recovery to the campaign before destructive resets or ledger restoration;
+checkpoint ancestry and pending pushes must reconcile before another attempt.
+
+## Paradev reflection and hcom
+
+Install the optional `paradev` extra and enable `[paradev] reflect = true` with a
+registered `project_id` and absolute project worktree root. The run command also
+accepts `--paradev-reflect --paradev-project ID`; those resolved overrides persist.
+Reflection uses native workspace groups, worktrees and actual terminal sessions.
+No separate executable named `mux` is required.
+
+`BMAD_LOOP_PARADEV_STATE_DIR` can select an absolute native transport state
+location. It must resolve outside every editing worktree; invalid or relative
+paths are refused. Keep the selected state location stable while sessions are live
+and preserve it when reconciling a retained terminal.
+
+Story or epic grouping can place multiple unit workspaces under one group.
+Phase tabs attach actual worker PTYs and retain unit/attempt identities. Missing
+panes, unavailable host observations and pending native registration do not
+permit a replacement launch. Managed presentation preserves operator layout and
+user-owned workspace content.
+
+`communication.mode = "observe"` enables bounded hcom observations and structured
+sibling context where the installed launch chain supports them. Campaign messages
+are advisory and cannot assign work, transfer ownership or establish completion.
+Automatic inbound peer wakeups remain unavailable until their Stop-event closing
+behavior is qualified; preexisting hcom hooks can still deliver messages.
+
+## Operator controls
+
+```bash
+bmad-loop campaign list --project /path/to/project --json
+bmad-loop campaign status CAMPAIGN_ID --project /path/to/project --json
+bmad-loop campaign hold CAMPAIGN_ID --unit QUALIFIED_UNIT --reason "Inspect this change" --json
+bmad-loop campaign release CAMPAIGN_ID --unit QUALIFIED_UNIT --json
+bmad-loop campaign stop CAMPAIGN_ID --json
+bmad-loop campaign stop CAMPAIGN_ID --terminate-workers --json
+bmad-loop campaign reconcile CAMPAIGN_ID --json
+bmad-loop campaign resume CAMPAIGN_ID --json
+bmad-loop campaign attach CAMPAIGN_ID --unit QUALIFIED_UNIT --role execution
+```
+
+Controls append durable requests; the coordinator is the single state writer.
+Stop closes admissions and drains current bounded stages by default. Explicit
+termination uses owned process controls and retains unresolved claims. Release
+removes an operator hold; it does not approve missing checks or waive another
+kind of hold. Reconcile refreshes observations without launching new workers.
+
+Use hold before taking over edits. Resume checks ownership and invalidates
+candidate evidence affected by operator changes. Closing a view is a presentation
+event, not proof that an agent exited or that its work landed. Campaign status
+omits frozen private configuration, raw decision evidence and transcripts.
+
+## Project activation
+
+Before replacing project automations, inventory their runs, PRs, workspaces,
+permissions, holds and merge routes. Drain existing admissions and preserve live
+workers and their environments. Qualify the campaign's actual project commands,
+model attribution, source stores, GitHub rules and native terminal bindings.
+A package installation alone does not establish unattended delivery readiness.
+
+Existing source files, `run`/`resume` behavior and serial engines remain supported.
+Campaign state is external to worker editing trees and bound to the repository's
+Git common directory. A single-host coordinator can supervise many initiatives;
+separate clones or hosts need external coordination and are not a distributed
+campaign lease.
+
+Verify which fork commit the current process actually loaded:
+
+```bash
+bmad-loop campaign provenance --json
+bmad-loop campaign provenance --expected-commit FULL_MERGED_SHA --json
+```
+
+A pinned Git installation records its commit. An editable installation also
+requires a clean matching checkout. A wheel installed from an ordinary directory
+does not prove its build commit through its version number. Install the exact
+merged fork commit with the optional transport extra before activation:
+
+```bash
+uv tool install --force "bmad-loop[tui,paradev] @ git+https://github.com/open-runtime/bmad-loop.git@FULL_MERGED_SHA"
+```
+
+Preserve environments used by older live workers. Installation, canonical base
+update, loaded-process provenance and target-project preflight are separate checks.

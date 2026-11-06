@@ -12,10 +12,21 @@ import copy
 import hashlib
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Mapping
 
 from .campaign_github import GithubError, GithubGateway, JsonObject, MutationIntent, managed_marker
 from .campaign_model import CampaignSnapshot, CampaignUnit, UnitState
+
+
+def _settled_member(unit: CampaignUnit) -> bool:
+    if unit.state == UnitState.DELIVERED:
+        return True
+    if unit.state == UnitState.CANCELED:
+        from .campaign_runtime_intake import optional_canceled
+
+        return optional_canceled(unit)
+    return False
 
 
 @dataclass(frozen=True)
@@ -151,6 +162,69 @@ class HierarchyCoordinator:
                 body=body,
                 milestone=milestone,
                 generation=snapshot.generation,
+            )
+            return TrackingStep(action_key, intent, bindings, unit_bindings)
+        # A delivered reviewed plan can extend closed scope. New owner edits
+        # after that review remain a hold rather than being reopened by a bot.
+        planning = snapshot.units.get(str(unit.bindings.get("planning_unit", "")))
+        for key, kind, _, parent, story in nodes:
+            if story is not None:
+                continue
+            binding = bindings[key]
+            observed = (
+                self.gateway.issue(binding["number"])
+                if kind == "issue"
+                else self.gateway.get(f"{self.gateway.root}/milestones/{binding['number']}")
+            )
+            if observed.get("state") not in {"open", "closed"}:
+                raise GithubError("Parent scope state is unavailable")
+            if observed.get("state") != "closed":
+                binding.pop("closed_confirmed", None)
+                binding["state"] = "open"
+                continue
+            flow = planning.evidence.get("planning_flow", {}) if planning else {}
+            reviewed_at = flow.get("stages", {}).get("planning_review", {}).get("finished_at", 0)
+            try:
+                updated_at = datetime.fromisoformat(
+                    observed.get("updated_at", "").replace("Z", "+00:00")
+                ).timestamp()
+            except (ValueError, TypeError):
+                updated_at = float("inf")
+            source_revision = metadata.get(unit.id, {}).get("revision")
+            if (
+                not planning
+                or planning.state != UnitState.DELIVERED
+                or unit.id not in flow.get("activated_units", ())
+                or not source_revision
+                or not reviewed_at
+                or updated_at > reviewed_at
+            ):
+                return TrackingStep(
+                    "",
+                    None,
+                    bindings,
+                    unit_bindings,
+                    reason="Closed parent scope needs reviewed extension authority and fresh owner-state reconciliation",
+                )
+            action_key = self._action(snapshot, key, "reopen")
+            if saved.get(action_key) and saved[action_key].state == "confirmed":
+                return TrackingStep(
+                    action_key,
+                    None,
+                    bindings,
+                    unit_bindings,
+                    reason="Parent was closed again after the reviewed scope reopening",
+                )
+            intent = self.gateway.reopen_intent(
+                kind,
+                binding["number"],
+                action_id=action_key,
+                generation=snapshot.generation,
+                approved_scope={
+                    "planning_pr": planning.bindings["pr"]["number"],
+                    "source_revision": source_revision,
+                    "graph_revision": snapshot.graph_revision,
+                },
             )
             return TrackingStep(action_key, intent, bindings, unit_bindings)
         # Creation is complete. Native relationships are separate durable actions.
@@ -304,7 +378,7 @@ class HierarchyCoordinator:
                 + f"{unit.spec.source}:{unit.spec.initiative or snapshot.spec.name}:{unit.spec.epic}"
                 == key
             ]
-            if not members or any(unit.state != UnitState.DELIVERED for unit in members):
+            if not members or any(not _settled_member(unit) for unit in members):
                 continue
             action_key = self._action(snapshot, key, "close")
             existing = saved.get(action_key)
@@ -347,7 +421,7 @@ class HierarchyCoordinator:
                 for unit in snapshot.units.values()
                 if f"{unit.spec.source}:{unit.spec.initiative or snapshot.spec.name}" == namespace
             ]
-            if not members or any(unit.state != UnitState.DELIVERED for unit in members):
+            if not members or any(not _settled_member(unit) for unit in members):
                 continue
             if any(
                 k.startswith("epic:" + namespace + ":") and not b.get("closed_confirmed")
@@ -367,6 +441,17 @@ class HierarchyCoordinator:
                     bindings,
                     {},
                     reason=existing.error or "Milestone closure pending",
+                )
+            open_members = self.gateway.pages(
+                f"{self.gateway.root}/issues?state=open&milestone={binding['number']}"
+            )
+            if open_members:
+                return TrackingStep(
+                    action_key,
+                    None,
+                    bindings,
+                    {},
+                    reason="Milestone retains open scope outside this delivered selection",
                 )
             intent = self.gateway.close_milestone_intent(
                 binding["number"],
@@ -463,4 +548,6 @@ class HierarchyCoordinator:
 
     @staticmethod
     def _action(snapshot: CampaignSnapshot, key: str, operation: str) -> str:
+        if operation in {"close", "reopen"}:
+            operation += f":graph-{snapshot.graph_revision}"
         return "github-" + hashlib.sha256(f"{snapshot.id}:{key}:{operation}".encode()).hexdigest()

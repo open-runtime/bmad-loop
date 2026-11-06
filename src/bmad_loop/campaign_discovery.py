@@ -66,6 +66,32 @@ class OverlapDisposition:
     adopted_pr: int | None = None
 
 
+def evidence_ids(inventory: CoverageReceipt) -> frozenset[str]:
+    """Exact observed object versions a disposition may cite."""
+    values = set()
+    for row in inventory.issues:
+        values.add(f"issue:{row['number']}@{row.get('updated_at', '')}")
+        if row.get("html_url"):
+            values.add(row["html_url"])
+    for row in inventory.pulls:
+        head = row.get("head", {}).get("sha", "")
+        values.add(f"pr:{row['number']}@{head}")
+        if head:
+            values.add(head)
+        if row.get("html_url"):
+            values.add(row["html_url"])
+    for row in (*inventory.local_refs, *inventory.remote_refs):
+        values.add(f"ref:{row['ref']}@{row['sha']}")
+        values.add(row["sha"])
+    for row in inventory.worktrees:
+        if row.get("HEAD"):
+            values.add(f"worktree:{row['worktree']}@{row['HEAD']}")
+            values.add(row["HEAD"])
+    for row in inventory.archives:
+        values.add(f"archive:{row['path']}@{row['sha256']}")
+    return frozenset(values)
+
+
 def validate_overlap(
     disposition: OverlapDisposition,
     inventory: CoverageReceipt,
@@ -82,6 +108,8 @@ def validate_overlap(
         raise ValueError("Incomplete inventory cannot authorize work admission")
     if disposition.disposition != "new_work" and not disposition.evidence_ids:
         raise ValueError("Overlap disposition requires exact source/PR/commit evidence")
+    if set(disposition.evidence_ids) - evidence_ids(inventory):
+        raise ValueError("Overlap disposition cites evidence absent from the observed inventory")
     if disposition.disposition == "already_delivered" and not delivery_verified:
         raise ValueError("Delivery requires independent merged/source verification")
     if disposition.disposition == "continue_existing_work":
@@ -119,7 +147,7 @@ class RepositoryDiscovery:
         remote: str = "origin",
         recent_since: str = "",
         mapped_prs: tuple[int, ...] = (),
-        detailed_prs: tuple[int, ...] = (),
+        detailed_prs: tuple[int, ...] | None = (),
         archive_roots: tuple[Path, ...] = (),
     ) -> CoverageReceipt:
         if remote.startswith("-") or not remote:
@@ -141,7 +169,10 @@ class RepositoryDiscovery:
                     pulls.append(self.gateway.pull(number))
             detailed: list[JsonObject] = []
             for row in pulls:
-                if row["number"] in detailed_prs:
+                if (
+                    detailed_prs is None
+                    and (row.get("state", "open") == "open" or row["number"] in mapped_prs)
+                ) or (detailed_prs is not None and row["number"] in detailed_prs):
                     full = self.gateway.pull(row["number"])
                     files = self.gateway.files(row["number"])
                     if len(files) < full.get("changed_files", len(files)) or len(files) >= 3000:
@@ -251,6 +282,12 @@ class RepositoryDiscovery:
                 "remote_branch_tips",
                 "common_dir_refs_worktrees",
                 "explicit_archive_manifests",
+                *(("recent_closed_prs",) if recent_since else ()),
+                *(
+                    ("active_pr_diffs_reviews",)
+                    if detailed_prs is None
+                    else ("selected_pr_details",) if detailed_prs else ()
+                ),
             ),
             not unavailable and not truncated,
             tuple(unavailable),

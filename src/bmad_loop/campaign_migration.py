@@ -351,7 +351,6 @@ def inventory(
         except (OSError, ValueError, RuntimeError) as exc:
             unavailable.append(f"github:{type(exc).__name__}")
     services = []
-    now = clock()
     for observer in observers:
         try:
             observed = observer(project, common)
@@ -367,7 +366,7 @@ def inventory(
                 or observed.faults
             ):
                 raise MigrationError("service inventory incomplete or unversioned")
-            if not 0 <= now - observed.observed_at <= 120:
+            if not 0 <= clock() - observed.observed_at <= 120:
                 raise MigrationError("service inventory stale")
             if any(
                 not item.id
@@ -393,7 +392,7 @@ def inventory(
         1,
         str(project),
         str(common),
-        now,
+        clock(),
         tuple(items),
         tuple(services),
         tuple(unavailable),

@@ -16,7 +16,7 @@ import uuid
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .campaign_model import (
     CampaignError,
@@ -28,6 +28,9 @@ from .campaign_model import (
 )
 from .platform_util import atomic_write_text, file_lock
 from .statemachine import check_campaign_transition
+
+if TYPE_CHECKING:
+    from .campaign_external_merge import ExternalMergeEvidence
 
 
 class RevisionConflict(CampaignError):
@@ -148,7 +151,21 @@ class CampaignStore:
                 if unit.claim and not unit.claim.quiescent and replacement is None:
                     raise CampaignError(f"uncertain/live claim cannot be removed: {key}")
                 if replacement and replacement.state != unit.state:
-                    check_campaign_transition(key, unit.state, replacement.state)
+                    if (
+                        unit.state == UnitState.READY_TO_PUBLISH
+                        and replacement.state == UnitState.MERGED_PENDING_SYNC
+                        and replacement.evidence.get("external_merge")
+                    ):
+                        from .campaign_external_merge import ExternalMergeEvidence
+
+                        raw = dict(replacement.evidence["external_merge"])
+                        raw["parents"] = tuple(raw["parents"])
+                        raw["checkpoint_heads"] = tuple(raw["checkpoint_heads"])
+                        audit = snapshot.clone()
+                        audit.units[key].state = unit.state
+                        reconcile_external_merge(audit, key, ExternalMergeEvidence(**raw))
+                    else:
+                        check_campaign_transition(key, unit.state, replacement.state)
             if any(
                 key not in snapshot.units or snapshot.units[key].spec != unit.spec
                 for key, unit in previous.units.items()
@@ -320,3 +337,54 @@ def transition(snapshot: CampaignSnapshot, unit: str, target: UnitState, **detai
     source = current.state
     current.state = target
     add_event(snapshot, "transition", unit=unit, source=str(source), target=str(target), **details)
+
+
+def reconcile_external_merge(
+    snapshot: CampaignSnapshot, unit_id: str, proof: ExternalMergeEvidence
+) -> None:
+    """Record a canonical external landing without inventing native submission."""
+    from .campaign_external_merge import ExternalMergeEvidence
+    from .statemachine import check_campaign_external_merge
+
+    unit = snapshot.units[unit_id]
+    check_campaign_external_merge(unit_id, unit.state)
+    integrated = unit.evidence.get("integrated", {})
+    if (
+        not isinstance(proof, ExternalMergeEvidence)
+        or proof.schema_version != 1
+        or proof.repository != snapshot.repository
+        or proof.unit_id != unit.id
+        or proof.head != integrated.get("head")
+        or proof.base != integrated.get("base")
+        or proof.target != snapshot.spec.target
+        or not proof.merge_commit
+        or not proof.canonical_head
+        or not proof.covered_tree
+        or not proof.quiescent
+        or not proof.parents
+        or not unit.claim
+        or not unit.claim.quiescent
+        or unit.hold
+        or proof.source_revision != unit.bindings.get("source_revision", "")
+        or proof.graph_revision != snapshot.graph_revision
+        or proof.config_revision != snapshot.config_revision
+        or not proof.verification_launch
+        or not proof.review_launch
+        or proof.verification_launch != unit.evidence.get("verification", {}).get("launch_id")
+        or proof.review_launch != unit.evidence.get("review", {}).get("launch_id")
+    ):
+        raise CampaignError(
+            "external merge proof is stale, uncovered or does not match accepted unit authority"
+        )
+    from dataclasses import asdict
+
+    unit.state = UnitState.MERGED_PENDING_SYNC
+    unit.evidence["external_merge"] = asdict(proof)
+    add_event(
+        snapshot,
+        "external-merge-reconciled",
+        unit=unit.id,
+        head=proof.head,
+        merge_commit=proof.merge_commit,
+        canonical_head=proof.canonical_head,
+    )

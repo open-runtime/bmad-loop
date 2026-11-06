@@ -5,8 +5,8 @@ Every `bmad-loop` subcommand, its options, its `--json` document, the process ex
 ## Global options
 
 - The top-level parser documents only `-h` and `--version`. A subcommand is required; a missing or unknown one exits 2.
-- **`--project PROJECT`** — every subcommand except `relay` accepts it. It names the target project root; the default is the current directory. Before dispatch, these subcommands apply the project's `[mux] backend` choice; a broken `policy.toml` falls back to auto-selection there. Commands that need the policy load it themselves and fail with `error: …`, exit 1.
-- **`--json`** — accepted by `validate`, `plugins`, `probe-adapter`, `decisions`, `confirm`, `list`, `status`, `diagnose`, `cleanup` and `clean`. See [Machine-readable output](#machine-readable-output---json).
+- **`--project PROJECT`** — every subcommand except `relay` accepts it. It names the target project root; the default is the current directory. Legacy commands apply the project's `[mux] backend` choice; a broken `policy.toml` falls back to auto-selection there. Campaign validation and observations bypass this legacy mux setup. Commands that need the policy load it themselves and fail with `error: …`, exit 1.
+- **`--json`** — accepted by `validate`, `plugins`, `probe-adapter`, `decisions`, `confirm`, `list`, `status`, `diagnose`, `cleanup`, `clean` and campaign commands except `campaign attach`. See [Machine-readable output](#machine-readable-output---json).
 
 ### Run references
 
@@ -27,6 +27,42 @@ Every `bmad-loop` subcommand, its options, its `--json` document, the process ex
 ## Subcommands
 
 Listed in `bmad-loop --help` order. `--project` is omitted from the option tables below.
+
+### `campaign`
+
+Supervises a versioned dependency graph through planning, isolated workers,
+review, merge and tracking reconciliation. Each campaign uses exact IDs from
+`campaign list`; legacy partial run references do not apply.
+
+```text
+bmad-loop campaign validate SPEC [--json]
+bmad-loop campaign preflight SPEC [--json]
+bmad-loop campaign run SPEC [--paradev-reflect] [--paradev-project ID] [--json]
+bmad-loop campaign list [--json]
+bmad-loop campaign status ID [--json]
+bmad-loop campaign resume ID [--json]
+bmad-loop campaign stop ID [--terminate-workers] [--json]
+bmad-loop campaign hold ID --unit UNIT --reason TEXT [--json]
+bmad-loop campaign release ID --unit UNIT [--json]
+bmad-loop campaign attach ID --unit UNIT [--role ROLE]
+bmad-loop campaign reconcile ID [--json]
+```
+
+`--project PROJECT` is accepted before or after the campaign action. Validation
+is offline and mutation-free. Preflight reports separate planning, execution,
+publication and reflection verdicts without starting agents or changing rules.
+Run/resume supervise in the foreground; reconcile does not launch workers.
+Controls enqueue durable requests. Stop drains bounded stages unless explicit
+termination is requested. Release only requests removal of an operator hold.
+
+JSON results contain `schema_version`, `command` and `ok`. Status and execution
+results have a `campaign` projection; list has `campaigns`; controls have `request`.
+Invalid validation/preflight is a failing verdict document. Operational errors
+leave stdout empty and report on stderr. Status excludes private configuration
+and raw evidence; `delivered` requires confirmed merge and reconciled tracking.
+
+See the [campaign guide](../campaign-guide.md) for configuration, GitHub mapping,
+model pools, reflection and project activation requirements.
 
 ### `init`
 

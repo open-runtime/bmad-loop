@@ -1,0 +1,248 @@
+"""A real campaign reaches canonical delivery through queued synthetic G checks."""
+
+import sys
+from dataclasses import replace
+from urllib.parse import urlsplit
+
+from conftest import git
+from test_campaign_merge_adapter import source
+from test_campaign_runtime import diagnose
+from test_campaign_runtime import production_case as production_case
+from test_campaign_runtime import run_case
+
+from bmad_loop import campaign_runtime, verify
+from bmad_loop.campaign_github import ApiResponse, UncertainMutation
+from bmad_loop.campaign_model import GitHubSpec, UnitState
+
+
+class QueuedServer:
+    """Extend the scripted authenticated service with a real merge-queue DAG."""
+
+    def __init__(self, service):
+        self.service = service
+        self.original = service.request
+        self.entries = {}
+        self.checks = []
+        self.groups = []
+        self.group_numbers = set()
+        self.drop_check_ack = True
+        self.check_creates = 0
+
+    def _reply(self, data, status=200):
+        return ApiResponse(status, data, {})
+
+    def _build(self, number, base):
+        service = self.service
+        pr = service._pull(number)
+        head = pr["head"]["sha"]
+        tree = git(service.remote, "merge-tree", "--write-tree", base, head).splitlines()[0]
+        group = git(
+            service.remote,
+            "-c",
+            "user.name=GitHub Queue",
+            "-c",
+            "user.email=queue@example.test",
+            "commit-tree",
+            tree,
+            "-p",
+            base,
+            "-p",
+            head,
+            "-m",
+            f"Merge queue G for #{number}",
+        )
+        git(
+            service.remote,
+            "update-ref",
+            f"refs/heads/gh-readonly-queue/main/pr-{number}-{group[:12]}",
+            group,
+        )
+        entry = {
+            "id": f"QE_{number}",
+            "state": "AWAITING_CHECKS",
+            "headCommit": {"oid": group},
+            "baseCommit": {"oid": base},
+            "pullRequest": {
+                "id": pr["node_id"],
+                "number": number,
+                "headRefOid": head,
+                "baseRefName": "main",
+            },
+        }
+        self.entries[number] = entry
+        self.groups.append((number, group, base, head))
+        self.group_numbers.add(number)
+        return entry
+
+    def _entry(self, number):
+        if number not in self.entries:
+            return None
+        entry = self.entries[number]
+        base = self.service._base()
+        if not verify.is_ancestor(self.service.remote, base, entry["headCommit"]["oid"]):
+            entry = self._build(number, base)
+        return entry
+
+    def _land(self):
+        for number in list(self.entries):
+            entry = self._entry(number)
+            head = entry["headCommit"]["oid"]
+            check = next(
+                (
+                    row
+                    for row in self.checks
+                    if row["head_sha"] == head
+                    and row["name"] == "CI"
+                    and row["app"]["id"] == 7
+                    and row["conclusion"] == "success"
+                ),
+                None,
+            )
+            if check is None:
+                break
+            base = self.service._base()
+            assert verify.is_ancestor(self.service.remote, base, head)
+            git(self.service.remote, "update-ref", "refs/heads/main", head, base)
+            pr = self.service.pulls[number]
+            pr.update(merged=True, state="closed", merge_commit_sha=head)
+            self.service.merge_bases[number] = base
+            self.entries.pop(number)
+            self.service._save()
+
+    def request(self, method, path, payload=None):
+        service = self.service
+        route = urlsplit(path).path.removeprefix("repos/a/b/")
+        with service.lock:
+            if path == "graphql" and "dequeuePullRequest" in payload.get("query", ""):
+                node = payload["variables"]["input"]["pullRequestId"]
+                pr = next(row for row in service.pulls.values() if row["node_id"] == node)
+                self.entries.pop(pr["number"], None)
+                return self._reply(
+                    {
+                        "data": {
+                            "dequeuePullRequest": {
+                                "pullRequest": {
+                                    "id": node,
+                                    "headRefOid": pr["head"]["sha"],
+                                    "baseRefName": "main",
+                                    "mergeQueueEntry": None,
+                                }
+                            }
+                        }
+                    }
+                )
+            if path == "graphql" and "mergeQueueEntry" in payload.get("query", ""):
+                number = payload["variables"]["number"]
+                pr = service._pull(number)
+                return self._reply(
+                    {
+                        "data": {
+                            "repository": {
+                                "nameWithOwner": "a/b",
+                                "pullRequest": {
+                                    "id": pr["node_id"],
+                                    "number": number,
+                                    "headRefOid": pr["head"]["sha"],
+                                    "baseRefName": "main",
+                                    "merged": pr["merged"],
+                                    "state": pr["state"].upper(),
+                                    "mergeQueueEntry": self._entry(number),
+                                },
+                            }
+                        }
+                    }
+                )
+            if method == "GET" and route == "rules/branches/main":
+                original = self.original(method, path, payload)
+                return self._reply(
+                    [
+                        *original.data,
+                        {"type": "merge_queue", "parameters": {"merge_method": "MERGE"}},
+                    ]
+                )
+            if method == "PUT" and route.endswith("/merge-async"):
+                assert payload["merge_action"] == "merge_queue" and payload["bypass_rules"] is False
+                number = int(route.split("/")[1])
+                assert payload["sha"] == service._pull(number)["head"]["sha"]
+                self._build(number, service._base())
+                service.calls.append((method, path, payload))
+                return self._reply(
+                    {
+                        "status": "enqueued",
+                        "details": {
+                            "uuid": f"queue-{number}",
+                            "expected_head_sha": payload["sha"],
+                            "merge_action": "merge_queue",
+                            "bypass_rules": False,
+                        },
+                    },
+                    202,
+                )
+            if method == "GET" and route.startswith("pulls/") and "/merge-async/" in route:
+                return self._reply({"status": "enqueued", "details": {"bypass_rules": False}})
+            if method == "GET" and route.startswith("commits/") and route.endswith("/check-runs"):
+                head = route.split("/")[1]
+                if any(group[1] == head for group in self.groups):
+                    return self._reply(
+                        {"check_runs": [row for row in self.checks if row["head_sha"] == head]}
+                    )
+            if method == "POST" and route == "check-runs":
+                service.calls.append((method, path, payload))
+                self.check_creates += 1
+                row = {**payload, "id": 1000 + self.check_creates, "app": {"id": 7}}
+                self.checks.append(row)
+                self._land()
+                if self.drop_check_ack:
+                    self.drop_check_ack = False
+                    raise UncertainMutation("lost check acknowledgement after canonical landing")
+                return self._reply(row, 201)
+            return self.original(method, path, payload)
+
+
+def test_production_campaign_queue_checks_exact_g_and_preserves_h_on_lost_ack(
+    production_case, tmp_path, monkeypatch
+):
+    case = production_case
+    server = QueuedServer(case.service)
+    monkeypatch.setattr(case.service, "request", server.request)
+    script = tmp_path / "qualified-combined-verifier.py"
+    script.write_text(source())
+    probe = tmp_path / "authenticated-app-producer.py"
+    probe.write_text(
+        "import json,time\nprint(json.dumps({'schema_version':1,'repository':'a/b','context':'CI','app_id':7,'mode':'native','authenticated':True,'producer':'scripted-github-app','checks_write':True,'observed_at':time.monotonic()*100}))\n"
+    )
+    settings = GitHubSpec(
+        repository="a/b",
+        merge_mode="queue",
+        candidate_command=(sys.executable, str(script)),
+        candidate_check_context="CI",
+        candidate_check_app_id=7,
+        candidate_producer_probe=(sys.executable, str(probe)),
+    )
+    spec = replace(case.snapshot.spec, name="queued-production", units=(), github=settings)
+    _, snapshot = campaign_runtime.create(case.repo, spec)
+    dependent = snapshot.units["source:project:dependent"]
+    dependent.spec = replace(dependent.spec, after=("source:project:first",))
+    snapshot.graph_revision += 1
+    snapshot = case.store.save(snapshot, snapshot.revision)
+    case.snapshot = snapshot
+    result = run_case(case, ticks=2500)
+    assert result.phase == "delivered", diagnose(result)
+    assert all(unit.state == UnitState.DELIVERED for unit in result.units.values())
+    assert len(server.group_numbers) >= 3
+    assert server.checks and all(row["app"]["id"] == 7 for row in server.checks)
+    assert len({row["external_id"] for row in server.checks}) == len(server.checks)
+    for unit in result.units.values():
+        if unit.spec.kind in {"planning", "tracking"}:
+            continue
+        state = unit.evidence["queue"]
+        assert unit.bindings["head"] == unit.evidence["integrated"]["head"]
+        assert state["verification"]["group_head"] != unit.bindings["head"]
+        assert verify.is_ancestor(
+            case.remote, unit.bindings["head"], git(case.remote, "rev-parse", "main")
+        )
+    assert not [
+        payload
+        for method, path, payload in case.service.calls
+        if method == "PUT" and path.endswith("merge-async") and payload.get("bypass_rules")
+    ]

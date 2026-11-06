@@ -1468,6 +1468,17 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             ]
         if spec.model:
             argv += [self.profile.model_flag, spec.model]
+        if spec.effort:
+            # Additive to both fresh and resumed launches: extra_args replaces
+            # permission flags and is therefore the wrong channel for effort.
+            if self.profile.hooks.dialect == "codex-hooks-json":
+                if spec.effort not in {"minimal", "low", "medium", "high", "xhigh", "max", "ultra"}:
+                    raise ValueError(f"unsupported Codex reasoning effort: {spec.effort}")
+                argv += ["-c", f'model_reasoning_effort="{spec.effort}"']
+            elif self.profile.hooks.dialect == "claude-settings-json":
+                if spec.effort not in {"low", "medium", "high", "max"}:
+                    raise ValueError(f"unsupported Claude reasoning effort: {spec.effort}")
+                argv += ["--effort", spec.effort]
         return argv
 
     def _linked_worktree_grant(self, cwd: Path) -> tuple[str, ...]:
@@ -1584,6 +1595,10 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
     # --------------------------------------------------------------- adapter
 
     def start_session(self, spec: SessionSpec) -> SessionHandle:
+        from ..campaign_hold import held
+
+        if held():
+            raise MultiplexerError("campaign operator hold suppresses automatic session launch")
         # Refuse before touching prompt/artifact files or opening a window.
         # The engine performs the same check before a retry can reset the tree;
         # this boundary also protects callers outside Engine.
@@ -2348,13 +2363,29 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 last_activity = self._log_activity_key(handle.task_id)
             return True
 
+        hold_noted = False
         while True:
+            from ..campaign_hold import held
+
+            operator_held = held()
+            if operator_held:
+                # Takeover never kills a live agent through a stall/budget timer.
+                # Continue consuming native hooks and detecting actual death.
+                deadline = max(deadline, time.monotonic() + 60)
+                wall_deadline = max(wall_deadline, time.time() + 60)
+                if stall_deadline is not None:
+                    stall_deadline = max(stall_deadline, time.monotonic() + 60)
+                if turn_error_due is not None:
+                    turn_error_due = max(turn_error_due, time.monotonic() + 60)
+                if not hold_noted:
+                    self._note_lifecycle(handle.task_id, "campaign-operator-held")
+                    hold_noted = True
             # Top-of-tick pane-frame sample for the no-work verdict (#727). Before
             # the timeout check so growth on the final tick still counts; before the
             # nudge arm so a tick that both sees growth and sends a nudge scores the
             # growth (the nudge cannot have caused what preceded it).
             sample_frame()
-            if quota.waiting:
+            if quota.waiting and not operator_held:
                 # Usage-limit quota wait (DW-396): the CLI sits behind a usage
                 # window it will continue from by itself, so the session clock
                 # stands still. The cap is checked first, on the longer of the
@@ -2749,7 +2780,8 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # transcript_path is unknown until the first hook event carries
                 # it (SessionStart for claude); until then the guard is inert.
                 if (
-                    not budget_tripped
+                    not operator_held
+                    and not budget_tripped
                     and spec.token_budget is not None
                     and spec.token_budget_mode in ("warn", "enforce")
                     and transcript_path
@@ -2854,9 +2886,13 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             # The token-budget grace is deliberately NOT frozen by a usage-limit
             # quota wait (DW-396): a crossed budget is real spend, and a session
             # waiting out a reset after crossing it has nothing left to earn.
-            if budget_deadline is not None and (
-                time.monotonic() >= budget_deadline
-                or (budget_wall_deadline is not None and time.time() >= budget_wall_deadline)
+            if (
+                not operator_held
+                and budget_deadline is not None
+                and (
+                    time.monotonic() >= budget_deadline
+                    or (budget_wall_deadline is not None and time.time() >= budget_wall_deadline)
+                )
             ):
                 # Grace expired with no completion (wall co-bound included: a
                 # suspend-frozen monotonic clock must not stretch the window,
@@ -2969,6 +3005,8 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         stop_seen=stop_seen,
                         produced_work=produced_work(),
                     )
+                if operator_held:
+                    continue
                 if stall_deadline is not None:
                     # No artifact shortcut here: the window is alive on this tick
                     # (a dead one returned "crashed" above), and a terminal
@@ -3386,6 +3424,11 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         self._end_quota_wait(handle, quota, "latch")
                 continue
             if event.event == "StopFailure":
+                if operator_held:
+                    self._note_lifecycle(
+                        handle.task_id, "stop-nudge-withheld", reason="campaign-operator-hold"
+                    )
+                    continue
                 # An API error ended the turn (#865): Claude Code fires this
                 # INSTEAD of `Stop`, so it is never a completion — no
                 # `stop_seen`, no result read, no grace re-arm, no restored
@@ -3617,6 +3660,11 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         budget_weighted=budget_weighted,
                         stop_seen=stop_seen,
                     )
+                if operator_held:
+                    self._note_lifecycle(
+                        handle.task_id, "stop-nudge-withheld", reason="campaign-operator-hold"
+                    )
+                    continue
                 if quota.waiting:
                     # A result-less Stop while the CLI waits out a usage-window
                     # reset (DW-396): typing the stop nudge into it can only
@@ -4536,6 +4584,11 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         tries an hcom request into the same session (the instance its relay
         reported, when hcom shows it listening) and falls back to tmux keystrokes
         on any miss; upstream, and by default, it types into the pane."""
+        from ..campaign_hold import held
+
+        if held():
+            self._note_lifecycle(handle.task_id, "nudge-withheld", reason="campaign-operator-hold")
+            return
         if self.policy.recovery.nudge_via == "hcom" and self._send_via_hcom(handle, text):
             return
         self.mux.send_text(handle.pane_target or handle.native_id, text)

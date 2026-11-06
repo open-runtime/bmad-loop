@@ -227,6 +227,21 @@ class CampaignSupervisor:
             with ThreadPoolExecutor(max_workers=self.io_workers) as executor:
                 snapshot = self._reconciled(campaign_id, executor)
                 snapshot = self._commands(snapshot)
+                observations = getattr(self.driver, "reconciliation_observations", None)
+                if observations is not None:
+                    snapshot = self._queue(snapshot, observations(snapshot))
+                    for action in tuple(snapshot.outbox):
+                        if action.state == "prepared" and action.kind in {
+                            "inventory",
+                            "capacity",
+                            "intake",
+                            "observe-worker",
+                        }:
+                            snapshot = self._submit(snapshot, action, executor, reconcile=False)
+                    while self._active:
+                        snapshot = self._harvest(snapshot)
+                        if self._active:
+                            self._wake.wait(0.05)
                 return snapshot
 
     def run(self, campaign_id: str, *, max_ticks: int | None = None) -> CampaignSnapshot:
@@ -265,10 +280,22 @@ class CampaignSupervisor:
                 # be treated as dead merely because this generation is new.
                 snapshot = self.store.save(snapshot, snapshot.revision)
                 ticks = 0
+                progress_at = 0.0
                 try:
                     while snapshot.phase not in {"delivered", "stopped"}:
                         snapshot = self._commands(snapshot)
                         snapshot = self._harvest(snapshot)
+                        if self.clock() - progress_at >= 10:
+                            counts: dict[str, int] = {}
+                            for unit in snapshot.units.values():
+                                counts[str(unit.state)] = counts.get(str(unit.state), 0) + 1
+                            self.progress(
+                                f"{snapshot.id}: {snapshot.phase}; "
+                                + ", ".join(
+                                    f"{key}={value}" for key, value in sorted(counts.items())
+                                )
+                            )
+                            progress_at = self.clock()
                         proposals = self.driver.observe_workers(snapshot)
                         if snapshot.phase == "active":
                             proposals += self.driver.proposals(snapshot)
@@ -295,13 +322,16 @@ class CampaignSupervisor:
                             for action in snapshot.outbox
                         )
                         from .campaign_runtime_intake import optional_canceled, settled
+
                         if (
                             snapshot.units
                             and all(
                                 unit.state == UnitState.DELIVERED or optional_canceled(unit)
                                 for unit in snapshot.units.values()
                             )
-                            and not unsettled and settled(snapshot)
+                            and not unsettled
+                            and settled(snapshot)
+                            and getattr(self.driver, "completion_ready", lambda _: True)(snapshot)
                         ):
                             snapshot.phase = "delivered"
                             add_event(snapshot, "campaign-delivered")

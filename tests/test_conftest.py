@@ -1703,6 +1703,7 @@ _EXPECTED_E2E_DEF_COUNTS: dict[str, dict[str, int]] = {
     },
     "test_tickets_e2e.py": {"test_e2e_tickets_": 17},
     "test_conftest.py": {"test_private_tmux_": 1},
+    "test_campaign_workers.py": {"test_child_module_": 1},
 }
 
 

@@ -473,6 +473,58 @@ def test_new_ignored_story_spec_publishes_only_accepted_unit(project, tmp_path):
     )
 
 
+def test_tracked_story_manifest_does_not_force_ignored_new_spec_into_code_pr(project, tmp_path):
+    from conftest import install_bmad_config
+    from test_stories_engine import SPEC_FOLDER, setup_stories
+
+    install_bmad_config(project)
+    folder = setup_stories(project, [{"id": "one", "title": "One", "description": "Implement one"}])
+    with (project.project / ".gitignore").open("a", encoding="utf-8") as out:
+        out.write("/" + SPEC_FOLDER + "/stories/*.md\n")
+    git(project.project, "add", ".gitignore")
+    git(project.project, "commit", "-m", "ignored new specs with tracked manifest")
+    remote(project.project, tmp_path / "code.git", "source-code")
+    publication = SourcePublication(project.project, tmp_path / "publication", remote="source-code")
+    source = SourceSelector("stories", id="stories", path=SPEC_FOLDER)
+    unit = UnitSpec("stories:one", "stories", "epic", "One", selector="one")
+    binding = publication.capture(source, unit)
+    assert binding.versioning == "code-repo" and binding.path == ""
+    artifact = b"---\nid: one\nstatus: done\n---\n# Accepted new story\n"
+    merge, acceptance = reviewed(publication, artifact)
+    target = folder / "stories" / "one-accepted.md"
+    accepted = publication.prepare_artifact(
+        "story", binding, artifact, canonical_path=target, merge=merge, acceptance=acceptance
+    )
+    result = publication.publish(
+        "story",
+        source,
+        unit,
+        binding,
+        merged_commit=merge["merged_commit"],
+        journal=Journal(tmp_path / "journal"),
+        accepted_plan=accepted,
+    )
+    assert result.state == "confirmed" and target.read_bytes() == artifact
+    assert (
+        verify.git_bytes(
+            project.project, "ls-files", "--", target.relative_to(project.project).as_posix()
+        ).stdout
+        == b""
+    )
+    assert (
+        publication.publish(
+            "story",
+            source,
+            unit,
+            binding,
+            merged_commit=merge["merged_commit"],
+            journal=Journal(tmp_path / "journal"),
+            accepted_plan=accepted,
+        ).state
+        == "confirmed"
+    )
+
+
 def closure_case(shared):
     publication, source, _, plan = shared
     tree = TicketTree(publication.project)

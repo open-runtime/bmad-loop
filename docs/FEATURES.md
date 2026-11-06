@@ -15,6 +15,21 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
 
 ## Core loop
 
+### Native development campaigns
+
+- **Stability:** experimental
+- **Description:** A repository coordinator supervises independent unit workers, planning and GitHub delivery with durable ownership, recovery and optional native Paradev reflection.
+- **Properties:**
+  - Versioned TOML validation is offline; preflight reports separate planning, execution, publication and reflection readiness.
+  - Independent units within and across epics can be admitted together, subject to explicit dependencies, ownership and separate execution/review/verification capacities.
+  - Dependencies release on delivered work; local completion and merged work with tracking debt remain distinct.
+  - Campaign snapshots commit transitions and outbound intents atomically, and uncertain launches retain ownership.
+  - Evidence review recognizes existing owner decisions and actual approvals without inventing authorization; bounded diagnosis and repair preserve lifetime budgets.
+  - Operator controls enqueue requests, while status projects units, holds and links without exposing private configuration or raw evidence.
+- **Config:** `bmad-loop campaign --help`; versioned campaign TOML; optional `[paradev] reflect`
+- **Tested by:** `tests/test_campaign_core.py`, `tests/test_campaign_cli.py`, `tests/test_campaign_decisions.py`, `tests/test_campaign_resolution.py`, `tests/test_campaign_publication.py`, `tests/test_campaign_paradev.py`
+- **Docs:** [Campaign guide](campaign-guide.md), [CLI reference: campaign](reference/cli.md#campaign)
+
 ### Deterministic story pipeline
 
 - **Stability:** stable

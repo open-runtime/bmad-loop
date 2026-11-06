@@ -187,6 +187,8 @@ def apply(snapshot: Any, unit: Any, data: dict[str, Any]) -> None:
     raw = dict(data["result"])
     raw["coordinates"] = EvidenceCoordinates(**raw["coordinates"])
     raw["verification"] = tuple((tuple(command), code) for command, code in raw["verification"])
+    if unit.evidence.get("retained_finalization_pending") and unit.claim:
+        unit.evidence["retained_finalization_pending"]["quiescence_receipt"] = unit.claim.launch_id
     finish_repair(snapshot, unit.id, ResolutionResult(**raw))
     for key in (
         "accepted_resolution",

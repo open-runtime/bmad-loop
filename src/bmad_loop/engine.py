@@ -917,7 +917,12 @@ class Engine:
         registry: PluginRegistry | None = None,
         retro_adapter: CodingCLIAdapter | None = None,
         plugin_grants: GrantSet = GrantSet.empty(),
+        campaign_execution: Any = None,
     ):
+        if state.campaign_binding and campaign_execution is None:
+            raise ValueError("campaign child requires its frozen campaign execution envelope")
+        self.campaign_execution = campaign_execution
+        self._campaign_retained_permit: Any = None
         self.paths = paths
         # where code+git work + artifact reads happen. isolation="none" (today's
         # only mode) → the repo root in place; Phase 3 swaps in per-unit worktrees.
@@ -1088,6 +1093,20 @@ class Engine:
             spec_confine_root=lambda task: self._spec_confine_root(task),
             owned_plan=self._owned_plan_writer(),
             ledger_rel=lambda: self._ledger_rel(),
+            campaign_recovery=(self._campaign_recovery if campaign_execution is not None else None),
+        )
+
+    def _campaign_recovery(self, task: StoryTask, *, cause: str = "retry") -> NoReturn:
+        """Hand off before reset, ledger restoration or lifecycle normalization."""
+        assert self.campaign_execution is not None
+        head = verify.rev_parse_head(self.workspace.root)
+        self.campaign_execution.recovery_request(task, head, cause=cause)
+        self.journal.append(
+            "campaign-recovery-requested", story_key=task.story_key, head=head, reason=cause
+        )
+        self._save()
+        self._escalation_pause(
+            "campaign recovery requested; checkpoint history preserved", task.story_key
         )
 
     def _escalation_pause(
@@ -1732,6 +1751,8 @@ class Engine:
         An unreadable or invalid file is journaled as deferred too, and the run
         goes on under the policy it has. The decision reads the policy in force,
         so turning the key off in the file stops reloads from the next one on."""
+        if self.campaign_execution is not None:
+            return
         if self.policy.recovery.reload_policy != "story-boundary":
             return
         from . import policy as policy_mod
@@ -2644,6 +2665,12 @@ class Engine:
 
     def _finish_inflight(self) -> None:
         """Complete or roll back tasks interrupted by a pause or crash."""
+        if self.campaign_execution is not None:
+            from .campaign_finalization import validate_resume
+
+            for task in self.state.tasks.values():
+                if not task.terminal and not validate_resume(self, task):
+                    self._campaign_recovery(task, cause="resume")
         for task in list(self.state.tasks.values()):
             if task.stopped_native:
                 self._continue_stopped_native(task)
@@ -3390,6 +3417,9 @@ class Engine:
         and returns it so the caller can read whitelisted mutations / resolve a
         veto. ``ctx.shared`` aliases ``state.plugin_shared`` so cross-stage
         mutations persist automatically."""
+        if self.campaign_execution is not None and stage in {"post_story", "post_run"}:
+            self.journal.append("campaign-hook-suppressed", stage=stage)
+            return None
         if not self._bus.active(stage):
             return None
         ctx = self._make_context(stage, task, **fields)
@@ -4396,6 +4426,8 @@ class Engine:
         runs before its failed relaunch probe pauses (DW-615). ``replayed`` names
         a crash-replayed attempt: its ledger restore journals a missing snapshot
         (``ledger-snapshot-missing``) instead of skipping it silently."""
+        if self.campaign_execution is not None:
+            self._campaign_recovery(task, cause="rejected-attempt")
         try:
             self._rollback_or_pause(task)
         finally:
@@ -5711,6 +5743,7 @@ class Engine:
                     publication_remote=publication_remote,
                     publication_branch=task.branch,
                     on_plan=record_finalization,
+                    append_only=self.campaign_execution is not None,
                 )
             task.commit_sha = sha or task.baseline_commit
             # the corrected spec is now durable in HEAD; later attempts need no
@@ -5729,6 +5762,8 @@ class Engine:
             task.dispatched_spec_snapshot = None
             task.dispatched_spec_absent = False
         except verify.GitError as e:
+            if self.campaign_execution is not None:
+                self._campaign_recovery(task, cause="finalization-failed")
             self._restore_deferred_closes(task, snapshot)
             self._restore_park_record(task, park_record)
             unrestored = self._undo_terminal_plan_write(task, plan_undo)
@@ -5741,6 +5776,8 @@ class Engine:
             # takes the arm above) passes through as itself. Either leaves the
             # ledger flipped — and the park record written — for a commit that
             # does not exist. Restore, then re-raise untouched.
+            if self.campaign_execution is not None:
+                self._campaign_recovery(task, cause="finalization-interrupted")
             self._restore_deferred_closes(task, snapshot)
             self._restore_park_record(task, park_record)
             # A failed put-back is journaled by the work source; the task stays
@@ -9767,8 +9804,24 @@ class Engine:
         commit_engine_ledger: bool = False,
         continuation: int = 0,
     ) -> SessionResult:
+        if self.campaign_execution is not None:
+            from .campaign_hold import held
+
+            if held():
+                self.journal.append(
+                    "campaign-session-withheld", story_key=task.story_key, role=role
+                )
+                self._escalation_pause("campaign operator hold; no automatic retry", task.story_key)
         # A session may change the environment a probe pass vouched for, so no
         # pass survives a launch (DW-523).
+        if self.campaign_execution is not None:
+            prompt += (
+                "\n\nCampaign execution: make coherent commits frequently (target ten minutes) "
+                "and at planning, implementation and repair boundaries. Keep the draft PR branch "
+                "append-only: no amend, reset, rebase or force push. The coordinator owns pushes, "
+                "main integration, GitHub tracking and merge. Stay within this unit; never start "
+                "another worker or close its parent epic. Preserve other agents' work."
+            )
         self._env_probes_fresh_root = None
         # ``label`` names a non-standard session (a plugin-provided workflow) so
         # its task_id stays distinct from the role's own dev/review attempts.

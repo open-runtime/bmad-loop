@@ -1559,20 +1559,18 @@ def cmd_validate(args: argparse.Namespace) -> int:
                         f"{role} adapter.extra_args for {prof.name} (opencode-http): {unservable}",
                         {"role": role, "profile": prof.name, "extra_args": list(cfg.extra_args)},
                     )
-            # Reasoning effort (#643) has exactly one carrier: the opencode-http
-            # kind sends it as the per-prompt `variant`. The tmux generic family
-            # has no channel for it — no profile flag, no hook field — so a stage
-            # that sets it there runs at the provider default with nothing to show
-            # for it. Keyed on the bundled GENERIC kind, like the two checks above,
-            # because "cannot carry effort" is a fact about that family; an
-            # out-of-tree kind's capability is not knowable here, so it stays
-            # silent rather than assert one. Advisory: severity `problem` is
-            # validate's exit code, and an ignored knob does not make a run unrunnable.
-            if prof is not None and prof.adapter == adapter_registry.GENERIC and cfg.effort:
+            # Native Codex and Claude profiles carry additive effort arguments.
+            # Other generic dialects retain their advisory legacy behavior.
+            if (
+                prof is not None
+                and prof.adapter == adapter_registry.GENERIC
+                and cfg.effort
+                and prof.hooks.dialect not in {"codex-hooks-json", "claude-settings-json"}
+            ):
                 report.warn(
                     "policy.effort-unsupported",
                     f"{role} effort {cfg.effort!r} is ignored by {prof.name}: "
-                    f"only the opencode-http adapter carries a reasoning-effort value",
+                    "this profile has no qualified native effort argument",
                     {"role": role, "effort": cfg.effort, "profile": prof.name},
                 )
             # DW-349: an explicit extra_args REPLACES the profile's bypass_args, so
@@ -6250,6 +6248,11 @@ def _prepare_resume_locked(
     ``accept_baseline`` is `resume --accept-baseline` (DW-371). It is written onto
     ``state.accept_baseline`` on EVERY resume — False included — so a plain, TUI,
     or `resolve` resume clears a latch a paused `--accept-baseline` resume left."""
+    from .campaign_execution import legacy_control_refusal
+
+    if refusal := legacy_control_refusal(run_dir):
+        print(refusal, file=sys.stderr)
+        return ExitCode.FAILURE
     # An id that aliases a control session (`ctl` / `ctl-<16hex>` —
     # runs.run_id_aliases_control_session; NOT the mint's broader reservation,
     # since a historical `ctl-foo` run has a genuine agent session and resumes
@@ -6924,6 +6927,11 @@ def _resume_paused_run(
     that drives a recorded run's engine comes through here, so a chained child
     resumed to finished continues its parent's chain here
     (:func:`_drive_initiative_chain`)."""
+    from .campaign_execution import legacy_control_refusal
+
+    if refusal := legacy_control_refusal(run_dir):
+        print(refusal, file=sys.stderr)
+        return ExitCode.FAILURE
     with state_lock(run_dir):
         # Cleanup removes the run under this same hold. A resume that resolved the
         # path before cleanup won must not let Journal/save_state recreate it after
@@ -7061,6 +7069,11 @@ def cmd_resume(args: argparse.Namespace) -> int:
         print(str(e), file=sys.stderr)
         return 1
     args.run_id = run_dir.name  # normalize so messages show the full id
+    from .campaign_execution import legacy_control_refusal
+
+    if refusal := legacy_control_refusal(run_dir):
+        print(refusal, file=sys.stderr)
+        return ExitCode.FAILURE
     # Gate here, NOT in _resume_paused_run: that helper is also resolve's re-arm
     # path, which is already gated at resolve entry. A provably-live engine blocks
     # outright (the TUI warns in its confirm modal instead; the CLI has no confirm
@@ -7489,6 +7502,11 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         print(str(e), file=sys.stderr)
         return 1
     args.run_id = run_dir.name  # normalize so echoed hints show the full id
+    from .campaign_execution import legacy_control_refusal
+
+    if refusal := legacy_control_refusal(run_dir):
+        print(refusal, file=sys.stderr)
+        return ExitCode.FAILURE
     # Ahead of EVERY side effect, not delegated to _resume_paused_run's gate:
     # this flow launches the interactive resolve session and re-arms the
     # escalation before it reaches that helper, and refusing after either
@@ -11501,6 +11519,10 @@ def main(argv: list[str] | None = None) -> int:
         p.set_defaults(func=func)
         return p
 
+    from . import campaign_cli
+
+    campaign_cli.register(sub)
+
     init_p = add(
         "init", cmd_init, "install hooks + skills + policy template into the target project"
     )
@@ -12079,6 +12101,8 @@ def main(argv: list[str] | None = None) -> int:
         # Install the policy [mux] backend choice before dispatch: several
         # handlers (probe/diagnose/attach/stop/cleanup/tui) reach the mux
         # without ever loading policy, so this is the one reliable seam.
+        if args.command == "campaign":
+            return args.func(args)
         _configure_mux(_project(args))
         if args.ctl_launch and args.func in (cmd_resume, cmd_resolve):
             return _drive_ctl_launch(args)

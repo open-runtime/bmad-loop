@@ -609,13 +609,22 @@ class SourcePublication:
                 self.project, "ls-tree", "-z", "HEAD", "--", ":(literal)" + code_relative
             )
             if not tracked and source.kind == "stories":
+                ignored = verify.git_bytes(
+                    self.project, "check-ignore", "-q", "--no-index", code_relative
+                )
+                if ignored.returncode not in (0, 1):
+                    raise SourcePublicationHold("Story source ownership is unavailable")
                 manifest = (
                     stories.resolve_spec_folder(self.project, source.path)
                     / stories.STORIES_FILENAME
                 )
                 manifest_rel = manifest.relative_to(self.project).as_posix()
-                tracked = self._git(
-                    self.project, "ls-tree", "-z", "HEAD", "--", ":(literal)" + manifest_rel
+                tracked = (
+                    b""
+                    if ignored.returncode == 0
+                    else self._git(
+                        self.project, "ls-tree", "-z", "HEAD", "--", ":(literal)" + manifest_rel
+                    )
                 )
             if tracked:
                 versioning = "code-repo"
@@ -637,6 +646,24 @@ class SourcePublication:
             native_ticket,
             source.path,
         )
+
+    def _mapped_story_binding(self, binding: SourceBinding, path: Path, head: str) -> SourceBinding:
+        """Classify the exact newly mapped spec; a tracked manifest is not its file."""
+        relative = (
+            path.relative_to(self.project).as_posix() if path.is_relative_to(self.project) else ""
+        )
+        versioning = binding.versioning
+        if (
+            versioning == "code-repo"
+            and relative
+            and not self._git(self.project, "ls-tree", "-z", head, "--", ":(literal)" + relative)
+        ):
+            ignored = verify.git_bytes(self.project, "check-ignore", "-q", "--no-index", relative)
+            if ignored.returncode not in (0, 1):
+                raise SourcePublicationHold("Mapped story source ownership is unavailable")
+            if ignored.returncode == 0:
+                versioning = "none"
+        return replace(binding, path=str(path), code_relative=relative, versioning=versioning)
 
     def _source_bytes(self, binding: SourceBinding, head: str, path: str) -> bytes | None:
         if binding.versioning == "code-repo":
@@ -1668,15 +1695,7 @@ class SourcePublication:
                     raise SourcePublicationHold(
                         "Accepted story artifact belongs to a different canonical source root"
                     )
-                binding = replace(
-                    binding,
-                    path=str(accepted_plan.plan.resolve()),
-                    code_relative=(
-                        accepted_plan.plan.resolve().relative_to(self.project).as_posix()
-                        if accepted_plan.plan.resolve().is_relative_to(self.project)
-                        else ""
-                    ),
-                )
+                binding = self._mapped_story_binding(binding, accepted_plan.plan.resolve(), head)
             elif binding.versioning == "code-repo":
                 prefix = (
                     (Path(binding.source_root) / "stories").relative_to(self.project).as_posix()
@@ -1730,6 +1749,8 @@ class SourcePublication:
         # External/shared binding is re-resolved before any mutation. No stale
         # whole-board or whole-store restoration is performed.
         fresh = self.capture(source, unit)
+        if source.kind == "stories" and not fresh.path:
+            fresh = self._mapped_story_binding(fresh, Path(binding.path), head)
         if (fresh.source_root, fresh.path or binding.path, fresh.versioning, fresh.store_repo) != (
             binding.source_root,
             binding.path,

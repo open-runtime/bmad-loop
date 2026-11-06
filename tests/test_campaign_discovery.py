@@ -14,7 +14,7 @@ class Gateway:
         return [{"id": 1, "number": 1, "title": "Existing"}]
 
     def pulls(self, state="open"):
-        return [{"id": 2, "number": 2, "title": "Active", "state": state}]
+        return [{"id": 2, "number": 2, "title": "Active", "state": state, "head": {"sha": "head"}}]
 
 
 def test_inventory_observes_local_refs_worktree_dirty_content_without_checkouts(project):
@@ -56,5 +56,7 @@ def test_partial_inventory_and_active_overlap_do_not_authorize_adoption(project)
     with pytest.raises(ValueError, match="authorization"):
         validate_overlap(adoption, receipt)
     validate_overlap(adoption, receipt, owned_pr=2)
+    with pytest.raises(ValueError, match="absent from.*inventory"):
+        validate_overlap(replace(disposition, evidence_ids=("pr:999@invented",)), receipt)
     with pytest.raises(ValueError, match="merged/source"):
         validate_overlap(replace(adoption, disposition="already_delivered"), receipt)

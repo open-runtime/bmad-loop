@@ -872,6 +872,10 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
     # -------------------------------------------------------------- adapter
 
     def start_session(self, spec: SessionSpec) -> SessionHandle:
+        from ..campaign_hold import held
+
+        if held():
+            raise OpencodeServerError("campaign operator hold suppresses automatic session launch")
         task_dir = validated_task_directory(self.tasks_dir, spec.task_id)
         # `messages.json` is this transport's own; the rest are the inherited
         # `_ResultFileMixin`'s writes, validated here for the same reason
@@ -956,6 +960,11 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         catch it, crumb ``nudge-send-failed`` and carry on — a server that died
         between the liveness probe and the nudge is caught as `crashed` on the
         next tick, not by blowing up the completion loop."""
+        from ..campaign_hold import held
+
+        if held():
+            self._note_lifecycle(handle.task_id, "nudge-withheld", reason="campaign-operator-hold")
+            return
         sess = self._sessions.get(handle.task_id)
         if sess is None:
             raise OpencodeNudgeSendError(f"no live opencode session for task {handle.task_id!r}")
@@ -1283,6 +1292,8 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         return replace(result, usage_limited=evidence, usage_limit_class=limit_class)
 
     def _wait_loop(self, handle: SessionHandle, spec: SessionSpec) -> SessionResult:
+        from ..campaign_hold import held
+
         sess = self._sessions.get(handle.task_id)
         if sess is None:
             raise OpencodeServerError(f"no live opencode server for task {handle.task_id!r}")
@@ -1369,6 +1380,8 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             running subagent still samples the spend the subagent adds."""
             nonlocal budget_tripped, budget_weighted, budget_deadline
             nonlocal budget_wall_deadline, usage_failures
+            if held():
+                return None
             if (
                 not budget_tripped
                 and spec.token_budget is not None
@@ -1463,9 +1476,13 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         def budget_due() -> bool:
             """Whether an armed enforce-mode budget grace has expired (the wall
             clock may expire it, never extend it — #157)."""
-            return budget_deadline is not None and (
-                time.monotonic() >= budget_deadline
-                or (budget_wall_deadline is not None and time.time() >= budget_wall_deadline)
+            return (
+                not held()
+                and budget_deadline is not None
+                and (
+                    time.monotonic() >= budget_deadline
+                    or (budget_wall_deadline is not None and time.time() >= budget_wall_deadline)
+                )
             )
 
         # A zero-grace enforce verdict reached inside `_await_descendants`.
@@ -1480,7 +1497,17 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 budget_verdict = sample_budget()
             return budget_verdict is not None
 
+        hold_noted = False
         while True:
+            operator_held = held()
+            if operator_held:
+                deadline = max(deadline, time.monotonic() + 60)
+                wall_deadline = max(wall_deadline, time.time() + 60)
+                if stall_deadline is not None:
+                    stall_deadline = max(stall_deadline, time.monotonic() + 60)
+                if not hold_noted:
+                    self._note_lifecycle(handle.task_id, "campaign-operator-held")
+                    hold_noted = True
             remaining = deadline - time.monotonic()
             wall_expired = time.time() >= wall_deadline
             if remaining <= 0 or wall_expired:
@@ -1670,7 +1697,7 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         gap_recheck_at = now + self.silence_threshold_s
                     elif gap_due:
                         gap_recheck_at = now + self.silence_threshold_s
-                    if stall_deadline is not None:
+                    if not operator_held and stall_deadline is not None:
                         # Re-arm on activity (any SSE traffic since arming) —
                         # a session streaming subagent work is working, not
                         # stalled; only genuine silence trips the stall below.
@@ -1756,6 +1783,11 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         transcript_path=transcript,
                         budget_weighted=budget_weighted,
                     )
+                if operator_held:
+                    self._note_lifecycle(
+                        handle.task_id, "stop-nudge-withheld", reason="campaign-operator-hold"
+                    )
+                    continue
                 if nudges_left > 0:
                     nudges_left -= 1
                     try:

@@ -7,6 +7,12 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Added
+
+- Add native development campaigns with parallel unit ownership, draft PR delivery and recoverable GitHub synchronization.
+- Add campaign planning roles, evidence-based decisions and bounded escalation resolution.
+- Bundle optional Paradev workspace and terminal reflection with scoped hcom observations.
+
 ## [0.13.15] — 2026-11-05
 
 ### Fixed

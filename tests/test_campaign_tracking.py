@@ -22,6 +22,8 @@ class HierarchyTransport:
             if route == "issues":
                 return ApiResponse(200, list(self.issues.values()), {})
             parts = route.split("/")
+            if parts[0] == "milestones" and len(parts) == 2:
+                return ApiResponse(200, self.milestones[int(parts[1])], {})
             if parts[0] == "issues":
                 number = int(parts[1])
                 if len(parts) == 2:
@@ -48,6 +50,7 @@ class HierarchyTransport:
                 "number": number,
                 "html_url": f"https://github.com/a/b/milestone/{number}",
                 "state": "open",
+                "updated_at": "2026-01-01T00:00:00Z",
                 **payload,
             }
             self.milestones[number] = row
@@ -66,6 +69,11 @@ class HierarchyTransport:
             row["milestone"] = self.milestones.get(payload.get("milestone"))
             self.issues[number] = row
             return ApiResponse(201, row, {})
+        if method == "PATCH":
+            parts = route.split("/")
+            row = (self.milestones if parts[0] == "milestones" else self.issues)[int(parts[1])]
+            row.update(payload)
+            return ApiResponse(200, row, {})
         if method == "POST" and route.endswith("/sub_issues"):
             parent = int(route.split("/")[1])
             child = next(
@@ -131,6 +139,7 @@ def test_existing_tracker_retains_its_epic_and_milestone_lineage():
         "title": "Human epic",
         "milestone": milestone,
         "updated_at": "t0",
+        "state": "open",
     }
     transport.issues[11] = {
         "id": 1011,
@@ -138,6 +147,7 @@ def test_existing_tracker_retains_its_epic_and_milestone_lineage():
         "title": "Existing story",
         "milestone": milestone,
         "updated_at": "t0",
+        "state": "open",
     }
     transport.parents[11] = 10
     unit_id = next(iter(state.units))
@@ -196,3 +206,88 @@ def test_parent_closure_waits_for_all_children_and_closure_unit_delivered():
     ready = coordinator.close_parents(state)
     assert ready.intent.payload == {"state": "closed", "state_reason": "completed"}
     assert transport.effects == []
+
+
+def projected():
+    state = snapshot()
+    transport = HierarchyTransport()
+    gateway = GithubGateway(transport, "a/b")
+    coordinator = HierarchyCoordinator(gateway)
+    receipts = {}
+    unit_id = next(iter(state.units))
+    for _ in range(20):
+        step = coordinator.step(state, unit_id, receipts=receipts)
+        state.bindings["github_hierarchy"] = step.bindings
+        state.units[unit_id].bindings = step.unit_bindings
+        if step.intent:
+            receipts[step.action_key] = gateway.execute(
+                replace(step.intent, state="sent_unknown"), generation=1
+            )
+        if step.complete:
+            return state, transport, gateway, coordinator, receipts, unit_id
+    raise AssertionError("fixture projection did not converge")
+
+
+def test_reviewed_scope_extension_reopens_existing_parent_without_recreating_it():
+    from bmad_loop.campaign_model import UnitState
+
+    state, transport, gateway, coordinator, receipts, unit_id = projected()
+    transport.milestones[1].update(state="closed", updated_at="2026-01-01T00:00:00Z")
+    plan = CampaignUnit(
+        UnitSpec("planning", "campaign-plan", "planning", "Plan", kind="planning"),
+        UnitState.DELIVERED,
+        bindings={"pr": {"number": 90}},
+        evidence={
+            "planning_flow": {
+                "activated_units": [unit_id],
+                "stages": {"planning_review": {"finished_at": 1793929000}},
+            }
+        },
+    )
+    state.units[plan.id] = plan
+    state.units[unit_id].bindings["planning_unit"] = plan.id
+    state.graph_revision += 1
+    step = coordinator.step(
+        state, unit_id, receipts=receipts, source_metadata={unit_id: {"revision": "reviewed-main"}}
+    )
+    assert step.intent.kind == "reopen_milestone"
+    assert step.intent.coordinates["approved_scope"]["planning_pr"] == 90
+    result = gateway.execute(replace(step.intent, state="sent_unknown"), generation=1)
+    receipts[step.action_key] = result
+    assert result.state == "confirmed"
+    assert transport.milestones[1]["state"] == "open"
+    assert len(transport.milestones) == 1 and len(transport.issues) == 2
+
+
+def test_closed_scope_without_reviewed_extension_is_held():
+    state, transport, _, coordinator, receipts, unit_id = projected()
+    transport.milestones[1].update(state="closed", updated_at="2026-01-01T00:00:00Z")
+    before = list(transport.effects)
+    step = coordinator.step(state, unit_id, receipts=receipts)
+    assert step.intent is None and "reviewed extension authority" in step.reason
+    assert transport.effects == before
+
+
+def test_new_owner_closure_after_scope_review_is_not_reopened():
+    from bmad_loop.campaign_model import UnitState
+
+    state, transport, _, coordinator, receipts, unit_id = projected()
+    transport.milestones[1].update(state="closed", updated_at="2026-11-06T00:00:00Z")
+    plan = CampaignUnit(
+        UnitSpec("planning", "campaign-plan", "planning", "Plan", kind="planning"),
+        UnitState.DELIVERED,
+        bindings={"pr": {"number": 90}},
+        evidence={
+            "planning_flow": {
+                "activated_units": [unit_id],
+                "stages": {"planning_review": {"finished_at": 1}},
+            }
+        },
+    )
+    state.units[plan.id] = plan
+    state.units[unit_id].bindings["planning_unit"] = plan.id
+    step = coordinator.step(
+        state, unit_id, receipts=receipts, source_metadata={unit_id: {"revision": "reviewed-main"}}
+    )
+    assert step.intent is None and "owner-state" in step.reason
+    assert transport.milestones[1]["state"] == "closed"

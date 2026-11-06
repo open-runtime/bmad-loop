@@ -433,18 +433,25 @@ def test_build_command_gemini_uses_interactive_flag(tmp_path):
 
 
 @pytest.mark.parametrize("profile_name", ["claude", "codex", "gemini"])
-def test_effort_never_reaches_the_generic_argv_or_env(tmp_path, profile_name):
-    """#643: the tmux generic family has no channel for a reasoning-effort value,
-    so `SessionSpec.effort` is ignored — argv and env are byte-identical to an
-    effort-less spec's (and `config_digest` therefore stays untouched). The
-    carrier is the opencode-http adapter; validate warns about this family."""
+def test_effort_uses_qualified_native_dialect_and_preserves_other_launch_flags(
+    tmp_path, profile_name
+):
+    """Reasoning arguments are additive; unqualified dialects keep their advisory behavior."""
     adapter = make_adapter(tmp_path, profile_name=profile_name)
     plain = make_spec(tmp_path)
     with_effort = dataclasses.replace(plain, effort="max")
     assert with_effort.effort == "max"  # the field landed (kept LAST on SessionSpec)
-    assert adapter.interactive_argv(with_effort) == adapter.interactive_argv(plain)
+    expected = {
+        "claude": ["--effort", "max"],
+        "codex": ["-c", 'model_reasoning_effort="max"'],
+        "gemini": [],
+    }[profile_name]
+    assert adapter.interactive_argv(with_effort) == adapter.interactive_argv(plain) + expected
     assert adapter.interactive_env(with_effort) == adapter.interactive_env(plain)
-    assert "max" not in adapter.build_command(with_effort)
+    if expected:
+        assert "max" in adapter.build_command(with_effort)
+    else:
+        assert "max" not in adapter.build_command(with_effort)
 
 
 def test_extra_args_replace_profile_bypass(tmp_path):

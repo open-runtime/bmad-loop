@@ -96,6 +96,9 @@ class GitHubSpec:
     require_independent_review: bool = True
     candidate_command: tuple[str, ...] = ()
     candidate_check_context: str = ""
+    candidate_check_app_id: int = 0
+    candidate_producer_probe: tuple[str, ...] = ()
+    candidate_publish: str = "native"
     merge_command: tuple[str, ...] = ()
     recent_days: int = 30
 
@@ -359,6 +362,7 @@ def _construct(cls: Any, value: Any, name: str) -> Any:
             "required_checks",
             "hold_labels",
             "candidate_command",
+            "candidate_producer_probe",
             "merge_command",
             "sources",
             "transcript_sources",
@@ -366,6 +370,9 @@ def _construct(cls: Any, value: Any, name: str) -> Any:
             "stages",
         }:
             out[key] = _strings(item, f"{name}.{key}")
+        elif key == "candidate_check_app_id":
+            if type(item) is not int or item < 0:
+                raise CampaignError("github.candidate_check_app_id must be a nonnegative integer")
         elif key in {
             "verify_slots",
             "max_sessions",
@@ -665,6 +672,10 @@ def spec_from_dict(value: Mapping[str, Any]) -> CampaignSpec:
         raise CampaignError("campaign requires sources, explicit units or planning")
     if spec.github.merge_mode not in {"direct-strict", "queue", "project-command"}:
         raise CampaignError("github.merge_mode must be direct-strict, queue or project-command")
+    if spec.github.merge_mode == "project-command" and not spec.github.merge_command:
+        raise CampaignError("project-command requires a configured maintained publication gate")
+    if spec.github.candidate_publish not in {"native", "external"}:
+        raise CampaignError("github.candidate_publish must be native or external")
     if spec.github.merge_method != "merge":
         raise CampaignError(
             "github.merge_method must be merge: campaigns preserve all checkpoint commits and agent history; squash and rebase are prohibited"

@@ -192,6 +192,83 @@ def bind_mirrors(workspace: Path, receipt: dict[str, Any]) -> None:
         artifact["review_path"] = mirror
 
 
+def drift(unit: Any) -> list[dict[str, str]]:
+    workspace = Path(unit.bindings["workspace"])
+    head = verify.rev_parse_head(workspace)
+    latest = {}
+    for stage, receipt in unit.evidence.get("planning_flow", {}).get("stages", {}).items():
+        if stage == "planning_review":
+            continue
+        for artifact in receipt.get("validated", {}).get("artifacts", []):
+            latest[artifact["path"]] = {**artifact, "stage": stage}
+    changed = []
+    for relative, artifact in latest.items():
+        path = workspace / relative
+        mirror = artifact.get("review_path", relative)
+        data = verify.file_bytes_at_revision(workspace, head, mirror)
+        if (
+            is_link_like(path)
+            or not path.is_file()
+            or path.stat().st_size > 8 * 1024 * 1024
+            or hashlib.sha256(path.read_bytes()).hexdigest() != artifact["sha256"]
+            or data is None
+            or hashlib.sha256(data).hexdigest() != artifact["sha256"]
+        ):
+            changed.append({"path": relative, "stage": artifact["stage"]})
+    return changed
+
+
+def validate_stage_products(
+    workspace: Path, receipt: dict[str, Any], sources: tuple[SourceSelector, ...]
+) -> None:
+    """Planning writes product documents in its declared source view and docs."""
+    roots = [workspace / "docs", *(source_root(workspace, source) for source in sources)]
+    allowed = set()
+    for artifact in receipt["validated"]["artifacts"]:
+        path = workspace / artifact["path"]
+        if path.suffix not in SUFFIXES or not any(
+            path.resolve().is_relative_to(root.resolve()) for root in roots
+        ):
+            raise CampaignError("planning artifact escaped its product-document ownership")
+        allowed.update((artifact["path"], artifact.get("review_path", artifact["path"])))
+    observed = verify.git_bytes(
+        workspace, "diff", "--name-only", "-z", receipt["base"], receipt["head"]
+    )
+    if observed.returncode:
+        raise CampaignError("planning changed-path observation failed")
+    actual = {raw.decode("utf-8") for raw in observed.stdout.split(b"\0") if raw}
+    if actual - allowed:
+        raise CampaignError("planning committed changes outside its declared product artifacts")
+
+
+def invalidate(snapshot: Any, unit: Any, changed: list[dict[str, str]]) -> None:
+    from .campaign_model import UnitState
+    from .campaign_planning_flow import STAGES
+    from .campaign_store import add_event, transition
+
+    state = unit.evidence["planning_flow"]
+    earliest = min((item["stage"] for item in changed), key=STAGES.index)
+    for stage in STAGES[STAGES.index(earliest) :]:
+        state["stages"].pop(stage, None)
+    state.update(
+        state="planning",
+        proposal=None,
+        repair=True,
+        findings=[
+            {
+                "required": True,
+                "stage": earliest,
+                "reason": "Main integration or steering changed reviewed planning products",
+                "artifacts": changed,
+            }
+        ],
+    )
+    for key in ("integrated", "verification", "review", "pushed"):
+        unit.evidence.pop(key, None)
+    transition(snapshot, unit.id, UnitState.READY)
+    add_event(snapshot, "planning-evidence-invalidated", unit=unit.id, changed=changed)
+
+
 def publish(runtime: Any, snapshot: Any, unit: Any, action: Any) -> dict[str, Any]:
     """Publish all approved source products before activating the reviewed graph."""
     flow = unit.evidence["planning_flow"]
@@ -210,6 +287,9 @@ def publish(runtime: Any, snapshot: Any, unit: Any, action: Any) -> dict[str, An
     units = {value["id"]: value for value in proposal["units"]}
     bindings, publications = {}, {}
     review = unit.evidence["review"]
+    review_coordinates = review.get("validated", {}).get("coordinates", {}) or review.get(
+        "artifact", {}
+    ).get("coordinates", {})
     merge_coordinates = {
         "head": unit.evidence["integrated"]["head"],
         "merged_commit": merge["merge_commit"],
@@ -219,8 +299,8 @@ def publish(runtime: Any, snapshot: Any, unit: Any, action: Any) -> dict[str, An
         "head": merge_coordinates["head"],
         "verdict": "approved",
         "review_id": review.get("session_id") or review.get("launch_id"),
-        "graph_revision": snapshot.graph_revision,
-        "config_revision": snapshot.config_revision,
+        "graph_revision": review_coordinates.get("graph_revision", snapshot.graph_revision),
+        "config_revision": review_coordinates.get("config_revision", snapshot.config_revision),
     }
     for source in snapshot.spec.sources:
         authored = changes(
@@ -254,12 +334,28 @@ def publish(runtime: Any, snapshot: Any, unit: Any, action: Any) -> dict[str, An
             "detail": published.detail,
         }
         if published.state != "confirmed":
+            tracking_control = None
+            if published.state == "tracking_pr_required":
+                from .campaign_runtime_tracking import prepare
+
+                tracking_control = prepare(
+                    snapshot,
+                    unit,
+                    published,
+                    state_dir=runtime.store.directory(snapshot.id),
+                    publisher_project=runtime.project,
+                    source=source,
+                    changes=authored,
+                    merge=merge_coordinates,
+                    acceptance=acceptance,
+                )
             return {
                 "state": published.state,
                 "canonical_head": canonical,
                 "publications": publications,
                 "proposal": published.proposal,
                 "detail": published.detail,
+                "tracking_control": tracking_control,
             }
         by_path = {change.path: change for change in authored}
         row = next(value for value in manifest["sources"] if value["source"] == source.id)

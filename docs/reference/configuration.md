@@ -17,6 +17,11 @@ Plugin activation (`[plugins] enabled`) and plugin settings (`[plugins.<name>]`)
 
 ## Environment variables
 
+`BMAD_LOOP_PARADEV_STATE_DIR` selects the absolute external registry directory
+for the optional Paradev transport. Campaigns persist their selected directory
+and reuse it for workers, terminal observation, attach and recovery. An empty
+value uses the normal transport state directory; a relative path is refused.
+
 Operator overrides read by the orchestrator:
 
 | Variable                      | Value                                          | Effect                                                                                                                                                                                                                                                                                                                                           |
