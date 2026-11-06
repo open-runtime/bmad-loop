@@ -202,3 +202,34 @@ def test_planning_native_sprint_board_is_validated_before_publication(project, m
     else:
         with pytest.raises(CampaignError, match="invalid native sprint board"):
             validate_stage_products(repo, receipt, (SourceSelector("sprint-status", id="sprint"),))
+
+
+@pytest.mark.parametrize("orphan", [False, True])
+def test_planning_ticket_plan_only_edit_is_validated_without_manifest_edit(project_v7, orphan):
+    layout = project_v7
+    repo = layout.project
+    baseline = verify.rev_parse_head(repo)
+    source = SourceSelector("tickets", id="tickets", initiative=layout.initiative)
+    plan = write_plan(
+        layout,
+        "epic-cart",
+        "orphan-plan" if orphan else "story-cart-model-plan",
+        999 if orphan else 1,
+        "ready-for-dev",
+    )
+    git(repo, "add", "-A")
+    git(repo, "commit", "-m", "planning authored only a native plan")
+    receipt = {
+        "base": baseline,
+        "head": verify.rev_parse_head(repo),
+        "validated": {"artifacts": [{"path": plan.relative_to(repo).as_posix()}]},
+    }
+    assert (
+        git(repo, "diff", "--name-only", baseline, receipt["head"])
+        == plan.relative_to(repo).as_posix()
+    )
+    if orphan:
+        with pytest.raises(CampaignError, match="invalid native ticket tree"):
+            validate_stage_products(repo, receipt, (source,))
+    else:
+        validate_stage_products(repo, receipt, (source,))

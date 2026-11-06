@@ -14,7 +14,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from . import sprintstatus, stories, ticketlayout, verify
+from . import sprintstatus, stories, verify
 from .campaign_model import CampaignError, SourceSelector
 from .campaign_sources import source_paths
 from .platform_util import atomic_write_text, is_link_like, safe_segment
@@ -292,8 +292,7 @@ def validate_stage_products(
         elif source.kind == "tickets":
             folder = source_paths(workspace, source).initiative_folder
             if folder is None or not any(
-                path.name == ticketlayout.BREAKDOWN and path.is_relative_to(folder.resolve())
-                for path in authored
+                path.is_relative_to(folder.resolve()) for path in authored
             ):
                 continue
             try:
