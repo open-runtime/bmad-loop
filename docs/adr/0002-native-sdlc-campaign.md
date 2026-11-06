@@ -1,6 +1,6 @@
 # ADR 0002: A deterministic SDLC campaign with GitHub delivery
 
-- **Status:** Implemented in the development PR; final review and activation qualification pending
+- **Status:** Partially implemented in the development PR; audited runtime gaps and activation qualification remain
 - **Date:** 2026-11-05
 - **Scope:** An opt-in campaign supervisor, isolated workers, planning, GitHub synchronization and native Paradev reflection
 
@@ -25,6 +25,10 @@ retention and activation decisions below. Both documents define the contract for
 one implementation PR; current usage is in the [campaign guide](../campaign-guide.md).
 Capability and repository-policy prerequisites remain explicit; implementation
 tests do not establish that a target project has been activated.
+
+The proposed [bounded reasoning and handoff extension](0003-bounded-reasoning-and-handoff.md)
+adds semantic routing, graph/priority review and portable cross-harness continuity.
+It preserves this record's delivery contract and does not replace outstanding repairs.
 
 Add a deterministic Python campaign supervisor above the existing serial story
 engine. Planning, implementation, conflict repair and review run in coding-CLI

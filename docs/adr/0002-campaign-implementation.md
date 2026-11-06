@@ -1,14 +1,17 @@
 # ADR 0002 implementation contract
 
-- **Status:** Implemented in the development PR; final review and project activation pending
+- **Status:** Partially implemented in the development PR; audited runtime gaps and project activation remain
 - **Date:** 2026-11-05
 - **Parent:** [Native SDLC campaign](0002-native-sdlc-campaign.md)
 - **Delivery:** One bmad-loop PR, including code, tests, documentation and local deployment tooling
 
 This contract resolves implementation choices in ADR 0002. The experimental
-campaign implements these boundaries above the existing serial engines. The
+campaign targets these boundaries above the existing serial engines; audit found
+runtime integration and recovery gaps that must be repaired before activation. The
 [campaign guide](../campaign-guide.md) describes its current commands. Repository
 policy, migration and installation qualification remain activation prerequisites.
+The proposed [reasoning-job and handoff contract](0003-bounded-reasoning-and-handoff.md)
+extends this work without weakening its acceptance or publication gates.
 
 ## Command and configuration contract
 
