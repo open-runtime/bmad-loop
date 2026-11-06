@@ -222,11 +222,12 @@ class CampaignDatabase:
                 connection.execute(
                     "CREATE INDEX IF NOT EXISTS observation_unit ON observations(unit, sequence)"
                 )
+                from .campaign_action_archive import archive, validate_incoming
                 from .campaign_observation_archive import split
 
+                validate_incoming(connection, hot.get("outbox", []))
                 hot["outbox"], archived = split(hot.get("outbox", []))
                 self._archive_observations(connection, state.get("outbox", []), archived)
-                from .campaign_action_archive import archive
 
                 protected = {
                     unit["claim"]["launch_id"]

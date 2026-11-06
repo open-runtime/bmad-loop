@@ -576,6 +576,29 @@ Reasoning defaults to disabled. The route manifest pins the installed binary,
 wrapper, supported effort and measured input/output limits; it distinguishes
 no-tools reasoning from scoped execution. Preflight checks qualification and
 campaign creation freezes the manifest. Route installation alone is insufficient.
+When one model has separately qualified thinking levels, keep their earned
+capabilities under `by_effort` in its `profile:model` route:
+
+```json
+{
+  "schema_version": 1,
+  "routes": {
+    "grok:grok-4.7": {
+      "by_effort": {
+        "medium": { "reasoning": { "efforts": ["medium"] } },
+        "xhigh": { "reasoning": { "efforts": ["xhigh"] } }
+      }
+    }
+  }
+}
+```
+
+The abbreviated capability objects above must each be replaced with that
+effort's complete earned capability. A variant may also contain an independently
+qualified `execution` capability. The selected role's exact effort chooses the
+variant; missing levels fail visibly and never borrow another effort's proof.
+Existing single-capability and `reasoning`/`execution` route forms remain supported.
+
 Configure `routing`, `reasoning`, `graph_review`, `reporting`, `summarization` and
 `handoff_audit` role pools as needed, alongside the ordinary triage/execution
 roles. Each job also respects total campaign, role and current provider capacity.
@@ -610,6 +633,12 @@ hard limits. Unless a native generation limit is explicitly qualified, the ceili
 is a result acceptance limit rather than a promise that generation cannot exceed
 it. This does not establish a provider's advertised maximum or semantic summary
 fidelity. Larger inputs need a larger successful qualification.
+
+Changing the effort, launcher, transport or permissions requires matching native evidence;
+copying a capability and editing its checklist does not qualify the new route.
+Keep its report, frozen request, source and native receipt together. New reports
+bind the complete request file; earlier reports use their matching frozen request
+and owned receipt without modifying the retained proof.
 Native selected aliases and served model names remain separate in receipts.
 
 Workspace-tools routes need their own qualification:
@@ -649,10 +678,37 @@ exercises sealed history through qualified native map/reduce jobs and production
 citation/coverage validators. The snapshots explicitly name archived prefixes;
 verified native lineage deduplicates inherited copies without deleting their
 source archives. `--prepare-only` writes the bounded job plan without inference.
+
+The exact rendered input includes schema and source metadata. Oversized chunks
+split independently, preserving chunks that already fit; reducers retain whole
+validated children and the citations actually represented by those children.
+Native owner quotations use immutable span IDs, and the controller retrieves the
+exact bytes. Each rejected completed result permits at most two separately
+recorded corrective jobs; source corruption and unknown actor state do not retry.
+Output token limits use verified native telemetry when available, including the
+provider's reported reasoning contribution. Unknown usage retains a conservative
+UTF-8 byte bound. Model-supplied usage fields do not establish that measurement.
+
 Completed job receipts and validated results allow the same command to resume;
 changed sources, route or limits require a new trial directory. Failure stops new
-admissions while existing bounded jobs drain. The report distinguishes structural
-completion from semantic qualification: automatic handoff additionally requires a
+admissions while existing bounded jobs drain. `--reuse PRIOR_DIRECTORY` follows
+explicit retained trial bindings, revalidates native qualification and source
+coverage, and preserves completed work across route changes. `--reducer-capability`
+selects a separately qualified reducer route, allowing a different effort from maps.
+Trial concurrency is explicitly bounded to 1–64 jobs. `--drain` stops admissions
+while admitted jobs finish; rerunning after the drained report resumes the work.
+
+The report distinguishes structural completion from semantic qualification: automatic handoff additionally requires a
 separately recorded review from an independent provider that verifies critical
 obligations, conflicts and authority against the source records. Tests for these
 commands use scripted native processes and consume no model tokens.
+
+Semantic qualification uses a version 2 proof list attached to a native capability.
+Each proof binds the exact model, effort, transport qualification, current readers,
+schemas and prompts to the operation it qualifies: history extraction, reduction,
+audit, constraint reduction/audit or recovery extraction/audit. The independent
+native reviewer must attest to those same bindings and the source corpus. A
+successful history summary does not qualify an auditor or a different thinking
+level. Retain all referenced proof and source files; changed or missing evidence
+leaves the operation waiting for qualification. Earlier generic semantic proofs
+require renewed assessment; native transport proof compatibility is separate.

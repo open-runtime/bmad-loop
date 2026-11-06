@@ -64,11 +64,20 @@ def register(subparsers: Any) -> None:
             )
             child.add_argument("--capability", required=True, help="earned native route capability")
             child.add_argument(
+                "--reducer-capability",
+                help="separately earned reducer route; defaults to the map route",
+            )
+            child.add_argument(
                 "--directory", required=True, help="private external evidence directory"
             )
             child.add_argument("--parallel", type=int, default=4)
             child.add_argument("--timeout", type=int, default=600)
             child.add_argument("--prepare-only", action="store_true")
+            child.add_argument(
+                "--drain",
+                action="store_true",
+                help="stop new trial admissions while owned jobs finish",
+            )
             child.add_argument(
                 "--reuse", help="reuse validated map coverage from an explicit prior trial"
             )
@@ -598,6 +607,10 @@ def dispatch(args: argparse.Namespace) -> int:
                 timeout_s=args.timeout,
                 execute=not args.prepare_only,
                 reuse_directory=Path(args.reuse).expanduser() if args.reuse else None,
+                reducer_capability_path=(
+                    Path(args.reducer_capability).expanduser() if args.reducer_capability else None
+                ),
+                drain=args.drain,
             )
             return _emit(args, _result(command, **report))
         except (CampaignError, OSError, ValueError, KeyError, TypeError) as exc:

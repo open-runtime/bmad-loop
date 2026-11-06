@@ -151,7 +151,9 @@ class CheckpointPusher:
         result = self.git(self.repo, "merge-base", "--is-ancestor", older, newer, env=_env())
         if result.returncode not in (0, 1):
             # A remote actor may have introduced an object not fetched locally.
-            self._run("fetch", "--no-tags", self.remote, newer)
+            self._run(
+                "fetch", "--no-tags", "--no-write-fetch-head", "--refmap=", self.remote, newer
+            )
             result = self.git(self.repo, "merge-base", "--is-ancestor", older, newer, env=_env())
         if result.returncode not in (0, 1):
             raise RecoveryHold("Checkpoint ancestry observation unavailable")

@@ -12,7 +12,14 @@ from bmad_loop import campaign_reasoning_plan as plan
 from bmad_loop import campaign_reasoning_results as results
 from bmad_loop.campaign_intake import IntakeBatch
 from bmad_loop.campaign_jobs import validate_result
-from bmad_loop.campaign_model import CampaignError, PlanningSpec, ReasoningSpec, RoleSpec, UnitState
+from bmad_loop.campaign_model import (
+    CampaignError,
+    Hold,
+    PlanningSpec,
+    ReasoningSpec,
+    RoleSpec,
+    UnitState,
+)
 from bmad_loop.campaign_planning_flow import activate, next_stage
 from bmad_loop.campaign_runtime import CampaignRuntime
 from bmad_loop.campaign_store import CampaignStore, add_action
@@ -103,7 +110,7 @@ def test_priority_rechecks_head_after_successful_json_validation(tmp_path, prepa
         "rationale": "Priority",
     }
     next(iter(snapshot.units.values())).evidence["local"] = {"head": "new-head", "base": "main"}
-    with pytest.raises(CampaignError, match="evidence changed"):
+    with pytest.raises(CampaignError, match="current validated result"):
         apply(snapshot, runtime, "priority", result)
     assert snapshot.graph_revision == 1
 
@@ -336,3 +343,86 @@ def test_operator_report_marks_changed_canonical_facts_stale(tmp_path, prepared)
     assert status_document(snapshot)["reasoning"]["report"]["current"] is True
     next(iter(snapshot.units.values())).state = UnitState.DELIVERED
     assert status_document(snapshot)["reasoning"]["report"]["current"] is False
+
+
+def test_recurring_context_creates_new_job_without_reactivating_cold_history(tmp_path, prepared):
+    snapshot, runtime, _ = case(tmp_path, prepared, ["report"])
+    prior = []
+    for index, hold in enumerate((None, Hold("operator", "Pause"), None)):
+        runtime.clock = lambda: 100 + index
+        for unit in snapshot.units.values():
+            unit.hold = hold
+        prepare_jobs(snapshot, runtime)
+        row = apply(
+            snapshot,
+            runtime,
+            "report",
+            {**result_for(snapshot, "report"), "summary": "Open work", "claims": []},
+        )
+        prior.append((row["id"], row["request_digest"]))
+        snapshot = runtime.store.save(snapshot, snapshot.revision)
+        assert snapshot.jobs == {}
+        assert plan.proposals(runtime, snapshot) == ()
+    assert len({identity for identity, _ in prior}) == 3
+    for identity, request_digest in prior:
+        saved = runtime.store.jobs(snapshot.id, job_id=identity)[0]
+        assert saved["state"] == "applied"
+        assert saved["request_digest"] == request_digest
+
+
+def test_exhausted_obsolete_reports_archive_before_retry_and_latest_report_applies(
+    tmp_path, prepared
+):
+    from bmad_loop.campaign_supervisor import CampaignSupervisor
+
+    snapshot, runtime, _ = case(tmp_path, prepared, ["report"])
+    supervisor = CampaignSupervisor(runtime.store, runtime, clock=runtime.clock)
+    old_ids = []
+    for index in range(3):
+        prepare_jobs(snapshot, runtime)
+        row = next(iter(snapshot.jobs.values()))
+        old_ids.append(row["id"])
+        row.update(
+            state="failed",
+            failure_attempts=snapshot.spec.reasoning.max_attempts,
+            retry_at=runtime.clock() + 1000,
+        )
+        # Current exhausted work remains visible; changing canonical evidence
+        # makes the old advice obsolete even without a graph/config revision.
+        assert not [p for p in runtime.observe_workers(snapshot) if p.kind == "reasoning-stale"]
+        next(iter(snapshot.units.values())).hold = Hold("operator", f"owner direction {index}")
+        proposals = [p for p in runtime.observe_workers(snapshot) if p.kind == "reasoning-stale"]
+        assert len(proposals) == 1
+        snapshot = supervisor._queue(snapshot, proposals)
+        action = next(
+            a for a in snapshot.outbox if a.kind == "reasoning-stale" and a.state == "prepared"
+        )
+        runtime.apply(snapshot, action, runtime.perform(snapshot, action))
+        action.state = "confirmed"
+        snapshot = runtime.store.save(snapshot, snapshot.revision)
+        assert snapshot.jobs == {}
+        assert runtime.store.jobs(snapshot.id, job_id=old_ids[-1])[0]["state"] == "stale"
+    prepare_jobs(snapshot, runtime)
+    latest = apply(
+        snapshot,
+        runtime,
+        "report",
+        {**result_for(snapshot, "report"), "summary": "Newest owner direction", "claims": []},
+    )
+    snapshot = runtime.store.save(snapshot, snapshot.revision)
+    assert snapshot.jobs == {}
+    assert runtime.store.jobs(snapshot.id, job_id=latest["id"])[0]["state"] == "applied"
+    assert snapshot.bindings["reasoning_decisions"]["report"]["summary"] == "Newest owner direction"
+
+
+def test_replayed_semantic_trigger_preserves_request_despite_later_clock(tmp_path, prepared):
+    snapshot, runtime, _ = case(tmp_path, prepared, ["report"])
+    proposal = plan.proposals(runtime, snapshot)[0]
+    action = add_action(snapshot, proposal.kind, proposal.unit, payload=proposal.payload)
+    first = plan.perform(runtime, snapshot, action)
+    runtime.clock = lambda: 200
+    second = plan.perform(runtime, snapshot, action)
+    assert first.data["requests"] == second.data["requests"]
+    plan.apply(runtime, snapshot, action, first)
+    plan.apply(runtime, snapshot, action, second)
+    assert len(snapshot.jobs) == 1

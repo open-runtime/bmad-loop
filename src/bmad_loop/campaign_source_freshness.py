@@ -64,6 +64,8 @@ def inspect(
         project,
         "fetch",
         "--no-tags",
+        "--no-write-fetch-head",
+        "--refmap=",
         "--",
         spec.remote,
         f"refs/heads/{spec.target}:{observation_ref}",

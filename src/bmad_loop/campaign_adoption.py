@@ -937,6 +937,8 @@ def prepare(runtime, snapshot, action) -> dict[str, Any]:
         runtime.project,
         "fetch",
         "--no-tags",
+        "--no-write-fetch-head",
+        "--refmap=",
         snapshot.spec.remote,
         "refs/heads/" + manifest.branch + ":" + observation_ref,
     )

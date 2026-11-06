@@ -286,7 +286,7 @@ def test_stacked_queue_requires_predecessor_checks_and_rebuilds_after_dequeue(pr
     assert case.service.merge_bases[third] == new_heads[0]
 
 
-@pytest.mark.parametrize("late_hold", [False, True])
+@pytest.mark.parametrize("late_hold", [False, True, "check-hold", "check-review"])
 def test_production_campaign_queue_checks_exact_g_and_preserves_h_on_lost_ack(
     production_case, tmp_path, monkeypatch, late_hold
 ):
@@ -298,15 +298,47 @@ def test_production_campaign_queue_checks_exact_g_and_preserves_h_on_lost_ack(
     def request(method, path, payload=None):
         nonlocal held_number
         result = server.request(method, path, payload)
-        if late_hold and held_number is None and method == "PUT" and path.endswith("/merge-async"):
+        if (
+            late_hold is True
+            and held_number is None
+            and method == "PUT"
+            and path.endswith("/merge-async")
+        ):
             held_number = int(path.split("/")[-2])
             case.service.issues[held_number]["labels"] = [{"name": "bmad:hold"}]
         if path == "graphql" and "dequeuePullRequest" in payload.get("query", ""):
             removed.append(held_number)
             case.service.issues[held_number]["labels"] = []
+            case.service.pulls[held_number]["requested_reviewers"] = []
         return result
 
     monkeypatch.setattr(case.service, "request", request)
+    submit = case.runtime._perform_github_submission
+
+    def late_submission(snapshot, action):
+        nonlocal held_number
+        intent = action.payload["intent"]
+        if (
+            late_hold in {"check-hold", "check-review"}
+            and held_number is None
+            and action.payload.get("purpose") == "queue-check"
+            and intent["payload"]["conclusion"] == "success"
+        ):
+            held_number = intent["coordinates"]["candidate"]["pr_number"]
+            if late_hold == "check-hold":
+                case.service.issues[held_number]["labels"] = [{"name": "bmad:hold"}]
+            else:
+                case.service.pulls[held_number]["requested_reviewers"] = [
+                    {"login": "late-reviewer"}
+                ]
+        result = submit(snapshot, action)
+        if held_number is not None and held_number not in removed:
+            assert not case.service.pulls[held_number][
+                "merged"
+            ], "late publication gate was bypassed"
+        return result
+
+    monkeypatch.setattr(case.runtime, "_perform_github_submission", late_submission)
     script = tmp_path / "qualified-combined-verifier.py"
     script.write_text(source())
     probe = tmp_path / "authenticated-app-producer.py"

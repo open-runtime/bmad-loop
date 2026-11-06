@@ -278,6 +278,7 @@ def validate_alias_evidence(capability) -> None:
 
 
 def result(request_path: Path, observation: dict[str, Any]) -> dict[str, Any]:
+    from .campaign_capability_evidence import request_binding
     from .campaign_headless import read_json, write_json
 
     envelope = read_json(request_path)
@@ -292,7 +293,8 @@ def result(request_path: Path, observation: dict[str, Any]) -> dict[str, Any]:
         and receipt.get("result") == envelope["probe"]["expected"]
     )
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "request_binding": request_binding(request_path),
         "ok": passed,
         "state": "passed" if passed else "unqualified",
         "launch_id": envelope["launch_id"],
@@ -381,6 +383,7 @@ def qualify(
         evidence_path = Path(report["evidence_path"])
         qualified = {
             **capability,
+            "efforts": [selection.effort],
             "input_tokens": report["coverage"]["input_tokens"],
             "output_tokens": report["coverage"]["configured_output_tokens"],
             "max_turns": 1,

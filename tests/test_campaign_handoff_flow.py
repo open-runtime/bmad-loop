@@ -34,22 +34,20 @@ def campaign(prepared, project, tmp_path):
     second = RoleCandidate("claude", "claude-test", "high", "anthropic")
 
     def cap(candidate, execution=False):
+        from test_campaign_execution_qualification import fixture_writer_capability
+        from test_campaign_headless import fixture_capability
+
         value = {
             **basecap,
             "profile": candidate.profile,
             "model": candidate.model,
             "permissions": "workspace-tools" if execution else "no-tools",
         }
-        value["qualification"] = {
-            **value["qualification"],
-            "checks": [
-                "scoped_tools" if execution and item == "no_tools" else item
-                for item in value["qualification"]["checks"]
-            ]
-            + ["handoff_fidelity"],
-        }
         if execution:
-            value["argv"] = [*value["argv"], "{grants_path}"]
+            value = fixture_writer_capability(tmp_path, value, candidate, input_bytes=100000)
+        else:
+            value = fixture_capability(tmp_path, value, candidate)
+        from bmad_loop.campaign_fidelity import PURPOSES, route_binding
         from bmad_loop.campaign_headless import file_digest, write_json
         from bmad_loop.campaign_summary import (
             EXTRACT_PROMPT_VERSION,
@@ -57,6 +55,11 @@ def campaign(prepared, project, tmp_path):
             summary_schema,
         )
         from bmad_loop.campaign_transcripts import READER_VERSIONS, digest
+
+        route_bindings = [route_binding(value, purpose, candidate) for purpose in sorted(PURPOSES)]
+        evidence_name = (
+            candidate.profile + "-" + digest(dataclasses.asdict(candidate))[:12] + str(execution)
+        )
 
         corpus = [
             {
@@ -70,7 +73,7 @@ def campaign(prepared, project, tmp_path):
         from bmad_loop.campaign_handoff_recovery import AUDIT_SCHEMA as RECOVERY_AUDIT_SCHEMA
         from bmad_loop.campaign_handoff_recovery import SCHEMA as RECOVERY_SCHEMA
 
-        native_path = tmp_path / (candidate.profile + str(execution) + "-native-fidelity.json")
+        native_path = tmp_path / (evidence_name + "-native-fidelity.json")
         write_json(
             native_path,
             {
@@ -83,6 +86,7 @@ def campaign(prepared, project, tmp_path):
                 ),
                 "result": {
                     "verdict": "passed",
+                    "route_bindings_digest": digest(route_bindings),
                     "contract_schema_digests": {
                         "constraints-v1": digest([REDUCTION_SCHEMA, CONSTRAINT_AUDIT_SCHEMA]),
                         "recovery-v1": digest([RECOVERY_SCHEMA, RECOVERY_AUDIT_SCHEMA]),
@@ -95,10 +99,8 @@ def campaign(prepared, project, tmp_path):
             },
         )
         qualification = {
-            "schema_version": 1,
-            "route": {
-                key: value[key] for key in ("profile", "model", "cli_version", "binary_sha256")
-            },
+            "schema_version": 2,
+            "route_bindings": route_bindings,
             "reader_versions": READER_VERSIONS,
             "summary_schema_digest": digest(summary_schema()),
             "audit_schema_digest": digest(flow.AUDIT_SCHEMA),
@@ -112,10 +114,10 @@ def campaign(prepared, project, tmp_path):
                 "sha256": file_digest(native_path),
             },
         }
-        qualification_path = tmp_path / (candidate.profile + str(execution) + "-fidelity.json")
+        qualification_path = tmp_path / (evidence_name + "-fidelity.json")
         write_json(qualification_path, qualification)
         value["semantic_qualification"] = {
-            "schema_version": 1,
+            "schema_version": 2,
             "path": str(qualification_path),
             "sha256": file_digest(qualification_path),
         }
@@ -234,7 +236,9 @@ def campaign(prepared, project, tmp_path):
             state="confirmed",
         )
     )
-    runtime = SimpleNamespace(store=CampaignStore(tmp_path / "store"), clock=lambda: 100.0)
+    runtime = SimpleNamespace(
+        store=CampaignStore(tmp_path / "store"), clock=lambda: 100.0, fixture_cap=cap
+    )
     snapshot = runtime.store.create(snapshot)
     return runtime, snapshot, snapshot.units[unit.id], receipt
 
@@ -275,7 +279,7 @@ def complete_maps(runtime, snapshot, unit):
             state="validated",
             validation="valid",
             result=result,
-            receipt={"result": result, "provider_family": "openai"},
+            receipt={"job_id": key, "result": result, "provider_family": "openai"},
         )
         apply_result(runtime, snapshot, row)
         row["state"] = "applied"

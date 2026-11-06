@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from test_campaign_handoff_flow import campaign as campaign
 from test_campaign_handoff_flow import step
-from test_campaign_headless import finish
+from test_campaign_headless import finish, fixture_capability
 from test_campaign_headless import prepared as prepared
 
 from bmad_loop import campaign_handoff_flow as flow
@@ -151,6 +151,7 @@ time.sleep(20)
         "argv": [cap["binary"], str(script)],
         "dependencies": [{"path": str(script), "sha256": file_digest(script)}],
     }
+    cap = fixture_capability(tmp_path, cap)
     path = runner.prepare(
         tmp_path / "canceled", request, candidate, cap, launch_id="cancel", generation=1
     )
@@ -187,6 +188,7 @@ print(json.dumps({"type":"result","is_error":True,"error":{"code":"quota_exceede
         "argv": [cap["binary"], str(script)],
         "dependencies": [{"path": str(script), "sha256": file_digest(script)}],
     }
+    cap = fixture_capability(tmp_path, cap)
     adapter = HeadlessAdapter(
         run_dir=tmp_path / "quota-adapter",
         profile=get_profile("codex"),

@@ -25,6 +25,9 @@ breaking changes may land in a minor release.
 - Reflect native task status and observe bounded hcom context through normal campaign operation.
 - Resume closure after external prerequisites complete without reserving an idle writer.
 - Preserve native quota telemetry and refresh fallback routing before continuing interrupted work.
+- Recheck publication holds before releasing merge groups and resume suppressed queue effects.
+- Bind native and semantic qualifications to their earned model, thinking level, permissions and purpose.
+- Preserve reasoning-job identity through late acknowledgements and coordinator restart.
 
 ## [0.14.0] — 2026-11-05
 

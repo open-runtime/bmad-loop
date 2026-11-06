@@ -2121,6 +2121,8 @@ class CampaignRuntime:
                 self.project,
                 "fetch",
                 "--no-tags",
+                "--no-write-fetch-head",
+                "--refmap=",
                 snapshot.spec.remote,
                 f"refs/heads/{snapshot.spec.target}:{observation_ref}",
             )
@@ -2519,6 +2521,11 @@ class CampaignRuntime:
 
     def _perform_github_submission(self, snapshot, action) -> Observation:
         intent = MutationIntent.from_dict(action.payload["intent"])
+        from .campaign_queue_publication import guard_success
+
+        blocked = guard_success(self, snapshot, action, intent)
+        if blocked is not None:
+            return blocked
         if action.payload.get("purpose") == "adoption-draft":
             from .campaign_adoption import guard_draft_submission
 
@@ -2629,6 +2636,11 @@ class CampaignRuntime:
 
     def _perform_push(self, snapshot, action) -> Observation:
         unit = snapshot.units[action.unit]
+        from .campaign_object_promotion import promote
+
+        promote(
+            Path(unit.bindings["workspace"]), action.payload["head"], unit.bindings.get("base", "")
+        )
         row = self._pusher(snapshot, unit).push(action.id, action.payload["head"])
         return Observation(
             "confirmed" if row.state == "confirmed" else "unknown", dataclasses.asdict(row)
@@ -3301,6 +3313,21 @@ class CampaignRuntime:
             from .campaign_usage import worker_accounting
 
             result["accounting"] = worker_accounting(request, {"outcome": "interrupted"})
+        from .campaign_object_promotion import promote
+
+        try:
+            promote(
+                Path(unit.bindings["workspace"]),
+                result["head"] if result["state"] == "interrupted" else result["receipt"]["head"],
+                request.get("checkpoint_base", unit.bindings.get("base", "")),
+            )
+        except (CampaignError, verify.GitError, OSError) as exc:
+            # The actor is terminal, but its candidate objects have not earned
+            # durable acceptance. Release capacity without advancing its head.
+            result["quiescence_confirmed"] = True
+            result["object_promotion_error"] = str(exc)
+            return Observation("confirmed", result)
+        if result["state"] == "interrupted":
             return Observation("confirmed", result)
         receipt = result["receipt"]
         if receipt.get("outcome") == "locally_complete":
@@ -4040,9 +4067,23 @@ class CampaignRuntime:
         unit = snapshot.units.get(action.unit)
         kind = action.kind
         if data.get("operator_suppressed"):
+            from .campaign_queue_publication import release_suppressed
+
+            release_suppressed(unit, action)
             if kind == "prepare-unit" and unit.state == UnitState.PLANNING:
                 transition(snapshot, unit.id, UnitState.PENDING)
             add_event(snapshot, "operator-held-effect-suppressed", unit=action.unit, effect=kind)
+            return
+        if data.get("queue_success_blocked"):
+            from .campaign_queue_publication import apply_blocked
+
+            apply_blocked(snapshot, action, data)
+            add_event(
+                snapshot,
+                "queue-success-publication-blocked",
+                unit=action.unit,
+                reasons=data["gate_reasons"],
+            )
             return
         if kind in {"hierarchy", "hierarchy-close"}:
             from .campaign_tracking_delta import apply as apply_hierarchy
@@ -4657,6 +4698,24 @@ class CampaignRuntime:
         claim = unit.claim
         if not claim or claim.launch_id != action.payload["launch_id"]:
             raise CampaignError("worker receipt no longer owns its claim")
+        if data.get("object_promotion_error"):
+            if data["state"] not in {"finished", "interrupted"} or not data.get(
+                "quiescence_confirmed"
+            ):
+                raise CampaignError("unsealed object failure lacks terminal worker quiescence")
+            claim.quiescent = True
+            claim.status = data["state"]
+            unit.evidence["failure"] = {
+                "code": "object_promotion_failed",
+                "producer": "campaign.object_promotion",
+                "id": claim.launch_id,
+                "detail": data["object_promotion_error"],
+            }
+            self._set_hold(
+                unit,
+                Hold("ownership_uncertain", data["object_promotion_error"], id=claim.launch_id),
+            )
+            return
         if data["state"] == "interrupted":
             if not data.get("quiescence_confirmed"):
                 raise CampaignError(

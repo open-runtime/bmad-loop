@@ -267,7 +267,7 @@ def allocate_checkout(
             return owned
         state_dir.mkdir(parents=True, exist_ok=True)
         atomic_write_text(intent, json.dumps(value, sort_keys=True), follow_symlinks=False)
-    _git(project, "fetch", "--no-tags", remote, group.head)
+    _git(project, "fetch", "--no-tags", "--no-write-fetch-head", "--refmap=", remote, group.head)
     root.mkdir(parents=True, exist_ok=True)
     with worktree_metadata_lock(project):
         if (owned := existing()) is not None:

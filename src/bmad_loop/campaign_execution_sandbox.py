@@ -9,14 +9,16 @@ required. Unsupported platforms fail rather than running an unsandboxed writer.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
 from . import verify
 from .campaign_model import CampaignError
-from .platform_util import is_link_like
+from .platform_util import atomic_write_text, file_lock, is_link_like
 
 
 def _git(workspace, *argv):
@@ -73,7 +75,9 @@ def write_paths(grants, directory):
         ).resolve()
         if git_dir == common:
             raise CampaignError("Execution sandbox requires an isolated Git worktree")
-        allowed.extend([git_dir, common / "objects"])
+        # Objects are shared by every worktree, including protected branches.
+        # A writer gets a separate object bank below, never this common store.
+        allowed.append(git_dir)
         for parent in (common / "refs" / "heads", common / "logs" / "refs" / "heads"):
             branch_path = _path(branch, root=parent)
             allowed.extend([branch_path, Path(str(branch_path) + ".lock")])
@@ -92,17 +96,121 @@ def write_paths(grants, directory):
     return workspace, tuple(dict.fromkeys(allowed)), scratch
 
 
-def macos_profile(paths):
+def reject_legacy_bank_alternates(common):
+    """Refuse old global exposure without deleting unresolved work or user config."""
+    alternates = common / "objects/info/alternates"
+    if not alternates.exists():
+        return
+    if is_link_like(alternates):
+        raise CampaignError("Git object alternates are redirected")
+    parent = (common / "bmad-loop-object-banks").resolve()
+    for line in alternates.read_text(encoding="utf-8").splitlines():
+        if not line:
+            continue
+        # Earlier BMAD bank registrations always used literal absolute paths.
+        # Preserve every unrelated alternate, including its exact quoting.
+        path = Path(line)
+        if not path.is_absolute():
+            path = common / "objects" / path
+        path = path.resolve()
+        if path.parent == parent and re.fullmatch(r"[0-9a-f]{64}", path.name):
+            raise CampaignError(
+                "Legacy native object bank remains globally visible; migrate its objects "
+                "and remove its owned alternate before resuming"
+            )
+
+
+def _object_bank(grants, directory, workspace):
+    """Register private per-launch objects without exposing them to trusted Git.
+
+    Only the promotion helper may read banks explicitly. Adding them to common
+    alternates is unsafe: a forged loose object can shadow a canonical packed
+    object. Banks outlive worktree/job cleanup; a collector must first prove
+    reachable objects have been copied and verified in canonical storage.
+    """
+    if not grants.get("git_branch"):
+        return None, None
+    common = Path(
+        _git(workspace, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    ).resolve()
+    reject_legacy_bank_alternates(common)
+    objects = common / "objects"
+    parent = common / "bmad-loop-object-banks"
+    identity = hashlib.sha256(
+        json.dumps(
+            [
+                str(directory.resolve()),
+                grants["config_digest"],
+                str(workspace),
+                grants["git_branch"],
+            ]
+        ).encode()
+    ).hexdigest()
+    bank = parent / identity
+    for path in (parent, bank):
+        if is_link_like(path):
+            raise CampaignError("Git object-bank registration path is redirected")
+        path.mkdir(parents=True, exist_ok=True)
+    if any(char in str(bank) for char in '\n\r"'):
+        raise CampaignError("Git object bank has an unsupported pathname")
+    manifest = parent / (identity + ".json")
+    record = {
+        "schema_version": 1,
+        "path": str(bank),
+        "workspace": str(workspace),
+        "git_branch": grants["git_branch"],
+        "config_digest": grants["config_digest"],
+        "launch_directory": str(directory.resolve()),
+    }
+    with file_lock(common / "bmad-loop-object-banks.lock"):
+        if is_link_like(manifest):
+            raise CampaignError("Git object bank manifest is redirected")
+        if manifest.exists():
+            if json.loads(manifest.read_text(encoding="utf-8")) != record:
+                raise CampaignError("Git object bank manifest changed")
+        else:
+            atomic_write_text(manifest, json.dumps(record, sort_keys=True), follow_symlinks=False)
+    return bank, objects
+
+
+def macos_profile(paths, *, object_bank=None):
     """Seatbelt applies write confinement to child tools as well as the native CLI."""
     clauses = []
     for path in paths:
         operator = "literal" if path.is_file() else "subpath"
         clauses.append(f"({operator} {json.dumps(str(path), ensure_ascii=True)})")
-    return (
-        '(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write* (literal "/dev/null") '
+    profile = (
+        '(version 1)\n(allow default)\n(deny file-write* file-link)\n(allow file-write* (literal "/dev/null") '
         + " ".join(clauses)
         + ")\n"
     )
+    if object_bank is not None:
+        # Seatbelt permits initial data writes through a newly created file's
+        # descriptor, but denies reopening an existing object for mutation.
+        # Git closes its temporary object before renaming it to its final hash.
+        # Do not permit hardlinks: a writable alias can damage read-only history.
+        prefix = re.escape(str(object_bank))
+        fanout = prefix + "/[0-9a-f][0-9a-f]"
+        # Git's own bounded object-file pattern, not a temp directory.
+        temporary = fanout + "/tmp_obj_[A-Za-z0-9]+"  # nosec B108
+
+        def pattern(value):
+            # Seatbelt's #"..." reader retains regex escapes verbatim; normal
+            # JSON's doubled backslash would match a literal backslash instead.
+            return json.dumps(value, ensure_ascii=False).replace("\\\\", "\\")
+
+        profile += (
+            "(allow file-write-create (regex #"
+            + pattern("^" + fanout + "$")
+            + ") (regex #"
+            + pattern("^" + fanout + "/[0-9a-f]+$")
+            + ") (regex #"
+            + pattern("^" + temporary + "$")
+            + "))\n(allow file-write-unlink (regex #"
+            + pattern("^" + temporary + "$")
+            + "))\n"
+        )
+    return profile
 
 
 def command(grants_path, native, *, platform=None):
@@ -116,12 +224,23 @@ def command(grants_path, native, *, platform=None):
     sandbox = Path("/usr/bin/sandbox-exec")
     if not sandbox.is_file():
         raise CampaignError("Qualified macOS execution sandbox is unavailable")
+    bank, objects = _object_bank(grants, grants_path.parent, workspace)
     profile = grants_path.parent / "execution.sb"
-    from .platform_util import atomic_write_text
 
-    atomic_write_text(profile, macos_profile(allowed), follow_symlinks=False)
+    atomic_write_text(profile, macos_profile(allowed, object_bank=bank), follow_symlinks=False)
     environment = dict(os.environ)
     environment.update(TMPDIR=str(scratch), TMP=str(scratch), TEMP=str(scratch))
+    if bank is not None:
+        environment["GIT_OBJECT_DIRECTORY"] = str(bank)
+        environment["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = json.dumps(
+            str(objects), ensure_ascii=False
+        )
+        count = int(environment.get("GIT_CONFIG_COUNT", "0"))
+        for key, value in (("core.createObject", "rename"), ("gc.auto", "0")):
+            environment[f"GIT_CONFIG_KEY_{count}"] = key
+            environment[f"GIT_CONFIG_VALUE_{count}"] = value
+            count += 1
+        environment["GIT_CONFIG_COUNT"] = str(count)
     return [str(sandbox), "-f", str(profile), *native], workspace, environment
 
 

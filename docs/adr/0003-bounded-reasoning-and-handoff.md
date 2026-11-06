@@ -76,6 +76,13 @@ and context/output limits from the qualified route snapshot, never a guessed
 alias or advertised API limit. On fallback, replan unfinished chunks for the
 destination's payload budget while retaining valid completed results.
 
+The native capability manifest supports explicit `by_effort` variants under each
+profile/model key. Medium map jobs and xhigh reducer jobs on the same model retain
+separate native proofs and permission modes. Preflight, semantic planning, child
+workers and handoff selection resolve the exact candidate effort; absence cannot
+fall back to a differently qualified level. Legacy single-capability and
+reasoning/execution mappings remain readable.
+
 Preserve TeamRouter/account policy and use supported deployment routes. A consumer
 CLI whose integration terms or protocol do not support the application is not
 qualified merely because its binary exists. Use an eligible configured fallback
@@ -124,6 +131,11 @@ are short effects; no model session occupies an I/O executor while waiting for
 minutes. Store large inputs/results outside the hot snapshot by content hash.
 Persist event history incrementally rather than expanding whole-history rewrites.
 
+Parallel Git observations use action or launch-specific destination refs. Explicit
+fetches disable configured ref mapping and `FETCH_HEAD` writes, so linked worktrees
+cannot race on a campaign-wide target or `origin/main`. Each integration retains
+the exact target it observed even when another worker fetches a newer main.
+
 Extend stop/drain/terminate, observation, restart reconciliation and campaign
 completion to job claims as well as unit claims. Draining closes new admissions
 and accounts for already admitted dependencies; termination reconciles each owned
@@ -137,6 +149,11 @@ development stage that assumes its whole working tree stays unchanged. Concurren
 snapshot readers must tolerate legitimate unit edits elsewhere without accepting
 changed input as their original context. Results apply only against matching
 source/graph/configuration revisions and the required head/base coordinates.
+Semantic jobs also bind their purpose-specific canonical context digest. Retire
+obsolete nonlive jobs before retry delays or exhausted-attempt checks, preserving
+their history as stale records. Current exhausted work remains observable; this
+does not waive required handoff work or invalidate immutable map inputs merely
+because unrelated campaign activity progressed.
 
 ## Storage and compatibility
 
@@ -154,6 +171,8 @@ exact native IDs and confirmation evidence, with visibility bounded by the
 reader's saved revision. Own-comment filtering, metadata preimages, hierarchy
 receipts, checkpoint provenance and deterministic action deduplication must use
 these reads. Export and paginated action history retain all archived receipts.
+Validate incoming IDs across both action and polling-observation archives before
+either splitter removes rows; an archived write cannot reappear as an observation.
 SQLite version 2 remains readable; its next save upgrades the database before
 publishing the version 3 marker. Both the old-marker/new-database crash window
 and old-reader refusal are tested. A newer marker over an older database is an
@@ -445,6 +464,13 @@ and termination have independently admitted executor slots, including when regul
 I/O is saturated. Concurrent GitHub hierarchy observations apply field deltas with
 preimages and identity/state fences rather than replacing a stale full projection.
 
+Repeated semantic context receives a new job identity for each durable trigger;
+replaying the same trigger preserves its request and creation time. A cleared
+hold can therefore revisit earlier context without reactivating a completed job.
+Native effects bind the exact job request and launch attempt. A late launch or
+observation reply cannot overwrite a newer claim or a completed receipt. Replies
+for archived terminal jobs settle the effect without modifying immutable history.
+
 Execution pools select both development and ordinary child-review routes. A
 cross-harness continuation preserves the same worktree, draft PR, partial product,
 source obligations and all contributor families. Interrupted ordinary review uses
@@ -491,6 +517,17 @@ supplied IDs. Replanning a mixed quota/failure batch preserves semantic failure
 counts by immutable source coverage; changing routes, job IDs or chunk geometry
 cannot renew those attempts. Exhaustion produces an explicit continuation hold,
 while quota waits themselves do not consume that budget.
+
+Semantic qualification uses schema-2 proofs for exact operation, effort and
+earned transport-evidence hash. A capability may reference several independent
+proofs for history extraction, reduction, audit and the separate constraint or
+recovery operations. The native independent result must bind the complete
+route-purpose list digest as well as the corpus and any additional contract
+schemas. Editing a manifest cannot extend an existing receipt to another effort
+or purpose. Older generic semantic proofs require requalification; verified
+version-1 native transport canaries retain their separate supported read path.
+Automatic map/reduce admission applies these semantic gates before launching,
+and completed result reuse retains its original source and route provenance.
 
 Headless write-capable execution requires a qualified native route and an OS
 confinement wrapper. The shipped macOS wrapper enforces frozen product/private-source,
@@ -550,6 +587,15 @@ qualification. Grok prompt-file recipes must preserve full input with its native
 verbatim option; Muse recipes pin the native binary and suppress launcher updates.
 Native protocol decoders preserve structured quota failures and provider usage.
 
+Native admission reads the referenced qualification report and binds its completed
+receipt to the fixed canary request, exact selected effort, executable/dependency
+hashes, argv, transport and permissions. Editable checklist fields cannot expand
+earned input, output or turn limits. Version 2 reports also hash the complete
+request envelope; version 1 reports remain readable through their matching frozen
+sibling request and owned receipt, without rewriting private evidence. Independently
+validated semantic-fidelity evidence may be attached without changing this native
+transport identity. A capability cannot inherit another effort's native proof.
+
 Workspace-tools qualification is a separate explicit `campaign qualify-writer`
 canary. It creates a new disposable repository/worktree and grants exactly one
 owned file plus owned Git metadata. The native model must make the exact edit and
@@ -562,6 +608,17 @@ would discard virtualenv dependency resolution. No-tools canaries cannot earn
 writer qualification. Earned input coverage, actual output/turn usage and configured
 ceilings remain separate. This finite operation establishes an executable scoped
 writer route, not unrestricted workflow or cross-harness completion qualification.
+
+Native Git writes use a private object bank for each launch. Canonical objects and
+earlier banks remain read-only, and banks are never canonical Git alternates:
+even a forged loose object can otherwise shadow a valid packed object. Trusted
+checkpoint observation and terminal acceptance independently repack and verify the
+exact new graph into canonical storage before inspecting it or publishing its SHA.
+The copied objects use new inodes, so a writer's already-open descriptor cannot
+modify an accepted checkpoint. A baseline available only in an unsealed bank, a
+corrupt object, or an older global bank-alternate registration produces a visible
+hold. Banks remain retained until a separate verified reachability cleanup; this
+promotion path does not collect them.
 The CLI retains failed startup attempts and resumes only the same immutable job.
 
 The separate `campaign trial-handoff` command reads explicitly sealed prefixes,
@@ -574,3 +631,19 @@ qualification. A separate independent-provider review must establish critical
 constraint fidelity and absence of invented authority before automatic handoff.
 The real whole-thread trial remains a qualification gate; a successful fixed
 transport canary and scripted regression coverage do not satisfy it.
+
+Rendered-input planning splits an oversized map or reducer independently rather
+than shrinking every job's payload. Map splits retain exact native ranges; reducer
+splits retain complete validated children, with citation enums drawn from their
+actual retained facts. Owner quote selections identify verified source spans;
+the controller extracts the original text instead of trusting reconstructed quote
+strings. A model-result rejection permits two immutable corrective attempts and
+retains the rejected receipts. Source corruption or uncertain native lifecycle is
+not a semantic retry.
+
+Explicit trial reuse follows only retained bindings and revalidates each source,
+native receipt and earned route qualification. Map and reducer routes may use
+separately qualified efforts. The operator can configure up to 64 concurrent trial
+jobs and drain admission while existing jobs finish; this is a bounded trial
+ceiling, not a claim about provider capacity. Provider limits remain observable,
+and structural success remains distinct from independent semantic qualification.

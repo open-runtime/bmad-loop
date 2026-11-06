@@ -2179,6 +2179,7 @@ def git_bytes(
     *args: str,
     timeout_s: int | None = None,
     env: dict[str, str] | None = None,
+    input_data: bytes | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     """Run one `git -C <repo> …` through the chokepoint, capturing raw BYTES.
 
@@ -2203,7 +2204,17 @@ def git_bytes(
     expressed as a `CompletedProcess`.
 
     `env` is opt-in and mirrors `_git_out`'s: it replaces the inherited
-    environment for this one child (`LC_ALL=C` still merged on top)."""
+    environment for this one child (`LC_ALL=C` still merged on top). Optional
+    `input_data` supplies bounded binary stdin through the same chokepoint."""
+    if input_data is not None:
+        return _run_git(
+            ["git", "-C", str(repo), *args],
+            repo,
+            binary=True,
+            timeout_s=timeout_s,
+            env=env,
+            input_data=input_data,
+        )
     return _run_git(
         ["git", "-C", str(repo), *args], repo, binary=True, timeout_s=timeout_s, env=env
     )

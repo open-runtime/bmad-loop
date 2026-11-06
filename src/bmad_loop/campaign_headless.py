@@ -165,10 +165,10 @@ def _validate_capability(
         for item in raw.get("dependencies", []):
             if file_digest(Path(item["path"])) != item["sha256"]:
                 raise CampaignError("Qualified wrapper/native dependency changed")
-        if qualification_required and file_digest(Path(evidence.get("path", ""))) != evidence.get(
-            "sha256"
-        ):
-            raise CampaignError("Native qualification evidence changed")
+        if qualification_required:
+            from .campaign_capability_evidence import validate
+
+            validate(raw, candidate)
 
 
 def validate_capability(raw, candidate, *, verify_files=True, permissions="no-tools") -> None:
@@ -193,26 +193,90 @@ def load_capabilities(path: Path) -> dict[str, Any]:
     if document.get("schema_version") != 1 or not isinstance(document.get("routes"), dict):
         raise CampaignError("Invalid headless capability file")
     for key, value in document["routes"].items():
-        modes = value if "reasoning" in value or "execution" in value else {"flat": value}
-        for mode, cap in modes.items():
-            candidate = RoleCandidate(cap["profile"], cap["model"], (cap.get("efforts") or [""])[0])
-            if key != candidate.profile + ":" + candidate.model:
-                raise CampaignError("Headless capability key differs from its route")
-            permission = (
-                "workspace-tools" if mode == "execution" else cap.get("permissions", "no-tools")
+        if not isinstance(value, dict):
+            raise CampaignError("Headless route must be a capability or permission mapping")
+        variants = {None: value}
+        if "by_effort" in value:
+            if (
+                set(value) != {"by_effort"}
+                or not isinstance(value["by_effort"], dict)
+                or not value["by_effort"]
+            ):
+                raise CampaignError(
+                    "Headless effort variants require an exclusive nonempty mapping"
+                )
+            variants = value["by_effort"]
+        for effort, variant in variants.items():
+            if not isinstance(variant, dict):
+                raise CampaignError(
+                    "Headless effort variant must contain a capability or permission mapping"
+                )
+            modes = (
+                variant if "reasoning" in variant or "execution" in variant else {"flat": variant}
             )
-            validate_capability(cap, candidate, permissions=permission)
+            if modes is variant and set(modes) - {"reasoning", "execution"}:
+                raise CampaignError("Headless permission mapping contains ambiguous fields")
+            for mode, cap in modes.items():
+                if (
+                    not isinstance(cap, dict)
+                    or not isinstance(cap.get("profile"), str)
+                    or not isinstance(cap.get("model"), str)
+                ):
+                    raise CampaignError("Headless capability lacks a profile/model route")
+                if effort is not None and cap.get("efforts") != [effort]:
+                    raise CampaignError(
+                        "Headless effort variant differs from its earned thinking level"
+                    )
+                candidate = RoleCandidate(
+                    cap["profile"], cap["model"], (cap.get("efforts") or [""])[0]
+                )
+                if key != candidate.profile + ":" + candidate.model:
+                    raise CampaignError("Headless capability key differs from its route")
+                permission = {"reasoning": "no-tools", "execution": "workspace-tools"}.get(
+                    mode, cap.get("permissions", "no-tools")
+                )
+                if not isinstance(permission, str):
+                    raise CampaignError("Headless capability permission must be explicit")
+                validate_capability(cap, candidate, permissions=permission)
     return document["routes"]
 
 
 def capability_for(
-    routes: dict[str, Any], profile: str, model: str, permissions: str = "no-tools"
+    routes: dict[str, Any],
+    profile: str,
+    model: str,
+    permissions: str = "no-tools",
+    *,
+    effort: str | None = None,
 ) -> dict[str, Any]:
+    """Select the exact earned effort without borrowing another route's proof."""
     value = routes.get(profile + ":" + model, {})
+    if not isinstance(value, dict):
+        raise CampaignError("Headless route must be a capability or permission mapping")
+    by_effort = "by_effort" in value
+    if "by_effort" in value:
+        variants = value["by_effort"]
+        if set(value) != {"by_effort"} or not isinstance(variants, dict):
+            raise CampaignError("Headless effort variants require an exclusive mapping")
+        if effort is None or effort not in variants:
+            raise CampaignError(
+                f"No qualified exact thinking level {effort!r} for {profile}/{model}"
+            )
+        value = variants[effort]
+    if not isinstance(value, dict):
+        raise CampaignError(
+            "Headless effort variant must contain a capability or permission mapping"
+        )
     if "reasoning" in value or "execution" in value:
         value = value.get("reasoning" if permissions == "no-tools" else "execution", {})
-    if value.get("permissions") != permissions:
+    if not isinstance(value, dict) or value.get("permissions") != permissions:
         raise CampaignError(f"No qualified {permissions} route for {profile}/{model}")
+    if by_effort and value.get("efforts") != [effort]:
+        raise CampaignError("Headless effort variant differs from its earned thinking level")
+    if effort is not None and effort not in value.get("efforts", []):
+        raise CampaignError(
+            f"Selected thinking level {effort!r} is not qualified for {profile}/{model}"
+        )
     return value
 
 

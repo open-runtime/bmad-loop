@@ -72,18 +72,13 @@ def _coordinates(row: dict[str, Any]) -> tuple[str, str]:
     )
 
 
-def archive(
-    connection: sqlite3.Connection,
-    rows: list[dict[str, Any]],
-    *,
-    revision: int,
-    protected: Iterable[str] = (),
-) -> tuple[list[dict[str, Any]], set[str]]:
-    """Register order and move terminal payloads in the caller's authority transaction."""
-    schema(connection)
+def validate_incoming(connection: sqlite3.Connection, rows: list[dict[str, Any]]) -> None:
+    """Fence every incoming ID before either archive class can remove a row."""
     identities = [row["id"] for row in rows]
     if len(set(identities)) != len(identities):
         raise CampaignError("duplicate action history identities")
+    if not available(connection):
+        return
     supplied = {row["id"]: row for row in rows}
     for offset in range(0, len(identities), 256):
         batch = identities[offset : offset + 256]
@@ -98,6 +93,18 @@ def archive(
                 raise CampaignError("cannot reactivate an archived effect ID")
             if (supplied[identity]["kind"], supplied[identity]["unit"]) != (kind, unit):
                 raise CampaignError("cannot redefine a recorded effect identity")
+
+
+def archive(
+    connection: sqlite3.Connection,
+    rows: list[dict[str, Any]],
+    *,
+    revision: int,
+    protected: Iterable[str] = (),
+) -> tuple[list[dict[str, Any]], set[str]]:
+    """Register order and move terminal payloads in the caller's authority transaction."""
+    schema(connection)
+    validate_incoming(connection, rows)
     connection.executemany(
         "INSERT INTO action_history(id,kind,unit,state,native_id,tracking_key) "
         "VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING",

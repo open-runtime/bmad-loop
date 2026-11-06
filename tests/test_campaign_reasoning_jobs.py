@@ -1,5 +1,7 @@
 """Reasoning jobs use production claims, storage and native child lifecycle."""
 
+import copy
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -19,6 +21,9 @@ from bmad_loop.campaign_supervisor import CampaignSupervisor
 def case(tmp_path, prepared, count=2):
     runner, _, request, candidate, cap = prepared
     snapshot = make_snapshot()
+    common = tmp_path / "git-common"
+    common.mkdir()
+    snapshot.common_dir = str(common)
     snapshot.generation = 1
     snapshot.spec = replace(
         snapshot.spec,
@@ -122,6 +127,57 @@ def test_terminal_jobs_leave_hot_authority_but_remain_queryable(tmp_path, prepar
         driver.store.save(restored, restored.revision)
 
 
+def test_restart_adopts_prepared_binding_and_launches_real_child(tmp_path, prepared, monkeypatch):
+    from bmad_loop.campaign_reasoning_flow import _binding, _superseded
+    from bmad_loop.campaign_supervisor import Proposal
+
+    snapshot, driver, supervisor, _ = case(tmp_path, prepared, count=1)
+    snapshot = supervisor._queue(snapshot, driver.observe_workers(snapshot))
+    launch_id = snapshot.jobs["job-0"]["claim"]["launch_id"]
+    snapshot = supervisor._queue(
+        snapshot, (Proposal("reasoning-observe", "", {"job_id": "job-0"}),)
+    )
+    old_generation = snapshot.generation
+    monkeypatch.setattr(driver, "observe_workers", lambda _: ())
+    monkeypatch.setattr(driver, "proposals", lambda _: ())
+    supervisor.run(snapshot.id, max_ticks=1)
+    snapshot = driver.store.load(snapshot.id)
+    row = snapshot.jobs["job-0"]
+    assert row["claim"]["generation"] == old_generation + 1
+    bound = [action for action in snapshot.outbox if action.payload.get("job_id") == "job-0"]
+    assert len(bound) == 2
+    assert all(action.payload["job_binding"] == _binding(row) for action in bound)
+    assert not _superseded(row, next(action for action in bound if action.id == launch_id))
+    assert len(prepared[0].mux.processes) == 1
+    for child in prepared[0].mux.processes.values():
+        assert child.wait(timeout=30) == 0
+
+
+def test_generation_adoption_preserves_superseded_and_sent_bindings(tmp_path, prepared):
+    from bmad_loop.campaign_reasoning_flow import adopt_prepared_generation
+
+    snapshot, driver, supervisor, _ = case(tmp_path, prepared, count=1)
+    snapshot = supervisor._queue(snapshot, driver.observe_workers(snapshot))
+    launch = snapshot.outbox[0]
+    old_binding = copy.deepcopy(launch.payload["job_binding"])
+    stale = copy.deepcopy(launch)
+    stale.id = "previous-launch"
+    stale.payload["job_binding"]["launch_id"] = stale.id
+    sent = copy.deepcopy(launch)
+    sent.id = "observer-already-sent"
+    sent.kind = "reasoning-observe"
+    sent.state = "sent_unknown"
+    snapshot.outbox.extend([stale, sent])
+    stale.generation += 1
+    adopt_prepared_generation(snapshot, stale)
+    assert snapshot.jobs["job-0"]["claim"]["generation"] == old_binding["generation"]
+    launch.generation += 1
+    adopt_prepared_generation(snapshot, launch)
+    assert launch.payload["job_binding"]["generation"] == launch.generation
+    assert stale.payload["job_binding"]["launch_id"] == stale.id
+    assert sent.payload["job_binding"] == old_binding
+
+
 def test_job_admission_selects_qualified_subset_of_role_pool(tmp_path, prepared):
     snapshot, driver, _, _ = case(tmp_path, prepared, count=1)
     candidate = prepared[3]
@@ -217,6 +273,116 @@ def test_late_predecessor_receipt_cannot_complete_new_attempt(tmp_path, prepared
             },
         )
     assert row["receipt"] is None and row["state"] == "prepared"
+
+
+@pytest.mark.parametrize("archived", [False, True])
+def test_late_launch_ack_preserves_completed_claim_and_terminal_history(
+    tmp_path, prepared, archived
+):
+    from bmad_loop import campaign_reasoning_flow as flow
+    from bmad_loop.campaign_supervisor import Observation
+
+    snapshot, runtime, supervisor, _ = case(tmp_path, prepared, count=1)
+    snapshot = supervisor._queue(snapshot, runtime.observe_workers(snapshot))
+    action = snapshot.outbox[0]
+    row = snapshot.jobs["job-0"]
+    receipt = {
+        "job_id": row["id"],
+        "request_digest": row["request_digest"],
+        "launch_id": row["claim"]["launch_id"],
+        "generation": row["claim"]["generation"],
+        "quiescent": True,
+        "outcome": "failed",
+        "usage": {},
+    }
+    flow.apply(
+        runtime,
+        snapshot,
+        action,
+        Observation("confirmed", {"state": "finished", "receipt": receipt}),
+    )
+    assert row["failure_attempts"] == 1
+    if archived:
+        row["state"] = "stale"
+    before = copy.deepcopy(row)
+    snapshot = runtime.store.save(snapshot, snapshot.revision)
+    if archived:
+        assert "job-0" not in snapshot.jobs
+        observation = flow.perform(runtime, snapshot, action, reconcile=True)
+        assert observation.data["state"] == "settled"
+    for data in ({"state": "running"}, {"state": "finished", "receipt": receipt}):
+        flow.apply(runtime, snapshot, action, Observation("confirmed", data))
+    snapshot = runtime.store.save(snapshot, snapshot.revision)
+    assert runtime.store.jobs(snapshot.id, job_id="job-0")[0] == before
+
+
+def test_prior_observer_cannot_overwrite_replacement_claim(tmp_path, prepared):
+    from bmad_loop import campaign_reasoning_flow as flow
+    from bmad_loop.campaign_store import add_action
+    from bmad_loop.campaign_supervisor import Observation
+
+    snapshot, runtime, supervisor, _ = case(tmp_path, prepared, count=1)
+    snapshot = supervisor._queue(snapshot, runtime.observe_workers(snapshot))
+    action = add_action(snapshot, "reasoning-observe", "", payload={"job_id": "job-0"})
+    flow.prepare_effect(runtime, snapshot, action)
+    row = snapshot.jobs["job-0"]
+    row["claim"] = {**row["claim"], "launch_id": "replacement", "attempt": 2}
+    before = copy.deepcopy(row)
+    flow.apply(
+        runtime,
+        snapshot,
+        action,
+        Observation("confirmed", {"state": "running", "native_id": "old-native"}),
+    )
+    assert row == before
+    assert flow.perform(runtime, snapshot, action).data["state"] == "settled"
+
+
+def test_real_child_completion_can_archive_before_launch_ack_arrives(tmp_path, prepared):
+    snapshot, runtime, supervisor, clock = case(tmp_path, prepared, count=1)
+    runner = runtime.reasoning_runner
+    launch = runner.launch
+    started, release = threading.Event(), threading.Event()
+
+    def delayed_launch(path):
+        observed = launch(path)
+        started.set()
+        assert release.wait(60), "launch acknowledgement was never released"
+        return observed
+
+    runner.launch = delayed_launch
+    snapshot = supervisor._queue(snapshot, runtime.observe_workers(snapshot))
+    launch_id = snapshot.jobs["job-0"]["claim"]["launch_id"]
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        try:
+            snapshot = supervisor._submit(snapshot, snapshot.outbox[0], executor, reconcile=False)
+            assert started.wait(30)
+            deadline = time.monotonic() + 45
+            while "job-0" in snapshot.jobs:
+                assert time.monotonic() < deadline, snapshot.jobs["job-0"]
+                snapshot = supervisor._harvest(snapshot)
+                if snapshot.jobs.get("job-0", {}).get("state") == "validated":
+                    snapshot.graph_revision += 1
+                    snapshot = runtime.store.save(snapshot, snapshot.revision)
+                clock[0] += 1
+                snapshot = supervisor._queue(snapshot, runtime.observe_workers(snapshot))
+                for action in tuple(snapshot.outbox):
+                    if action.state == "prepared":
+                        snapshot = supervisor._submit(snapshot, action, executor, reconcile=False)
+                time.sleep(0.01)
+            before = runtime.store.jobs(snapshot.id, job_id="job-0")[0]
+            assert before["state"] == "stale" and before["claim"]["quiescent"]
+            assert launch_id in supervisor._active
+            release.set()
+            while launch_id in supervisor._active:
+                assert time.monotonic() < deadline
+                snapshot = supervisor._harvest(snapshot)
+                time.sleep(0.01)
+        finally:
+            release.set()
+    assert runtime.store.jobs(snapshot.id, job_id="job-0")[0] == before
+    assert next(row for row in snapshot.outbox if row.id == launch_id).state == "confirmed"
+    assert len(runner.mux.processes) == 1
 
 
 @pytest.mark.parametrize("value", [{"answer": True}, {"answer": "x", "approval": True}, {}])

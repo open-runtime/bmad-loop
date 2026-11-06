@@ -1021,6 +1021,14 @@ SHA/base, policy and source evidence. Read back the same required App/context
 identity for both; a G-only producer cannot satisfy an H enqueue prerequisite.
 Reconcile uncertain check writes before retrying, with no fabricated green check.
 
+Posting a successful G check can release the merge queue, so its send path
+rechecks the current candidate, group, rules, local acceptance and remote
+holds/reviews. A proven-unsent veto clears the submitted flag and requests
+dequeue; removing the blocking condition permits fresh admission and proof.
+Operator-suppressed check or dequeue intents cannot leave a submitted flag that
+prevents the next authorized attempt. Uncertain submissions remain reconciled
+against the remote identity before any replacement write.
+
 Keep the existing project gate-command contract and add a separate actual merge
 executor. Its durable request binds repository, PR, H/B, rules fingerprint,
 method and bypass policy. Submission may be pending or uncertain; reconcile the
@@ -1202,6 +1210,15 @@ automations only after their responsibilities are covered and existing workers
 are accounted for. Passing bmad-loop tests or installing the wheel alone does
 not establish REM readiness; an unresolved activation prerequisite leaves the
 overall outcome incomplete.
+
+Preserved REM worktrees can still call the external BMAD compatibility relay now
+maintained in Paradev tooling. Preserve worker `BMAD_LOOP_RUN_DIR`,
+`BMAD_LOOP_TASK_ID`, `engine.pid` and available process-birth identity so hooks
+resolve their owning engine before the relay's configured/global fallback. The
+relay forwards arguments and stdin; it does not start an engine. Current REM's
+absence of registrations or an idle engine observation does not establish that
+preserved worktree callers are retired. Relay removal requires explicit migration
+or retirement of those callers, outside this campaign implementation milestone.
 
 The present implementation milestone stops before those deployment actions:
 review-ready means committed and pushed code/docs, normal-path qualification and

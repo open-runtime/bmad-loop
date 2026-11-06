@@ -76,6 +76,7 @@ def _cap(snapshot, candidate, mode="workspace-tools"):
         candidate.profile,
         candidate.model,
         mode,
+        effort=candidate.effort,
     )
     validate_capability(cap, candidate, permissions=mode)
     return cap
@@ -748,10 +749,21 @@ def _coordinates(snapshot, unit, value):
     }
 
 
-def _summary_route(runtime, snapshot, role, value=None, excluded_families=(), *, min_payload=0):
+def _summary_route(
+    runtime,
+    snapshot,
+    role,
+    value=None,
+    excluded_families=(),
+    *,
+    min_payload=0,
+    purpose="",
+    contract="",
+):
     from .campaign_headless import provider_family
 
-    allowed = []
+    allowed, failures = [], []
+    purpose = purpose or ("handoff_audit" if role == "handoff_audit" else "handoff_map")
     excluded = {
         route
         for route, until in (value or {}).get("route_cooldowns", {}).items()
@@ -765,9 +777,13 @@ def _summary_route(runtime, snapshot, role, value=None, excluded_families=(), *,
             continue
         try:
             cap = _cap(snapshot, candidate, "no-tools")
+            validate_fidelity_qualification(
+                cap, candidate=candidate, purpose=purpose, contract=contract
+            )
             if min_payload and _budget(candidate, cap).payload_tokens < min_payload:
                 continue
-        except CampaignError:
+        except CampaignError as exc:
+            failures.append(str(exc))
             continue
         allowed.append(candidate)
     selected = (
@@ -776,7 +792,11 @@ def _summary_route(runtime, snapshot, role, value=None, excluded_families=(), *,
         else allowed[0] if allowed else None
     )
     if selected is None:
-        raise HandoffRouteWait("No currently available qualified headless route for " + role)
+        raise HandoffRouteWait(
+            "No currently available qualified headless route for "
+            + role
+            + (": " + "; ".join(dict.fromkeys(failures)) if failures else "")
+        )
     return selected, _cap(snapshot, selected, "no-tools")
 
 
@@ -786,7 +806,13 @@ def _budget(candidate, cap):
     # JSON source wrapping can double escaped text; leave measured headroom for
     # outer prompt/schema/manifest. Admission rechecks the actual rendered bytes.
     return ContextBudget(
-        candidate.profile + ":" + candidate.model,
+        candidate.profile
+        + ":"
+        + candidate.model
+        + "@"
+        + candidate.effort
+        + ":"
+        + cap["qualification"]["sha256"],
         min(cap["input_tokens"] // 2, cap["context_tokens"] - cap["reserved_tokens"]),
         min(cap["output_tokens"], 32768),
         prompt_tokens=8192,
@@ -923,7 +949,9 @@ def _reduce(runtime, snapshot, unit, value):
         return None
     if value.get("reduction_level", 0) >= 8:
         raise CampaignError("History reduction failed to converge within eight qualified rounds")
-    candidate, cap = _summary_route(runtime, snapshot, "summarization", value)
+    candidate, cap = _summary_route(
+        runtime, snapshot, "summarization", value, purpose="handoff_reduce", contract=""
+    )
     budget = _budget(candidate, cap)
     budget = dataclasses.replace(
         budget, output_tokens=min(budget.output_tokens, max(1024, ceiling // 8))
@@ -975,86 +1003,18 @@ def _reduce(runtime, snapshot, unit, value):
     return {"requests": jobs, "reduction": True}
 
 
-def validate_fidelity_qualification(cap, *, contract=""):
-    """Require a corpus-bound independent native proof, not native transport success."""
-    from .campaign_headless import file_digest, provider_family
-    from .campaign_summary import EXTRACT_PROMPT_VERSION, REDUCE_PROMPT_VERSION, summary_schema
-    from .campaign_transcripts import READER_VERSIONS
+def validate_fidelity_qualification(cap, *, candidate=None, purpose="", contract=""):
+    """Require an independent proof for the exact operation, effort and transport."""
+    from .campaign_fidelity import validate
 
-    binding = cap.get("semantic_qualification") or {}
-    if binding.get("schema_version") != 1 or not binding.get("path"):
-        raise HandoffRouteWait("Semantic handoff fidelity qualification is missing")
-    path = Path(binding["path"])
-    if file_digest(path) != binding.get("sha256"):
-        raise HandoffRouteWait("Semantic handoff qualification artifact changed")
-    evidence = read_json(path)
-    expected = {
-        "schema_version": 1,
-        "route": {key: cap[key] for key in ("profile", "model", "cli_version", "binary_sha256")},
-        "reader_versions": READER_VERSIONS,
-        "summary_schema_digest": digest(summary_schema()),
-        "audit_schema_digest": digest(AUDIT_SCHEMA),
-        "prompt_versions": [EXTRACT_PROMPT_VERSION, REDUCE_PROMPT_VERSION],
-        "structural_pass": True,  # nosec B105: qualification verdict, not a credential.
-    }
-    if contract == "constraints-v1":
-        from .campaign_handoff_constraints import AUDIT_SCHEMA as CONSTRAINT_AUDIT_SCHEMA
-        from .campaign_handoff_constraints import (
-            REDUCTION_SCHEMA,
-        )
-
-        expected["constraint_schemas_digest"] = digest([REDUCTION_SCHEMA, CONSTRAINT_AUDIT_SCHEMA])
-    elif contract == "recovery-v1":
-        from .campaign_handoff_recovery import AUDIT_SCHEMA as RECOVERY_AUDIT_SCHEMA
-        from .campaign_handoff_recovery import SCHEMA as RECOVERY_SCHEMA
-
-        expected["recovery_schemas_digest"] = digest([RECOVERY_SCHEMA, RECOVERY_AUDIT_SCHEMA])
-    if any(evidence.get(key) != value for key, value in expected.items()):
-        raise HandoffRouteWait(
-            "Semantic fidelity proof does not match current readers/templates/schema/route"
-        )
-    corpus = evidence.get("corpus")
-    if not isinstance(corpus, list) or not corpus:
-        raise HandoffRouteWait("Semantic fidelity corpus is missing")
-    for source in corpus:
-        if not source.get("critical_ids") or file_digest(Path(source["source_path"])) != source.get(
-            "source_sha256"
-        ):
-            raise HandoffRouteWait("Semantic fidelity corpus changed or lacks critical obligations")
-    independent = evidence.get("independent_review") or {}
-    if not independent.get("native_receipt_path") or file_digest(
-        Path(independent["native_receipt_path"])
-    ) != independent.get("sha256"):
-        raise HandoffRouteWait("Independent native fidelity receipt is missing or changed")
-    receipt = read_json(Path(independent["native_receipt_path"]))
-    observed = provider_family(receipt.get("observed_model", ""))
-    result = receipt.get("result") or {}
-    if contract:
-        field = (
-            "constraint_schemas_digest"
-            if contract == "constraints-v1"
-            else "recovery_schemas_digest"
-        )
-        if result.get("contract_schema_digests", {}).get(contract) != expected[field]:
-            raise HandoffRouteWait(
-                "Independent native fidelity receipt did not review this contract"
-            )
-    if (
-        receipt.get("outcome") != "completed"
-        or receipt.get("quiescent") is not True
-        or receipt.get("input_complete") is not True
-        or not receipt.get("session_id")
-        or not observed
-        or observed == provider_family(cap["model"])
-        or result.get("verdict") != "passed"
-        or result.get("corpus_digest") != digest(corpus)
-        or any(
-            result.get(key) != []
-            for key in ("missing_critical_ids", "invented_authority", "unresolved_conflicts")
-        )
-    ):
-        raise HandoffRouteWait("Independent native fidelity validation has not passed")
-    return binding
+    purpose = purpose or {
+        "constraints-v1": "constraint_audit",
+        "recovery-v1": "recovery_audit",
+    }.get(contract, "handoff_audit")
+    try:
+        return validate(cap, AUDIT_SCHEMA, candidate=candidate, purpose=purpose, contract=contract)
+    except CampaignError as exc:
+        raise HandoffRouteWait(str(exc)) from exc
 
 
 def _audit_plan(runtime, snapshot, unit, value):
@@ -1072,7 +1032,6 @@ def _audit_plan(runtime, snapshot, unit, value):
 
     if provider_family(candidate.model) in map_families:
         raise CampaignError("Handoff constraint audit requires an independent model family")
-    validate_fidelity_qualification(cap)
     histories = tuple(HistorySnapshot(**row) for row in value["capture"]["sources"])
     events = {event.id: event for history in histories for event in load_events(history)}
     jobs = []
@@ -1288,7 +1247,17 @@ def _contract_job(
         "handoff_job_field": field,
     }
     identifier = (
-        "context-" + digest([coordinates, data.decode(), candidate.profile, candidate.model])[:32]
+        "context-"
+        + digest(
+            [
+                coordinates,
+                data.decode(),
+                candidate.profile,
+                candidate.model,
+                candidate.effort,
+                cap["qualification"]["sha256"],
+            ]
+        )[:32]
     )
     request = JobRequest(
         identifier,
@@ -1336,7 +1305,14 @@ def _constraint_plan(runtime, snapshot, unit, value):
         raise HandoffRouteWait(
             "Current constraint reduction did not converge within its bounded rounds"
         )
-    candidate, cap = _summary_route(runtime, snapshot, "summarization", value)
+    candidate, cap = _summary_route(
+        runtime,
+        snapshot,
+        "summarization",
+        value,
+        purpose="constraint_reduce",
+        contract="constraints-v1",
+    )
     if value.get("constraint_jobs"):
         nodes = [
             node
@@ -1397,8 +1373,15 @@ def _constraint_audit_plan(runtime, snapshot, unit, value):
         (_job(runtime, snapshot, key).get("receipt") or {}).get("provider_family")
         for key in value["constraint_jobs"]
     }
-    candidate, cap = _summary_route(runtime, snapshot, "handoff_audit", value, families)
-    validate_fidelity_qualification(cap, contract="constraints-v1")
+    candidate, cap = _summary_route(
+        runtime,
+        snapshot,
+        "handoff_audit",
+        value,
+        families,
+        purpose="constraint_audit",
+        contract="constraints-v1",
+    )
     jobs = []
     for key in value["constraint_jobs"]:
         row = _job(runtime, snapshot, key)
@@ -1429,7 +1412,14 @@ def _constraint_audit_plan(runtime, snapshot, unit, value):
 def _recovery_plan(runtime, snapshot, unit, value):
     from .campaign_handoff_recovery import SCHEMA, collect
 
-    candidate, cap = _summary_route(runtime, snapshot, "summarization", value)
+    candidate, cap = _summary_route(
+        runtime,
+        snapshot,
+        "summarization",
+        value,
+        purpose="recovery_extract",
+        contract="recovery-v1",
+    )
     bound = _budget(candidate, cap).payload_tokens // 2
     evidence = {
         **collect(runtime, snapshot, unit, value["capture"], max_bytes=bound),
@@ -1468,8 +1458,15 @@ def _recovery_audit_plan(runtime, snapshot, unit, value):
             or "Missing native history requires authoritative current owner evidence",
         }
     families = {row.get("receipt", {}).get("provider_family")}
-    candidate, cap = _summary_route(runtime, snapshot, "handoff_audit", value, families)
-    validate_fidelity_qualification(cap, contract="recovery-v1")
+    candidate, cap = _summary_route(
+        runtime,
+        snapshot,
+        "handoff_audit",
+        value,
+        families,
+        purpose="recovery_audit",
+        contract="recovery-v1",
+    )
     content = {
         **value["recovery_evidence"],
         "handoff_id": value["id"],
@@ -1527,15 +1524,17 @@ def _contract_replan(runtime, snapshot, unit, value):
         data = Path(source["path"]).read_bytes()
         if hashlib.sha256(data).hexdigest() != source["sha256"]:
             raise CampaignError("Retried context job source changed")
-        candidate, cap = _summary_route(
-            runtime, snapshot, raw["role"], value, excluded, min_payload=len(data)
-        )
         contract = raw["coordinates"]["contract"]
-        if raw["role"] == "handoff_audit":
-            validate_fidelity_qualification(
-                cap,
-                contract="constraints-v1" if contract.startswith("constraint-") else "recovery-v1",
-            )
+        candidate, cap = _summary_route(
+            runtime,
+            snapshot,
+            raw["role"],
+            value,
+            excluded,
+            min_payload=len(data),
+            purpose=contract.removesuffix("-v1").replace("-", "_"),
+            contract="constraints-v1" if contract.startswith("constraint-") else "recovery-v1",
+        )
         requests.append(
             _contract_job(
                 runtime,

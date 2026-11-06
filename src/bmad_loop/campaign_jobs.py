@@ -201,7 +201,12 @@ def live(row: Mapping[str, Any]) -> bool:
     return bool(claim and not claim.get("quiescent"))
 
 
-def current(snapshot: CampaignSnapshot, request: JobRequest) -> bool:
+def current(
+    snapshot: CampaignSnapshot,
+    request: JobRequest,
+    *,
+    semantic_fingerprints: dict[str, str] | None = None,
+) -> bool:
     coordinates = request.coordinates
     if coordinates["config_revision"] != snapshot.config_revision:
         return False
@@ -214,6 +219,15 @@ def current(snapshot: CampaignSnapshot, request: JobRequest) -> bool:
         return handoff.get("id") == coordinates["handoff_id"]
     if coordinates["graph_revision"] != snapshot.graph_revision:
         return False
+    if coordinates.get("context_digest"):
+        from .campaign_reasoning_plan import ROLES, fingerprint
+
+        if request.purpose in ROLES:
+            cache = {} if semantic_fingerprints is None else semantic_fingerprints
+            if request.purpose not in cache:
+                cache[request.purpose] = fingerprint(snapshot, request.purpose)
+            if coordinates["context_digest"] != cache[request.purpose]:
+                return False
     if request.unit:
         unit = snapshot.units[request.unit]
         observed = unit.evidence.get("integrated") or unit.evidence.get("local") or {}

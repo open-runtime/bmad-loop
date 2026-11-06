@@ -475,7 +475,9 @@ def execution(request, session):
     MARKERS.mkdir(exist_ok=True)
     (MARKERS/suffix).write_text("started")
     if suffix in {"first","second"}:
-        deadline=time.monotonic()+10
+        # This is a synchronization barrier, not an admission-latency benchmark.
+        # The first worker cannot finish until a second actually starts.
+        deadline=time.monotonic()+120
         independent=("first","second","planned") if remote.get("planning_required") else ("first","second")
         while sum((MARKERS/name).exists() for name in independent)<2:
             if time.monotonic()>deadline: raise RuntimeError("independent units were serialized")
@@ -893,7 +895,7 @@ def test_tracking_debt_blocks_only_affected_dependent_until_reconciled(
     # of extra ticks adds no overlap evidence and only repeats the held API read.
     with monkeypatch.context() as patch:
         patch.setattr(case.runtime, "proposals", observer)
-        pending = run_case(case, ticks=1500)
+        pending = run_case(case)
     assert pending.phase == "stopped", diagnose(pending)
     assert pending.units["source:project:first"].state == UnitState.MERGED_PENDING_SYNC, diagnose(
         pending

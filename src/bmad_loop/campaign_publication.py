@@ -610,7 +610,16 @@ class PublicationController:
         ref = (
             f"refs/bmad-campaign/observed/{hashlib.sha256(candidate.unit_id.encode()).hexdigest()}"
         )
-        result = git_bytes(repo, "fetch", "--no-tags", "--", remote, f"refs/heads/{target}:{ref}")
+        result = git_bytes(
+            repo,
+            "fetch",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--refmap=",
+            "--",
+            remote,
+            f"refs/heads/{target}:{ref}",
+        )
         if result.returncode:
             raise GithubError("Could not fetch canonical target after merge")
         head = git_bytes(repo, "rev-parse", "--verify", ref)

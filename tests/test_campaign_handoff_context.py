@@ -109,6 +109,42 @@ def result(job, events):
     }
 
 
+def test_native_output_measurement_overrides_conservative_bytes_only_with_receipt(tmp_path):
+    from dataclasses import replace
+
+    from bmad_loop.campaign_summary import measured_output_tokens
+
+    snapshot = capture(tmp_path, [native_row("codex")])
+    events = load_events(snapshot)
+    job = replace(plan_maps(events, budget(), tmp_path / "maps")[0], output_tokens=32768)
+    value = result(job, events)
+    value["facts"][0]["text"] = "preserved contextual detail " * 1500
+    assert len(encoded(value)) > 38000
+    receipt = {
+        "outcome": "completed",
+        "quiescent": True,
+        "input_complete": True,
+        "usage_known": True,
+        "usage": {"output_tokens": 23328},
+    }
+    validated = validate_summary(
+        job, value, events, observed_output_tokens=measured_output_tokens(receipt)
+    )
+    assert validated["output_measurement"] == {"kind": "native-receipt", "tokens": 23328}
+    with pytest.raises(CampaignError, match="output budget"):
+        validate_summary(job, value, events, observed_output_tokens=32769)
+    value["usage"] = {"output_tokens": 1}
+    with pytest.raises(CampaignError, match="output budget"):
+        validate_summary(
+            job,
+            value,
+            events,
+            observed_output_tokens=measured_output_tokens({"usage_known": False}),
+        )
+    with pytest.raises(CampaignError, match="lifecycle proof"):
+        measured_output_tokens({**receipt, "quiescent": False})
+
+
 @pytest.mark.parametrize("harness", ["claude", "codex", "grok", "antigravity", "muse"])
 def test_each_native_reader_preserves_exact_owner_source_and_raw_bytes(tmp_path, harness):
     row = native_row(harness)

@@ -32,7 +32,25 @@ def byte_token_bound(text: str) -> int:
     return len(text.encode())
 
 
-def validate_job_result(request, result: dict[str, Any], artifact_root: Path) -> dict[str, Any]:
+def measured_output_tokens(receipt: dict[str, Any] | None) -> int | None:
+    """Read trusted native telemetry, never counters inside model result JSON."""
+    if not receipt or receipt.get("usage_known") is not True:
+        return None
+    tokens = (receipt.get("usage") or {}).get("output_tokens")
+    if (
+        receipt.get("outcome") != "completed"
+        or receipt.get("quiescent") is not True
+        or receipt.get("input_complete") is not True
+        or type(tokens) is not int
+        or tokens < 0
+    ):
+        raise CampaignError("Summary output measurement lacks completed native lifecycle proof")
+    return tokens
+
+
+def validate_job_result(
+    request, result: dict[str, Any], artifact_root: Path, *, native_receipt=None
+) -> dict[str, Any]:
     """Validate a generic durable job against its immutable native source index."""
     from .campaign_transcripts import HistorySnapshot, load_events
 
@@ -49,7 +67,13 @@ def validate_job_result(request, result: dict[str, Any], artifact_root: Path) ->
         for row in coordinates["history_snapshots"]
         for event in load_events(HistorySnapshot(**row))
     )
-    validated = validate_summary(spec, result, events)
+    if native_receipt is not None and (
+        native_receipt.get("job_id") != request_id or native_receipt.get("result") != result
+    ):
+        raise CampaignError("Summary telemetry belongs to a different native result")
+    validated = validate_summary(
+        spec, result, events, observed_output_tokens=measured_output_tokens(native_receipt)
+    )
     content = encoded(validated)
     artifact = blob(artifact_root, content)
     return {
@@ -339,12 +363,22 @@ def validate_summary(
     events: tuple[HistoryEvent, ...],
     *,
     count: TokenCounter = byte_token_bound,
+    observed_output_tokens: int | None = None,
 ) -> dict[str, Any]:
     """Validate structural fidelity; this cannot certify semantic completeness."""
     input_payload = load_input(job)
     if not isinstance(result, dict):
         raise SummaryResultRejected("summary result must be an object")
-    if count(encoded(result).decode()) > job.output_tokens:
+    if observed_output_tokens is not None and (
+        type(observed_output_tokens) is not int or observed_output_tokens < 0
+    ):
+        raise CampaignError("Invalid native summary output measurement")
+    output_count = (
+        count(encoded(result).decode())
+        if observed_output_tokens is None
+        else observed_output_tokens
+    )
+    if output_count > job.output_tokens:
         raise SummaryResultRejected("summary exceeds its qualified output budget")
     if (
         result.get("schema_version") != 1
@@ -497,6 +531,10 @@ def validate_summary(
         "structural_coverage": True,
         "semantic_fidelity": "unqualified",
         "complete": not gaps,
+        "output_measurement": {
+            "kind": "utf8-byte-upper-bound" if observed_output_tokens is None else "native-receipt",
+            "tokens": output_count,
+        },
     }
 
 
@@ -527,7 +565,14 @@ def plan_reduction(
                 budget.output_tokens,
                 budget.route,
                 tuple(job.id for job, _ in items),
-                tuple(dict.fromkeys(ref for job, _ in items for ref in job.event_ids)),
+                tuple(
+                    dict.fromkeys(
+                        ref
+                        for _, result in items
+                        for fact in result["facts"]
+                        for ref in fact["citations"]
+                    )
+                ),
                 tuple(job.id for job, _ in items),
                 prompt_version=REDUCE_PROMPT_VERSION,
             )
@@ -645,6 +690,95 @@ def corrective_spec(
     )
 
 
+def split_map_input(job: SummaryJobSpec, artifact_root: Path) -> tuple[SummaryJobSpec, ...]:
+    """Split only an oversized map, preserving exact native source ranges.
+
+    Rendering adds schema and quoting overhead that varies per chunk. A dense
+    chunk must not reduce the usable capacity of every other chunk in a corpus.
+    Halos are contextual; every primary character remains assigned exactly once.
+    """
+    payload = load_input(job)
+    if job.purpose != "handoff-map" or job.correction_of:
+        raise CampaignError("Only an unlaunched map input can be repartitioned")
+    primary, halo = payload["primary"], payload.get("halo", [])
+    if len(primary) > 1:
+        middle = len(primary) // 2
+        neighbor_context = [*halo, *primary[:middle]]
+        while neighbor_context and len(encoded(neighbor_context)) > len(encoded(halo)):
+            neighbor_context.pop(0)
+        groups = [(primary[:middle], halo), (primary[middle:], neighbor_context)]
+    elif halo:
+        groups = [(primary, halo[len(halo) // 2 + 1 :])]
+    elif len(primary) == 1 and len(primary[0]["text"]) > 1:
+        fragment = primary[0]
+        middle = len(fragment["text"]) // 2
+        pieces = []
+        for start, end in ((0, middle), (middle, len(fragment["text"]))):
+            value = {
+                **fragment,
+                "start": fragment["start"] + start,
+                "end": fragment["start"] + end,
+                "text": fragment["text"][start:end],
+            }
+            value["id"] = digest([value["event_id"], value["start"], value["end"]])
+            pieces.append(([value], []))
+        groups = pieces
+    else:
+        raise CampaignError("Native route cannot fit one source character and its metadata")
+    result = []
+    for owned, context in groups:
+        value = {**payload, "primary": owned, "halo": context}
+        content = encoded(value)
+        path = blob(artifact_root, content)
+        result.append(
+            replace(
+                job,
+                id=digest([job.id, value, "adaptive-render-v1"]),
+                input_path=str(path),
+                input_sha256=hashlib.sha256(content).hexdigest(),
+                input_tokens=len(content),
+                primary_ids=tuple(row["id"] for row in owned),
+                event_ids=tuple(dict.fromkeys(row["event_id"] for row in [*owned, *context])),
+            )
+        )
+    return tuple(result)
+
+
+def split_reduction_input(job: SummaryJobSpec, artifact_root: Path) -> tuple[SummaryJobSpec, ...]:
+    """Repartition whole child summaries when rendered reducer metadata is dense."""
+    payload = load_input(job)
+    children = payload.get("children", [])
+    if job.purpose != "handoff-reduce" or job.correction_of or len(children) < 2:
+        raise CampaignError("A whole child summary cannot fit the qualified reducer input")
+    result = []
+    middle = len(children) // 2
+    for group in (children[:middle], children[middle:]):
+        value = {**payload, "children": group}
+        content = encoded(value)
+        path = blob(artifact_root, content)
+        identifiers = tuple(child["job_id"] for child in group)
+        result.append(
+            replace(
+                job,
+                id=digest([job.id, value, "adaptive-render-v1"]),
+                input_path=str(path),
+                input_sha256=hashlib.sha256(content).hexdigest(),
+                input_tokens=len(content),
+                primary_ids=identifiers,
+                dependencies=identifiers,
+                event_ids=tuple(
+                    dict.fromkeys(
+                        ref
+                        for child in group
+                        for fact in child["summary"]["facts"]
+                        for ref in fact["citations"]
+                    )
+                ),
+            )
+        )
+    return tuple(result)
+
+
 def summary_schema(job: SummaryJobSpec | None = None) -> dict[str, Any]:
     """Portable structured-output schema; semantic/source checks remain local."""
     schema: dict[str, Any] = {
@@ -684,7 +818,10 @@ def summary_schema(job: SummaryJobSpec | None = None) -> dict[str, Any]:
             "maxItems": len(job.primary_ids),
         }
         facts = props["facts"]["items"]
-        facts["properties"]["citations"]["items"]["enum"] = list(job.event_ids)
+        if job.event_ids:
+            facts["properties"]["citations"]["items"]["enum"] = list(job.event_ids)
+        else:
+            props["facts"]["maxItems"] = 0
         catalog = quote_catalog(job)
         facts["properties"].pop("source_quote")
         facts["properties"]["source_quote_id"] = {"type": "string", "enum": ["", *catalog]}

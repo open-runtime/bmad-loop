@@ -234,7 +234,13 @@ def inspect(
                 reasons = []
                 for candidate in spec.candidates(role):
                     try:
-                        cap = capability_for(routes, candidate.profile, candidate.model, mode)
+                        cap = capability_for(
+                            routes,
+                            candidate.profile,
+                            candidate.model,
+                            mode,
+                            effort=candidate.effort,
+                        )
                         validate_capability(cap, candidate, permissions=mode)
                         qualified.append(candidate.profile + ":" + candidate.model)
                     except (CampaignError, OSError, ValueError) as exc:

@@ -56,6 +56,7 @@ def outstanding(snapshot) -> bool:
 
 def proposals(runtime, snapshot) -> tuple[Proposal, ...]:
     result: list[Proposal] = []
+    semantic_fingerprints: dict[str, str] = {}
     active = sum(live(row) for row in snapshot.jobs.values())
     sessions = (
         sum(
@@ -83,6 +84,13 @@ def proposals(runtime, snapshot) -> tuple[Proposal, ...]:
             continue
         if row["state"] in TERMINAL or snapshot.phase != "active":
             continue
+        # Canonical context can change without a graph edit (a hold, remote
+        # answer, head or delivery). Retire obsolete advice before retry clocks
+        # or exhausted budgets strand its payload in hot authority forever.
+        if not current(snapshot, request, semantic_fingerprints=semantic_fingerprints):
+            if not pending(snapshot, job_id, "reasoning-stale"):
+                result.append(Proposal("reasoning-stale", request.unit, {"job_id": job_id}))
+            continue
         if row["state"] == "validated":
             if not pending(snapshot, job_id, "reasoning-apply"):
                 result.append(Proposal("reasoning-apply", request.unit, {"job_id": job_id}))
@@ -103,9 +111,6 @@ def proposals(runtime, snapshot) -> tuple[Proposal, ...]:
                 snapshot, job_id, "reasoning-wait"
             ):
                 result.append(Proposal("reasoning-wait", request.unit, {"job_id": job_id}))
-            continue
-        if not current(snapshot, request):
-            result.append(Proposal("reasoning-stale", request.unit, {"job_id": job_id}))
             continue
         if request.purpose.startswith("handoff_") and request.coordinates.get("handoff_id"):
             from .campaign_handoff_flow import job_launch_allowed
@@ -148,6 +153,7 @@ def proposals(runtime, snapshot) -> tuple[Proposal, ...]:
 def prepare_effect(runtime, snapshot, action) -> None:
     row = snapshot.jobs[action.payload["job_id"]]
     if action.kind != "reasoning-launch":
+        action.payload["job_binding"] = _binding(row)
         return
     if live(row):
         raise CampaignError("reasoning job already has an unreconciled claim")
@@ -181,6 +187,7 @@ def prepare_effect(runtime, snapshot, action) -> None:
     row["reason"] = ""
     row["state"] = "prepared"
     row["updated_at"] = runtime.clock()
+    action.payload["job_binding"] = _binding(row)
     selections = snapshot.bindings.setdefault("role_selections", {})
     key = candidate.profile + "\0" + candidate.model
     selections[key] = selections.get(key, 0) + 1
@@ -200,10 +207,62 @@ def _runner(runtime, snapshot):
     )
 
 
+def _binding(row):
+    claim = row.get("claim") or {}
+    return {
+        "request_digest": row["request_digest"],
+        **{key: claim.get(key) for key in ("launch_id", "generation", "attempt")},
+    }
+
+
+def adopt_prepared_generation(snapshot, action):
+    """Rebind only never-sent effects for the exact adopted launch claim."""
+    row = snapshot.jobs.get(action.payload.get("job_id", ""))
+    claim = (row or {}).get("claim") or {}
+    if (
+        action.kind != "reasoning-launch"
+        or claim.get("status") != "prepared"
+        or claim.get("launch_id") != action.id
+    ):
+        return
+    prior = _binding(row)
+    claim["generation"] = action.generation
+    for pending_action in snapshot.outbox:
+        if (
+            pending_action.state == "prepared"
+            and pending_action.payload.get("job_binding") == prior
+        ):
+            pending_action.payload["job_binding"] = _binding(row)
+
+
+def _effect_row(runtime, snapshot, action):
+    identity = action.payload["job_id"]
+    row = snapshot.jobs.get(identity)
+    if row is not None:
+        return row
+    saved = runtime.store.jobs(snapshot.id, job_id=identity, limit=1)
+    if saved and saved[0]["state"] in TERMINAL:
+        return saved[0]  # Detached immutable history, never reinsert into hot authority.
+    raise CampaignError("reasoning effect has no current or terminal job binding")
+
+
+def _superseded(row, action, data=None):
+    expected = action.payload.get("job_binding") or (data or {}).get("effect_binding")
+    if expected is not None:
+        return expected != _binding(row)
+    # Older persisted launch effects still carry their exact native claim ID.
+    return action.kind == "reasoning-launch" and (
+        (row.get("claim") or {}).get("launch_id") != action.id
+        or (row.get("claim") or {}).get("generation") != action.generation
+    )
+
+
 def perform(runtime, snapshot, action, *, reconcile: bool = False) -> Observation:
     from .campaign_headless import capability_for
 
-    row = snapshot.jobs[action.payload["job_id"]]
+    row = _effect_row(runtime, snapshot, action)
+    if row["state"] in TERMINAL or _superseded(row, action):
+        return Observation("confirmed", {"state": "settled", "effect_binding": _binding(row)})
     request = request_from_dict(row["request"])
     if action.kind in {"reasoning-stale", "reasoning-apply", "reasoning-wait"}:
         return Observation("confirmed", {})
@@ -220,7 +279,9 @@ def perform(runtime, snapshot, action, *, reconcile: bool = False) -> Observatio
             )
             routes = snapshot.config_snapshot.get("reasoning_capabilities", {})
             try:
-                capability = capability_for(routes, candidate.profile, candidate.model, "no-tools")
+                capability = capability_for(
+                    routes, candidate.profile, candidate.model, "no-tools", effort=candidate.effort
+                )
                 path = runner.prepare(
                     path.parent,
                     request,
@@ -264,11 +325,40 @@ def perform(runtime, snapshot, action, *, reconcile: bool = False) -> Observatio
             reason=observed.get("reason", "reasoning ownership uncertain"),
             retry_at=runtime.clock() + 5,
         )
-    return Observation("confirmed", observed)
+    return Observation("confirmed", {**observed, "effect_binding": _binding(row)})
 
 
 def apply(runtime, snapshot, action, observation) -> None:
-    row = snapshot.jobs[action.payload["job_id"]]
+    row = _effect_row(runtime, snapshot, action)
+    superseded = _superseded(row, action, observation.data)
+    if (
+        not superseded
+        and observation.data.get("state") == "finished"
+        and row.get("receipt") is not None
+        and observation.data.get("receipt") != row["receipt"]
+    ):
+        raise CampaignError("reasoning attempt already has a different terminal receipt")
+    if (
+        row["state"] in TERMINAL
+        or superseded
+        or observation.data.get("state") == "settled"
+        or (
+            row.get("receipt") is not None
+            and action.kind in {"reasoning-launch", "reasoning-observe", "reasoning-terminate"}
+        )
+    ):
+        # Another observer may have already completed the exact native claim,
+        # applied its result and archived the job while launch's ACK was in flight.
+        # Acknowledge only the effect; never rewrite or resurrect that job.
+        add_event(
+            snapshot,
+            "reasoning-observation-retired",
+            unit=row["request"].get("unit", ""),
+            job_id=row["id"],
+            action=action.id,
+            reason="job is terminal or its native claim changed",
+        )
+        return
     request = request_from_dict(row["request"])
     data = observation.data
     if action.kind == "reasoning-wait":

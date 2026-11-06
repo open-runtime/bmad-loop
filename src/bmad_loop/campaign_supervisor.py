@@ -378,9 +378,9 @@ class CampaignSupervisor:
                         unit = snapshot.units.get(action.unit)
                         if unit and unit.claim and unit.claim.status == "prepared":
                             unit.claim.generation = snapshot.generation
-                        job = snapshot.jobs.get(action.payload.get("job_id", ""))
-                        if job and job.get("claim") and job["claim"]["status"] == "prepared":
-                            job["claim"]["generation"] = snapshot.generation
+                        from .campaign_reasoning_flow import adopt_prepared_generation
+
+                        adopt_prepared_generation(snapshot, action)
                 add_event(snapshot, "coordinator-start", generation=snapshot.generation)
                 # Generation ownership advances atomically; no prior actor may
                 # be treated as dead merely because this generation is new.

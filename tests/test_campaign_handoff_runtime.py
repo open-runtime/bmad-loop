@@ -98,7 +98,7 @@ class ScriptedReasoning:
 def test_real_worker_quota_continues_same_pr_through_normal_supervisor(
     campaign, production_case, tmp_path
 ):
-    _, configured, _, _ = campaign
+    configured_runtime, configured, _, _ = campaign
     case = production_case
     snapshot = case.store.load(case.snapshot.id)
     fixture_roles = dict(configured.spec.roles)
@@ -108,7 +108,7 @@ def test_real_worker_quota_continues_same_pr_through_normal_supervisor(
     unavailable = dataclasses.replace(first, model="gpt-capacity-unavailable")
     routes = copy.deepcopy(configured.config_snapshot["reasoning_capabilities"])
     routes["codex:" + unavailable.model] = {
-        "execution": {**routes["codex:" + first.model]["execution"], "model": unavailable.model}
+        "execution": configured_runtime.fixture_cap(unavailable, True)
     }
     capabilities = tmp_path / "capabilities.json"
     capabilities.write_text(json.dumps({"schema_version": 1, "routes": routes}))
@@ -128,6 +128,12 @@ def test_real_worker_quota_continues_same_pr_through_normal_supervisor(
     from bmad_loop.campaign_runtime import create
 
     _, snapshot = create(case.repo, spec)
+    # Recreate the accepted dependency added by production_case after its import;
+    # create() above imports fresh source units rather than that saved graph.
+    dependent = snapshot.units["source:project:dependent"]
+    dependent.spec = dataclasses.replace(dependent.spec, after=("source:project:first",))
+    snapshot.graph_revision += 1
+    snapshot = case.store.save(snapshot, snapshot.revision)
     from bmad_loop.campaign_scheduler import CapacityObservation
 
     case.runtime.capacity_observer = lambda candidate, project: CapacityObservation(
@@ -141,6 +147,9 @@ def test_real_worker_quota_continues_same_pr_through_normal_supervisor(
         workspace=Path(request["workspace"])
         partial=workspace/"src"/"first.txt"
         if not request.get("handoff_id"):
+            event("execution-start",request)
+            MARKERS.mkdir(exist_ok=True)
+            (MARKERS/"first").write_text("started")
             partial.parent.mkdir(exist_ok=True)
             partial.write_text("preserved partial work")
             history=Path(request["execution"]).parent/"history.jsonl"
@@ -167,7 +176,7 @@ def test_real_worker_quota_continues_same_pr_through_normal_supervisor(
         'history=Path(request["execution"]).parent/"stage-history.jsonl"\n    history.write_text(json.dumps({"type":"user","sessionId":"scripted-"+request["launch_id"],"isMeta":True,"message":{"role":"user","content":request["prompt"]}})+"\\n")\n    return SessionResult(status="completed",session_id="scripted-"+request["launch_id"],transcript_path=str(history),native_binding={"profile":request["candidate"]["profile"]},result_json=artifact)',
     )
     script.write_text(body)
-    deadline = time.monotonic() + 90
+    deadline = time.monotonic() + 300
 
     stop_requested = False
 
@@ -175,6 +184,7 @@ def test_real_worker_quota_continues_same_pr_through_normal_supervisor(
         nonlocal stop_requested
         current = case.store.load(snapshot.id)
         unit = current.units["source:project:first"]
+        independent = current.units["source:project:second"]
         lineage = unit.evidence.get("session_lineage", [])
         if (
             lineage
@@ -182,11 +192,15 @@ def test_real_worker_quota_continues_same_pr_through_normal_supervisor(
                 row.get("outcome") == "locally_complete"
                 for row in unit.evidence.get("worker_history", [])
             )
+            and any(
+                row.get("outcome") == "locally_complete"
+                for row in independent.evidence.get("worker_history", [])
+            )
             and not stop_requested
         ):
             case.store.enqueue(current.id, "stop")
             stop_requested = True
-        assert time.monotonic() < deadline, diagnose(current)
+        assert time.monotonic() < deadline, json.dumps(diagnose(current), indent=2)
         return case.runtime.clock()
 
     supervisor = CampaignSupervisor(
@@ -194,6 +208,10 @@ def test_real_worker_quota_continues_same_pr_through_normal_supervisor(
     )
     result = supervisor.run(snapshot.id)
     first = result.units["source:project:first"]
+    assert any(
+        row.get("outcome") == "locally_complete"
+        for row in result.units["source:project:second"].evidence["worker_history"]
+    )
     assert any(
         row.get("outcome") == "locally_complete" and row.get("head")
         for row in first.evidence["worker_history"]

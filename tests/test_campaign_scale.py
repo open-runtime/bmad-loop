@@ -12,6 +12,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from conftest import git
+from test_campaign_headless import fixture_capability
 from test_campaign_headless import prepared as prepared
 from test_campaign_merge_adapter import source as combined_verifier_source
 from test_campaign_runtime import production_case as production_case
@@ -68,6 +69,7 @@ print(json.dumps({'type':'result','structured_output':result,'usage':{'input_tok
         "argv": [str(Path(sys.executable).resolve()), str(script)],
         "dependencies": [{"path": str(script), "sha256": file_digest(script)}],
     }
+    cap = fixture_capability(tmp_path, cap)
     path = tmp_path / "scale-capabilities.json"
     path.write_text(
         json.dumps(
@@ -77,12 +79,12 @@ print(json.dumps({'type':'result','structured_output':result,'usage':{'input_tok
     return runner, candidate, path
 
 
-def recorded_job_count(store, campaign_id):
-    count, after = 0, ""
+def recorded_job_states(store, campaign_id):
+    states, after = Counter(), ""
     while rows := store.jobs(campaign_id, after=after, limit=1000):
-        count += len(rows)
+        states.update(row["state"] for row in rows)
         after = rows[-1]["id"]
-    return count
+    return states
 
 
 def test_48_stories_24_epics_verify8_and_reasoning_drain_resume(
@@ -232,6 +234,7 @@ def test_48_stories_24_epics_verify8_and_reasoning_drain_resume(
     assert all(not row.get("claim") or row["claim"]["quiescent"] for row in stopped.jobs.values())
     result = run_case(case, timeout_s=1800)
     elapsed = time.monotonic() - started
+    job_states = recorded_job_states(case.store, result.id)
     metrics.update(
         elapsed_s=elapsed,
         delivered=sum(unit.state.value == "delivered" for unit in result.units.values()),
@@ -239,13 +242,15 @@ def test_48_stories_24_epics_verify8_and_reasoning_drain_resume(
         events=len(result.events),
         outbox_hot=len(result.outbox),
         jobs_hot=len(result.jobs),
-        jobs_total=recorded_job_count(case.store, result.id),
+        jobs_total=sum(job_states.values()),
+        job_states=dict(job_states),
     )
     (tmp_path / "scale-metrics.json").write_text(json.dumps(metrics, indent=2))
     assert result.phase == "delivered" and metrics["delivered"] == 48
     assert metrics["max_execution"] == 24 and metrics["max_verify"] == 8
     assert metrics["max_verify"] <= 8 and metrics["max_review"] <= 8
     assert metrics["max_reasoning"] >= 1
+    assert job_states["applied"] >= 1
     assert metrics["control_ack_seconds"] is not None and metrics["control_ack_seconds"] < 30
     assert len(set(metrics["first_launch_epics"])) == 24
     assert len(case.service.closed_units) >= 48

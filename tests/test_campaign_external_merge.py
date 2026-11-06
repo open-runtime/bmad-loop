@@ -162,7 +162,7 @@ def test_external_ready_pr_merge_reconciles_canonical_delivery_without_native_me
     case = production_case
     external = ExternalMerger(case.service)
     monkeypatch.setattr(case.service, "request", external.request)
-    result = run_case(case, ticks=2500)
+    result = run_case(case)
     assert result.phase == "delivered", diagnose(result)
     assert external.merged
     reconciled = [row for row in result.events if row["kind"] == "external-merge-reconciled"]

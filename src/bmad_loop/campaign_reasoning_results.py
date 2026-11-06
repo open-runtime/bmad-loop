@@ -169,7 +169,10 @@ def apply_result(runtime, snapshot, row: dict[str, Any]) -> None:
         from .campaign_summary import validate_job_result
 
         artifact = validate_job_result(
-            request, result, runtime.store.directory(snapshot.id) / "summary-results"
+            request,
+            result,
+            runtime.store.directory(snapshot.id) / "summary-results",
+            native_receipt=row.get("receipt"),
         )
         row["applied_result"] = {
             key: value for key, value in artifact.items() if key != "validated"

@@ -376,6 +376,8 @@ class SourcePublication:
             self.project,
             "fetch",
             "--no-tags",
+            "--no-write-fetch-head",
+            "--refmap=",
             self.remote,
             "refs/heads/" + self.target + ":" + target_ref,
         )
@@ -771,7 +773,15 @@ class SourcePublication:
         pusher = CheckpointPusher(repo, self.root / "store-pushes", remote, branch)
         remote_head = pusher.remote_head()
         if remote_head is not None:
-            self._git(repo, "fetch", "--no-tags", remote, remote_head)
+            self._git(
+                repo,
+                "fetch",
+                "--no-tags",
+                "--no-write-fetch-head",
+                "--refmap=",
+                remote,
+                remote_head,
+            )
             if all(
                 verify.file_bytes_at_revision(repo, remote_head, rel) == value
                 for rel, value in wanted.items()

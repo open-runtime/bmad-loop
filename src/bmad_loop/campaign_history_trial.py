@@ -33,8 +33,11 @@ from .campaign_summary import (
     SummaryJobSpec,
     SummaryResultRejected,
     corrective_spec,
+    measured_output_tokens,
     plan_reduction,
     plan_remaining_maps,
+    split_map_input,
+    split_reduction_input,
     summary_prompt,
     summary_schema,
     validate_summary,
@@ -132,7 +135,12 @@ def _single_attempt(job, snapshots, events, capability, directory, timeout_s, ru
             receipt = _observed_receipt(request_path, runner)
             if saved["receipt_sha256"] != file_digest(destination / "receipt.json"):
                 raise CampaignError("Trial receipt changed after validation")
-            validated = validate_summary(job, receipt["result"], events)
+            validated = validate_summary(
+                job,
+                receipt["result"],
+                events,
+                observed_output_tokens=measured_output_tokens(receipt),
+            )
             if saved["artifact_sha256"] != file_digest(Path(saved["artifact_path"])):
                 raise CampaignError("Trial validated summary changed")
             return job, validated
@@ -165,7 +173,9 @@ def _single_attempt(job, snapshots, events, capability, directory, timeout_s, ru
                 "Native trial job did not complete with full input and owned-process quiescence: "
                 + str(receipt.get("reason", ""))
             )
-        validated = validate_summary(job, receipt["result"], events)
+        validated = validate_summary(
+            job, receipt["result"], events, observed_output_tokens=measured_output_tokens(receipt)
+        )
         content = encoded(validated)
         artifact = blob(directory / "summaries", content)
         write_json(
@@ -224,6 +234,13 @@ def _reuse_maps(roots, events, capability, runner):
         for path in sorted((root / "jobs").glob("*/validated.json")):
             saved = read_json(path)
             envelope = read_json(path.parent / "request.json")
+            prior_cap = envelope["capability"]
+            validate_capability(
+                prior_cap,
+                RoleCandidate(
+                    prior_cap["profile"], prior_cap["model"], envelope["selection"]["effort"]
+                ),
+            )
             receipt_path = path.parent / "receipt.json"
             receipt = _observed_receipt(path.parent / "request.json", runner)
             spec = SummaryJobSpec(**envelope["request"]["coordinates"]["summary_spec"])
@@ -250,8 +267,75 @@ def _reuse_maps(roots, events, capability, runner):
                 or receipt.get("input_complete") is not True
             ):
                 raise CampaignError("Reused summary lacks completed native lifecycle proof")
-            completed[spec.id] = (spec, validate_summary(spec, receipt["result"], events))
+            completed[spec.id] = (
+                spec,
+                validate_summary(
+                    spec,
+                    receipt["result"],
+                    events,
+                    observed_output_tokens=measured_output_tokens(receipt),
+                ),
+            )
     return tuple(completed.values())
+
+
+def _reuse_roots(directory, reuse_directory):
+    """Follow only explicitly retained trial bindings, never discover histories."""
+    roots, pending = [], [directory, *([reuse_directory] if reuse_directory else [])]
+    seen = set()
+    while pending:
+        root = pending.pop(0).absolute()
+        if root in seen:
+            continue
+        if is_link_like(root) or len(seen) >= 32:
+            raise CampaignError("Trial reuse lineage is redirected or exceeds its bound")
+        seen.add(root)
+        roots.append(root)
+        binding = root / "binding.json"
+        if binding.exists() and (previous := read_json(binding).get("reuse_directory")):
+            pending.append(Path(previous))
+    return tuple(roots)
+
+
+def _fit_maps(jobs, capability, snapshots, timeout_s, directory):
+    fitted, pending = [], [(job, 0) for job in reversed(jobs)]
+    while pending:
+        job, depth = pending.pop()
+        try:
+            minimum_output = {
+                "schema_version": 1,
+                "job_id": job.id,
+                "input_sha256": job.input_sha256,
+                "covered_ids": list(job.primary_ids),
+                "facts": [],
+                "gaps": [],
+            }
+            if len(encoded(minimum_output)) > job.output_tokens // 2:
+                raise CampaignError("Mandatory output coverage leaves insufficient summary space")
+            render_input(trial_request(job, capability, snapshots, timeout_s), capability)
+        except CampaignError as exc:
+            if (
+                "Mandatory output coverage" not in str(exc)
+                and "exceeds its input token bound" not in str(exc)
+                and "insufficient output/thinking context" not in str(exc)
+            ):
+                raise
+            if depth >= 64:
+                raise CampaignError("Adaptive map partition did not converge") from exc
+            split = split_map_input if job.purpose == "handoff-map" else split_reduction_input
+            pending.extend((part, depth + 1) for part in reversed(split(job, directory)))
+        else:
+            fitted.append(job)
+    return tuple(fitted)
+
+
+def _draining(directory):
+    path = directory / "drain.json"
+    if not path.exists():
+        return False
+    if read_json(path).get("binding_sha256") != file_digest(directory / "binding.json"):
+        raise CampaignError("Trial drain request belongs to different frozen coordinates")
+    return True
 
 
 def run_trial(
@@ -264,21 +348,56 @@ def run_trial(
     execute=True,
     runner=None,
     reuse_directory: Path | None = None,
+    reducer_capability_path: Path | None = None,
+    drain: bool = False,
 ) -> dict[str, Any]:
     """Process all sealed sources; no aggregate token ceiling or silent partial success."""
-    if not 1 <= parallel <= 16 or not 1 <= timeout_s <= 3600 or is_link_like(directory):
+    if not 1 <= parallel <= 64 or not 1 <= timeout_s <= 3600 or is_link_like(directory):
         raise CampaignError("Invalid native history trial bounds")
+    if drain:
+        binding_path = directory / "binding.json"
+        binding = read_json(binding_path)
+        if binding.get("snapshots_sha256") != file_digest(snapshot_path) or binding.get(
+            "capability_sha256"
+        ) != file_digest(capability_path):
+            raise CampaignError("Trial drain does not match frozen sources and route")
+        write_json(
+            directory / "drain.json",
+            {
+                "schema_version": 1,
+                "binding_sha256": file_digest(binding_path),
+                "requested_at": time.time(),
+            },
+        )
+        return {
+            "schema_version": 1,
+            "ok": True,
+            "state": "drain-requested",
+            "semantic_fidelity": "unqualified",
+        }
     capability = read_json(capability_path)
     selection = RoleCandidate(capability["profile"], capability["model"], capability["efforts"][0])
     validate_capability(capability, selection)
+    reducer_capability = (
+        read_json(reducer_capability_path) if reducer_capability_path else capability
+    )
+    validate_capability(
+        reducer_capability,
+        RoleCandidate(
+            reducer_capability["profile"],
+            reducer_capability["model"],
+            reducer_capability["efforts"][0],
+        ),
+    )
     document = read_json(snapshot_path)
     if document.get("schema_version") != 1 or not document.get("snapshots"):
         raise CampaignError("Trial requires explicit sealed source snapshots")
     snapshots = tuple(HistorySnapshot(**row) for row in document["snapshots"])
     events = merge_lineage_events(snapshots)
     runner = runner or HeadlessRunner()
+    roots = _reuse_roots(directory, reuse_directory)
     reusable = _reuse_maps(
-        (directory, reuse_directory) if reuse_directory else (directory,),
+        roots,
         events,
         capability,
         runner,
@@ -298,15 +417,28 @@ def run_trial(
     )
     path = directory / "binding.json"
     with file_lock(directory / "trial.lock"):
+        if (
+            (directory / "report.json").exists()
+            and read_json(directory / "report.json").get("state") == "drained"
+            and _draining(directory)
+        ):
+            control = directory / "drain.json"
+            blob(directory / "control-history", control.read_bytes())
+            control.unlink()
+        planning = "adaptive-render-v1"
         if path.exists():
             prior = read_json(path)
             budget = ContextBudget(**prior["budget"])
             payload = budget.payload_tokens
+            planning = prior.get("planning", "legacy-global")
         while True:
             jobs = plan_remaining_maps(
                 events, reusable, budget, directory / "inputs", overlap_tokens=payload // 8
             )
             try:
+                if planning == "adaptive-render-v1":
+                    jobs = _fit_maps(jobs, capability, snapshots, timeout_s, directory / "inputs")
+                    break
                 for job in jobs:
                     render_input(trial_request(job, capability, snapshots, timeout_s), capability)
                 break
@@ -338,6 +470,12 @@ def run_trial(
             "prompt_versions": [EXTRACT_PROMPT_VERSION, REDUCE_PROMPT_VERSION],
             "correction_budget": 2,
         }
+        if planning == "adaptive-render-v1":
+            binding["planning"] = planning
+        if reducer_capability_path:
+            binding["reducer_capability_sha256"] = file_digest(reducer_capability_path)
+        completed_ids = {job.id for job, _ in reusable}
+        jobs = tuple(job for job in jobs if job.id not in completed_ids)
         if path.exists() and read_json(path) != binding:
             raise CampaignError(
                 "Trial directory belongs to different frozen sources, route or limits"
@@ -368,16 +506,26 @@ def run_trial(
         layer = 0
         while True:
             current, problems = (list(reusable) if layer == 0 else []), []
+            active_capability = capability if layer == 0 else reducer_capability
             # Every submitted job has a bounded native lifecycle. A failed job
             # stops new admissions while existing futures drain and keep receipts.
             with ThreadPoolExecutor(max_workers=parallel) as pool:
                 pending = {}
                 iterator = iter(jobs)
                 for _ in range(min(parallel, len(jobs))):
+                    if _draining(directory):
+                        break
                     job = next(iterator)
                     pending[
                         pool.submit(
-                            _one, job, snapshots, events, capability, directory, timeout_s, runner
+                            _one,
+                            job,
+                            snapshots,
+                            events,
+                            active_capability,
+                            directory,
+                            timeout_s,
+                            runner,
                         )
                     ] = job
                 while pending:
@@ -399,7 +547,7 @@ def run_trial(
                         directory / "report.json",
                         {**report, "state": "running", "layer": layer, "problems": problems},
                     )
-                    if not problems:
+                    if not problems and not _draining(directory):
                         next_job = next(iterator, None)
                         if next_job is not None:
                             pending[
@@ -408,7 +556,7 @@ def run_trial(
                                     next_job,
                                     snapshots,
                                     events,
-                                    capability,
+                                    active_capability,
                                     directory,
                                     timeout_s,
                                     runner,
@@ -416,6 +564,9 @@ def run_trial(
                             ] = next_job
             if problems:
                 report.update(state="incomplete", problems=problems, layer=layer)
+                break
+            if _draining(directory):
+                report.update(state="drained", layer=layer)
                 break
             event_order = {event.id: index for index, event in enumerate(events)}
             current.sort(
@@ -437,7 +588,20 @@ def run_trial(
                     layer=layer,
                 )
                 break
-            next_jobs = plan_reduction(tuple(current), budget, directory / "inputs")
+            reducer_output = reducer_capability["output_tokens"]
+            reducer_payload = max(1024, reducer_capability["input_tokens"] * 3 // 4 - 8192)
+            reducer_budget = ContextBudget(
+                reducer_capability["profile"] + ":" + reducer_capability["model"],
+                reducer_payload + reducer_output,
+                reducer_output,
+                prompt_tokens=0,
+                working_tokens=0,
+                qualified=True,
+            )
+            next_jobs = plan_reduction(tuple(current), reducer_budget, directory / "inputs")
+            next_jobs = _fit_maps(
+                next_jobs, reducer_capability, snapshots, timeout_s, directory / "inputs"
+            )
             if len(next_jobs) >= len(current) or layer >= 8:
                 report.update(
                     state="incomplete",
@@ -452,7 +616,6 @@ def run_trial(
             jobs = next_jobs
             layer += 1
         report["usage"] = {}
-        roots = (directory, reuse_directory) if reuse_directory else (directory,)
         receipt_paths = {
             p.resolve() for root in roots for p in (root / "jobs").glob("*/receipt.json")
         }

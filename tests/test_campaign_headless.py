@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 from dataclasses import replace
 from pathlib import Path
 
@@ -67,12 +68,76 @@ class ChildMux:
         return self.processes[identifier].poll() is None
 
 
+def fixture_capability(tmp_path, capability, candidate=None):
+    """Construct full synthetic canary evidence, never a production proof bypass."""
+    from bmad_loop.campaign_qualification import result
+
+    proposal = {key: value for key, value in capability.items() if key != "qualification"}
+    candidate = candidate or RoleCandidate(
+        proposal["profile"], proposal["model"], proposal["efforts"][0]
+    )
+    runner = HeadlessRunner(ChildMux())
+    path = runner.prepare_probe(
+        tmp_path / ("fixture-proof-" + uuid.uuid4().hex),
+        candidate,
+        proposal,
+        input_bytes=min(90000, proposal["input_tokens"] - 4096),
+        output_tokens=proposal["output_tokens"],
+    )
+    envelope = read_json(path)
+    receipt = {
+        "schema_version": 1,
+        "job_id": envelope["request"]["id"],
+        "launch_id": envelope["launch_id"],
+        "generation": envelope["generation"],
+        "request_digest": envelope["request_digest"],
+        "outcome": "completed",
+        "quiescent": True,
+        "processes_quiescent": True,
+        "completion_evidence": "owned-window-death-and-process-readback",
+        "input_complete": True,
+        "input_delivery": envelope["input"],
+        "selected_model": candidate.model,
+        "observed_model": candidate.model,
+        "observed_models": [candidate.model],
+        "session_id": "synthetic-canary",
+        "turns": 1,
+        "usage": {"input_tokens": 1000, "output_tokens": 8},
+        "result": envelope["probe"]["expected"],
+    }
+    write_json(path.parent / "receipt.json", receipt)
+    report = result(path, {"state": "finished", "receipt": receipt})
+    return {
+        **proposal,
+        "input_tokens": report["coverage"]["input_tokens"],
+        "max_turns": 1,
+        "qualification": {
+            "status": "passed",
+            "path": report["evidence_path"],
+            "sha256": file_digest(Path(report["evidence_path"])),
+            "input_tokens": report["coverage"]["input_tokens"],
+            "output_tokens": report["coverage"]["configured_output_tokens"],
+            "observed_output_tokens": report["coverage"]["output_tokens"],
+            "native_output_limit_enforced": False,
+            "served_models": [candidate.model],
+            "checks": [
+                "full_input",
+                "no_tools",
+                "window_completion",
+                "quiescence",
+                "model_attribution",
+                "structured_output",
+                "turn_bound",
+                "output_bound",
+            ],
+        },
+    }
+
+
 @pytest.fixture
 def prepared(tmp_path):
     source = tmp_path / "source.txt"
     source.write_text("owner obligation\n" * 2000)
-    evidence = tmp_path / "qualification.json"
-    evidence.write_text('{"fixture":"zero-token protocol"}')
     script = tmp_path / "native.py"
     script.write_text("""import hashlib,json,sys,time
 payload=sys.stdin.buffer.read()
@@ -103,24 +168,8 @@ print(json.dumps({"type":"result","structured_output":{"digest":hashlib.sha256(p
         "output_tokens": 4096,
         "reserved_tokens": 4096,
         "max_turns": 4,
-        "qualification": {
-            "status": "passed",
-            "path": str(evidence),
-            "sha256": file_digest(evidence),
-            "input_tokens": 100000,
-            "output_tokens": 4096,
-            "checks": [
-                "full_input",
-                "no_tools",
-                "window_completion",
-                "quiescence",
-                "model_attribution",
-                "structured_output",
-                "turn_bound",
-                "output_bound",
-            ],
-        },
     }
+    cap = fixture_capability(tmp_path, cap, candidate)
     request = JobRequest(
         "job-1",
         "handoff_map",
@@ -140,7 +189,7 @@ print(json.dumps({"type":"result","structured_output":{"digest":hashlib.sha256(p
             "properties": {"digest": {"type": "string"}, "bytes": {"type": "integer"}},
             "required": ["digest", "bytes"],
         },
-        JobLimits(100000, 4096, timeout_s=15),
+        JobLimits(100000, 4096, max_turns=1, timeout_s=15),
         candidates=(candidate,),
     )
     mux = ChildMux()
@@ -303,32 +352,47 @@ def test_live_descendant_prevents_completion_even_after_window_death(prepared, m
     assert runner.observe(path)["state"] == "finished"
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="qualified writer requires the macOS sandbox")
 def test_headless_adapter_handoff_and_grants_reach_native_stdin(prepared, tmp_path):
+    from test_campaign_execution_qualification import writer
+
     from bmad_loop.adapters.base import SessionSpec
     from bmad_loop.adapters.headless import HeadlessAdapter
     from bmad_loop.adapters.profile import get_profile
+    from bmad_loop.campaign_execution_qualification import qualify
     from bmad_loop.policy import Policy
 
-    runner, _, request, candidate, original = prepared
-    cap = {
-        **original,
-        "permissions": "workspace-tools",
-        "argv": [*original["argv"], "{grants_path}"],
-        "qualification": {
-            **original["qualification"],
-            "checks": [
-                "scoped_tools" if value == "no_tools" else value
-                for value in original["qualification"]["checks"]
-            ],
-        },
-    }
-    grants = {
-        "schema_version": 1,
-        "workspace": str(tmp_path),
-        "scopes": ["src"],
-        "config_digest": "frozen",
-        "generation": 2,
-    }
+    runner, _, request, candidate, _ = prepared
+    proposal, _, cap = writer.__wrapped__(prepared, tmp_path)
+    script = Path(cap["dependencies"][0]["path"])
+    body = script.read_text(encoding="utf-8")
+    body = body.replace("import json,re,subprocess,sys", "import hashlib,json,re,subprocess,sys")
+    body = body.replace(
+        "nonce=re.search(r'QUALIFICATION NONCE ([a-f0-9]+)',text)[1]",
+        """match=re.search(r'QUALIFICATION NONCE ([a-f0-9]+)',text)
+if match is None:
+    payload=Path(sys.argv[1]).read_bytes()
+    print(json.dumps({'type':'system','model':'gpt-test','session_id':'fixture-successor'}))
+    print(json.dumps({'type':'result','structured_output':{'digest':hashlib.sha256(payload).hexdigest(),'bytes':len(payload)},'usage':{'input_tokens':100,'output_tokens':80}}))
+    sys.exit(0)
+nonce=match[1]""",
+    )
+    script.write_text(body, encoding="utf-8")
+    cap["dependencies"][0]["sha256"] = file_digest(script)
+    proposal.write_text(json.dumps(cap), encoding="utf-8")
+    report = qualify(
+        proposal,
+        tmp_path / "writer-proof",
+        input_bytes=65536,
+        output_tokens=4096,
+        timeout_s=30,
+        runner=runner,
+    )
+    assert report["ok"], report
+    cap = read_json(Path(report["capability_path"]))
+    grants = read_json(Path(report["capability_path"]).parent / "grants.json")
+    grants["generation"] = 2
+    workspace = Path(grants["workspace"])
     adapter = HeadlessAdapter(
         run_dir=tmp_path / "adapter", profile=get_profile("codex"), policy=Policy(), mux=runner.mux
     )
@@ -337,7 +401,7 @@ def test_headless_adapter_handoff_and_grants_reach_native_stdin(prepared, tmp_pa
         "execution-task",
         "dev",
         "Continue exactly",
-        tmp_path,
+        workspace,
         model=candidate.model,
         effort=candidate.effort,
         timeout_s=15,

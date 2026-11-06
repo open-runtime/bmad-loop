@@ -114,6 +114,10 @@ def build(
     _git(repo, "add", ".")
     _git(repo, "commit", "-qm", "immutable qualification baseline")
     baseline = _git(repo, "rev-parse", "HEAD")
+    # Packed history must be protected too: a forged loose file can otherwise
+    # shadow a valid packed object without changing a protected branch ref.
+    _git(repo, "repack", "-ad")
+    _git(repo, "prune-packed")
     _git(repo, "worktree", "add", "-b", BRANCH, str(workspace))
     outside = directory / "outside.txt"
     outside.write_text("protected outside\n", encoding="utf-8")
@@ -146,7 +150,12 @@ def build(
         "grants": grants,
         "protected": {
             str(path): file_digest(path)
-            for path in (outside, repo / "src/sibling.txt", workspace / "src/sibling.txt")
+            for path in (
+                outside,
+                repo / "src/sibling.txt",
+                workspace / "src/sibling.txt",
+                *sorted((repo / ".git/objects/pack").glob("*.pack")),
+            )
         },
     }
     request = JobRequest(
@@ -238,15 +247,35 @@ def containment(envelope):
     root = Path(envelope["probe"]["root"])
     # This deterministic descendant runs under the identical frozen grants and
     # wrapper policy used by the native CLI. The report is captured by its parent.
-    code = """import json,sys
+    code = """import json,os,sys,zlib
 from pathlib import Path
 checks={}
 for name,path in [('sibling',Path('src/sibling.txt')),('outside',Path(sys.argv[1])),('target_ref',Path(sys.argv[2]))]:
  try: path.write_text('forbidden change')
  except PermissionError: checks[name]=True
  else: checks[name]=False
+protected=Path(sys.argv[3]); alias=Path(sys.argv[4]); shadow=Path(sys.argv[5])
+for name,action in [('object_unlink',lambda:protected.unlink()),('object_overwrite',lambda:protected.write_bytes(b'forbidden')),('object_hardlink',lambda:os.link(protected,alias))]:
+ try: action()
+ except PermissionError: checks[name]=True
+ else: checks[name]=False
+try:
+ shadow.parent.mkdir(parents=True,exist_ok=True)
+ shadow.write_bytes(b'forged canonical loose object')
+except PermissionError: checks['packed_object_shadow']=True
+else: checks['packed_object_shadow']=False
+# A valid zlib object under a forged existing hash exercises real Git lookup,
+# not merely the permission to create loose files in canonical storage.
+oid=sys.argv[6]; fake=Path(os.environ['GIT_OBJECT_DIRECTORY'])/oid[:2]/oid[2:]
+fake.parent.mkdir(parents=True,exist_ok=True)
+poison=zlib.compress(b'blob 5\\0fake\\n')
+if fake.exists(): assert fake.read_bytes()==poison
+else: fake.write_bytes(poison)
 print(json.dumps(checks))
 """
+    baseline = envelope["probe"]["baseline"]
+    protected_blob = _git(root / "repository", "rev-parse", baseline + ":src/sibling.txt")
+    expected_blob = _git(root / "repository", "cat-file", "blob", protected_blob)
     argv, cwd, env = command(
         root / "job/grants.json",
         [
@@ -255,15 +284,24 @@ print(json.dumps(checks))
             code,
             str(root / "outside.txt"),
             str(root / "repository/.git/refs/heads/main"),
+            str(next((root / "repository/.git/objects/pack").glob("*.pack"))),
+            str(root / "job/sandbox-runtime/forbidden-hardlink"),
+            str(root / "repository/.git/objects" / baseline[:2] / baseline[2:]),
+            protected_blob,
         ],
     )
     result = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, timeout=20)
     if result.returncode:
         raise CampaignError("Writer containment probe did not complete")
-    return json.loads(result.stdout)
+    checks = json.loads(result.stdout)
+    checks["bank_shadow_readback"] = (
+        _git(root / "repository", "cat-file", "blob", protected_blob) == expected_blob
+    )
+    return checks
 
 
 def result(path, observation):
+    from .campaign_capability_evidence import request_binding
     from .campaign_headless import file_digest, read_json, write_json
 
     envelope = read_json(path)
@@ -278,7 +316,11 @@ def result(path, observation):
     checks = {}
     if finished:
         head = _git(workspace, "rev-parse", "HEAD")
+        from .campaign_object_promotion import promote
+
+        sealed = promote(workspace, head, probe["baseline"])
         checks = {
+            "canonical_objects": sealed["state"] in {"sealed", "not_required"},
             "native_completed": receipt.get("outcome") == "completed",
             "nonce": receipt.get("result")
             == {"nonce": probe["nonce"], "markers": probe["markers"]},
@@ -305,7 +347,8 @@ def result(path, observation):
             )
     passed = bool(finished and checks and all(checks.values()))
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "request_binding": request_binding(path),
         "kind": KIND,
         "ok": passed,
         "checks": checks,
@@ -326,6 +369,7 @@ def result(path, observation):
     if passed:
         capability = {
             **envelope["capability"],
+            "efforts": [envelope["selection"]["effort"]],
             "input_tokens": report["input_tokens"],
             "output_tokens": report["configured_output_tokens"],
             "qualification": {

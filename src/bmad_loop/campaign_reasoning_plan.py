@@ -131,7 +131,9 @@ def _routes(snapshot, purpose: str):
     accepted, errors = [], []
     for candidate in snapshot.spec.candidates(role):
         try:
-            cap = capability_for(configured, candidate.profile, candidate.model)
+            cap = capability_for(
+                configured, candidate.profile, candidate.model, effort=candidate.effort
+            )
             validate_capability(cap, candidate, verify_files=False)
             accepted.append((candidate, cap))
         except CampaignError as exc:
@@ -278,7 +280,13 @@ def perform(runtime, snapshot, action) -> Observation:
         import hashlib
 
         request = JobRequest(
-            id="semantic-" + purpose + "-" + digest([expected, snapshot.graph_revision])[:32],
+            # Identical context can recur after an intervening owner hold or
+            # state change. A new durable trigger is a new occurrence, while
+            # replay of this same planning effect retains its immutable job.
+            id="semantic-"
+            + purpose
+            + "-"
+            + digest([action.id, expected, snapshot.graph_revision])[:32],
             purpose=purpose,
             role=ROLES[purpose],
             coordinates={
@@ -306,7 +314,7 @@ def perform(runtime, snapshot, action) -> Observation:
             ),
             candidates=tuple(candidate for candidate, _ in routes),
             required=False,
-            created_at=runtime.clock(),
+            created_at=action.payload.get("prepared_at", 0),
         )
         request.validate()
         requests.append(asdict(request))

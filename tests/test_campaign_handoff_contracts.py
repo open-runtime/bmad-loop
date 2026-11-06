@@ -25,6 +25,7 @@ def complete(runtime, snapshot, unit, field, result_for):
             validation="valid",
             result=result,
             receipt={
+                "job_id": key,
                 "result": result,
                 "provider_family": "anthropic" if field.endswith("audits") else "openai",
             },
@@ -61,7 +62,7 @@ def complete_history(runtime, snapshot, unit):
                     state="validated",
                     validation="valid",
                     result=result,
-                    receipt={"result": result, "provider_family": "openai"},
+                    receipt={"job_id": key, "result": result, "provider_family": "openai"},
                 )
                 apply_result(runtime, snapshot, row)
                 row["state"] = "applied"
@@ -135,6 +136,7 @@ def test_oversized_current_constraints_reduce_and_are_independently_audited(camp
         )
         step(runtime, snapshot, unit, "handoff-assemble")
     step(runtime, snapshot, unit, "handoff-release")
+    assert unit.evidence["handoff"]["phase"] == "ready", unit.hold
     packet = json.loads(Path(unit.evidence["handoff"]["packet"]["path"]).read_text())
     assert packet["read_only"] is False
     exact = json.loads(Path(packet["exact_current_constraint_index"]["path"]).read_text())
@@ -327,11 +329,8 @@ def test_ready_fallback_reuses_or_replans_packet_for_fresh_destination_capacity(
             for name, pool in snapshot.spec.role_pools
         ),
     )
-    cap = {
-        **snapshot.config_snapshot["reasoning_capabilities"]["codex:gpt-test"]["execution"],
-        "model": alternative.model,
-        "input_tokens": input_limit,
-    }
+    cap = runtime.fixture_cap(alternative, True)
+    cap["input_tokens"] = min(input_limit, cap["input_tokens"])
     snapshot.config_snapshot["reasoning_capabilities"]["codex:gpt-available"] = {"execution": cap}
     runtime._role = lambda snapshot, role, *, allowed_candidates: next(
         (candidate for candidate in allowed_candidates if candidate == alternative), None
@@ -374,7 +373,7 @@ def test_each_additional_contract_requires_its_own_earned_fidelity_binding(
     path = tmp_path / "history-only-fidelity.json"
     path.write_text(json.dumps(evidence))
     cap["semantic_qualification"] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "path": str(path),
         "sha256": file_digest(path),
     }

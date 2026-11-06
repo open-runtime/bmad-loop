@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import pytest
+from test_campaign_headless import fixture_capability
 from test_campaign_headless import prepared as prepared
 
 from bmad_loop.campaign_headless import file_digest, read_json
@@ -232,7 +233,18 @@ print(json.dumps({"type":"result","structured_output":{"ok":True},"usage":{"inpu
         "argv": [cap["binary"], str(script)],
         "dependencies": [{"path": str(script), "sha256": file_digest(script)}],
     }
-    request = replace(request, limits=JobLimits(100000, 64, timeout_s=20))
+    cap["argv"].extend(
+        [
+            "--preset",
+            "empty",
+            "--disable-web-tools",
+            "--disable-reminders",
+            "--disable-shell",
+            "--disable-write",
+        ]
+    )
+    cap = fixture_capability(tmp_path, cap)
+    request = replace(request, limits=JobLimits(100000, 64, max_turns=1, timeout_s=20))
     path = runner.prepare(
         tmp_path / "wire", request, candidate, cap, launch_id="wire", generation=1
     )

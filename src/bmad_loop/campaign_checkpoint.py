@@ -254,6 +254,10 @@ class ProgressMonitor:
         identity = {key: self.request[key] for key in IDENTITY}
         try:
             head = verify.rev_parse_head(self.workspace)
+            from .campaign_object_promotion import promote
+
+            if head not in self.path_cache:
+                promote(self.workspace, head, self.base)
             if (
                 _git(self.workspace, "symbolic-ref", "--short", "HEAD").decode().strip()
                 != identity["branch"]
@@ -376,6 +380,11 @@ def read(
     ):
         raise CampaignError("worker checkpoint identity, freshness or observation is unavailable")
     workspace = Path(expected["workspace"])
+    from .campaign_object_promotion import promote
+
+    if row["baseline"] != expected.get("checkpoint_base", row["baseline"]):
+        raise CampaignError("checkpoint baseline differs from the sealed launch")
+    promote(workspace, row["head"], row["baseline"])
     actual = _git(workspace, "symbolic-ref", "--short", "HEAD").decode().strip()
     if actual != row["branch"] or not verify.is_ancestor(
         workspace, row["head"], verify.rev_parse_head(workspace)
@@ -383,8 +392,6 @@ def read(
         raise CampaignError("checkpoint branch/head no longer belongs to this worker")
     if not verify.is_ancestor(workspace, row["baseline"], row["head"]):
         raise CampaignError("checkpoint baseline ancestry differs")
-    if row["baseline"] != expected.get("checkpoint_base", row["baseline"]):
-        raise CampaignError("checkpoint baseline differs from the sealed launch")
     paths = _committed_paths(workspace, row["baseline"], row["head"])
     if paths != row.get("committed_paths"):
         raise CampaignError("checkpoint committed path receipt differs from Git")

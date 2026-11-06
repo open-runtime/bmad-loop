@@ -44,6 +44,7 @@ class HeadlessAdapter(CodingCLIAdapter):
         self.handoff_packet = None
         self.requests: dict[str, Path] = {}
         self.receipts: dict[str, dict[str, Any]] = {}
+        self.baselines: dict[str, str] = {}
         self.name = profile.name
 
     def set_capability(self, capability, grants, coordinates, handoff_packet=None):
@@ -135,6 +136,10 @@ class HeadlessAdapter(CodingCLIAdapter):
             ),
         )
         self.requests[spec.task_id] = path
+        if permission == "workspace-tools":
+            from ..verify import rev_parse_head
+
+            self.baselines[spec.task_id] = rev_parse_head(spec.cwd)
         launched_ns = time.time_ns()
         launched = self.runner.launch(path)
         return SessionHandle(
@@ -158,6 +163,13 @@ class HeadlessAdapter(CodingCLIAdapter):
                     "Headless termination quiescence remains unknown; replacement forbidden"
                 )
             time.sleep(0.1)
+        if handle.task_id in self.baselines:
+            from ..campaign_object_promotion import promote
+            from ..verify import rev_parse_head
+
+            # Native completion precedes all legacy verification/commit reads.
+            # Only sealed canonical bytes may enter the child engine's proofs.
+            promote(spec.cwd, rev_parse_head(spec.cwd), self.baselines[handle.task_id])
         self.receipts[handle.task_id] = receipt
         outcome = receipt["outcome"]
         if self.journal is not None and receipt.get("observed_model"):

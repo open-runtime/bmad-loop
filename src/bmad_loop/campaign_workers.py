@@ -482,12 +482,18 @@ def _adapters(
         if key not in routes:
             continue
         modes = routes[key]
+        if "by_effort" in modes:
+            # Inspect permissions only within the selected effort. A reasoning
+            # proof must not replace an otherwise valid legacy coding adapter.
+            modes = modes["by_effort"].get(selected.effort, {})
         mode = "reasoning" if permission == "no-tools" else "execution"
         if ("reasoning" in modes or "execution" in modes) and mode not in modes:
             continue
         if "permissions" in modes and modes["permissions"] != permission:
             continue
-        selected_caps[role] = capability_for(routes, selected.name, selected.model, permission)
+        selected_caps[role] = capability_for(
+            routes, selected.name, selected.model, permission, effort=selected.effort
+        )
         profiles[role] = dataclasses.replace(profiles[role], adapter="bounded-headless")
     handoff_role = (
         "triage"
@@ -505,7 +511,7 @@ def _adapters(
             continue
         selected = policy.adapter.resolved(role)
         cap = selected_caps.get(role) or capability_for(
-            routes, selected.name, selected.model, permission
+            routes, selected.name, selected.model, permission, effort=selected.effort
         )
         adapter.set_capability(
             cap,
@@ -821,16 +827,20 @@ def _integrate(request: dict[str, Any], envelope: CampaignExecution) -> dict[str
     if not verify.worktree_clean(workspace):
         raise CampaignError("integration requires a clean quiescent candidate")
     before = verify.rev_parse_head(workspace)
-    observation_ref = f"refs/bmad-campaign/{envelope.campaign_id}/target"
+    # Worktrees share refs. Each launch must retain its own fresh target, and
+    # fetching it must not opportunistically race on origin/main or FETCH_HEAD.
+    prefix = f"refs/bmad-campaign/{envelope.campaign_id}/integration/{request['launch_id']}"
+    observation_ref = f"{prefix}/observed-target"
     git(
         workspace,
         "fetch",
         "--no-tags",
+        "--no-write-fetch-head",
+        "--refmap=",
         request["remote"],
         f"refs/heads/{request['target']}:{observation_ref}",
     )
     target = verify.rev_parse_revision(workspace, observation_ref)
-    prefix = f"refs/bmad-campaign/{envelope.campaign_id}/integration/{request['launch_id']}"
     git(workspace, "update-ref", f"{prefix}/candidate", before)
     git(workspace, "update-ref", f"{prefix}/target", target)
     base = git(workspace, "merge-base", before, target)

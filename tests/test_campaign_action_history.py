@@ -8,7 +8,7 @@ from test_campaign_database import state
 from bmad_loop.campaign_action_history import TrackingReceipts, action, actions, counts
 from bmad_loop.campaign_boundary_sync import metadata_preimage
 from bmad_loop.campaign_database import LEGACY_MARKER, MARKER, CampaignDatabase
-from bmad_loop.campaign_model import CampaignError, WorkerClaim, snapshot_to_dict
+from bmad_loop.campaign_model import CampaignError, OutboxAction, WorkerClaim, snapshot_to_dict
 from bmad_loop.campaign_runtime_intake import _owned_projection
 from bmad_loop.campaign_store import CampaignStore, add_action, add_event
 
@@ -218,3 +218,22 @@ def test_archived_polling_observation_identity_cannot_be_reused(tmp_path):
     assert [row["id"] for row in store.observations(snapshot.id)] == ["old-observation"]
     with pytest.raises(CampaignError, match="already exists"):
         add_action(snapshot, "github", "", {}, action_id="old-observation")
+
+
+def test_cold_mutation_cannot_be_reused_and_hidden_by_observation_archival(tmp_path):
+    store = CampaignStore(tmp_path)
+    snapshot = store.create(state())
+    confirmed(snapshot, "old-write")
+    confirmed(snapshot, "new-write")
+    snapshot = store.save(snapshot, snapshot.revision)
+    # Bypass add_action deliberately: commit must defend its own namespace,
+    # including rows the observation splitter would remove before action archival.
+    for identity in ("old-write", "new-poll"):
+        row = OutboxAction(identity, "capacity", "", {}, snapshot.generation)
+        row.state = "confirmed"
+        snapshot.outbox.append(row)
+    with pytest.raises(CampaignError, match="reactivate"):
+        store.save(snapshot, snapshot.revision)
+    restored = store.load(snapshot.id)
+    assert action(restored, "old-write").kind == "github"
+    assert store.observations(snapshot.id) == []

@@ -228,7 +228,15 @@ class RepositoryDiscovery:
             return sha
         observation = "refs/bmad-campaign/discovery/" + sha
         self._git(
-            ["fetch", "--no-tags", "--no-write-fetch-head", "--", remote, ref + ":" + observation]
+            [
+                "fetch",
+                "--no-tags",
+                "--no-write-fetch-head",
+                "--refmap=",
+                "--",
+                remote,
+                ref + ":" + observation,
+            ]
         )
         actual = self._git(["rev-parse", "--verify", observation + "^{commit}"]).strip()
         if actual != sha:

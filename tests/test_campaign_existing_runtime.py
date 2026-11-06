@@ -28,7 +28,7 @@ def test_preexisting_done_baseline_uses_no_engine_and_reaches_delivery_through_d
     spec = replace(case.snapshot.spec, name="existing-canonical-baseline", units=())
     _, current = campaign_runtime.create(case.repo, spec)
     case.snapshot = current
-    result = run_case(case, ticks=1600)
+    result = run_case(case)
     assert result.phase == "delivered", diagnose(result)
     assert all(unit.state == UnitState.DELIVERED for unit in result.units.values())
     assert len(case.service.pulls) == 3
@@ -74,7 +74,7 @@ def test_same_delivered_source_reuses_actual_prior_delivery_after_fresh_remote_r
     current = case.store.save(current, current.revision)
     case.snapshot = current
     before = len(case.service.pulls)
-    result = run_case(case, ticks=1000)
+    result = run_case(case)
     assert result.phase == "delivered", {
         "current": diagnose(result),
         "prior_hierarchy": {

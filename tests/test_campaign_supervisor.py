@@ -165,11 +165,26 @@ def run_until_observed(supervisor, campaign_id, predicate, *, timeout_s=30):
         supervisor.clock = clock
 
 
+def run_to_completion(supervisor, campaign_id):
+    clock = supervisor.clock
+    deadline = time.monotonic() + 60
+
+    def bounded_clock():
+        assert time.monotonic() < deadline, "supervisor did not complete"
+        return clock()
+
+    supervisor.clock = bounded_clock
+    try:
+        return supervisor.run(campaign_id)
+    finally:
+        supervisor.clock = clock
+
+
 def test_workers_in_one_epic_start_concurrently_with_durable_claims(campaign_store):
     store, campaign_id = campaign_store
     driver = PipelineDriver(store, barrier=threading.Barrier(2))
-    result = CampaignSupervisor(store, driver, progress=lambda _: None).run(
-        campaign_id, max_ticks=500
+    result = run_to_completion(
+        CampaignSupervisor(store, driver, progress=lambda _: None), campaign_id
     )
     assert result.phase == "delivered", [
         (row.kind, row.unit, row.state, row.error) for row in result.outbox
@@ -219,7 +234,7 @@ def test_hold_from_durable_inbox_blocks_one_unit_while_other_delivers(campaign_s
     assert result.units["s:e:second"].state == UnitState.DELIVERED
     assert driver.deliveries == ["s:e:second"]
     store.enqueue(campaign_id, "release", unit="s:e:first")
-    result = supervisor.run(campaign_id, max_ticks=200)
+    result = run_to_completion(supervisor, campaign_id)
     assert result.phase == "delivered"
     assert driver.deliveries == ["s:e:second", "s:e:first"]
 
@@ -299,8 +314,8 @@ def test_prepared_action_restart_is_revalidated_and_adopted_before_effect(campai
 
     driver.control(snapshot, {"kind": "prepare-effect", "action": asdict(action)})
     store.save(snapshot, snapshot.revision)
-    result = CampaignSupervisor(store, driver, progress=lambda _: None).run(
-        campaign_id, max_ticks=200
+    result = run_to_completion(
+        CampaignSupervisor(store, driver, progress=lambda _: None), campaign_id
     )
     adopted = next(row for row in result.outbox if row.id == "prepared-start")
     assert adopted.state == "confirmed", adopted.error
