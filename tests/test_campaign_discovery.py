@@ -303,3 +303,37 @@ def test_detail_readback_detects_native_pr_movement_during_inventory(semantic_in
     partial = RepositoryDiscovery(gateway, repo).collect(remote="inventory", detailed_prs=None)
     assert not partial.complete
     assert any("PR identity moved" in value for value in partial.unavailable)
+
+
+def test_branch_rename_out_of_selected_scope_keeps_full_rename_evidence(semantic_inventory):
+    from conftest import git
+
+    repo, _, _, _, gateway = semantic_inventory
+    canonical = git(repo, "branch", "--show-current")
+    # The source path exists on canonical main before the external rename.
+    git(repo, "merge", "--ff-only", "external-work")
+    base = git(repo, "rev-parse", "HEAD")
+    git(repo, "push", "inventory", "HEAD:refs/heads/" + canonical)
+    git(
+        repo, "fetch", "--no-tags", "inventory", "refs/heads/external-work:refs/heads/remote-rename"
+    )
+    git(repo, "switch", "remote-rename")
+    (repo / "docs").mkdir(exist_ok=True)
+    git(repo, "mv", "src/shared.py", "docs/shared.py")
+    git(repo, "commit", "-m", "Move selected cache implementation outside its prior scope")
+    head = git(repo, "rev-parse", "HEAD")
+    git(repo, "push", "inventory", "HEAD:refs/heads/external-work")
+    git(repo, "switch", canonical)
+    git(repo, "config", "diff.renames", "true")
+
+    receipt = RepositoryDiscovery(gateway, repo).collect(
+        remote="inventory", target=canonical, relevant_paths=("src/shared.py",)
+    )
+    assert receipt.complete, receipt.unavailable
+    branch = next(row for row in receipt.remote_refs if row["ref"] == "refs/heads/external-work")
+    evidence = branch["branch_evidence"]
+    assert evidence["base"] == base and evidence["head"] == head
+    assert "rename from src/shared.py" in evidence["diff"]
+    assert "rename to docs/shared.py" in evidence["diff"]
+    assert git(repo, "rev-parse", "HEAD") == base
+    assert git(repo, "status", "--porcelain") == ""

@@ -285,6 +285,8 @@ class RepositoryDiscovery:
                             [
                                 "diff",
                                 "--name-only",
+                                # A rename away also touches its original scope.
+                                "--no-renames",
                                 "-z",
                                 "--no-ext-diff",
                                 "--no-textconv",
