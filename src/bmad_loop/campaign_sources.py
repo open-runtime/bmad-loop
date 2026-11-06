@@ -240,6 +240,9 @@ def _prepare_ticket_source(
     canonical = source_paths(project, source)
     if source.kind != "tickets":
         return canonical.rebased(workspace)
+    # The shared copy retains its first selector's native default. Resolve this
+    # selector against the canonical default before preparing or reusing it.
+    selected = dataclasses.replace(source, initiative=canonical.active_initiative)
     topology = ticketstore.assess_store(canonical, "worktree")
     if isinstance(topology, ticketstore.StoreRefusal):
         raise CampaignError(f"cannot isolate ticket source: {topology.code}")
@@ -292,7 +295,7 @@ def _prepare_ticket_source(
         != bmadconfig.load_paths(workspace, want_tickets=True).active_initiative
     ):
         ticketstore.redirect_mount_config(workspace, main_store=None, initiative=source.initiative)
-    paths = source_paths(workspace, source)
+    paths = source_paths(workspace, selected)
     if not paths.output_folder.resolve().is_relative_to(workspace.resolve()):
         raise CampaignError("worker source still resolves outside its private checkout")
     return paths

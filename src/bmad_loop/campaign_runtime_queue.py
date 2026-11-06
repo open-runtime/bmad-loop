@@ -212,6 +212,8 @@ def observe_effect(runtime, snapshot, action) -> Observation:
             {
                 "observed_at": runtime.clock(),
                 "group": None,
+                "gate_reasons": list(gate.reasons),
+                "candidate": asdict(candidate),
                 "reason": "waiting for authenticated synthetic merge-group candidate",
             },
         )

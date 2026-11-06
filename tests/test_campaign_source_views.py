@@ -55,8 +55,11 @@ def test_same_store_two_initiatives_reuse_one_private_copy_and_keep_primary_defa
     assert not authority.is_relative_to(workspace)
 
 
-def test_implicit_ticket_selector_is_frozen_to_its_actual_initiative(views):
-    first, _, workspace, authority, selectors = views
+@pytest.mark.parametrize("prepare_explicit_first", [False, True])
+def test_implicit_ticket_selector_is_frozen_to_its_actual_initiative(views, prepare_explicit_first):
+    first, second, workspace, authority, selectors = views
+    if prepare_explicit_first:
+        prepare(views, 1)
     implicit = prepare_source_view(
         first.project,
         workspace,
@@ -65,7 +68,11 @@ def test_implicit_ticket_selector_is_frozen_to_its_actual_initiative(views):
     )
     prepare(views, 1)
     assert implicit.selector.initiative == first.initiative
+    assert implicit.paths.initiative_folder.name == first.initiative
     assert source_paths(workspace, implicit.selector).initiative_folder.name == first.initiative
+    assert bmadconfig.load_paths(workspace, want_tickets=True).active_initiative == (
+        second.initiative if prepare_explicit_first else first.initiative
+    )
 
 
 @pytest.mark.parametrize("owner_change", ["none", "modify", "delete", "new"])

@@ -456,6 +456,67 @@ def test_queue_observation_retains_h_requirements_alongside_successful_g(
 
 
 @pytest.mark.parametrize("defect", [None, "hold", "check", "team"])
+def test_queue_without_group_keeps_fresh_publication_veto(monkeypatch, publishable, defect):
+    from types import SimpleNamespace
+
+    from bmad_loop import campaign_runtime_queue as queue
+
+    old, candidate, evidence, observation = publishable
+    good = replace(
+        observation,
+        checks=observation.checks + (security(candidate),),
+        rules=replace(observation.rules, queue=True, queue_merge_method="MERGE"),
+    )
+    observed = (
+        replace(good, issue={"labels": [{"name": "custom:wait"}]})
+        if defect == "hold"
+        else (
+            replace(good, checks=observation.checks)
+            if defect == "check"
+            else replace(good, requested_teams=("security",)) if defect == "team" else good
+        )
+    )
+    unit = CampaignUnit(UnitSpec("unit", "s", "e", "Unit"), state=UnitState.MERGE_REQUESTED)
+    spec = CampaignSpec(
+        "queue-wait",
+        units=(unit.spec,),
+        github=GitHubSpec(
+            merge_mode="queue",
+            candidate_check_context="CI",
+            hold_labels=("custom:wait",),
+            required_checks=("security-scan",),
+        ),
+    )
+    snapshot = CampaignSnapshot("queue-wait", "a/b", spec, {unit.id: unit})
+    runtime = SimpleNamespace(
+        gateway=lambda _: old.gateway,
+        _candidate=lambda *args: candidate,
+        _publication_evidence=lambda *args: evidence,
+        clock=lambda: 100,
+    )
+    monkeypatch.setattr(old.gateway, "pull", lambda _: observation.pr)
+    monkeypatch.setattr(
+        queue,
+        "membership",
+        lambda *args: {
+            "merged": False,
+            "state": "OPEN",
+            "mergeQueueEntry": {"state": "AWAITING_CHECKS"},
+        },
+    )
+    monkeypatch.setattr(queue, "observe_group", lambda *args, **kwargs: None)
+    monkeypatch.setattr(PublicationController, "inspect", lambda *args: observed)
+    action = OutboxAction("observe", "queue-observe", unit.id, {}, 0)
+    result = queue.observe_effect(runtime, snapshot, action)
+    queue.apply_effect(runtime, snapshot, unit, action, result.data)
+    assert result.data["group"] is None
+    assert bool(unit.evidence["queue"].get("needs_dequeue")) is bool(defect)
+    proposals = queue.proposals(runtime, snapshot, unit, lambda _: True)
+    assert [row.kind for row in proposals] == (["queue-dequeue"] if defect else [])
+    assert unit.evidence["queue"]["candidate"] == asdict(candidate)
+
+
+@pytest.mark.parametrize("defect", [None, "hold", "check", "team"])
 def test_external_merge_canonical_proof_does_not_waive_campaign_requirements(
     project, monkeypatch, publishable, defect
 ):
