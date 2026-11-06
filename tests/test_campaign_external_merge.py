@@ -157,6 +157,8 @@ class ExternalMerger:
 def test_external_ready_pr_merge_reconciles_canonical_delivery_without_native_merge_intent(
     production_case, monkeypatch
 ):
+    from bmad_loop.campaign_action_history import actions
+
     case = production_case
     external = ExternalMerger(case.service)
     monkeypatch.setattr(case.service, "request", external.request)
@@ -170,7 +172,7 @@ def test_external_ready_pr_merge_reconciles_canonical_delivery_without_native_me
         assert unit.state == UnitState.DELIVERED
         assert not [
             action
-            for action in result.outbox
+            for action in actions(result)
             if action.unit == unit.id and action.payload.get("purpose") == "merge"
         ]
         assert verify.is_ancestor(case.remote, row["head"], git(case.remote, "rev-parse", "main"))
@@ -182,7 +184,25 @@ def test_uncovered_external_merge_is_visible_followup_hold_and_never_delivered(
     case = production_case
     external = ExternalMerger(case.service, uncovered=True)
     monkeypatch.setattr(case.service, "request", external.request)
-    result = run_case(case, ticks=700)
+    original_proposals = case.runtime.proposals
+    hold_observed = False
+
+    def observe_hold(snapshot):
+        nonlocal hold_observed
+        if not hold_observed and any(
+            unit.hold and unit.hold.kind == "postmerge_acceptance"
+            for unit in snapshot.units.values()
+        ):
+            hold_observed = True
+            case.store.enqueue(snapshot.id, "stop", request_id="observed-postmerge-hold")
+        return original_proposals(snapshot)
+
+    # Wait for the actual hold, then drain outstanding effects. A tick budget
+    # races real Git subprocesses when the suite runs under parallel load.
+    monkeypatch.setattr(case.runtime, "proposals", observe_hold)
+    result = run_case(case)
+    assert hold_observed, diagnose(result)
+    assert result.phase == "stopped", diagnose(result)
     held = [
         unit
         for unit in result.units.values()

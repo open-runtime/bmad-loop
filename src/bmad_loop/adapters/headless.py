@@ -125,6 +125,14 @@ class HeadlessAdapter(CodingCLIAdapter):
             environment={
                 key: value for key, value in spec.env.items() if key.startswith("BMAD_LOOP_")
             },
+            presentation=(
+                {
+                    "workspace": str(spec.cwd.resolve()),
+                    "workspace_id": spec.env["BMAD_LOOP_PARADEV_WORKSPACE_ID"],
+                }
+                if spec.env.get("BMAD_LOOP_PARADEV_WORKSPACE_ID")
+                else None
+            ),
         )
         self.requests[spec.task_id] = path
         launched_ns = time.time_ns()

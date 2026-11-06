@@ -419,6 +419,12 @@ panes, unavailable host observations and pending native registration do not
 permit a replacement launch. Managed presentation preserves operator layout and
 user-owned workspace content.
 
+Headless reasoning jobs use an owned campaign workspace for their terminal while
+keeping their input/output state outside the editing tree. Portfolio jobs wait
+visibly until a workspace is available. Job status includes the terminal and
+workspace IDs; managed titles identify the role and model. Native agent identity
+still requires the harness's actual lifecycle hook registration.
+
 `communication.mode = "observe"` enables bounded hcom observations and structured
 sibling context where the installed launch chain supports them. Campaign messages
 are advisory and cannot assign work, transfer ownership or establish completion.
@@ -605,6 +611,29 @@ is a result acceptance limit rather than a promise that generation cannot exceed
 it. This does not establish a provider's advertised maximum or semantic summary
 fidelity. Larger inputs need a larger successful qualification.
 Native selected aliases and served model names remain separate in receipts.
+
+Workspace-tools routes need their own qualification:
+`bmad-loop campaign qualify-writer PROPOSAL --directory NEW_PRIVATE_DIRECTORY --json`.
+The command creates a disposable fixture repository and isolated worktree, then
+asks the native CLI to edit and commit exactly one owned file. Independent readback
+checks committed bytes, clean Git state, unchanged sibling/outside files and the
+main ref, native session/model/usage and process quiescence. A separate descendant
+under the identical frozen OS sandbox verifies that protected writes are denied.
+The current write confinement is macOS only. Use a private directory approved for
+local worktrees; the command refuses existing occupied directories unless they
+contain its exact resumable job. It never uses the current repository as its fixture.
+
+The proposal's executable is a regular, hash-pinned launcher containing
+`campaign_execution_qualification.launcher_text()` with executable permissions.
+Its managed-interpreter shebang preserves the virtual environment. Pass
+`--grants {grants_path} -- ABSOLUTE_NATIVE_CLI ...` and pin the sandbox module,
+resolved Python interpreter, native executable and all native wrapper dependencies.
+Use native tool arguments appropriate to the fixture; the mandatory outer sandbox
+remains the write boundary. Native runtime write directories must be explicit in
+the proposal. No-tools qualification cannot substitute for this proof. Passing
+qualifies the measured input and configured budgets for this finite operation;
+it does not qualify every coding workflow, cross-provider continuation or a
+provider's advertised limits.
 
 For Grok, large prompt files require its native `--verbatim` option to avoid
 abbreviated input that would require a later tool read. For Muse, the qualified

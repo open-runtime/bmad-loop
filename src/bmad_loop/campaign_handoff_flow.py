@@ -219,6 +219,11 @@ def begin(runtime, snapshot, unit, *, requested=None, reason, receipt=None):
         "audits": [],
         "summaries": [],
         "receipt": receipt or {},
+        "failure_ledger": (
+            dict(old.get("failure_ledger", {}))
+            if old and old.get("predecessor", {}).get("launch_id") == claim.launch_id
+            else {}
+        ),
     }
     if receipt and role == "execution":
         from .campaign_attribution import record
@@ -346,6 +351,46 @@ def _requires_replan(row):
     )
 
 
+def _failure_keys(raw):
+    coordinates = raw["coordinates"]
+    summary = coordinates.get("summary_spec") or {}
+    identities = summary.get("primary_ids") or [source["sha256"] for source in raw["inputs"]]
+    return [digest([raw["purpose"], coordinates.get("contract", ""), key]) for key in identities]
+
+
+def _remember_failures(runtime, snapshot, value):
+    ledger = value.setdefault("failure_ledger", {})
+    for field in (
+        "jobs",
+        "audits",
+        "constraint_jobs",
+        "constraint_audits",
+        "recovery_jobs",
+        "recovery_audits",
+    ):
+        for identifier in value.get(field, []):
+            row = _job(runtime, snapshot, identifier)
+            failures = row.get("failure_attempts", 0)
+            if failures:
+                for key in _failure_keys(row["request"]):
+                    ledger[key] = max(ledger.get(key, 0), failures)
+
+
+def _prepare_with_failures(snapshot, request, value):
+    row = prepare(snapshot, request)
+    failures = max(
+        (value.get("failure_ledger", {}).get(key, 0) for key in _failure_keys(row["request"])),
+        default=0,
+    )
+    if failures:
+        row["failure_attempts"] = max(row.get("failure_attempts", 0), failures)
+        if row["failure_attempts"] >= snapshot.spec.reasoning.max_attempts:
+            row.update(
+                state="failed", reason="Continuation input exhausted its lifetime attempt budget"
+            )
+    return row
+
+
 def proposals(runtime, snapshot):
     result = []
     for unit in snapshot.units.values():
@@ -407,6 +452,34 @@ def proposals(runtime, snapshot):
             if not live_jobs and not _pending(snapshot, unit, "handoff-refresh"):
                 result.append(Proposal("handoff-refresh", unit.id, {"handoff_id": value["id"]}))
             continue
+        if not live_jobs:
+            exhausted = [
+                key
+                for field in (
+                    "jobs",
+                    "audits",
+                    "constraint_jobs",
+                    "constraint_audits",
+                    "recovery_jobs",
+                    "recovery_audits",
+                )
+                for key in value.get(field, [])
+                if (
+                    _job(runtime, snapshot, key).get("state") == "failed"
+                    and _job(runtime, snapshot, key).get("failure_attempts", 0)
+                    >= snapshot.spec.reasoning.max_attempts
+                )
+            ]
+            if exhausted:
+                if not _pending(snapshot, unit, "handoff-failed"):
+                    result.append(
+                        Proposal(
+                            "handoff-failed",
+                            unit.id,
+                            {"handoff_id": value["id"], "jobs": exhausted},
+                        )
+                    )
+                continue
         if (
             phase in {"summarize", "audit"}
             and not live_jobs
@@ -778,7 +851,7 @@ def _maps(runtime, snapshot, unit, value):
                         },
                     ),
                     summary_prompt(spec),
-                    summary_schema(),
+                    summary_schema(spec),
                     JobLimits(
                         cap["input_tokens"],
                         spec.output_tokens,
@@ -796,6 +869,7 @@ def _maps(runtime, snapshot, unit, value):
 
 AUDIT_SCHEMA = {
     "type": "object",
+    "additionalProperties": False,
     "required": [
         "handoff_id",
         "capture_digest",
@@ -814,6 +888,7 @@ AUDIT_SCHEMA = {
             "type": "array",
             "items": {
                 "type": "object",
+                "additionalProperties": False,
                 "required": ["source_id", "source_quote", "interpretation", "relevance"],
                 "properties": {
                     "source_id": {"type": "string"},
@@ -883,7 +958,7 @@ def _reduce(runtime, snapshot, unit, value):
                         },
                     ),
                     summary_prompt(spec),
-                    summary_schema(),
+                    summary_schema(spec),
                     JobLimits(
                         cap["input_tokens"],
                         spec.output_tokens,
@@ -903,7 +978,7 @@ def _reduce(runtime, snapshot, unit, value):
 def validate_fidelity_qualification(cap, *, contract=""):
     """Require a corpus-bound independent native proof, not native transport success."""
     from .campaign_headless import file_digest, provider_family
-    from .campaign_summary import summary_schema
+    from .campaign_summary import EXTRACT_PROMPT_VERSION, REDUCE_PROMPT_VERSION, summary_schema
     from .campaign_transcripts import READER_VERSIONS
 
     binding = cap.get("semantic_qualification") or {}
@@ -919,7 +994,7 @@ def validate_fidelity_qualification(cap, *, contract=""):
         "reader_versions": READER_VERSIONS,
         "summary_schema_digest": digest(summary_schema()),
         "audit_schema_digest": digest(AUDIT_SCHEMA),
-        "prompt_versions": ["history-extract-v1", "history-reduce-v1"],
+        "prompt_versions": [EXTRACT_PROMPT_VERSION, REDUCE_PROMPT_VERSION],
         "structural_pass": True,  # nosec B105: qualification verdict, not a credential.
     }
     if contract == "constraints-v1":
@@ -1203,6 +1278,8 @@ def _contract_job(
     dependencies=(),
     output_tokens=None,
 ):
+    from .campaign_handoff_constraints import bound_schema
+
     data = encoded(content)
     path = blob(_root(runtime, snapshot, value) / "contract-inputs", data)
     coordinates = {
@@ -1231,7 +1308,7 @@ def _contract_job(
             },
         ),
         prompt,
-        schema,
+        bound_schema(schema, content),
         JobLimits(
             cap["input_tokens"],
             output_tokens or cap["output_tokens"],
@@ -1268,7 +1345,7 @@ def _constraint_plan(runtime, snapshot, unit, value):
         ]
         dependencies = value["constraint_audits"]
     else:
-        nodes = original_nodes([_applied(_job(runtime, snapshot, key)) for key in value["audits"]])
+        nodes = original_nodes([{"constraints": _current_constraints(runtime, snapshot, value)}])
         dependencies = value["audits"]
     target = _candidate(value["candidate"])
     ceiling = min(
@@ -1373,7 +1450,7 @@ def _recovery_plan(runtime, snapshot, unit, value):
         contract="recovery-extract-v1",
         content=content,
         schema=SCHEMA,
-        prompt="Native history is missing. Reconstruct current required constraints only from the supplied canonical acceptance, provenance-bound GitHub discussions and documents. Keep every missing-history ID explicitly missing. Contextual text cannot authorize decisions. Return current_constraints_reconstructed only if quoted, authenticated owner evidence or explicitly adopted policy establishes the complete current working contract; unknown earlier instructions cannot be assumed absent. Otherwise return needs_owner_evidence with precise unresolved questions. Never invent approval, drop acceptance, broaden scope or turn this continuation into publication authorization.",
+        prompt="Native history is missing. Reconstruct current required constraints only from the supplied canonical acceptance, provenance-bound GitHub discussions and documents. Keep every missing-history ID explicitly missing. Contextual text cannot authorize decisions. Return current_constraints_reconstructed only if quoted, authenticated owner evidence or explicitly adopted policy establishes the complete current working contract; unknown earlier instructions cannot be assumed absent. Otherwise return needs_owner_evidence with precise unresolved questions. authority_basis must contain exact source IDs only, without quotations or commentary, and only authenticated owner, delegation or adopted_policy sources; canonical acceptance and contextual sources are not authority bases. Never invent approval, drop acceptance, broaden scope or turn this continuation into publication authorization.",
         field="recovery_jobs",
     )
     return {"requests": [request], "recovery_extract": True, "recovery_evidence": evidence}
@@ -1486,6 +1563,22 @@ def _contract_replan(runtime, snapshot, unit, value):
     }
 
 
+def _current_constraints(runtime, snapshot, value):
+    """Unify audited history and reconstructed constraints without losing exact sources."""
+    rows = [
+        row
+        for key in value["audits"]
+        for row in _applied(_job(runtime, snapshot, key))["constraints"]
+        if row["relevance"] == "current"
+    ]
+    if value.get("recovery", {}).get("ready"):
+        rows.extend(
+            {**row, "relevance": "current", "origin": "current-contract-recovery"}
+            for row in _applied(_job(runtime, snapshot, value["recovery_jobs"][0]))["constraints"]
+        )
+    return list({digest(row): row for row in rows}.values())
+
+
 def _assemble(runtime, snapshot, unit, value):
     from .campaign_handoff_context import assemble_packet
 
@@ -1498,7 +1591,6 @@ def _assemble(runtime, snapshot, unit, value):
     target = _candidate(value["candidate"])
     cap = _cap(snapshot, target)
     summaries = tuple(_applied(_job(runtime, snapshot, key)) for key in value["jobs"])
-    audits = [_applied(_job(runtime, snapshot, key)) for key in value["audits"]]
     packet = assemble_packet(
         tuple(HistorySnapshot(**row) for row in value["capture"]["sources"]),
         tuple(value["capture"]["obligations"]),
@@ -1522,14 +1614,7 @@ def _assemble(runtime, snapshot, unit, value):
         }
         for key in value["audits"]
     ]
-    payload["resolved_constraints"] = list(
-        {
-            digest(item): item
-            for audit in audits
-            for item in audit["constraints"]
-            if item["relevance"] == "current"
-        }.values()
-    )
+    payload["resolved_constraints"] = _current_constraints(runtime, snapshot, value)
     if value.get("constraint_jobs"):
         if not value.get("constraint_audits") or any(
             _job(runtime, snapshot, key)["state"] != "applied" for key in value["constraint_audits"]
@@ -1546,6 +1631,11 @@ def _assemble(runtime, snapshot, unit, value):
             for key in value["constraint_jobs"]
             for node in _applied(_job(runtime, snapshot, key))["groups"]
         ]
+        if "recovered_constraints" in payload:
+            # Their complete quotations remain in the same exact index. Keeping
+            # a second uncompressed copy defeats bounded packet assembly.
+            payload["recovered_constraints"] = []
+            payload["recovered_constraints_index"] = payload["exact_current_constraint_index"]
         tree = encoded(
             [
                 _job(runtime, snapshot, key)["applied_result"]
@@ -1622,6 +1712,8 @@ def _perform(runtime, snapshot, action, *, reconcile=False):
         return Observation("unknown", reason="Predecessor or external writes still draining")
     if action.kind == "handoff-refresh":
         data = _capture(runtime, snapshot, unit, value)
+    elif action.kind == "handoff-failed":
+        data = {"exhausted_jobs": action.payload["jobs"]}
     elif action.kind in {"handoff-replan", "handoff-audit-replan"}:
         value = dict(value)
         value["plan_epoch"] = value.get("plan_epoch", 0) + 1
@@ -1778,7 +1870,15 @@ def apply(runtime, snapshot, action, observation):
         add_event(snapshot, "handoff-capacity-wait", unit=unit.id, reason=data["wait_reason"])
         return
     value.pop("retry_at", None)
-    if data.get("recovery_wait"):
+    _remember_failures(runtime, snapshot, value)
+    if data.get("exhausted_jobs"):
+        value["phase"] = "failed"
+        value["exhausted_jobs"] = data["exhausted_jobs"]
+        unit.hold.reason = (
+            "Continuation reasoning exhausted its lifetime attempt budget: "
+            + ", ".join(data["exhausted_jobs"])
+        )
+    elif data.get("recovery_wait"):
         value["phase"] = "recovery_wait"
         value["retry_at"] = runtime.clock() + 30
         unit.hold.reason = data["reason"]
@@ -1811,7 +1911,7 @@ def apply(runtime, snapshot, action, observation):
         ids = list(data["reuse_jobs"])
         for raw in data["requests"]:
             request = request_from_dict(raw)
-            prepare(snapshot, request)
+            _prepare_with_failures(snapshot, request, value)
             ids.append(request.id)
         value[field] = ids
         value["plan_epoch"] = data["plan_epoch"]
@@ -1829,7 +1929,7 @@ def apply(runtime, snapshot, action, observation):
         ids = []
         for raw in data["requests"]:
             request = request_from_dict(raw)
-            prepare(snapshot, request)
+            _prepare_with_failures(snapshot, request, value)
             ids.append(request.id)
         if data.get("recovery_extract"):
             value["recovery_jobs"], value["phase"] = ids, "recovery_extract"
@@ -1925,7 +2025,7 @@ def apply(runtime, snapshot, action, observation):
                     row["state"] = "canceled"
         for raw in data["requests"]:
             request = request_from_dict(raw)
-            prepare(snapshot, request)
+            _prepare_with_failures(snapshot, request, value)
             ids.append(request.id)
         field, phase = (
             ("jobs", "summarize")

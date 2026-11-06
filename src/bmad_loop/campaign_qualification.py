@@ -157,6 +157,11 @@ def build_probe(directory, selection, capability, *, input_bytes, output_tokens,
 
 
 def validate_probe_request(request: JobRequest, probe: dict[str, Any]) -> None:
+    if probe.get("kind") == "workspace-tools-v1":
+        from .campaign_execution_qualification import validate_request
+
+        validate_request(request, probe)
+        return
     if (
         probe.get("schema_version") not in {1, 2, 3}
         or request.id != "qualification-" + str(probe.get("nonce", ""))
@@ -212,6 +217,11 @@ def validate_probe_request(request: JobRequest, probe: dict[str, Any]) -> None:
 
 def validate_probe_envelope(envelope) -> None:
     probe = envelope.get("probe")
+    if isinstance(probe, dict) and probe.get("kind") == "workspace-tools-v1":
+        from .campaign_execution_qualification import validate_envelope
+
+        validate_envelope(envelope)
+        return
     if (
         not isinstance(probe, dict)
         or digest(probe) != envelope.get("probe_digest")

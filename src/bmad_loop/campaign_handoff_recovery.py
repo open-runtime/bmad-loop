@@ -15,6 +15,7 @@ from .campaign_transcripts import digest
 
 SCHEMA = {
     "type": "object",
+    "additionalProperties": False,
     "required": [
         "handoff_id",
         "capture_digest",
@@ -40,6 +41,7 @@ SCHEMA = {
             "type": "array",
             "items": {
                 "type": "object",
+                "additionalProperties": False,
                 "required": ["source_id", "source_quote", "interpretation"],
                 "properties": {
                     "source_id": {"type": "string"},
@@ -48,13 +50,18 @@ SCHEMA = {
                 },
             },
         },
-        "authority_basis": {"type": "array", "items": {"type": "string"}},
+        "authority_basis": {
+            "type": "array",
+            "description": "Exact source IDs only, without quotes or commentary. Select only origin-verified owner, delegation or adopted_policy sources quoted in constraints. Canonical acceptance and context sources are never authority bases.",
+            "items": {"type": "string"},
+        },
         "unresolved": {"type": "array", "items": {"type": "string"}},
     },
 }
 
 AUDIT_SCHEMA = {
     "type": "object",
+    "additionalProperties": False,
     "required": [
         "handoff_id",
         "capture_digest",

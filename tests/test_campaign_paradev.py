@@ -216,6 +216,32 @@ def test_reflection_retains_operator_tags_and_reports_precedence(provider):
     assert data["group"] == "story"
 
 
+def test_native_tag_normalization_keeps_mixed_case_group_identity(provider):
+    p, host = provider
+    binding = p.allocate("unit", "campaign-unit", "unit", "action", group="Epic CART")
+    original = host.cli
+
+    def normalized(args):
+        result = original(args)
+        if args[:2] == ["workspaces", "update"]:
+            host.workspaces[0]["tags"] = host.workspaces[0]["tags"].lower()
+        return result
+
+    host.cli = normalized
+    data = p.reflect(binding, campaign_id="Campaign", epic="Epic CART", phase="running", attempt=1)
+    assert data["group"] == "Epic CART"
+    assert data["folder"] == "bmad-campaign-epic cart"
+    assert data["folder_selection"] == "confirmed"
+    before = len(host.calls)
+    assert (
+        p.reflect(binding, campaign_id="Campaign", epic="Epic CART", phase="review", attempt=1)[
+            "folder"
+        ]
+        == data["folder"]
+    )
+    assert len(host.calls) == before
+
+
 def test_optional_task_explicit_tracker_preserves_human_text(provider):
     p, host = provider
     binding = p.allocate("unit", "campaign-unit", "unit", "action")

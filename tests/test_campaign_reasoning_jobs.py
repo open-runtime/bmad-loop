@@ -110,7 +110,8 @@ def test_terminal_jobs_leave_hot_authority_but_remain_queryable(tmp_path, prepar
     snapshot, driver, supervisor, _ = case(tmp_path, prepared, count=1)
     snapshot.jobs["job-0"].update(state="canceled", application="canceled")
     add_event(snapshot, "job-canceled", job_id="job-0")
-    driver.store.save(snapshot, snapshot.revision)
+    saved = driver.store.save(snapshot, snapshot.revision)
+    assert saved.jobs == {}  # The uninterrupted coordinator must release them too.
     assert driver.store.load(snapshot.id).jobs == {}
     rows = driver.store.jobs(snapshot.id, job_id="job-0")
     assert len(rows) == 1 and rows[0]["state"] == "canceled"

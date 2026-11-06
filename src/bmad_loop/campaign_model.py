@@ -786,12 +786,18 @@ def spec_to_dict(spec: CampaignSpec) -> dict[str, Any]:
     return raw
 
 
-def snapshot_to_dict(snapshot: CampaignSnapshot, *, include_events: bool = True) -> dict[str, Any]:
+def snapshot_to_dict(
+    snapshot: CampaignSnapshot, *, include_events: bool = True, include_actions: bool = True
+) -> dict[str, Any]:
     # The persisted journal can be lazy. Never traverse it just to serialize hot
     # authority; explicit exports still include the complete event history.
     hot = copy.copy(snapshot)
     hot.events = []
     raw = asdict(hot)
+    if include_actions:
+        from .campaign_action_history import actions
+
+        raw["outbox"] = [asdict(row) for row in actions(snapshot)]
     if include_events:
         raw["events"] = list(snapshot.events)
     raw["spec"] = spec_to_dict(snapshot.spec)

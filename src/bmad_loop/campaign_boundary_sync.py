@@ -15,6 +15,8 @@ import json
 from pathlib import Path
 
 from . import verify
+from .campaign_action_history import actions as historical_actions
+from .campaign_action_history import confirmation_revision
 from .campaign_boundary_receipts import input_reference
 from .campaign_model import CampaignError, Hold, UnitState
 from .campaign_store import add_event, transition
@@ -104,32 +106,20 @@ def metadata_owned(snapshot, row):
             for name in ("state", "title", "body", "labels", "assignees")
         )
         and (receipt.get("milestone") or {}).get("id") == (row.get("milestone") or {}).get("id")
-        for action in snapshot.outbox
+        for action in historical_actions(snapshot, native_id=str(row.get("id", "")))
         for intent in [action.receipt.get("intent") or action.payload.get("intent") or {}]
     )
 
 
 def metadata_preimage(snapshot, row, value):
     """Recognize an immutable older read only through a later known own write."""
-    from .campaign_database import EventJournal
-
-    events = (
-        snapshot.events.matching("effect-confirmed")
-        if isinstance(snapshot.events, EventJournal)
-        else snapshot.events
-    )
-    confirmed = {
-        event.get("action"): event.get("revision", -1)
-        for event in events
-        if event.get("kind") == "effect-confirmed"
-    }
-    for action in snapshot.outbox:
+    for action in historical_actions(snapshot, native_id=str(row.get("id", ""))):
         intent = action.receipt.get("intent") or action.payload.get("intent") or {}
         coordinates, receipt = intent.get("coordinates") or {}, intent.get("receipt") or {}
         if (
             action.state != "confirmed"
             or intent.get("kind") not in _METADATA
-            or confirmed.get(action.id, -1) <= value.get("authority_revision", -1)
+            or confirmation_revision(snapshot, action.id) <= value.get("authority_revision", -1)
             or action.id in value.get("pending_metadata", ())
             or coordinates.get("id") != row.get("id")
             or not coordinates.get("updated_at")
@@ -163,7 +153,7 @@ def semantic(snapshot, unit, value, *, allowed_heads=()):
                 action.state == "confirmed"
                 and intent.get("kind") in {"close_issue", "close_issue_not_planned", "reopen_issue"}
                 and (intent.get("coordinates") or {}).get("id") == issue.get("id")
-                for action in snapshot.outbox
+                for action in historical_actions(snapshot, native_id=str(issue.get("id", "")))
                 for intent in [action.receipt.get("intent") or action.payload.get("intent") or {}]
             ):
                 result["issues"][name]["state_revision"] = issue.get("updated_at")
@@ -174,7 +164,7 @@ def semantic(snapshot, unit, value, *, allowed_heads=()):
         pr = item["pr"]
         draft = pr.get("draft")
         expected_draft = None
-        for action in snapshot.outbox:
+        for action in historical_actions(snapshot, unit=unit.id):
             intent = action.receipt.get("intent") or action.payload.get("intent") or {}
             receipt = intent.get("receipt") or {}
             if action.unit != unit.id or action.state != "confirmed":

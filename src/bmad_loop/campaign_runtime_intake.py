@@ -15,6 +15,7 @@ import re
 from typing import Any, Mapping
 
 from . import campaign_intake_flow as flow
+from .campaign_action_history import actions as historical_actions
 from .campaign_github import (
     GithubError,
     GithubGateway,
@@ -85,7 +86,8 @@ def _owned_projection(snapshot: CampaignSnapshot, observation: Mapping[str, Any]
     their managed fields still match; comments on them are independently polled.
     """
     payload = observation["payload"]
-    for action in reversed(snapshot.outbox):
+    history = historical_actions(snapshot, native_id=observation["object_id"])
+    for action in reversed(history):
         intent = action.receipt.get("intent") or action.payload.get("intent") or {}
         receipt = intent.get("receipt") or {}
         requested = intent.get("payload") or {}
@@ -103,7 +105,7 @@ def _owned_projection(snapshot: CampaignSnapshot, observation: Mapping[str, Any]
         if observation["kind"] == "issue" and intent.get("kind") == "issue":
             desired_state = "open"
             desired_milestone = requested.get("milestone")
-            for later in snapshot.outbox:
+            for later in history:
                 update = later.receipt.get("intent") or later.payload.get("intent") or {}
                 if (
                     later.state == "rejected"
@@ -116,6 +118,8 @@ def _owned_projection(snapshot: CampaignSnapshot, observation: Mapping[str, Any]
                     continue
                 if update.get("kind") in {"close_issue", "close_issue_not_planned"}:
                     desired_state = "closed"
+                if update.get("kind") == "reopen_issue":
+                    desired_state = "open"
                 if update.get("kind") == "milestone_assignment":
                     desired_milestone = (update.get("payload") or {}).get("milestone")
             return (
@@ -145,7 +149,7 @@ def _owned_projection(snapshot: CampaignSnapshot, observation: Mapping[str, Any]
             desired_state = previous.get("state")
             desired_milestone = (previous.get("milestone") or {}).get("number")
             owned = False
-            for action in snapshot.outbox:
+            for action in history:
                 intent = action.receipt.get("intent") or action.payload.get("intent") or {}
                 if (
                     action.state == "rejected"
@@ -158,6 +162,8 @@ def _owned_projection(snapshot: CampaignSnapshot, observation: Mapping[str, Any]
                     continue
                 if intent.get("kind") in {"close_issue", "close_issue_not_planned"}:
                     desired_state, owned = "closed", True
+                if intent.get("kind") == "reopen_issue":
+                    desired_state, owned = "open", True
                 if intent.get("kind") == "milestone_assignment":
                     desired_milestone, owned = intent["payload"]["milestone"], True
             if owned:

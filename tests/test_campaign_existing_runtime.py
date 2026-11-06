@@ -94,4 +94,6 @@ def test_same_delivered_source_reuses_actual_prior_delivery_after_fresh_remote_r
     }
     assert all(unit.evidence.get("prior_delivery") for unit in result.units.values())
     assert len(case.service.pulls) == before
-    assert not [row for row in result.outbox if row.kind == "launch"]
+    from bmad_loop.campaign_action_history import actions
+
+    assert not actions(result, kinds=("launch",))

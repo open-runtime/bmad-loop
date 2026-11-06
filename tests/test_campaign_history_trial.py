@@ -93,3 +93,45 @@ def test_trial_planning_accounts_for_rendered_json_escaping(tmp_path, prepared):
     assert report["map_jobs"] > 1
     bounds = read_json(directory / "binding.json")["budget"]
     assert bounds["context_tokens"] - bounds["output_tokens"] < 100000 * 3 // 4 - 8192
+
+
+def test_trial_corrects_rejected_completed_result_as_distinct_bounded_job(tmp_path, prepared):
+    runner, capability, snapshots = fixture_route(prepared, tmp_path)
+    cap = read_json(capability)
+    script = tmp_path / "summary-native.py"
+    text = script.read_text().replace(
+        "import json,sys", "import json,sys\nfrom pathlib import Path"
+    )
+    text = text.replace(
+        'print(json.dumps({"type":"system"',
+        'marker=Path(__file__).with_suffix(".attempt")\nif not marker.exists():\n result["covered_ids"]=["invalid-id"]\n marker.write_text("attempted")\nprint(json.dumps({"type":"system"',
+    )
+    script.write_text(text)
+    cap["dependencies"] = [{"path": str(script), "sha256": file_digest(script)}]
+    capability.write_text(json.dumps(cap))
+    directory = tmp_path / "corrected"
+    report = run_trial(snapshots, capability, directory, runner=runner, timeout_s=20)
+    assert report["ok"]
+    assert len(list((directory / "jobs").glob("*/receipt.json"))) == 2
+    assert len(list((directory / "jobs").glob("*/rejected.json"))) == 1
+    validated = next((directory / "jobs").glob("*/validated.json"))
+    request = read_json(validated.parent / "request.json")["request"]
+    assert request["coordinates"]["summary_spec"]["correction_of"]
+    assert "prior completed attempt was rejected" in request["prompt"]
+
+
+def test_trial_reuses_verified_prior_coverage_without_native_relaunch(tmp_path, prepared):
+    runner, capability, snapshots = fixture_route(prepared, tmp_path)
+    first = tmp_path / "first"
+    assert run_trial(snapshots, capability, first, runner=runner, timeout_s=20)["ok"]
+    count = len(runner.mux.processes)
+    report = run_trial(
+        snapshots,
+        capability,
+        tmp_path / "second",
+        runner=runner,
+        timeout_s=20,
+        reuse_directory=first,
+    )
+    assert report["ok"] and report["reused_jobs"] == 1 and report["new_map_jobs"] == 0
+    assert len(runner.mux.processes) == count

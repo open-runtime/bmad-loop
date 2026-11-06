@@ -806,7 +806,9 @@ def test_production_delivery_parallel_drafts_review_merge_and_tracking(productio
     for unit in result.units.values():
         assert unit.evidence["merge"]["canonical_head"]
         assert unit.bindings["pr"]["number"] in case.service.pulls
-        for action in result.outbox:
+        from bmad_loop.campaign_action_history import actions
+
+        for action in actions(result, unit=unit.id):
             if action.unit == unit.id and action.kind in {"push", "checkpoint"}:
                 assert verify.is_ancestor(case.remote, action.receipt["head"], canonical)
     assert len(case.service.pulls) == 3

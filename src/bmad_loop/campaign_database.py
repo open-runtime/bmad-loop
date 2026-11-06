@@ -20,8 +20,9 @@ from typing import Any, overload
 
 from .campaign_model import CampaignError
 
-STORAGE_SCHEMA_VERSION = 2
+STORAGE_SCHEMA_VERSION = 3
 MARKER = {"schema_version": STORAGE_SCHEMA_VERSION, "storage": "sqlite"}
+LEGACY_MARKER = {"schema_version": 2, "storage": "sqlite"}
 
 
 def encode(value: Any) -> str:
@@ -58,10 +59,10 @@ class CampaignDatabase:
                 connection.execute("PRAGMA busy_timeout=10000")
                 if not write:
                     connection.execute("PRAGMA query_only=ON")
-                if (
-                    connection.execute("PRAGMA user_version").fetchone()[0]
-                    != STORAGE_SCHEMA_VERSION
-                ):
+                if connection.execute("PRAGMA user_version").fetchone()[0] not in {
+                    2,
+                    STORAGE_SCHEMA_VERSION,
+                }:
                     raise CampaignError("unsupported campaign database schema")
                 yield connection
             finally:
@@ -96,7 +97,7 @@ class CampaignDatabase:
                     "CREATE TABLE observations (sequence INTEGER PRIMARY KEY, id TEXT UNIQUE NOT NULL, "
                     "kind TEXT NOT NULL, unit TEXT NOT NULL, payload TEXT NOT NULL);"
                     "CREATE INDEX observation_unit ON observations(unit, sequence);"
-                    "PRAGMA user_version=2;"
+                    "PRAGMA user_version=3;"
                 )
                 with connection:
                     hot, jobs = self._split_jobs(state)
@@ -163,10 +164,16 @@ class CampaignDatabase:
         )
 
     def read(
-        self, *, max_bytes: int | None = None, include_terminal_jobs: bool = False
+        self,
+        *,
+        max_bytes: int | None = None,
+        include_terminal_jobs: bool = False,
+        minimum_schema: int = 2,
     ) -> tuple[dict[str, Any], int]:
         with self.connect() as connection:
             connection.execute("BEGIN")
+            if connection.execute("PRAGMA user_version").fetchone()[0] < minimum_schema:
+                raise CampaignError("campaign marker requires a newer database schema")
             if max_bytes is not None:
                 size = connection.execute(
                     "SELECT length(CAST(payload AS BLOB)) FROM authority WHERE id=1"
@@ -219,12 +226,67 @@ class CampaignDatabase:
 
                 hot["outbox"], archived = split(hot.get("outbox", []))
                 self._archive_observations(connection, state.get("outbox", []), archived)
+                from .campaign_action_archive import archive
+
+                protected = {
+                    unit["claim"]["launch_id"]
+                    for unit in state.get("units", {}).values()
+                    if unit.get("claim")
+                } | {
+                    job["claim"]["launch_id"]
+                    for job in jobs
+                    if job.get("claim") and job["state"] not in {"applied", "stale", "canceled"}
+                }
+                hot["outbox"], archived_effects = archive(
+                    connection, hot["outbox"], revision=state["revision"], protected=protected
+                )
                 self._write_jobs(connection, jobs)
                 connection.execute(
                     "UPDATE authority SET revision=?, generation=?, payload=? WHERE id=1",
                     (state["revision"], state["generation"], encode(hot)),
                 )
-        return {row["id"] for row in archived}
+                # Old schema-2 readers must refuse authority whose terminal
+                # records now require indexed historical reads.
+                connection.execute("PRAGMA user_version=3")
+        return {row["id"] for row in archived} | archived_effects
+
+    def actions(self, **query: Any) -> list[dict[str, Any]]:
+        from .campaign_action_archive import read
+
+        with self.connect() as connection:
+            return read(connection, **query)
+
+    def action_positions(self, identities: list[str]) -> dict[str, int]:
+        from .campaign_action_archive import positions
+
+        with self.connect() as connection:
+            return positions(connection, identities)
+
+    def action_counts(self, *, through: int) -> dict[str, int]:
+        from .campaign_action_archive import counts
+
+        with self.connect() as connection:
+            return counts(connection, through=through)
+
+    def archived_observation_exists(self, identity: str) -> bool:
+        with self.connect() as connection:
+            if not connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='observations'"
+            ).fetchone():
+                return False
+            return (
+                connection.execute("SELECT 1 FROM observations WHERE id=?", (identity,)).fetchone()
+                is not None
+            )
+
+    def confirmation_revision(self, action_id: str, *, through: int) -> int:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT payload FROM events WHERE action=? AND kind='effect-confirmed' "
+                "AND sequence<=? ORDER BY sequence DESC LIMIT 1",
+                (action_id, through),
+            ).fetchone()
+        return int(json.loads(row[0]).get("revision", -1)) if row else -1
 
     @staticmethod
     def _archive_observations(connection, incoming, archived) -> None:

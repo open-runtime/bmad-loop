@@ -633,7 +633,9 @@ def test_github_issue_triage_planning_review_delivery_and_reused_issue_binding(p
     assert intake.control(controls[0])["state"] == "completed"
     assert controls[0].evidence["planning_flow"]["state"] == "activated"
     published_heads = set()
-    for action in result.outbox:
+    from bmad_loop.campaign_action_history import actions
+
+    for action in actions(result):
         if action.unit != controls[0].id or action.state != "confirmed":
             continue
         if action.kind == "push":

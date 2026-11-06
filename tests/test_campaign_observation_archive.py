@@ -7,7 +7,7 @@ from test_campaign_database import state
 
 from bmad_loop import cli
 from bmad_loop.campaign_database import CampaignDatabase
-from bmad_loop.campaign_model import CampaignError
+from bmad_loop.campaign_model import CampaignError, OutboxAction
 from bmad_loop.campaign_store import CampaignStore, add_action
 
 
@@ -63,7 +63,10 @@ def test_archive_keeps_uncertain_mutations_and_current_per_unit(tmp_path):
         row.state, row.receipt = state_, receipt
         expected.add(row.id)
     result = store.save(snapshot, snapshot.revision)
-    assert {row.id for row in result.outbox} == expected
+    from bmad_loop.campaign_action_history import actions
+
+    assert {row.id for row in actions(result)} == expected
+    assert {"keep0", "keep1"} <= {row.id for row in result.outbox}
     assert [row["id"] for row in store.observations(result.id)] == ["poll0", "poll1"]
 
 
@@ -90,7 +93,9 @@ def test_archived_id_cannot_be_reused_as_an_active_action(tmp_path):
     store = CampaignStore(tmp_path)
     snapshot = store.create(state())
     snapshot = store.save(polling(snapshot, 2), snapshot.revision)
-    add_action(snapshot, "push", "", {"head": "new"}, action_id="poll0")
+    with pytest.raises(CampaignError, match="already exists"):
+        add_action(snapshot, "push", "", {"head": "new"}, action_id="poll0")
+    snapshot.outbox.append(OutboxAction("poll0", "push", "", {"head": "new"}, snapshot.generation))
     with pytest.raises(CampaignError, match="reactivate"):
         store.save(snapshot, snapshot.revision)
     assert store.load(snapshot.id).outbox[0].id == "poll1"

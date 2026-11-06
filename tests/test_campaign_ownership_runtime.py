@@ -53,7 +53,9 @@ def test_child_rename_is_held_even_when_periodic_checkpoints_are_disabled(
     assert first.hold and first.hold.kind == "ownership_uncertain"
     assert "unowned-original.txt" in first.hold.reason
     assert first.claim.quiescent
-    assert not any(action.kind == "checkpoint" for action in result.outbox)
+    from bmad_loop.campaign_action_history import actions
+
+    assert not actions(result, kinds=("checkpoint",))
     pr = next(
         row for row in case.service.pulls.values() if row["head"]["ref"] == first.bindings["branch"]
     )

@@ -21,7 +21,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .campaign_database import MARKER, CampaignDatabase, EventJournal
+from .campaign_database import LEGACY_MARKER, MARKER, CampaignDatabase, EventJournal
 from .campaign_model import (
     CampaignError,
     CampaignSnapshot,
@@ -130,6 +130,11 @@ class CampaignStore:
                 database.initialize(_state_document(candidate), list(candidate.events))
                 self._write(directory / "snapshot.json", MARKER)
                 candidate.events = EventJournal(database, len(candidate.events))
+                candidate.jobs = {
+                    key: row
+                    for key, row in candidate.jobs.items()
+                    if row["state"] not in {"applied", "stale", "canceled"}
+                }
             else:
                 self._write(directory / "snapshot.json", snapshot_to_dict(candidate))
         self.project_events(candidate)
@@ -141,9 +146,9 @@ class CampaignStore:
             if path.is_symlink() or path.parent.is_symlink():
                 raise CampaignError("campaign snapshot path is symlinked")
             value = json.loads(path.read_text(encoding="utf-8"))
-            if value == MARKER:
+            if value in (MARKER, LEGACY_MARKER):
                 database = CampaignDatabase(path.parent)
-                value, count = database.read()
+                value, count = database.read(minimum_schema=value["schema_version"])
                 snapshot = snapshot_from_dict(value)
                 snapshot.events = EventJournal(database, count)
             else:
@@ -292,6 +297,14 @@ class CampaignStore:
                 )
                 candidate.outbox = [row for row in candidate.outbox if row.id not in archived]
                 candidate.events = EventJournal(database, len(candidate.events))
+                candidate.jobs = {
+                    key: row
+                    for key, row in candidate.jobs.items()
+                    if row["state"] not in {"applied", "stale", "canceled"}
+                }
+                marker_path = directory / "snapshot.json"
+                if json.loads(marker_path.read_text(encoding="utf-8")) != MARKER:
+                    self._write(marker_path, MARKER)
             else:
                 self._write(directory / "snapshot.json", snapshot_to_dict(candidate))
         self.project_events(candidate)
@@ -507,6 +520,13 @@ class CampaignStore:
             raise CampaignError("reasoning job history requires campaign migrate-state")
         return []
 
+    def action_history(self, campaign_id: str, **query: Any) -> list[dict[str, Any]]:
+        """Paginated immutable receipts; current effects remain in the hot snapshot."""
+        snapshot = self.load(campaign_id)
+        if isinstance(snapshot.events, EventJournal):
+            return snapshot.events.database.actions(through=snapshot.revision, **query)
+        return []
+
     def observations(
         self, campaign_id: str, *, after: int = 0, limit: int = 100, unit: str = ""
     ) -> list[dict[str, Any]]:
@@ -591,7 +611,12 @@ def add_action(
     action = OutboxAction(
         action_id or uuid.uuid4().hex, kind, unit, dict(payload), snapshot.generation
     )
-    if any(existing.id == action.id for existing in snapshot.outbox):
+    from .campaign_action_history import action as recorded_action
+
+    if recorded_action(snapshot, action.id) is not None or (
+        isinstance(snapshot.events, EventJournal)
+        and snapshot.events.database.archived_observation_exists(action.id)
+    ):
         raise CampaignError("outbox action ID already exists")
     snapshot.outbox.append(action)
     return action

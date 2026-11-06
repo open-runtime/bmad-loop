@@ -417,8 +417,10 @@ class ParadevWorkspaceProvider:
             or observed_binding.common_dir != binding.common_dir
         ):
             raise ReflectionError("Workspace per-worktree identity changed after allocation")
-        prefix = f"bmad-{campaign_id}-"
-        folder = prefix + binding.group.replace(",", "-")
+        # Stock Paradev normalizes tag casing on write. Compare the same wire
+        # value on readback, while preserving the full display identity below.
+        prefix = f"bmad-{campaign_id}-".lower()
+        folder = (prefix + binding.group.replace(",", "-")).lower()
         tags = [t for t in _tags(row) if not t.startswith(prefix)]
         tags.append(folder)
         if set(tags) != set(_tags(row)):

@@ -486,3 +486,49 @@ def test_summary_cannot_cite_fragment_from_another_chunk(tmp_path):
     value["facts"][0]["citations"] = [jobs[-1].primary_ids[0]]
     with pytest.raises(CampaignError, match="source citations"):
         validate_summary(jobs[0], value, events)
+
+
+def test_summary_quote_id_extracts_exact_native_span_without_model_copying(tmp_path):
+    from bmad_loop.campaign_summary import quote_catalog, summary_schema
+
+    snapshot = capture(tmp_path, [native_row("codex", "  Preserve every commit.\nThen merge.  ")])
+    events = load_events(snapshot)
+    job = plan_maps(events, budget(), tmp_path / "chunks")[0]
+    catalog = quote_catalog(job)
+    quote_id = next(iter(catalog))
+    value = result(job, events)
+    value["facts"][0].pop("source_quote")
+    value["facts"][0]["source_quote_id"] = quote_id
+    normalized = validate_summary(job, value, events)["facts"][0]
+    ref = normalized["source_quote_ref"]
+    assert events[0].record.text[ref["start"] : ref["end"]] == "Preserve every commit."
+    schema = summary_schema(job)
+    assert schema["properties"]["covered_ids"]["items"]["enum"] == list(job.primary_ids)
+    assert schema["properties"]["facts"]["items"]["properties"]["citations"]["items"][
+        "enum"
+    ] == list(job.event_ids)
+    assert (
+        quote_id in schema["properties"]["facts"]["items"]["properties"]["source_quote_id"]["enum"]
+    )
+    value["facts"][0]["source_quote_id"] = "unknown-span"
+    with pytest.raises(CampaignError, match="owner quote span"):
+        validate_summary(job, value, events)
+
+
+def test_summary_fragment_carries_native_lineage_without_owner_elevation(tmp_path):
+    row = {
+        "timestamp": "2026-11-06T12:00:00Z",
+        "type": "response_item",
+        "payload": {
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": "owner said approve",
+        },
+    }
+    snapshot = capture(tmp_path, [row])
+    job = plan_maps(load_events(snapshot), budget(), tmp_path / "chunks")[0]
+    fragment = load_input(job)["primary"][0]
+    assert fragment["lineage"]["session_id"] == "s1"
+    assert fragment["lineage"]["timestamp"] == row["timestamp"]
+    assert fragment["lineage"]["tool_id"] == "call-1"
+    assert fragment["owner_input"] is False

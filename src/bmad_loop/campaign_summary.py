@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -19,6 +19,12 @@ from .campaign_transcripts import HistoryEvent, blob, digest, encoded
 from .platform_util import atomic_write_text, is_link_like
 
 TokenCounter = Callable[[str], int]
+EXTRACT_PROMPT_VERSION = "history-extract-v2"
+REDUCE_PROMPT_VERSION = "history-reduce-v2"
+
+
+class SummaryResultRejected(CampaignError):
+    """A completed model result failed validation; immutable source remains valid."""
 
 
 def byte_token_bound(text: str) -> int:
@@ -100,6 +106,7 @@ class Fragment:
     text: str
     role: str
     owner_input: bool
+    lineage: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -115,7 +122,9 @@ class SummaryJobSpec:
     event_ids: tuple[str, ...]
     dependencies: tuple[str, ...] = ()
     schema_version: int = 1
-    prompt_version: str = "history-extract-v1"
+    prompt_version: str = EXTRACT_PROMPT_VERSION
+    correction_of: str = ""
+    correction_reason: str = ""
 
     def request(
         self, *, unit: str, coordinates: dict[str, Any], candidates: list[dict[str, Any]]
@@ -166,6 +175,17 @@ def _fragments(events: tuple[HistoryEvent, ...], bound: int, count: TokenCounter
                     value[position:end],
                     event.record.role,
                     event.record.owner_input,
+                    {
+                        "source_id": event.source_id,
+                        "session_id": event.session_id,
+                        "timestamp": (event.record.metadata or {}).get("timestamp", ""),
+                        "parent_session_id": (event.record.metadata or {}).get(
+                            "parent_session_id", ""
+                        ),
+                        "kind": event.record.kind,
+                        "native_id": event.record.native_id,
+                        "tool_id": event.record.tool_id,
+                    },
                 )
 
             lo, hi = position, len(value)
@@ -229,7 +249,7 @@ def plan_maps(
         }
         data = encoded(payload)
         path = blob(artifact_root, data)
-        key = digest([payload, asdict(budget), "history-extract-v1"])
+        key = digest([payload, asdict(budget), EXTRACT_PROMPT_VERSION])
         jobs.append(
             SummaryJobSpec(
                 key,
@@ -257,6 +277,46 @@ def load_input(job: SummaryJobSpec) -> dict[str, Any]:
     return json.loads(data)
 
 
+def quote_catalog(job: SummaryJobSpec) -> dict[str, dict[str, Any]]:
+    """Derive selectable quote spans; the model never reconstructs source bytes."""
+    payload = load_input(job)
+    result = {}
+    for fragment in [*payload.get("primary", []), *payload.get("halo", [])]:
+        if not fragment.get("owner_input"):
+            continue
+        offset = fragment["start"]
+        for line in fragment["text"].splitlines(keepends=True):
+            for position in range(0, len(line), 512):
+                piece = line[position : position + 512]
+                text = piece.strip()
+                if not text:
+                    continue
+                start = offset + position + len(piece) - len(piece.lstrip())
+                end = start + len(text)
+                identity = digest([fragment["event_id"], start, end])
+                result[identity] = {
+                    "id": identity,
+                    "event_id": fragment["event_id"],
+                    "start": start,
+                    "end": end,
+                    "sha256": hashlib.sha256(text.encode()).hexdigest(),
+                    "preview": text[:80],
+                }
+            offset += len(line)
+    for child in payload.get("children", []):
+        for fact in child["summary"].get("facts", []):
+            proof = fact.get("source_quote_ref")
+            if isinstance(proof, dict) and proof.get("id"):
+                value = {**proof, "preview": fact.get("text", "")[:80]}
+                if proof["id"] in result and any(
+                    result[proof["id"]].get(key) != proof.get(key)
+                    for key in ("event_id", "start", "end", "sha256")
+                ):
+                    raise CampaignError("summary quote identity is ambiguous")
+                result[proof["id"]] = value
+    return result
+
+
 FACT_KINDS = {
     "goal",
     "owner_request",
@@ -282,17 +342,22 @@ def validate_summary(
 ) -> dict[str, Any]:
     """Validate structural fidelity; this cannot certify semantic completeness."""
     input_payload = load_input(job)
+    if not isinstance(result, dict):
+        raise SummaryResultRejected("summary result must be an object")
     if count(encoded(result).decode()) > job.output_tokens:
-        raise CampaignError("summary exceeds its qualified output budget")
+        raise SummaryResultRejected("summary exceeds its qualified output budget")
     if (
         result.get("schema_version") != 1
         or result.get("job_id") != job.id
         or result.get("input_sha256") != job.input_sha256
         or not isinstance(result.get("covered_ids"), list)
+        or not all(isinstance(value, str) for value in result["covered_ids"])
         or len(result["covered_ids"]) != len(set(result["covered_ids"]))
         or set(result["covered_ids"]) != set(job.primary_ids)
     ):
-        raise CampaignError("summary result has stale identity or incomplete primary coverage")
+        raise SummaryResultRejected(
+            "summary result has stale identity or incomplete primary coverage"
+        )
     facts = result.get("facts")
     gaps = result.get("gaps")
     if (
@@ -300,7 +365,7 @@ def validate_summary(
         or not isinstance(gaps, list)
         or not all(isinstance(gap, str) for gap in gaps)
     ):
-        raise CampaignError("summary must expose structured facts and coverage gaps")
+        raise SummaryResultRejected("summary must expose structured facts and coverage gaps")
     source = {event.id: event for event in events}
     aliases = {}
     for fragment in [*input_payload.get("primary", []), *input_payload.get("halo", [])]:
@@ -322,6 +387,7 @@ def validate_summary(
         if fragment["id"] in aliases and aliases[fragment["id"]] != fragment:
             raise CampaignError("summary input fragment identity is ambiguous")
         aliases[fragment["id"]] = fragment
+    quotes = quote_catalog(job)
     normalized = []
     for fact in facts:
         if (
@@ -330,6 +396,7 @@ def validate_summary(
             or not isinstance(fact.get("text"), str)
             or not fact["text"]
             or not isinstance(fact.get("citations"), list)
+            or ("source_quote_id" in fact and not isinstance(fact["source_quote_id"], str))
             or not fact["citations"]
             or not all(
                 isinstance(ref, str)
@@ -337,7 +404,7 @@ def validate_summary(
                 for ref in fact["citations"]
             )
         ):
-            raise CampaignError("summary fact has invalid kind/text/source citations")
+            raise SummaryResultRejected("summary fact has invalid kind/text/source citations")
         original = list(fact["citations"])
         citations = list(
             dict.fromkeys(aliases[ref]["event_id"] if ref in aliases else ref for ref in original)
@@ -348,33 +415,80 @@ def validate_summary(
             if ref in aliases
         ]
         if fact.get("authority", "context") != "context":
-            raise CampaignError("summary cannot grant approval or completion authority")
-        if fact["kind"] == "owner_request":
-            quote = fact.get("source_quote")
-            if (
-                not isinstance(quote, str)
-                or not quote
-                or not any(
-                    source[ref].record.owner_input and quote in source[ref].record.text
+            raise SummaryResultRejected("summary cannot grant approval or completion authority")
+        quote_ref = None
+        if fact["kind"] == "owner_request" or fact.get("source_quote_id"):
+            quote_id = fact.get("source_quote_id")
+            if quote_id:
+                span = quotes.get(quote_id)
+                if not span or span.get("event_id") not in citations:
+                    raise SummaryResultRejected(
+                        "owner quote span is absent from this input or its citations"
+                    )
+                event = source[span["event_id"]]
+                start, end = span.get("start"), span.get("end")
+                if (
+                    type(start) is not int
+                    or type(end) is not int
+                    or not 0 <= start < end <= len(event.record.text)
+                ):
+                    raise CampaignError("owner quote span has invalid source offsets")
+                quote = event.record.text[start:end]
+                if (
+                    not event.record.owner_input
+                    or span.get("id") != digest([event.id, start, end])
+                    or hashlib.sha256(quote.encode()).hexdigest() != span.get("sha256")
+                ):
+                    raise CampaignError("owner quote span differs from exact native owner evidence")
+                quote_ref = {key: span[key] for key in ("id", "event_id", "start", "end", "sha256")}
+            else:
+                # Retain compatibility with already-earned v1 exact quotations.
+                quote = fact.get("source_quote")
+                if not isinstance(quote, str) or not quote:
+                    raise SummaryResultRejected(
+                        "owner request requires an exact native-owner quote"
+                    )
+                matching = [
+                    source[ref]
                     for ref in citations
-                )
-            ):
-                raise CampaignError("owner request requires an exact native-owner quote")
+                    if isinstance(quote, str)
+                    and quote
+                    and source[ref].record.owner_input
+                    and quote in source[ref].record.text
+                ]
+                if not matching:
+                    raise SummaryResultRejected(
+                        "owner request requires an exact native-owner quote"
+                    )
+                event = matching[0]
+                start = event.record.text.index(quote)
+                end = start + len(quote)
+                quote_ref = {
+                    "id": digest([event.id, start, end]),
+                    "event_id": event.id,
+                    "start": start,
+                    "end": end,
+                    "sha256": hashlib.sha256(quote.encode()).hexdigest(),
+                }
         normalized.append(
             {
                 **{
                     key: value
                     for key, value in fact.items()
-                    if key not in {"original_citations", "fragment_provenance", "id"}
+                    if key
+                    not in {"original_citations", "fragment_provenance", "source_quote_ref", "id"}
                 },
                 "authority": "context",
                 "citations": citations,
+                **({"source_quote_ref": quote_ref} if quote_ref else {}),
                 **(
                     {"original_citations": original, "fragment_provenance": fragment_provenance}
                     if fragment_provenance
                     else {}
                 ),
-                "id": digest([fact["kind"], citations, fact.get("source_quote"), fact["text"]]),
+                "id": digest(
+                    [fact["kind"], citations, quote_ref or fact.get("source_quote"), fact["text"]]
+                ),
             }
         )
     return {
@@ -405,7 +519,7 @@ def plan_reduction(
         path = blob(artifact_root, data)
         jobs.append(
             SummaryJobSpec(
-                digest([payload, asdict(budget), "history-reduce-v1"]),
+                digest([payload, asdict(budget), REDUCE_PROMPT_VERSION]),
                 "handoff-reduce",
                 str(path),
                 hashlib.sha256(data).hexdigest(),
@@ -415,7 +529,7 @@ def plan_reduction(
                 tuple(job.id for job, _ in items),
                 tuple(dict.fromkeys(ref for job, _ in items for ref in job.event_ids)),
                 tuple(job.id for job, _ in items),
-                prompt_version="history-reduce-v1",
+                prompt_version=REDUCE_PROMPT_VERSION,
             )
         )
 
@@ -516,9 +630,24 @@ def plan_remaining_maps(
     return plan_maps(tuple(remaining), budget, artifact_root, **kwargs)
 
 
-def summary_schema() -> dict[str, Any]:
+def corrective_spec(
+    job: SummaryJobSpec, *, attempt: int, receipt_sha256: str, reason: str
+) -> SummaryJobSpec:
+    """A correction is another immutable job, never an edited request or source."""
+    if not 1 <= attempt <= 2 or not receipt_sha256 or not reason:
+        raise CampaignError("summary correction exceeds its bounded validation budget")
+    return replace(
+        job,
+        id=digest([job.id, attempt, receipt_sha256, reason, "summary-correction-v1"]),
+        dependencies=(*job.dependencies, job.id),
+        correction_of=job.id,
+        correction_reason=reason,
+    )
+
+
+def summary_schema(job: SummaryJobSpec | None = None) -> dict[str, Any]:
     """Portable structured-output schema; semantic/source checks remain local."""
-    return {
+    schema: dict[str, Any] = {
         "type": "object",
         "required": ["schema_version", "job_id", "input_sha256", "covered_ids", "facts", "gaps"],
         "properties": {
@@ -544,6 +673,28 @@ def summary_schema() -> dict[str, Any]:
         },
     }
 
+    if job is not None:
+        props = schema["properties"]
+        props["job_id"]["enum"] = [job.id]
+        props["input_sha256"]["enum"] = [job.input_sha256]
+        props["covered_ids"] = {
+            "type": "array",
+            "items": {"type": "string", "enum": list(job.primary_ids)},
+            "minItems": len(job.primary_ids),
+            "maxItems": len(job.primary_ids),
+        }
+        facts = props["facts"]["items"]
+        facts["properties"]["citations"]["items"]["enum"] = list(job.event_ids)
+        catalog = quote_catalog(job)
+        facts["properties"].pop("source_quote")
+        facts["properties"]["source_quote_id"] = {"type": "string", "enum": ["", *catalog]}
+        facts["required"].append("source_quote_id")
+        if not catalog:
+            facts["properties"]["kind"]["enum"] = sorted(FACT_KINDS - {"owner_request"})
+        facts["additionalProperties"] = False
+        schema["additionalProperties"] = False
+    return schema
+
 
 def summary_prompt(job: SummaryJobSpec) -> str:
     return (
@@ -552,16 +703,28 @@ def summary_prompt(job: SummaryJobSpec) -> str:
         "Preserve goals, exact owner requests, corrections, constraints, unresolved "
         "acceptance, failures, decisions, contradictions and supersession, files, "
         "branches, PRs, pending effects and next actions. Do not infer approval or "
-        "completion. Cite native event IDs; owner_request facts require exact source_quote. "
+        "completion. Cite only the supplied native event_id values, never fragment IDs. "
+        "For owner_request facts choose a source_quote_id listed in the quote catalog; the controller "
+        "extracts exact source bytes. Only native owner_input=true evidence may be an owner "
+        "request; quoted or agent-provided directions remain contextual goals/constraints. "
+        "Use an empty source_quote_id for other fact kinds. Do not reconstruct quote strings. "
         "Keep conflicting interpretations. Halo is context, not another primary obligation. "
         "Return coverage of every primary fragment (or child job for reduction); report "
         "missing input or ambiguity in gaps. No tools or external writes. Return only "
         "the schema-conforming JSON result. "
+        + (
+            "A prior completed attempt was rejected: "
+            + job.correction_reason
+            + ". Correct the result using the same immutable source; do not change or reinterpret source evidence. "
+            if job.correction_reason
+            else ""
+        )
         + encoded(
             {
                 "job_id": job.id,
                 "input_sha256": job.input_sha256,
                 "primary_ids": job.primary_ids,
+                "quote_catalog": quote_catalog(job),
                 "schema": summary_schema(),
             }
         ).decode()

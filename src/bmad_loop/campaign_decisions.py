@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from . import verify
+from .campaign_action_history import action as historical_action
 from .campaign_model import CampaignError, CampaignSnapshot, EvidenceCoordinates, Hold
 from .campaign_store import add_action, add_event
 from .platform_util import atomic_write_text
@@ -472,7 +473,7 @@ def apply_decision(snapshot: CampaignSnapshot, unit_id: str, receipt: DecisionRe
     receipts = snapshot.bindings.setdefault("decision_receipts", {})
     receipts[receipt.id] = asdict(receipt)
     projection = "decision-project:" + receipt.id
-    if not any(action.id == projection for action in snapshot.outbox):
+    if historical_action(snapshot, projection) is None:
         add_action(
             snapshot, "decision-project", unit_id, {"decision_id": receipt.id}, action_id=projection
         )

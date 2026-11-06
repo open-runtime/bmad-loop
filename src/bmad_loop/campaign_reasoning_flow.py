@@ -15,6 +15,27 @@ from .campaign_store import add_event
 from .campaign_supervisor import Observation, Proposal
 
 PREFIX = "reasoning-"
+WORKSPACE_WAIT = "Waiting for an owned Paradev workspace; unit allocation will resume this job"
+
+
+def presentation(snapshot, request):
+    """Bind read-only jobs to an existing owned workspace, never the coordinator's cwd."""
+    if not snapshot.spec.paradev.reflect:
+        return None
+    from .campaign_reflection_flow import workspace_binding
+
+    units = (
+        [snapshot.units[request.unit]]
+        if request.unit in snapshot.units
+        else sorted(
+            snapshot.units.values(), key=lambda unit: (unit.spec.kind != "planning", unit.id)
+        )
+    )
+    for unit in units:
+        if unit.bindings.get("native"):
+            binding = workspace_binding(unit)
+            return {"workspace": binding.path, "workspace_id": binding.workspace_id}
+    return None
 
 
 def pending(snapshot, job_id: str, kind: str) -> bool:
@@ -74,6 +95,14 @@ def proposals(runtime, snapshot) -> tuple[Proposal, ...]:
         if row.get("retry_at") and row["retry_at"] > runtime.clock():
             continue
         if pending(snapshot, job_id, "reasoning-launch"):
+            continue
+        if snapshot.spec.paradev.reflect and presentation(snapshot, request) is None:
+            # Preparing the first unit supplies a native workspace. Optional
+            # portfolio jobs wait without consuming a failed-attempt budget.
+            if row.get("reason") != WORKSPACE_WAIT and not pending(
+                snapshot, job_id, "reasoning-wait"
+            ):
+                result.append(Proposal("reasoning-wait", request.unit, {"job_id": job_id}))
             continue
         if not current(snapshot, request):
             result.append(Proposal("reasoning-stale", request.unit, {"job_id": job_id}))
@@ -142,8 +171,14 @@ def prepare_effect(runtime, snapshot, action) -> None:
         "started_at": runtime.clock(),
         "status": "prepared",
     }
+    if snapshot.spec.paradev.reflect:
+        view = presentation(snapshot, request)
+        if view is None:
+            raise CampaignError("Reasoning terminal awaits an owned native workspace")
+        row["claim"]["presentation"] = view
     row["selection"] = action.payload["candidate"]
     row["receipt"] = None
+    row["reason"] = ""
     row["state"] = "prepared"
     row["updated_at"] = runtime.clock()
     selections = snapshot.bindings.setdefault("role_selections", {})
@@ -170,7 +205,7 @@ def perform(runtime, snapshot, action, *, reconcile: bool = False) -> Observatio
 
     row = snapshot.jobs[action.payload["job_id"]]
     request = request_from_dict(row["request"])
-    if action.kind in {"reasoning-stale", "reasoning-apply"}:
+    if action.kind in {"reasoning-stale", "reasoning-apply", "reasoning-wait"}:
         return Observation("confirmed", {})
     claim = row.get("claim") or {}
     path = Path(claim["run_dir"]) / "request.json"
@@ -193,6 +228,7 @@ def perform(runtime, snapshot, action, *, reconcile: bool = False) -> Observatio
                     capability,
                     launch_id=claim["launch_id"],
                     generation=claim["generation"],
+                    presentation=claim.get("presentation"),
                 )
             except (CampaignError, OSError, ValueError) as exc:
                 # No launch has been attempted; this is a typed preparation
@@ -235,7 +271,10 @@ def apply(runtime, snapshot, action, observation) -> None:
     row = snapshot.jobs[action.payload["job_id"]]
     request = request_from_dict(row["request"])
     data = observation.data
-    if action.kind == "reasoning-stale":
+    if action.kind == "reasoning-wait":
+        if not live(row):
+            row["reason"] = WORKSPACE_WAIT
+    elif action.kind == "reasoning-stale":
         if live(row):
             raise CampaignError("cannot invalidate a live reasoning claim")
         row["state"], row["validation"], row["reason"] = (
@@ -302,7 +341,13 @@ def apply(runtime, snapshot, action, observation) -> None:
     else:
         row["state"] = "running"
         row["claim"]["status"] = "running"
-        row["claim"].update({key: data[key] for key in ("native_id", "run_dir") if key in data})
+        row["claim"].update(
+            {
+                key: data[key]
+                for key in ("native_id", "run_dir", "presentation_status")
+                if key in data
+            }
+        )
     row["observed_at"] = runtime.clock()
     row["updated_at"] = runtime.clock()
     add_event(

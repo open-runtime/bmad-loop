@@ -241,6 +241,25 @@ def test_history_reads_saved_events_without_starting_runtime(runtime, capsys):
     assert calls == []
 
 
+def test_history_reads_archived_action_receipts_without_starting_runtime(runtime, capsys):
+    from bmad_loop.campaign_store import add_action
+
+    store, snapshot, calls = runtime
+    for identity in ("old", "new"):
+        row = add_action(snapshot, "github", "s:e:u", {}, action_id=identity)
+        row.state = "confirmed"
+        snapshot = store.save(snapshot, snapshot.revision)
+    assert (
+        cli.main(["campaign", "history", snapshot.id, "--actions", "--unit", "s:e:u", "--json"])
+        == 0
+    )
+    result = json.loads(capsys.readouterr().out)
+    assert result["scope"] == "archived-actions"
+    assert [row["action"]["id"] for row in result["actions"]] == ["old"]
+    assert result["next_after"] == 1
+    assert calls == []
+
+
 def test_normal_cli_runtime_binds_transcript_provider(runtime):
     from bmad_loop import campaign_runtime
     from bmad_loop.campaign_cli import _runtime

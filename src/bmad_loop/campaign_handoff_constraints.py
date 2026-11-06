@@ -7,11 +7,14 @@ context and cannot waive canonical acceptance or confer approval.
 
 from __future__ import annotations
 
+import copy
+
 from .campaign_model import CampaignError
 from .campaign_transcripts import digest, encoded
 
 REDUCTION_SCHEMA = {
     "type": "object",
+    "additionalProperties": False,
     "required": ["handoff_id", "capture_digest", "covered_ids", "groups", "ambiguities"],
     "properties": {
         "handoff_id": {"type": "string"},
@@ -22,6 +25,7 @@ REDUCTION_SCHEMA = {
             "type": "array",
             "items": {
                 "type": "object",
+                "additionalProperties": False,
                 "required": ["text", "refs"],
                 "properties": {
                     "text": {"type": "string", "minLength": 1},
@@ -34,6 +38,7 @@ REDUCTION_SCHEMA = {
 
 AUDIT_SCHEMA = {
     "type": "object",
+    "additionalProperties": False,
     "required": ["handoff_id", "capture_digest", "covered_ids", "verdict", "ambiguities"],
     "properties": {
         "handoff_id": {"type": "string"},
@@ -43,6 +48,50 @@ AUDIT_SCHEMA = {
         "ambiguities": {"type": "array", "items": {"type": "string"}},
     },
 }
+
+
+def bound_schema(schema, inputs):
+    """Constrain native generation to this input's IDs; local checks still verify coverage."""
+    result = copy.deepcopy(schema)
+    properties = result["properties"]
+    for key in ("handoff_id", "capture_digest"):
+        properties[key]["enum"] = [inputs[key]]
+    identities = {}
+    if "nodes" in inputs:
+        identities["covered_ids"] = [row["id"] for row in inputs["nodes"]]
+        if "groups" in properties:
+            properties["groups"]["items"]["properties"]["refs"]["items"]["enum"] = identities[
+                "covered_ids"
+            ]
+    if "sources" in inputs:
+        identities.update(
+            covered_evidence_ids=[row["id"] for row in inputs["sources"]],
+            obligation_ids=inputs["obligation_ids"],
+            missing_history_ids=[row["id"] for row in inputs["missing_history"]],
+        )
+        if "constraints" in properties:
+            if identities["covered_evidence_ids"]:
+                properties["constraints"]["items"]["properties"]["source_id"]["enum"] = identities[
+                    "covered_evidence_ids"
+                ]
+            else:
+                properties["constraints"]["maxItems"] = 0
+        if "authority_basis" in properties:
+            authority = [
+                row["id"]
+                for row in inputs["sources"]
+                if row.get("origin_verified")
+                and row.get("authority") in {"owner", "adopted_policy", "delegation"}
+            ]
+            if authority:
+                properties["authority_basis"]["items"]["enum"] = authority
+            else:
+                properties["authority_basis"]["maxItems"] = 0
+    for key, values in identities.items():
+        properties[key].update(minItems=len(values), maxItems=len(values))
+        if values:
+            properties[key]["items"]["enum"] = values
+    return result
 
 
 def partition(rows, bound, *, max_nodes=None):

@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from . import verify
+from .campaign_action_history import action as historical_action
 from .campaign_model import CampaignError, SourceSelector, UnitSpec
 from .platform_util import atomic_write_text, is_link_like, safe_segment
 
@@ -486,16 +487,10 @@ def request(runtime, snapshot, unit, launch_id: str) -> tuple[Path, dict[str, An
         }.items()
     ):
         raise CampaignError("checkpoint launch binding differs")
-    launch = next(
-        (
-            action
-            for action in snapshot.outbox
-            if action.id == launch_id and action.kind == "launch"
-        ),
-        None,
-    )
+    launch = historical_action(snapshot, launch_id)
     if (
         launch is None
+        or launch.kind != "launch"
         or not all(key in launch.payload for key in ("checkpoint_base", "checkpoint_paths"))
         or any(
             value.get(key, []) != launch.payload.get(key, [])

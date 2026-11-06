@@ -173,8 +173,8 @@ def recovery_result(inputs, *, ready):
     }
 
 
-@pytest.mark.parametrize("authority", [False, True])
-def test_missing_history_attempts_readonly_recovery_before_escalation(campaign, authority):
+@pytest.mark.parametrize("authority,large", [(False, False), (True, False), (True, True)])
+def test_missing_history_attempts_readonly_recovery_before_escalation(campaign, authority, large):
     runtime, snapshot, unit, receipt = campaign
     runtime.project = Path(unit.bindings["workspace"])
     snapshot.spec = dataclasses.replace(
@@ -184,12 +184,18 @@ def test_missing_history_attempts_readonly_recovery_before_escalation(campaign, 
         policy = runtime.project / "CURRENT.md"
         policy.write_text(
             "This adopted policy is the complete current contract: retain every accepted feature and commit history. Prior conversation is historical context, not additional current requirements."
+            + (" Retain every required test." * 100 if large else "")
         )
         git(runtime.project, "add", "CURRENT.md")
         git(runtime.project, "commit", "-qm", "adopt complete current contract")
         snapshot.spec = dataclasses.replace(
             snapshot.spec,
             decisions=dataclasses.replace(snapshot.spec.decisions, sources=("CURRENT.md",)),
+        )
+    if large:
+        snapshot.spec = dataclasses.replace(
+            snapshot.spec,
+            reasoning=dataclasses.replace(snapshot.spec.reasoning, packet_token_limit=10000),
         )
     Path(receipt["sessions"][0]["transcript_path"]).unlink()
     flow.intercept_terminal(runtime, snapshot, unit, receipt)
@@ -229,11 +235,51 @@ def test_missing_history_attempts_readonly_recovery_before_escalation(campaign, 
     step(runtime, snapshot, unit, "handoff-audit-plan")
     complete_audits(runtime, snapshot, unit)
     step(runtime, snapshot, unit, "handoff-assemble")
+    if large:
+        assert value["phase"] == "constraint_reduce"
+        complete(
+            runtime,
+            snapshot,
+            unit,
+            "constraint_jobs",
+            lambda inputs: {
+                **audit_identity(inputs),
+                "covered_ids": [row["id"] for row in inputs["nodes"]],
+                "groups": [
+                    {
+                        "text": "Retain every accepted feature, published commit and required test. Adopted policy establishes the complete current contract; prior conversation is historical context only.",
+                        "refs": [row["id"] for row in inputs["nodes"]],
+                    }
+                ],
+                "ambiguities": [],
+            },
+        )
+        step(runtime, snapshot, unit, "handoff-constraint-audit")
+        complete(
+            runtime,
+            snapshot,
+            unit,
+            "constraint_audits",
+            lambda inputs: {
+                **audit_identity(inputs),
+                "covered_ids": [row["id"] for row in inputs["nodes"]],
+                "verdict": "faithful",
+                "ambiguities": [],
+            },
+        )
+        step(runtime, snapshot, unit, "handoff-assemble")
+        assert value["phase"] == "assemble", (value["phase"], unit.hold.reason)
     step(runtime, snapshot, unit, "handoff-release")
     packet = json.loads(Path(value["packet"]["path"]).read_text())
     assert packet["missing_native_history"]
     assert packet["current_contract_recovery"]["missing_history_retained"]
-    assert packet["recovered_constraints"]
+    if large:
+        index = json.loads(Path(packet["recovered_constraints_index"]["path"]).read_text())
+        assert index[0]["source_quote"] == policy.read_text()
+        assert packet["resolved_constraints"][0]["authority"] == "context-only"
+        assert len(Path(value["packet"]["path"]).read_bytes()) <= 10000
+    else:
+        assert packet["recovered_constraints"]
     assert unit.hold is None and value["phase"] == "ready"
 
 
@@ -448,3 +494,74 @@ def test_history_native_receipt_cannot_be_relabelled_as_contract_proof(
     cap["semantic_qualification"]["sha256"] = file_digest(path)
     with pytest.raises(flow.HandoffRouteWait, match="did not review this contract"):
         flow.validate_fidelity_qualification(cap, contract=contract)
+
+
+def test_quota_replan_preserves_sibling_semantic_failures_and_bounds_limits(campaign):
+    from bmad_loop.campaign_jobs import prepare, request_from_dict
+    from bmad_loop.campaign_model import OutboxAction
+
+    runtime, snapshot, unit, receipt = campaign
+    flow.intercept_terminal(runtime, snapshot, unit, receipt)
+    step(runtime, snapshot, unit, "handoff-capture")
+    step(runtime, snapshot, unit, "handoff-plan")
+    value = unit.evidence["handoff"]
+    original = snapshot.jobs[value["jobs"][0]]
+    original.update(state="failed", failure_attempts=1, receipt={"outcome": "completed"})
+    sibling = prepare(
+        snapshot, dataclasses.replace(request_from_dict(original["request"]), id="quota-sibling")
+    )
+    sibling.update(state="capacity_wait", receipt={"outcome": "quota"})
+    value["jobs"].append(sibling["id"])
+    assert flow.proposals(runtime, snapshot)[0].kind == "handoff-replan"
+    step(runtime, snapshot, unit, "handoff-replan")
+    replacement = snapshot.jobs[value["jobs"][0]]
+    assert replacement["id"] != original["id"]
+    assert replacement["failure_attempts"] == 1
+    for failures in range(2, snapshot.spec.reasoning.max_attempts):
+        replacement.update(state="failed", failure_attempts=failures, receipt={"outcome": "limit"})
+        step(runtime, snapshot, unit, "handoff-replan")
+        replacement = snapshot.jobs[value["jobs"][0]]
+        assert replacement["failure_attempts"] == failures
+    replacement.update(
+        state="failed",
+        failure_attempts=snapshot.spec.reasoning.max_attempts,
+        receipt={"outcome": "limit"},
+    )
+    proposed = flow.proposals(runtime, snapshot)[0]
+    assert proposed.kind == "handoff-failed"
+    action = OutboxAction("exhausted", proposed.kind, unit.id, proposed.payload, 0)
+    flow.apply(runtime, snapshot, action, flow.perform(runtime, snapshot, action))
+    assert value["phase"] == "failed" and "lifetime" in unit.hold.reason
+    assert not flow.proposals(runtime, snapshot)
+
+
+def test_bound_contract_schemas_use_exact_ids_without_empty_enums():
+    from bmad_loop.campaign_handoff_constraints import bound_schema
+    from bmad_loop.campaign_handoff_recovery import SCHEMA
+    from bmad_loop.campaign_jobs import validate_result, validate_schema
+
+    inputs = {
+        "handoff_id": "h",
+        "capture_digest": "c",
+        "sources": [],
+        "obligation_ids": [],
+        "missing_history": [{"id": "missing"}],
+    }
+    schema = bound_schema(SCHEMA, inputs)
+    validate_schema(schema)
+    result = {
+        "handoff_id": "h",
+        "capture_digest": "c",
+        "covered_evidence_ids": [],
+        "obligation_ids": [],
+        "missing_history_ids": ["missing"],
+        "disposition": "needs_owner_evidence",
+        "constraints": [],
+        "authority_basis": [],
+        "unresolved": ["No authenticated current contract is available"],
+    }
+    validate_result(result, schema)
+    assert '"enum": []' not in json.dumps(schema)
+    result["covered_evidence_ids"] = ["outer-transport-source"]
+    with pytest.raises(CampaignError):
+        validate_result(result, schema)

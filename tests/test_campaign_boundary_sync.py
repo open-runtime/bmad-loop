@@ -483,9 +483,11 @@ def test_production_post_stage_api_failure_releases_actor_and_recovers_without_a
     case.service.request = request
     result = run_case(case)
     assert result.phase == "delivered" and fault["quiescent"]
+    from bmad_loop.campaign_action_history import actions
+
     launches = [
         row.id
-        for row in result.outbox
+        for row in actions(result)
         if row.kind == "launch"
         and row.unit == fault["unit"]
         and row.payload.get("stage") == "admission_review"
@@ -498,5 +500,6 @@ def test_production_post_stage_api_failure_releases_actor_and_recovers_without_a
         for event in result.events
     )
     assert any(
-        row.kind == "github" and row.payload.get("purpose") == "transition" for row in result.outbox
+        row.kind == "github" and row.payload.get("purpose") == "transition"
+        for row in actions(result)
     )

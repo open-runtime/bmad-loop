@@ -11,7 +11,7 @@ from test_campaign_runtime import diagnose
 from test_campaign_runtime import production_case as production_case
 
 from bmad_loop.campaign_headless import HeadlessRunner, read_json
-from bmad_loop.campaign_summary import SummaryJobSpec, load_input
+from bmad_loop.campaign_summary import SummaryJobSpec, load_input, quote_catalog
 from bmad_loop.campaign_supervisor import CampaignSupervisor
 from bmad_loop.campaign_transcripts import HistorySnapshot, load_events
 
@@ -39,7 +39,11 @@ class ScriptedReasoning:
                     {
                         "kind": "owner_request",
                         "text": row["text"],
-                        "source_quote": row["text"],
+                        "source_quote_id": next(
+                            key
+                            for key, value in quote_catalog(spec).items()
+                            if value["event_id"] == row["event_id"]
+                        ),
                         "citations": [row["event_id"]],
                     }
                     for row in source["primary"]

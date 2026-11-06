@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import verify
+from .campaign_action_history import actions as historical_actions
 from .campaign_model import CampaignError, CampaignSnapshot
 
 
@@ -71,7 +72,9 @@ def _owned(
         ).decode().strip() != ref:
             raise CampaignError("planning branch ownership differs from its registered workspace")
         heads = {unit.bindings.get("head"), unit.bindings.get("last_pushed_head")}
-        for action in snapshot.outbox:
+        for action in historical_actions(
+            snapshot, unit=unit.id, kinds=("push", "checkpoint", "prepare-unit", "github")
+        ):
             if action.unit == unit.id and action.kind in {"push", "checkpoint", "prepare-unit"}:
                 heads.update(
                     (

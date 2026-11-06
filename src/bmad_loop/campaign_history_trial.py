@@ -27,10 +27,14 @@ from .campaign_headless import (
 from .campaign_jobs import JobLimits, JobRequest
 from .campaign_model import CampaignError, RoleCandidate
 from .campaign_summary import (
+    EXTRACT_PROMPT_VERSION,
+    REDUCE_PROMPT_VERSION,
     ContextBudget,
     SummaryJobSpec,
-    plan_maps,
+    SummaryResultRejected,
+    corrective_spec,
     plan_reduction,
+    plan_remaining_maps,
     summary_prompt,
     summary_schema,
     validate_summary,
@@ -65,7 +69,7 @@ def trial_request(
         ),
         prompt=summary_prompt(job)
         + f" Keep the complete JSON result below {job.output_tokens} UTF-8 bytes. Be concise while preserving required facts and all coverage IDs.",
-        output_schema=summary_schema(),
+        output_schema=summary_schema(job),
         limits=JobLimits(capability["input_tokens"], job.output_tokens, 1, timeout_s),
         candidates=(candidate,),
         dependencies=job.dependencies,
@@ -73,7 +77,49 @@ def trial_request(
     )
 
 
-def _one(job, snapshots, events, capability, directory, timeout_s, runner):
+def _observed_receipt(request_path, runner, observation=None):
+    """Persist terminal-death proof separately from the child's earlier receipt."""
+    directory = request_path.parent
+    raw_path = directory / "receipt.json"
+    path, binding_path = (
+        directory / "observed-receipt.json",
+        directory / "observed-receipt-binding.json",
+    )
+    if path.exists() and binding_path.exists():
+        binding = read_json(binding_path)
+        if binding.get("native_receipt_sha256") != file_digest(raw_path) or binding.get(
+            "observed_sha256"
+        ) != file_digest(path):
+            raise CampaignError("Observed native lifecycle receipt changed")
+        receipt = read_json(path)
+    else:
+        observation = observation or runner.observe(request_path)
+        receipt = observation.get("receipt", {})
+        if (
+            observation.get("state") != "finished"
+            or receipt.get("quiescent") is not True
+            or receipt.get("processes_quiescent") is not True
+        ):
+            raise CampaignError("Native terminal lifecycle is not proven quiescent")
+        write_json(path, receipt)
+        write_json(
+            binding_path,
+            {
+                "schema_version": 1,
+                "native_receipt_sha256": file_digest(raw_path),
+                "observed_sha256": file_digest(path),
+            },
+        )
+    envelope = read_json(request_path)
+    if (
+        receipt.get("request_digest") != envelope["request_digest"]
+        or receipt.get("launch_id") != envelope["launch_id"]
+    ):
+        raise CampaignError("Observed lifecycle belongs to another immutable request")
+    return receipt
+
+
+def _single_attempt(job, snapshots, events, capability, directory, timeout_s, runner):
     destination = directory / "jobs" / job.id
     destination.mkdir(parents=True, exist_ok=True, mode=0o700)
     with file_lock(destination / "trial.lock"):
@@ -83,7 +129,7 @@ def _one(job, snapshots, events, capability, directory, timeout_s, runner):
         if validated_path.exists():
             # Revalidate the original result and native receipt, not a mutable cache verdict.
             saved = read_json(validated_path)
-            receipt = read_json(destination / "receipt.json")
+            receipt = _observed_receipt(request_path, runner)
             if saved["receipt_sha256"] != file_digest(destination / "receipt.json"):
                 raise CampaignError("Trial receipt changed after validation")
             validated = validate_summary(job, receipt["result"], events)
@@ -108,7 +154,7 @@ def _one(job, snapshots, events, capability, directory, timeout_s, runner):
                     "Native trial timed out; cancellation requested, resume for quiescence readback"
                 )
             time.sleep(0.2)
-        receipt = observation.get("receipt", {})
+        receipt = _observed_receipt(request_path, runner, observation)
         if (
             receipt.get("outcome") != "completed"
             or receipt.get("input_complete") is not True
@@ -134,6 +180,80 @@ def _one(job, snapshots, events, capability, directory, timeout_s, runner):
         return job, validated
 
 
+def _one(job, snapshots, events, capability, directory, timeout_s, runner):
+    original = job
+    for attempt in range(3):
+        try:
+            return _single_attempt(job, snapshots, events, capability, directory, timeout_s, runner)
+        except SummaryResultRejected as exc:
+            destination = directory / "jobs" / job.id
+            receipt_path = destination / "receipt.json"
+            receipt = read_json(receipt_path)
+            if (
+                receipt.get("outcome") != "completed"
+                or receipt.get("processes_quiescent") is not True
+            ):
+                raise CampaignError(
+                    "Correction requires a completed, quiescent native attempt"
+                ) from exc
+            rejected = {
+                "schema_version": 1,
+                "root_job_id": original.id,
+                "job_id": job.id,
+                "attempt": attempt,
+                "reason": str(exc),
+                "receipt_sha256": file_digest(receipt_path),
+            }
+            write_json(destination / "rejected.json", rejected)
+            if attempt == 2:
+                raise SummaryResultRejected(
+                    "Summary validation budget exhausted after two corrective jobs: " + str(exc)
+                ) from exc
+            job = corrective_spec(
+                original,
+                attempt=attempt + 1,
+                receipt_sha256=rejected["receipt_sha256"],
+                reason=str(exc),
+            )
+    raise AssertionError("bounded summary attempts did not terminate")
+
+
+def _reuse_maps(roots, events, capability, runner):
+    completed = {}
+    for root in roots:
+        for path in sorted((root / "jobs").glob("*/validated.json")):
+            saved = read_json(path)
+            envelope = read_json(path.parent / "request.json")
+            receipt_path = path.parent / "receipt.json"
+            receipt = _observed_receipt(path.parent / "request.json", runner)
+            spec = SummaryJobSpec(**envelope["request"]["coordinates"]["summary_spec"])
+            if spec.purpose != "handoff-map":
+                continue
+            if (
+                envelope["capability"]["profile"] != capability["profile"]
+                or envelope["capability"]["model"] != capability["model"]
+            ):
+                raise CampaignError(
+                    "Reused summary route differs from this explicitly selected route"
+                )
+            if (
+                saved["receipt_sha256"] != file_digest(receipt_path)
+                or saved["artifact_sha256"] != file_digest(Path(saved["artifact_path"]))
+                or receipt.get("request_digest") != envelope["request_digest"]
+                or receipt.get("launch_id") != envelope["launch_id"]
+            ):
+                raise CampaignError("Reused summary native receipt/artifact binding changed")
+            if (
+                receipt.get("outcome") != "completed"
+                or receipt.get("quiescent") is not True
+                or receipt.get("processes_quiescent") is not True
+                or receipt.get("input_complete") is not True
+            ):
+                raise CampaignError("Reused summary lacks completed native lifecycle proof")
+            completed[spec.id] = (spec, validate_summary(spec, receipt["result"], events))
+    return tuple(completed.values())
+
+
 def run_trial(
     snapshot_path: Path,
     capability_path: Path,
@@ -143,6 +263,7 @@ def run_trial(
     timeout_s=600,
     execute=True,
     runner=None,
+    reuse_directory: Path | None = None,
 ) -> dict[str, Any]:
     """Process all sealed sources; no aggregate token ceiling or silent partial success."""
     if not 1 <= parallel <= 16 or not 1 <= timeout_s <= 3600 or is_link_like(directory):
@@ -155,6 +276,13 @@ def run_trial(
         raise CampaignError("Trial requires explicit sealed source snapshots")
     snapshots = tuple(HistorySnapshot(**row) for row in document["snapshots"])
     events = merge_lineage_events(snapshots)
+    runner = runner or HeadlessRunner()
+    reusable = _reuse_maps(
+        (directory, reuse_directory) if reuse_directory else (directory,),
+        events,
+        capability,
+        runner,
+    )
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     # Source JSON becomes a string inside the native request. Leave space for
     # escaping, source IDs, schema, and the exact primary-coverage list.
@@ -170,8 +298,14 @@ def run_trial(
     )
     path = directory / "binding.json"
     with file_lock(directory / "trial.lock"):
+        if path.exists():
+            prior = read_json(path)
+            budget = ContextBudget(**prior["budget"])
+            payload = budget.payload_tokens
         while True:
-            jobs = plan_maps(events, budget, directory / "inputs", overlap_tokens=payload // 8)
+            jobs = plan_remaining_maps(
+                events, reusable, budget, directory / "inputs", overlap_tokens=payload // 8
+            )
             try:
                 for job in jobs:
                     render_input(trial_request(job, capability, snapshots, timeout_s), capability)
@@ -200,6 +334,9 @@ def run_trial(
             "capability_sha256": file_digest(capability_path),
             "budget": asdict(budget),
             "timeout_s": timeout_s,
+            "reuse_directory": str(reuse_directory.absolute()) if reuse_directory else "",
+            "prompt_versions": [EXTRACT_PROMPT_VERSION, REDUCE_PROMPT_VERSION],
+            "correction_budget": 2,
         }
         if path.exists() and read_json(path) != binding:
             raise CampaignError(
@@ -217,8 +354,10 @@ def run_trial(
             "source_count": len(snapshots),
             "source_bytes": sum(s.captured_bytes for s in snapshots),
             "unique_events": sum(not e.duplicate_of for e in events),
-            "map_jobs": len(jobs),
-            "completed_jobs": 0,
+            "map_jobs": len(jobs) + len(reusable),
+            "new_map_jobs": len(jobs),
+            "reused_jobs": len(reusable),
+            "completed_jobs": len(reusable),
             "semantic_fidelity": "unqualified",
             "problems": [],
         }
@@ -226,10 +365,9 @@ def run_trial(
         if not execute:
             return report
         runner = runner or HeadlessRunner()
-        completed = []
         layer = 0
-        while jobs:
-            current, problems = [], []
+        while True:
+            current, problems = (list(reusable) if layer == 0 else []), []
             # Every submitted job has a bounded native lifecycle. A failed job
             # stops new admissions while existing futures drain and keep receipts.
             with ThreadPoolExecutor(max_workers=parallel) as pool:
@@ -279,9 +417,16 @@ def run_trial(
             if problems:
                 report.update(state="incomplete", problems=problems, layer=layer)
                 break
-            order = {job.id: index for index, job in enumerate(jobs)}
-            current.sort(key=lambda pair: order[pair[0].id])
-            completed.extend(current)
+            event_order = {event.id: index for index, event in enumerate(events)}
+            current.sort(
+                key=lambda pair: (
+                    min(
+                        (event_order.get(ref, len(events)) for ref in pair[0].event_ids),
+                        default=len(events),
+                    ),
+                    pair[0].id,
+                )
+            )
             # A final collection may contain several summaries. No promise of a
             # single giant prompt; exact source indexes remain separately retrievable.
             if sum(len(encoded(result)) for _, result in current) <= 160000:
@@ -293,7 +438,7 @@ def run_trial(
                 )
                 break
             next_jobs = plan_reduction(tuple(current), budget, directory / "inputs")
-            if len(next_jobs) >= len(jobs):
+            if len(next_jobs) >= len(current) or layer >= 8:
                 report.update(
                     state="incomplete",
                     problems=[
@@ -307,7 +452,14 @@ def run_trial(
             jobs = next_jobs
             layer += 1
         report["usage"] = {}
-        for receipt_path in (directory / "jobs").glob("*/receipt.json"):
+        roots = (directory, reuse_directory) if reuse_directory else (directory,)
+        receipt_paths = {
+            p.resolve() for root in roots for p in (root / "jobs").glob("*/receipt.json")
+        }
+        report["usage_unknown_jobs"] = 0
+        for receipt_path in receipt_paths:
+            if not read_json(receipt_path).get("usage_known"):
+                report["usage_unknown_jobs"] += 1
             for key, value in read_json(receipt_path).get("usage", {}).items():
                 if type(value) in (int, float):
                     report["usage"][key] = report["usage"].get(key, 0) + value

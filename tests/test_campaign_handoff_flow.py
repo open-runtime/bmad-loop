@@ -51,7 +51,11 @@ def campaign(prepared, project, tmp_path):
         if execution:
             value["argv"] = [*value["argv"], "{grants_path}"]
         from bmad_loop.campaign_headless import file_digest, write_json
-        from bmad_loop.campaign_summary import summary_schema
+        from bmad_loop.campaign_summary import (
+            EXTRACT_PROMPT_VERSION,
+            REDUCE_PROMPT_VERSION,
+            summary_schema,
+        )
         from bmad_loop.campaign_transcripts import READER_VERSIONS, digest
 
         corpus = [
@@ -100,7 +104,7 @@ def campaign(prepared, project, tmp_path):
             "audit_schema_digest": digest(flow.AUDIT_SCHEMA),
             "constraint_schemas_digest": digest([REDUCTION_SCHEMA, CONSTRAINT_AUDIT_SCHEMA]),
             "recovery_schemas_digest": digest([RECOVERY_SCHEMA, RECOVERY_AUDIT_SCHEMA]),
-            "prompt_versions": ["history-extract-v1", "history-reduce-v1"],
+            "prompt_versions": [EXTRACT_PROMPT_VERSION, REDUCE_PROMPT_VERSION],
             "structural_pass": True,
             "corpus": corpus,
             "independent_review": {
@@ -565,6 +569,10 @@ def test_semantic_failure_retries_same_job_without_resetting_failure_budget(camp
     assert not flow.proposals(runtime, snapshot)
     assert flow.job_launch_allowed(snapshot, row)
     row["failure_attempts"] = snapshot.spec.reasoning.max_attempts
+    assert flow.proposals(runtime, snapshot)[0].kind == "handoff-failed"
+    proposed = flow.proposals(runtime, snapshot)[0]
+    action = OutboxAction("exhausted", proposed.kind, unit.id, proposed.payload, 0)
+    flow.apply(runtime, snapshot, action, flow.perform(runtime, snapshot, action))
     assert not flow.proposals(runtime, snapshot)
     # The shared reasoning admission applies this unchanged terminal attempt
     # budget. No replacement identity can erase failed semantic attempts.

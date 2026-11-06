@@ -147,6 +147,18 @@ reasoning jobs out of the hot snapshot. Retain current outbox semantics and
 introduce indexed historical access before pruning anything needed for adoption,
 reconciliation or checkpoint proofs. Large artifacts remain content-addressed files.
 
+Storage version 3 archives repeated terminal effect payloads transactionally.
+Keep prepared/uncertain effects, current claim references and the latest terminal
+record per unit/kind hot. Indexed historical reads preserve creation order,
+exact native IDs and confirmation evidence, with visibility bounded by the
+reader's saved revision. Own-comment filtering, metadata preimages, hierarchy
+receipts, checkpoint provenance and deterministic action deduplication must use
+these reads. Export and paginated action history retain all archived receipts.
+SQLite version 2 remains readable; its next save upgrades the database before
+publishing the version 3 marker. Both the old-marker/new-database crash window
+and old-reader refusal are tested. A newer marker over an older database is an
+invalid authority binding.
+
 Use short transactions and per-thread or short-lived connections; perform no Git,
 network or model operation inside a transaction. Preserve permissions and symlink
 protections. Use SQLite's consistent backup mechanism, not a bare database-file
@@ -408,6 +420,13 @@ otherwise remain started while workspace tags and BMAD status expose their hold.
 Hcom observations have bounded event/transcript cursors and operate independently
 of Paradev reflection without peer wakeups.
 
+Headless native transport has an immutable presentation workspace independent of
+its job directory and permission grant. Preserve only verified new-terminal hook
+context across environment isolation. The macOS Grok canary established full
+input, native completion, exact host/CLI session identity, one native pane,
+managed title, retained history and task projection. This evidence does not
+qualify other harnesses, workspace-writing permissions or full-history fidelity.
+
 Zero-token tests exercise production runtime effect dispatch, persistent job/result
 application, ordinary intake control reservation and planning activation refusal,
 plus operator task/history/communication paths. They establish wiring and deterministic
@@ -418,6 +437,8 @@ separate gates; these fixture results do not establish autonomous REM readiness.
 
 SQLite stores the durable job/outbox transaction and indexed event history.
 Terminal reasoning jobs leave hot authority while remaining queryable. Coordinator
+history also keeps repeated terminal effects outside hot authority, with indexed
+snapshot-bound reads rather than discarding historical ownership evidence. Coordinator
 interruption reloads committed authority before recording drain; an interrupted
 save acknowledgement is never permission to replay an old revision. Observation
 and termination have independently admitted executor slots, including when regular
@@ -456,6 +477,20 @@ instructions. Insufficient evidence preserves a precise hold after the attempt.
 Successful recovery retains every missing-history marker, confers no approval or
 scope waiver, and rechecks source revisions before releasing the successor.
 Recovery has a separate schema-bound semantic qualification gate.
+
+An evidence wait performs a read-only refresh every 30 seconds and restarts
+reconstruction only when its bound sources change. New committed policy or owner
+evidence therefore resumes the same handoff without an unrelated graph change.
+Audited reconstructed constraints participate in the same bounded reduction tree
+as native-history constraints; the exact evidence quotations remain indexed even
+when their working packet representation is compressed. Additional contract
+qualification requires the independent native receipt itself to identify the
+reviewed schema digest, not merely a new digest in the qualification manifest.
+Native contract schemas bind coverage and authority references to the exact
+supplied IDs. Replanning a mixed quota/failure batch preserves semantic failure
+counts by immutable source coverage; changing routes, job IDs or chunk geometry
+cannot renew those attempts. Exhaustion produces an explicit continuation hold,
+while quota waits themselves do not consume that budget.
 
 Headless write-capable execution requires a qualified native route and an OS
 confinement wrapper. The shipped macOS wrapper enforces frozen product/private-source,
@@ -514,6 +549,20 @@ provider-generation limit. The normal launch path continues to require earned
 qualification. Grok prompt-file recipes must preserve full input with its native
 verbatim option; Muse recipes pin the native binary and suppress launcher updates.
 Native protocol decoders preserve structured quota failures and provider usage.
+
+Workspace-tools qualification is a separate explicit `campaign qualify-writer`
+canary. It creates a new disposable repository/worktree and grants exactly one
+owned file plus owned Git metadata. The native model must make the exact edit and
+commit it; Python independently checks the commit, protected bytes/main ref,
+identity, usage and process quiescence. An independent descendant under the same
+frozen macOS sandbox attempts forbidden sibling/outside/ref writes and must be
+denied. The launcher has an exact managed-interpreter shebang and pinned content,
+with pinned sandbox/native dependencies; resolving the interpreter before launch
+would discard virtualenv dependency resolution. No-tools canaries cannot earn
+writer qualification. Earned input coverage, actual output/turn usage and configured
+ceilings remain separate. This finite operation establishes an executable scoped
+writer route, not unrestricted workflow or cross-harness completion qualification.
+The CLI retains failed startup attempts and resumes only the same immutable job.
 
 The separate `campaign trial-handoff` command reads explicitly sealed prefixes,
 checks their immutable source hashes, deduplicates only verified inherited native

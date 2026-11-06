@@ -50,6 +50,12 @@ is a recoverable projection, not an additional authority. Immutable worker
 envelopes, transcript snapshots, inputs, results and terminal-history projections
 remain separate files beneath the campaign directory. Finished jobs leave the hot
 snapshot and remain accessible through paginated `campaign jobs` queries.
+Repeated terminal effect receipts move into indexed action history. The hot outbox
+retains prepared and uncertain effects, current claim references and the latest
+terminal record per unit/kind. `campaign history ID --actions` retrieves archived
+receipts in creation order; snapshots read only history visible at their saved
+revision. Full snapshot exports include this terminal action history; archived
+read-only polling observations remain a separate `history --observations` export.
 
 Legacy JSON campaigns remain readable and writable. `campaign migrate-state ID`
 requires quiescent workers and reconciled effects, preserves the byte-exact
@@ -58,6 +64,12 @@ marker. Older binaries reject that marker. Copying only a live SQLite main file
 does not include its write-ahead log; use SQLite's consistent backup mechanism
 when copying authority. Keep original transcript and worktree evidence until its retention rules
 permit removal.
+
+SQLite storage version 3 supports indexed effect history. Version 2 remains
+readable and upgrades transactionally on the next save. A crash after the database
+commit but before the marker replacement remains readable by the current binary;
+older readers reject the new database version. A version 3 marker cannot refer
+to a version 2 database.
 
 ## Project `.bmad-loop/` directory
 
@@ -273,6 +285,8 @@ See the [`[cleanup]` settings](configuration.md#cleanup).
 
 Completed, superseded read-only campaign observations move transactionally into
 an indexed SQLite archive. The latest observation per unit/kind and all uncertain
-operations remain in hot state. Mutation/launch/checkpoint receipts remain hot
-because synchronization and recovery use their historical identities. Polling
-history is bounded in memory; total mutation-history growth is not yet bounded.
+operations remain in hot state. Superseded mutation, launch and checkpoint
+receipts retain their exact IDs, payloads and creation order in indexed history.
+Recovery and synchronization use explicit historical reads. Repeated completed
+effect payloads no longer accumulate in the hot outbox; current units, acceptance
+records and tracking projections still scale with the selected work.

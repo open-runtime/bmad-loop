@@ -813,6 +813,7 @@ This command preserves unrelated holds and required GitHub reviews.
 ### Native campaign qualification
 
 - `bmad-loop campaign qualify-headless PROPOSAL --directory DIRECTORY [--input-bytes N] [--output-tokens N] [--timeout SECONDS] [--json]`: explicitly run a fixed native no-tools canary and write observed route qualification. The default input is 16,384 bytes, requested output ceiling is 4,096 tokens and timeout is 180 seconds. Input coverage is limited to measured input. The configured output acceptance ceiling and actual observed output remain separate; external time/byte limits do not imply a native generation-token limit. No normal campaign launch bypasses qualification.
+- `bmad-loop campaign qualify-writer PROPOSAL --directory DIRECTORY [--input-bytes N] [--output-tokens N] [--timeout SECONDS] [--json]`: explicitly qualify a native workspace-tools route in a new disposable repository and isolated worktree. Defaults match `qualify-headless`. The fixed canary edits and commits one owned file; independent readback checks exact content, clean Git state, protected files/main, native attribution and quiescence. A separate descendant exercises the same OS sandbox against forbidden writes. The proposal must pin the exact managed-interpreter sandbox launcher, sandbox module and native executable dependencies. Existing occupied directories are refused; an identical interrupted qualification resumes its durable job. macOS confinement is required. This earns finite writer coverage separately from no-tools qualification.
 - `bmad-loop campaign trial-handoff SNAPSHOTS --capability CAPABILITY --directory DIRECTORY [--parallel N] [--timeout SECONDS] [--prepare-only] [--json]`: qualify sealed history using durable native map/reduce jobs. Parallelism defaults to four and is bounded to 1–16; each job defaults to 600 seconds. Preparation sends no prompt. Structural completion does not grant semantic handoff qualification. Resume with identical source/capability hashes and bounds to reuse validated work.
 
 These explicit operator commands may use the selected provider. Their automated
@@ -822,5 +823,13 @@ artifacts in a private directory outside tracked source files.
 `bmad-loop campaign history ID --observations --after N --limit N [--unit UNIT]`
 reads archived, superseded observations with a separate sequence cursor. The
 latest completed observation per unit/kind remains hot, as do all uncertain
-operations, launches, checkpoints and mutation receipts. These pages preserve
+operations and current claim references. These pages preserve
 polling history without replaying it; they are not the full mutation archive.
+
+`bmad-loop campaign history ID --actions --after N --limit N [--unit UNIT]`
+reads archived terminal effect receipts in their original creation order, including
+mutations, launches and checkpoints. It has its own sequence cursor and returns
+`scope="archived-actions"`. `--actions` and `--observations` are mutually exclusive;
+neither accepts `--role`. Current effects remain in the hot outbox, while full
+snapshot exports include archived terminal actions. Pure observation history stays
+in the separate observation export.

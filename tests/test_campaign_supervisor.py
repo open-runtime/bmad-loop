@@ -7,6 +7,7 @@ OS coordinator locks and thread executors expose restart and ordering defects.
 from __future__ import annotations
 
 import threading
+import time
 from dataclasses import replace
 
 import pytest
@@ -135,6 +136,35 @@ class PipelineDriver:
             snapshot.phase = "draining"
 
 
+def run_until_observed(supervisor, campaign_id, predicate, *, timeout_s=30):
+    """Drain at a real state barrier; a deadline only detects a genuine hang."""
+    original = supervisor.driver.proposals
+    clock = supervisor.clock
+    deadline = time.monotonic() + timeout_s
+    requested = False
+
+    def proposals(snapshot):
+        nonlocal requested
+        if not requested and predicate(snapshot):
+            supervisor.store.enqueue(campaign_id, "stop")
+            requested = True
+        return original(snapshot)
+
+    def bounded_clock():
+        assert time.monotonic() < deadline, "supervisor did not reach the expected state"
+        return clock()
+
+    supervisor.driver.proposals = proposals
+    supervisor.clock = bounded_clock
+    try:
+        result = supervisor.run(campaign_id)
+        assert requested
+        return result
+    finally:
+        supervisor.driver.proposals = original
+        supervisor.clock = clock
+
+
 def test_workers_in_one_epic_start_concurrently_with_durable_claims(campaign_store):
     store, campaign_id = campaign_store
     driver = PipelineDriver(store, barrier=threading.Barrier(2))
@@ -179,7 +209,11 @@ def test_hold_from_durable_inbox_blocks_one_unit_while_other_delivers(campaign_s
     store.enqueue(campaign_id, "hold", unit="s:e:first", reason="Owner deciding")
     driver = PipelineDriver(store)
     supervisor = CampaignSupervisor(store, driver, progress=lambda _: None)
-    result = supervisor.run(campaign_id, max_ticks=100)
+    result = run_until_observed(
+        supervisor,
+        campaign_id,
+        lambda snapshot: snapshot.units["s:e:second"].state == UnitState.DELIVERED,
+    )
     assert result.units["s:e:first"].state == UnitState.READY
     assert result.units["s:e:first"].hold.kind == "operator"
     assert result.units["s:e:second"].state == UnitState.DELIVERED
@@ -245,8 +279,10 @@ def test_delivery_tracking_debt_prevents_dependent_admission(campaign_store):
             return super().perform(snapshot, action)
 
     driver = DebtDriver(store)
-    result = CampaignSupervisor(store, driver, progress=lambda _: None).run(
-        campaign_id, max_ticks=100
+    result = run_until_observed(
+        CampaignSupervisor(store, driver, progress=lambda _: None),
+        campaign_id,
+        lambda snapshot: snapshot.units["s:e:first"].state == UnitState.MERGED_PENDING_SYNC,
     )
     assert result.units["s:e:first"].state == UnitState.MERGED_PENDING_SYNC
     assert result.units["s:e:second"].state == UnitState.READY

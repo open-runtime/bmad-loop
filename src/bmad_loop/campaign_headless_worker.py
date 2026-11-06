@@ -134,6 +134,11 @@ def child_main(path: Path) -> int:
             communication=CommunicationSpec(),
         )
         environment.update(envelope.get("environment", {}))
+        from .campaign_headless_context import restore
+
+        environment, native_context = restore(environment, os.environ, envelope.get("presentation"))
+        if native_context:
+            receipt["native_terminal"] = native_context
         if capability["protocol"] == "muse-json":
             # The launcher can otherwise replace the pinned native executable
             # after qualification and before exec. Account routing is unchanged.

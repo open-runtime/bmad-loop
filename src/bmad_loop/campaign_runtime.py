@@ -2312,11 +2312,9 @@ class CampaignRuntime:
                 shutil.copyfile(source, destination)
 
     def _perform_hierarchy(self, snapshot, action) -> Observation:
-        receipts = {
-            row.payload["tracking_key"]: MutationIntent.from_dict(row.receipt["intent"])
-            for row in snapshot.outbox
-            if row.payload.get("tracking_key") and row.receipt.get("intent")
-        }
+        from .campaign_action_history import TrackingReceipts
+
+        receipts = TrackingReceipts(snapshot)
         result = HierarchyCoordinator(self.gateway(snapshot)).step(
             snapshot,
             action.unit,
@@ -2330,11 +2328,9 @@ class CampaignRuntime:
     def _perform_hierarchy_close(self, snapshot, action) -> Observation:
         if not self._units_settled(snapshot):
             return Observation("confirmed", {"stale_scope": True})
-        receipts = {
-            row.payload["tracking_key"]: MutationIntent.from_dict(row.receipt["intent"])
-            for row in snapshot.outbox
-            if row.payload.get("tracking_key") and row.receipt.get("intent")
-        }
+        from .campaign_action_history import TrackingReceipts
+
+        receipts = TrackingReceipts(snapshot)
         result = HierarchyCoordinator(self.gateway(snapshot)).close_parents(
             snapshot, receipts=receipts
         )
@@ -3987,7 +3983,9 @@ class CampaignRuntime:
         self, snapshot, unit, data: dict[str, Any], *, tracking_key: str = ""
     ) -> None:
         intent = data["intent"]
-        if any(row.id == intent["action_id"] for row in snapshot.outbox):
+        from .campaign_action_history import action as historical_action
+
+        if historical_action(snapshot, intent["action_id"]) is not None:
             return
         add_action(
             snapshot,

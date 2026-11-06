@@ -91,10 +91,15 @@ def test_48_stories_24_epics_verify8_and_reasoning_drain_resume(
     case = production_case
     sources, ownership = scaled_sources(case)
     runner, candidate, capabilities = reporting_route(tmp_path, prepared)
-    server = QueuedServer(case.service)
+    server = QueuedServer(case.service, stacked=True)
     monkeypatch.setattr(case.service, "request", server.request)
     verifier = tmp_path / "qualified-combined-verifier.py"
-    verifier.write_text(combined_verifier_source())
+    verifier.write_text(
+        "from pathlib import Path\n"
+        "assert Path('src.txt').read_text().strip() == 'original'\n"
+        "assert all(p.read_text().startswith('accepted ') for p in Path('src').glob('*.txt'))\n"
+        + combined_verifier_source()
+    )
     producer = tmp_path / "authenticated-check-producer.py"
     producer.write_text(
         "import json,time\nprint(json.dumps({'schema_version':1,'repository':'a/b',"
@@ -177,7 +182,12 @@ def test_48_stories_24_epics_verify8_and_reasoning_drain_resume(
             if unit.claim.role == "execution" and unit.id not in observed_launches:
                 observed_launches.add(unit.id)
                 metrics["first_launch_epics"].append(unit.spec.epic)
-        if metrics["stop_requested_at"] is None and len(live) >= 8:
+        if (
+            metrics["stop_requested_at"] is None
+            and metrics["max_execution"] == spec.max_workers
+            and metrics["max_verify"] == spec.resources.verify_slots
+            and len(live) >= 8
+        ):
             metrics["stop_requested_at"] = time.monotonic()
             case.store.enqueue(snapshot.id, "stop", reason="scale drain/restart qualification")
         if snapshot.phase == "draining" and metrics["control_ack_seconds"] is None:
@@ -233,7 +243,7 @@ def test_48_stories_24_epics_verify8_and_reasoning_drain_resume(
     )
     (tmp_path / "scale-metrics.json").write_text(json.dumps(metrics, indent=2))
     assert result.phase == "delivered" and metrics["delivered"] == 48
-    assert metrics["max_execution"] >= 2 and metrics["max_verify"] >= 2
+    assert metrics["max_execution"] == 24 and metrics["max_verify"] == 8
     assert metrics["max_verify"] <= 8 and metrics["max_review"] <= 8
     assert metrics["max_reasoning"] >= 1
     assert metrics["control_ack_seconds"] is not None and metrics["control_ack_seconds"] < 30

@@ -178,6 +178,11 @@ def validate_capability(raw, candidate, *, verify_files=True, permissions="no-to
 
 def validate_probe_capability(raw, candidate) -> None:
     """Operator canaries validate exact binaries but cannot claim qualification."""
+    if raw.get("permissions") == "workspace-tools":
+        from .campaign_execution_qualification import validate_proposal
+
+        validate_proposal(raw, candidate)
+        return
     if raw.get("qualification", {}).get("status") == "passed":
         raise CampaignError("Probe proposals must not claim already-passed qualification")
     _validate_capability(raw, candidate, permissions="no-tools", qualification_required=False)
@@ -285,6 +290,7 @@ class HeadlessRunner:
         permissions="no-tools",
         grants=None,
         environment=None,
+        presentation=None,
     ) -> Path:
         return self._prepare(
             directory,
@@ -296,6 +302,7 @@ class HeadlessRunner:
             permissions=permissions,
             grants=grants,
             environment=environment,
+            presentation=presentation,
         )
 
     def prepare_probe(
@@ -307,6 +314,7 @@ class HeadlessRunner:
         input_bytes=16384,
         output_tokens=4096,
         timeout_s=180,
+        presentation=None,
     ) -> Path:
         """Prepare only the fixed operator qualification canary, never arbitrary work."""
         from .campaign_qualification import build_probe
@@ -328,6 +336,7 @@ class HeadlessRunner:
             launch_id="probe-" + probe["nonce"],
             generation=1,
             probe=probe,
+            presentation=presentation,
         )
 
     def _prepare(
@@ -343,6 +352,7 @@ class HeadlessRunner:
         grants: dict[str, Any] | None = None,
         environment: dict[str, str] | None = None,
         probe: dict[str, Any] | None = None,
+        presentation: dict[str, str] | None = None,
     ) -> Path:
         request.validate()
         if environment and any(
@@ -357,7 +367,15 @@ class HeadlessRunner:
         else:
             from .campaign_qualification import validate_probe_request
 
-            if permissions != "no-tools" or grants or environment:
+            writer_probe = probe.get("kind") == "workspace-tools-v1"
+            if (
+                environment
+                or (
+                    writer_probe
+                    and (permissions != "workspace-tools" or grants != probe.get("grants"))
+                )
+                or (not writer_probe and (permissions != "no-tools" or grants))
+            ):
                 raise CampaignError(
                     "Qualification canaries cannot grant tools or environment overrides"
                 )
@@ -379,6 +397,22 @@ class HeadlessRunner:
         if not launch_id or type(generation) is not int or generation < 1:
             raise CampaignError("Headless launch ownership is invalid")
         directory = directory.absolute()
+        if presentation:
+            if (
+                set(presentation) != {"workspace", "workspace_id"}
+                or not all(isinstance(value, str) and value for value in presentation.values())
+                or not Path(presentation["workspace"]).is_absolute()
+                or is_link_like(Path(presentation["workspace"]))
+            ):
+                raise CampaignError("Headless terminal requires an exact workspace binding")
+            if (
+                permissions == "workspace-tools"
+                and grants
+                and Path(presentation["workspace"]).resolve() != Path(grants["workspace"]).resolve()
+            ):
+                raise CampaignError(
+                    "Headless terminal and write grant belong to different workspaces"
+                )
         if is_link_like(directory):
             raise CampaignError("Headless directory is redirected")
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -411,6 +445,10 @@ class HeadlessRunner:
         }
         if probe is not None:
             envelope.update(probe=probe, probe_digest=digest(probe))
+        if presentation:
+            # Presentation owns the outer terminal's worktree, not the native
+            # no-tools process cwd or its write permissions. Both are frozen.
+            envelope["presentation"] = presentation
         # Dataclass tuple fields (notably capacity_command) deserialize as JSON
         # lists. Compare the persisted wire form when reconciling a prepared job.
         envelope = json.loads(json.dumps(envelope))
@@ -454,11 +492,13 @@ class HeadlessRunner:
                 },
             )
             try:
+                presentation = envelope.get("presentation", {})
+                terminal_cwd = Path(presentation.get("workspace", str(directory)))
                 # Jobs share a session, but execute in independent windows. Only
                 # the check/create mutation needs a repository-local mutex.
                 with file_lock(directory.parent / "mux-session.lock"):
                     if not self.mux.has_session(envelope["session"]):
-                        self.mux.new_session(envelope["session"], directory)
+                        self.mux.new_session(envelope["session"], terminal_cwd)
             except (OSError, MultiplexerError) as exc:
                 write_json(
                     intent,
@@ -475,8 +515,12 @@ class HeadlessRunner:
             native_id = self.mux.new_window(
                 envelope["session"],
                 envelope["window_name"],
-                directory,
-                {},
+                terminal_cwd,
+                (
+                    {"BMAD_LOOP_PARADEV_WORKSPACE_ID": presentation["workspace_id"]}
+                    if presentation
+                    else {}
+                ),
                 native_window_command(argv),
             )
             write_json(
@@ -487,7 +531,33 @@ class HeadlessRunner:
                 directory / "go.json",
                 {"launch_id": envelope["launch_id"], "generation": envelope["generation"]},
             )
-        return {"state": "running", "run_dir": str(directory), "native_id": native_id}
+        if presentation:
+            request = envelope["request"]
+            title = " · ".join(
+                " ".join(str(value).split())
+                for value in (
+                    request.get("unit") or "campaign",
+                    request["role"],
+                    candidate.model,
+                )
+            )[:200]
+            status = {"state": "confirmed", "title": title, "terminal_id": native_id}
+            try:
+                getattr(self.mux, "set_display_title")(native_id, title)
+            except (AttributeError, OSError, MultiplexerError) as exc:
+                status.update(state="unavailable", reason=str(exc))
+            write_json(directory / "presentation.json", status)
+        return {
+            "state": "running",
+            "run_dir": str(directory),
+            "native_id": native_id,
+            "presentation_status": self._presentation_status(directory),
+        }
+
+    @staticmethod
+    def _presentation_status(directory):
+        path = directory / "presentation.json"
+        return read_json(path) if path.exists() else None
 
     def observe(self, request_path: Path) -> dict[str, Any]:
         envelope = read_json(request_path)
@@ -519,7 +589,11 @@ class HeadlessRunner:
         if window and window.get("launch_id") != envelope["launch_id"]:
             raise CampaignError("Headless window belongs to a different launch")
         if window and self.mux.window_alive(envelope["session"], window["native_id"]):
-            return {"state": "running", "native_id": window["native_id"]}
+            return {
+                "state": "running",
+                "native_id": window["native_id"],
+                "presentation_status": self._presentation_status(directory),
+            }
         if not startup_path.exists():
             return {"state": "unknown", "reason": "Window exited without owned startup identity"}
         startup = read_json(startup_path)
@@ -552,7 +626,9 @@ class HeadlessRunner:
         if receipt.get("processes_quiescent") is not True:
             return {"state": "unknown", "reason": "Headless descendant containment is unproven"}
         receipt.update(
-            quiescent=True, completion_evidence="owned-window-death-and-process-readback"
+            quiescent=True,
+            completion_evidence="owned-window-death-and-process-readback",
+            presentation_status=self._presentation_status(directory),
         )
         return {"state": "finished", "receipt": receipt, "run_dir": str(directory)}
 

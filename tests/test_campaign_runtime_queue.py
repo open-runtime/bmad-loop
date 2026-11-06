@@ -19,7 +19,7 @@ from bmad_loop.campaign_model import GitHubSpec, UnitState
 class QueuedServer:
     """Extend the scripted authenticated service with a real merge-queue DAG."""
 
-    def __init__(self, service):
+    def __init__(self, service, *, stacked=False):
         self.service = service
         self.original = service.request
         self.entries = {}
@@ -28,6 +28,7 @@ class QueuedServer:
         self.group_numbers = set()
         self.drop_check_ack = True
         self.check_creates = 0
+        self.stacked = stacked
 
     def _reply(self, data, status=200):
         return ApiResponse(status, data, {})
@@ -78,6 +79,18 @@ class QueuedServer:
     def _entry(self, number):
         if number not in self.entries:
             return None
+        if self.stacked:
+            base = self.service._base()
+            # Rebuild every affected successor after a dequeue or external main
+            # update. A check on an old G cannot authorize its replacement.
+            for current in self.entries:
+                entry = self.entries[current]
+                if entry["baseCommit"]["oid"] != base:
+                    entry = self._build(current, base)
+                if current == number:
+                    return entry
+                base = entry["headCommit"]["oid"]
+            raise AssertionError("queued entry disappeared")
         entry = self.entries[number]
         base = self.service._base()
         if not verify.is_ancestor(self.service.remote, base, entry["headCommit"]["oid"]):
@@ -102,6 +115,8 @@ class QueuedServer:
             if check is None:
                 break
             base = self.service._base()
+            if self.stacked:
+                assert entry["baseCommit"]["oid"] == base, "queued predecessors must land first"
             assert verify.is_ancestor(self.service.remote, base, head)
             git(self.service.remote, "update-ref", "refs/heads/main", head, base)
             pr = self.service.pulls[number]
@@ -171,7 +186,14 @@ class QueuedServer:
                     and row["conclusion"] == "success"
                     for row in self.checks
                 ), "PR-head App check must exist before queue submission"
-                self._build(number, service._base())
+                if self.stacked and number in self.entries:
+                    self._entry(number)
+                else:
+                    base = service._base()
+                    if self.stacked and self.entries:
+                        predecessor = self._entry(next(reversed(self.entries)))
+                        base = predecessor["headCommit"]["oid"]
+                    self._build(number, base)
                 service.calls.append((method, path, payload))
                 return self._reply(
                     {
@@ -203,6 +225,65 @@ class QueuedServer:
                     raise UncertainMutation("lost check acknowledgement after canonical landing")
                 return self._reply(row, 201)
             return self.original(method, path, payload)
+
+
+def test_stacked_queue_requires_predecessor_checks_and_rebuilds_after_dequeue(production_case):
+    case = production_case
+    server = QueuedServer(case.service, stacked=True)
+    server.drop_check_ack = False
+    initial = case.service._base()
+    numbers = []
+
+    def success(head):
+        server.request(
+            "POST",
+            "repos/a/b/check-runs",
+            {"head_sha": head, "name": "CI", "conclusion": "success"},
+        )
+
+    for name in ("first-queued", "second-queued", "third-queued"):
+        git(case.repo, "checkout", "-b", name, "main")
+        (case.repo / (name + ".txt")).write_text(name)
+        git(case.repo, "add", name + ".txt")
+        git(case.repo, "commit", "-qm", "test: " + name)
+        git(case.repo, "push", "origin", name)
+        pr = case.service.request(
+            "POST", "repos/a/b/pulls", {"head": name, "base": "main", "title": name}
+        ).data
+        numbers.append(pr["number"])
+        success(pr["head"]["sha"])
+        server.request(
+            "PUT",
+            f"repos/a/b/pulls/{pr['number']}/merge-async",
+            {"sha": pr["head"]["sha"], "merge_action": "merge_queue", "bypass_rules": False},
+        )
+    first, second, third = numbers
+    old_heads = [server._entry(number)["headCommit"]["oid"] for number in numbers]
+    assert verify.is_ancestor(case.remote, old_heads[0], old_heads[1])
+    assert verify.is_ancestor(case.remote, old_heads[1], old_heads[2])
+    success(old_heads[2])
+    assert case.service._base() == initial
+    server.request(
+        "POST",
+        "graphql",
+        {
+            "query": "mutation dequeuePullRequest",
+            "variables": {"input": {"pullRequestId": case.service.pulls[first]["node_id"]}},
+        },
+    )
+    new_heads = [server._entry(number)["headCommit"]["oid"] for number in (second, third)]
+    assert new_heads[0] != old_heads[1] and new_heads[1] != old_heads[2]
+    files = git(case.remote, "ls-tree", "--name-only", new_heads[1]).splitlines()
+    assert "first-queued.txt" not in files
+    assert "second-queued.txt" in files and "third-queued.txt" in files
+    success(new_heads[1])
+    assert case.service._base() == initial
+    success(new_heads[0])
+    assert case.service._base() == new_heads[1]
+    assert not case.service.pulls[first]["merged"]
+    assert all(case.service.pulls[number]["merged"] for number in (second, third))
+    assert case.service.merge_bases[second] == initial
+    assert case.service.merge_bases[third] == new_heads[0]
 
 
 @pytest.mark.parametrize("late_hold", [False, True])

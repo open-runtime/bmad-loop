@@ -30,6 +30,7 @@ def register(subparsers: Any) -> None:
         ("validate", "validate a campaign specification offline"),
         ("preflight", "read planning, execution, publication and reflection capabilities"),
         ("qualify-headless", "explicitly run a bounded native no-tools canary"),
+        ("qualify-writer", "explicitly qualify a scoped native writer in a disposable repository"),
         ("trial-handoff", "explicitly qualify sealed history through native summary jobs"),
         ("migration-inventory", "inspect current work and cache an exact migration review receipt"),
         (
@@ -68,7 +69,10 @@ def register(subparsers: Any) -> None:
             child.add_argument("--parallel", type=int, default=4)
             child.add_argument("--timeout", type=int, default=600)
             child.add_argument("--prepare-only", action="store_true")
-        elif command == "qualify-headless":
+            child.add_argument(
+                "--reuse", help="reuse validated map coverage from an explicit prior trial"
+            )
+        elif command in {"qualify-headless", "qualify-writer"}:
             child.add_argument("proposal", metavar="PROPOSAL", help="unqualified native route JSON")
             child.add_argument(
                 "--directory", required=True, help="private external evidence directory"
@@ -133,8 +137,12 @@ def register(subparsers: Any) -> None:
             child.add_argument("--role", default="", metavar="ROLE")
             child.add_argument("--after", type=int, default=0)
             child.add_argument("--limit", type=int, default=100)
-            child.add_argument(
+            history_kind = child.add_mutually_exclusive_group()
+            history_kind.add_argument(
                 "--observations", action="store_true", help="read archived superseded observations"
+            )
+            history_kind.add_argument(
+                "--actions", action="store_true", help="read archived terminal effect receipts"
             )
         if command == "jobs":
             child.add_argument("--unit", default="", metavar="UNIT")
@@ -186,6 +194,16 @@ def _job_document(row, *, details=False):
         for key in ("profile", "model", "effort", "provider_family")
         if key in selection
     }
+    claim, receipt = row.get("claim") or {}, row.get("receipt") or {}
+    presentation = claim.get("presentation") or {}
+    native = receipt.get("native_terminal") or {}
+    result["terminal"] = {
+        "workspace_id": presentation.get("workspace_id") or native.get("workspace_id"),
+        "terminal_id": claim.get("native_id") or native.get("terminal_id"),
+        "native_session_id": receipt.get("session_id"),
+        "presentation_status": receipt.get("presentation_status")
+        or claim.get("presentation_status"),
+    }
     if details:
         receipt = row.get("receipt") or {}
         result["receipt"] = {
@@ -205,6 +223,8 @@ def _job_document(row, *, details=False):
                 "effort",
                 "native_session_id",
                 "session_id",
+                "native_terminal",
+                "presentation_status",
                 "output_hash",
             )
             if key in receipt
@@ -275,6 +295,8 @@ def _checkpoint_document(snapshot, unit, now: float) -> dict[str, Any]:
 
 
 def status_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
+    from .campaign_action_history import counts as action_counts
+
     """Project execution identities; omit private configuration and evidence."""
     from .campaign_metrics import document as timing_document
     from .campaign_operator import diagnostics
@@ -490,10 +512,7 @@ def status_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
             for key in ("mode", "available", "detail", "missing_bindings", "observed_at")
             if key in snapshot.bindings.get("communication", {})
         },
-        "outbox": {
-            state: sum(action.state == state for action in snapshot.outbox)
-            for state in ("prepared", "sent_unknown", "confirmed", "rejected")
-        },
+        "outbox": action_counts(snapshot),
     }
 
 
@@ -578,12 +597,16 @@ def dispatch(args: argparse.Namespace) -> int:
                 parallel=args.parallel,
                 timeout_s=args.timeout,
                 execute=not args.prepare_only,
+                reuse_directory=Path(args.reuse).expanduser() if args.reuse else None,
             )
             return _emit(args, _result(command, **report))
         except (CampaignError, OSError, ValueError, KeyError, TypeError) as exc:
             return _emit(args, _result(command, ok=False, problems=[str(exc)]))
-    if command == "qualify-headless":
-        from .campaign_qualification import qualify
+    if command in {"qualify-headless", "qualify-writer"}:
+        if command == "qualify-writer":
+            from .campaign_execution_qualification import qualify
+        else:
+            from .campaign_qualification import qualify
 
         try:
             report = qualify(
@@ -686,6 +709,24 @@ def dispatch(args: argparse.Namespace) -> int:
 
         if args.unit and args.unit not in snapshot.units:
             raise CampaignError(f"unknown campaign unit {args.unit}")
+        if args.actions:
+            from .sanitize import scrub_json
+
+            if args.role:
+                raise CampaignError("action history does not accept a native session role")
+            rows = store.action_history(
+                campaign_id, after=args.after, limit=args.limit, unit=args.unit or None
+            )
+            return _emit(
+                args,
+                _result(
+                    command,
+                    actions=scrub_json(rows),
+                    next_after=rows[-1]["sequence"] if rows else args.after,
+                    has_more=len(rows) == args.limit,
+                    scope="archived-actions",
+                ),
+            )
         if args.observations:
             from .sanitize import scrub_json
 
