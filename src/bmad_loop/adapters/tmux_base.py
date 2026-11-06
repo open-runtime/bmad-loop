@@ -1180,3 +1180,25 @@ class BaseTmuxBackend(TerminalMultiplexer):
 
     def version_error(self) -> str | None:
         return self._version_error
+
+
+def posix_exec_command(argv: list[str]) -> str:
+    """Exec a bundled bootstrap in the host's POSIX initial-command field."""
+    return "exec " + shlex.join(argv)
+
+
+def posix_shell_argv(command: str) -> list[str]:
+    """Run a transport command under POSIX sh (Paradev macOS qualification)."""
+    return ["/bin/sh", "-c", command]
+
+
+def posix_parked_command(argv: list[str]) -> str:
+    """Render the seam's parked-window protocol without leaking shell syntax."""
+    banner = PARKED_BANNER.format(ec="%s")
+    script = (
+        shlex.join(argv)
+        + "; ec=$?; printf "
+        + shlex.quote(banner + "\n")
+        + ' "$ec"; read -r ignored'
+    )
+    return shlex.join(posix_shell_argv(script))
