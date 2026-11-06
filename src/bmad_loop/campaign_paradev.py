@@ -615,8 +615,8 @@ class ParadevWorkspaceProvider:
         """Optional flat task projection with durable create uncertainty.
 
         Only status and PR link are subsequently managed; operator text and labels
-        are never overwritten. The caller supplies an explicit status mapping for
-        held/blocked states when the installed tracker has no such native status.
+        are never overwritten. Prefer a native held/blocked status by name; when
+        unavailable these remain started and workspace hold tags carry the reason.
         """
         action = f"task:{campaign_id}:{binding.unit_id}"
         path = self.root / "tasks" / (hashlib.sha256(action.encode()).hexdigest() + ".json")
@@ -697,16 +697,34 @@ class ParadevWorkspaceProvider:
                 raise ReflectionError("Task status schema unsupported")
             mapping = {
                 "pending": "backlog",
+                "planning": "started",
+                "draft": "started",
                 "ready": "unstarted",
+                "claimed": "started",
                 "running": "started",
+                "locally_complete": "started",
+                "syncing": "started",
+                "verifying": "started",
                 "reviewing": "started",
+                "ready_to_publish": "started",
+                "merge_requested": "started",
+                "held": "started",
+                "blocked": "started",
                 "merged_pending_sync": "started",
                 "delivered": "completed",
                 "canceled": "canceled",
             }
             status_id = (status_ids or {}).get(state)
             if status_id is None:
-                choices = [row for row in statuses if row.get("type") == mapping.get(state)]
+                named = [
+                    row
+                    for row in statuses
+                    if state in {"held", "blocked"}
+                    and str(row.get("name", "")).lower() in {"held", "blocked", "on hold"}
+                ]
+                choices = named or [
+                    row for row in statuses if row.get("type") == mapping.get(state)
+                ]
                 if not choices:
                     raise ReflectionError(
                         f"No native status mapping for {state}; task remains visibly pending projection"
@@ -718,6 +736,36 @@ class ParadevWorkspaceProvider:
             self.host.cli(
                 ["tasks", "update", task_id, "--tracker", "superset", "--status-id", status_id]
             )
+            readback = self.host.cli(
+                [
+                    "tasks",
+                    "list",
+                    "--tracker",
+                    "superset",
+                    "--status",
+                    status_id,
+                    "--search",
+                    marker,
+                    "--limit",
+                    "100",
+                    "--offset",
+                    "0",
+                ]
+            )
+            if not isinstance(readback, list):
+                raise ReflectionError("Task status readback schema unsupported")
+            confirmed = [
+                row
+                for row in readback
+                if row.get("id") == task_id and marker in (row.get("description") or "")
+            ]
+            if len(confirmed) != 1:
+                raise ReflectionError("Task status update is not confirmed by readback")
+            observed_status = confirmed[0].get("statusId", confirmed[0].get("status_id"))
+            if observed_status is None and isinstance(confirmed[0].get("status"), dict):
+                observed_status = confirmed[0]["status"].get("id")
+            if observed_status != status_id:
+                raise ReflectionError("Task status update remains pending or unsupported")
             current = next(
                 (
                     row
@@ -736,4 +784,9 @@ class ParadevWorkspaceProvider:
                 self.host.cli(
                     ["workspaces", "update", binding.workspace_id, "--local", "--task-id", task_id]
                 )
+                if not any(
+                    row.get("id") == binding.workspace_id and row.get("taskId") == task_id
+                    for row in self._rows("workspace.list")
+                ):
+                    raise ReflectionError("Workspace task link is not confirmed by readback")
             return task_id

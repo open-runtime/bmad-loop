@@ -1,13 +1,15 @@
 """Atomic campaign authority, repository coordinator fencing and durable commands.
 
-The snapshot owns events and outbound intents. The JSONL projection is disposable:
-rebuild it from snapshot events after a crash. No lock here spans network I/O.
+SQLite atomically owns hot state, events and outbound intents. Legacy JSON state
+remains readable and writable until explicit quiescent migration. The JSONL
+projection is disposable. No transaction here spans network I/O.
 The coordinator lock is held for its lifetime and lives in the canonical Git
 common directory so alternate checkouts/state roots cannot create two owners.
 """
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -18,6 +20,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from .campaign_database import MARKER, CampaignDatabase, EventJournal
 from .campaign_model import (
     CampaignError,
     CampaignSnapshot,
@@ -59,9 +62,22 @@ class CampaignStore:
     must persist outbound intents in that same save before executing effects.
     """
 
-    def __init__(self, root: Path | str, *, clock: Callable[[], float] = time.time):
+    def __init__(
+        self, root: Path | str, *, clock: Callable[[], float] = time.time, storage: str = "sqlite"
+    ):
         self.root = Path(root).resolve()
         self.clock = clock
+        if storage not in {"sqlite", "json"}:
+            raise CampaignError("unknown campaign storage")
+        self.storage = storage
+
+    @staticmethod
+    def _normalize(snapshot: CampaignSnapshot) -> CampaignSnapshot:
+        result = snapshot_from_dict(
+            json.loads(_json(snapshot_to_dict(snapshot, include_events=False)))
+        )
+        result.events = copy.deepcopy(snapshot.events)
+        return result
 
     def directory(self, campaign_id: str) -> Path:
         return self.root / _segment(campaign_id)
@@ -71,7 +87,11 @@ class CampaignStore:
         atomic_write_text(path, _json(value), follow_symlinks=False)
 
     def create(self, snapshot: CampaignSnapshot) -> CampaignSnapshot:
-        snapshot = snapshot_from_dict(json.loads(_json(snapshot_to_dict(snapshot))))
+        snapshot = self._normalize(snapshot)
+        from .campaign_acceptance import ensure
+
+        for unit in snapshot.units.values():
+            ensure(unit)
         directory = self.directory(snapshot.id)
         with file_lock(self.root / ".state.lock"):
             if directory.exists():
@@ -82,15 +102,32 @@ class CampaignStore:
             candidate.updated_at = candidate.created_at
             for event in candidate.events:
                 event.setdefault("observed_at", candidate.created_at)
-            self._write(directory / "snapshot.json", snapshot_to_dict(candidate))
+            if self.storage == "sqlite":
+                directory.mkdir(parents=True, mode=0o700)
+                database = CampaignDatabase(directory)
+                database.initialize(
+                    snapshot_to_dict(candidate, include_events=False), list(candidate.events)
+                )
+                self._write(directory / "snapshot.json", MARKER)
+                candidate.events = EventJournal(database, len(candidate.events))
+            else:
+                self._write(directory / "snapshot.json", snapshot_to_dict(candidate))
         self.project_events(candidate)
         return candidate
 
     def load(self, campaign_id: str) -> CampaignSnapshot:
         path = self.directory(campaign_id) / "snapshot.json"
         try:
+            if path.is_symlink() or path.parent.is_symlink():
+                raise CampaignError("campaign snapshot path is symlinked")
             value = json.loads(path.read_text(encoding="utf-8"))
-            snapshot = snapshot_from_dict(value)
+            if value == MARKER:
+                database = CampaignDatabase(path.parent)
+                value, count = database.read()
+                snapshot = snapshot_from_dict(value)
+                snapshot.events = EventJournal(database, count)
+            else:
+                snapshot = snapshot_from_dict(value)
         except (OSError, ValueError, KeyError, TypeError) as exc:
             raise CampaignError(f"cannot read campaign {campaign_id}: {exc}") from exc
         if snapshot.id != campaign_id:
@@ -115,10 +152,23 @@ class CampaignStore:
         expected_generation: int | None = None,
     ) -> CampaignSnapshot:
         """CAS commit; authority and outbound intents replace as one document."""
-        snapshot = snapshot_from_dict(json.loads(_json(snapshot_to_dict(snapshot))))
+        snapshot = self._normalize(snapshot)
         directory = self.directory(snapshot.id)
         with file_lock(self.root / ".state.lock"):
             previous = self.load(snapshot.id)
+            from .campaign_acceptance import ensure
+
+            for key, unit in snapshot.units.items():
+                prior = previous.units.get(key)
+                if prior is not None:
+                    original = ensure(prior)
+                    ledger = unit.evidence.setdefault("acceptance", copy.deepcopy(original))
+                    retained = {row["id"] for row in ledger["criteria"]}
+                    for criterion in original["criteria"]:
+                        if criterion["id"] not in retained:
+                            ledger["criteria"].append(copy.deepcopy(criterion))
+                            ledger["revision"] += 1
+                ensure(unit)
             if previous.revision != expected_revision:
                 raise RevisionConflict(
                     f"campaign revision {previous.revision}, expected {expected_revision}"
@@ -142,6 +192,11 @@ class CampaignStore:
                     raise CampaignError("configuration change requires a new explicit revision")
                 if any(u.claim and not u.claim.quiescent for u in previous.units.values()):
                     raise CampaignError("configuration change requires quiescent workers")
+                if any(
+                    job.get("claim") and not job["claim"]["quiescent"]
+                    for job in previous.jobs.values()
+                ):
+                    raise CampaignError("configuration change requires quiescent reasoning jobs")
             for key, unit in previous.units.items():
                 replacement = snapshot.units.get(key)
                 if unit.state == UnitState.DELIVERED and (
@@ -180,13 +235,27 @@ class CampaignStore:
                         reconcile_external_merge(audit, key, ExternalMergeEvidence(**raw))
                     else:
                         check_campaign_transition(key, unit.state, replacement.state)
+            from .campaign_jobs import live as job_live
+
+            for key, job in previous.jobs.items():
+                replacement = snapshot.jobs.get(key)
+                if replacement is None:
+                    if job_live(job) or job["state"] not in {"applied", "stale", "canceled"}:
+                        raise CampaignError("active reasoning job cannot be removed")
+                elif replacement["request"] != job["request"]:
+                    raise CampaignError("reasoning request is immutable")
             if any(
                 key not in snapshot.units or snapshot.units[key].spec != unit.spec
                 for key, unit in previous.units.items()
             ) or set(snapshot.units) != set(previous.units):
                 if snapshot.graph_revision <= previous.graph_revision:
                     raise CampaignError("graph change requires a new graph revision")
-            if snapshot.events[: len(previous.events)] != previous.events:
+            database = (
+                previous.events.database if isinstance(previous.events, EventJournal) else None
+            )
+            if database is not None and isinstance(snapshot.events, EventJournal):
+                snapshot.events.validate_prefix(database, len(previous.events))
+            elif snapshot.events[: len(previous.events)] != previous.events:
                 raise CampaignError("campaign events are append-only")
             candidate = snapshot.clone()
             candidate.revision = expected_revision + 1
@@ -194,7 +263,16 @@ class CampaignStore:
             for event in candidate.events[len(previous.events) :]:
                 event.setdefault("observed_at", candidate.updated_at)
             self._validate(candidate)
-            self._write(directory / "snapshot.json", snapshot_to_dict(candidate))
+            if database is not None:
+                database.commit(
+                    snapshot_to_dict(candidate, include_events=False),
+                    revision=expected_revision,
+                    event_count=len(previous.events),
+                    events=list(candidate.events[len(previous.events) :]),
+                )
+                candidate.events = EventJournal(database, len(candidate.events))
+            else:
+                self._write(directory / "snapshot.json", snapshot_to_dict(candidate))
         self.project_events(candidate)
         return candidate
 
@@ -211,6 +289,12 @@ class CampaignStore:
         return self.save(snapshot, revision, expected_generation=expected_generation)
 
     def _validate(self, snapshot: CampaignSnapshot) -> None:
+        from .campaign_jobs import validate_record
+
+        for key, job in snapshot.jobs.items():
+            validate_record(job)
+            if key != job["id"]:
+                raise CampaignError("reasoning job key differs from its identity")
         if snapshot.phase not in {"active", "draining", "stopped", "delivered", "held"}:
             raise CampaignError("invalid campaign phase")
         if (
@@ -268,7 +352,15 @@ class CampaignStore:
         **payload: Any,
     ) -> dict[str, Any]:
         """Append an idempotent command without touching coordinator state."""
-        if kind not in {"stop", "hold", "release", "reconcile", "terminate-workers", "adopt"}:
+        if kind not in {
+            "stop",
+            "hold",
+            "release",
+            "reconcile",
+            "terminate-workers",
+            "adopt",
+            "handoff",
+        }:
             raise CampaignError(f"unknown campaign control {kind}")
         self.load(campaign_id)
         request_id = _segment(request_id or uuid.uuid4().hex)
@@ -310,11 +402,132 @@ class CampaignStore:
 
     def project_events(self, snapshot: CampaignSnapshot) -> None:
         """Recoverable observer projection: never the state writer's authority."""
+        if isinstance(snapshot.events, EventJournal):
+            self._project_database_events(snapshot)
+            return
         path = self.directory(snapshot.id) / "events.jsonl"
         text = "".join(
             _json({"sequence": index + 1, **event}) for index, event in enumerate(snapshot.events)
         )
         atomic_write_text(path, text, follow_symlinks=False)
+
+    def _project_database_events(self, snapshot: CampaignSnapshot) -> None:
+        directory = self.directory(snapshot.id)
+        path, cursor_path = directory / "events.jsonl", directory / "events.cursor.json"
+        with file_lock(directory / ".projection.lock"):
+            if path.is_symlink() or cursor_path.is_symlink():
+                raise CampaignError("campaign event projection is symlinked")
+            cursor = {"sequence": 0, "bytes": 0}
+            if cursor_path.exists() and path.exists():
+                try:
+                    observed = json.loads(cursor_path.read_text(encoding="utf-8"))
+                    if (
+                        0 <= observed["sequence"] <= len(snapshot.events)
+                        and observed["bytes"] == path.stat().st_size
+                    ):
+                        cursor = observed
+                except (ValueError, KeyError, TypeError):
+                    pass  # A disposable projection is rebuilt from authority below.
+            flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+            flags |= os.O_APPEND if cursor["sequence"] else os.O_TRUNC
+            descriptor = os.open(path, flags, 0o600)
+            with os.fdopen(descriptor, "ab") as stream:
+                database = CampaignDatabase(directory)
+                while cursor["sequence"] < len(snapshot.events):
+                    rows = database.events(
+                        after=cursor["sequence"], limit=1000, through=len(snapshot.events)
+                    )
+                    if not rows:
+                        raise CampaignError("campaign event projection is missing authority")
+                    for sequence, event in rows:
+                        payload = _json({"sequence": sequence, **event}).encode()
+                        stream.write(payload)
+                        cursor = {"sequence": sequence, "bytes": cursor["bytes"] + len(payload)}
+                stream.flush()
+                os.fsync(stream.fileno())
+            self._write(cursor_path, cursor)
+
+    def history(
+        self, campaign_id: str, *, after: int = 0, limit: int = 100, kind: str = "", unit: str = ""
+    ) -> list[dict[str, Any]]:
+        snapshot = self.load(campaign_id)
+        if after < 0 or not 1 <= limit <= 10000:
+            raise CampaignError("invalid campaign history pagination")
+        if isinstance(snapshot.events, EventJournal):
+            return [
+                {"sequence": sequence, **event}
+                for sequence, event in snapshot.events.database.events(
+                    after=after, limit=limit, kind=kind, unit=unit, through=len(snapshot.events)
+                )
+            ]
+        rows = [
+            {"sequence": index + 1, **event}
+            for index, event in enumerate(snapshot.events)
+            if index >= after
+            and (not kind or event.get("kind") == kind)
+            and (not unit or event.get("unit") == unit)
+        ]
+        return rows[:limit]
+
+    def jobs(
+        self,
+        campaign_id: str,
+        *,
+        after: str = "",
+        limit: int = 100,
+        unit: str = "",
+        job_id: str = "",
+    ) -> list[dict[str, Any]]:
+        snapshot = self.load(campaign_id)
+        if isinstance(snapshot.events, EventJournal):
+            return snapshot.events.database.jobs(after=after, limit=limit, unit=unit, job_id=job_id)
+        if snapshot.jobs:
+            raise CampaignError("reasoning job history requires campaign migrate-state")
+        return []
+
+    def migrate_state(self, campaign_id: str) -> CampaignSnapshot:
+        """Switch quiescent v1 authority atomically; old binaries reject the marker."""
+        initial = self.load(campaign_id)
+        if isinstance(initial.events, EventJournal):
+            return initial
+        common = Path(initial.common_dir)
+        if not initial.common_dir or not common.is_dir():
+            raise CampaignError("state migration requires the canonical Git common directory")
+        with file_lock(common / "bmad-loop-campaign.lock", blocking=False):
+            with file_lock(self.root / ".state.lock"):
+                snapshot = self.load(campaign_id)
+                if isinstance(snapshot.events, EventJournal):
+                    return snapshot
+                if any(unit.claim and not unit.claim.quiescent for unit in snapshot.units.values()):
+                    raise CampaignError("state migration requires quiescent workers")
+                if any(action.state in {"prepared", "sent_unknown"} for action in snapshot.outbox):
+                    raise CampaignError("state migration requires reconciled external effects")
+                directory = self.directory(campaign_id)
+                raw = (directory / "snapshot.json").read_bytes()
+                backup = directory / "snapshot.v1.backup.json"
+                if backup.exists():
+                    if backup.is_symlink() or backup.read_bytes() != raw:
+                        raise CampaignError("state migration backup differs from current authority")
+                else:
+                    descriptor = os.open(backup, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                    with os.fdopen(descriptor, "wb") as stream:
+                        stream.write(raw)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                database = CampaignDatabase(directory)
+                expected = json.loads(_json(snapshot_to_dict(snapshot, include_events=False)))
+                if not database.path.exists():
+                    database.initialize(expected, list(snapshot.events))
+                observed, count = database.read()
+                if observed != expected or count != len(snapshot.events):
+                    raise CampaignError("state migration database does not match v1 authority")
+                existing = EventJournal(database, count)
+                if existing != snapshot.events:
+                    raise CampaignError("state migration event verification failed")
+                self._write(directory / "snapshot.json", MARKER)
+        migrated = self.load(campaign_id)
+        self.project_events(migrated)
+        return migrated
 
 
 def add_event(snapshot: CampaignSnapshot, kind: str, *, unit: str = "", **details: Any) -> None:

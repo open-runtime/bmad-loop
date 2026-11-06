@@ -1,0 +1,12 @@
+# Meta Muse Code's exec transport requires a frozen qualification manifest.
+name = "muse"
+binary = "muse"
+adapter = "bounded-headless"
+prompt_template = "{prompt}"
+usage_parser = "none"
+first_run_note = "Qualify Muse Code's exact launcher/native version, exec JSON transport, model limits and scoped tools. No native hcom hook integration is implied."
+skill_tree = ".agents/skills"
+[hooks]
+dialect = "none"
+config_path = ""
+events = {}

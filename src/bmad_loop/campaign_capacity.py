@@ -8,6 +8,7 @@ Missing telemetry remains an explicit wait rather than guessed availability.
 from __future__ import annotations
 
 import json
+import math
 import time
 from pathlib import Path
 from typing import Any
@@ -55,6 +56,8 @@ def from_teamrouter(
         True,
         model_access=True,
         concurrency_known=False,
+        observed_at=observed / 1000,
+        expires_at=observed / 1000 + max_age_s,
         reason="route eligible; provider concurrency unadvertised, explicit campaign limits apply",
     )
 
@@ -62,6 +65,7 @@ def from_teamrouter(
 def observe(
     candidate: RoleCandidate, project: Path, *, now: float | None = None
 ) -> CapacityObservation:
+    observed_at = time.time() if now is None else now
     command = candidate.capacity_command or ("teamrouter", "status", "--json")
     result = run_argv(command, cwd=project, timeout=15, encoding="utf-8")
     if result.returncode or result.timed_out or result.interrupted:
@@ -87,10 +91,26 @@ def observe(
     slots = raw.get("slots")
     if type(slots) is not int or slots < 0:
         return CapacityObservation(False, reason="capacity probe slot count invalid", known=False)
+    reported_at = raw.get("observed_at", observed_at)
+    expires_at = raw.get(
+        "expires_at", reported_at + 120 if isinstance(reported_at, (int, float)) else None
+    )
+    if (
+        any(
+            type(value) not in (int, float) or not math.isfinite(value)
+            for value in (reported_at, expires_at)
+        )
+        or not reported_at <= observed_at <= expires_at <= reported_at + 120
+    ):
+        return CapacityObservation(
+            False, reason="capacity probe observation expired or invalid", known=False
+        )
     return CapacityObservation(
         raw.get("available") is True,
         slots=slots,
         model_access=raw.get("model_access") is True,
         budget_remaining=raw.get("budget_remaining"),
         reason=str(raw.get("reason", "")),
+        observed_at=reported_at,
+        expires_at=expires_at,
     )

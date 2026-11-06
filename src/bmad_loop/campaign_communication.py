@@ -116,7 +116,8 @@ class HcomObserver:
                 if (
                     row.get("session_id") != binding.session_id
                     or context.get("process_id") != binding.process_id
-                    or context.get("env", {}).get("SUPERSET_TERMINAL_ID") != binding.terminal_id
+                    or (context.get("env", {}).get("SUPERSET_TERMINAL_ID") or "")
+                    != binding.terminal_id
                 ):
                     raise CommunicationError("Peer name was reused or native binding changed")
                 peers.append(
@@ -194,9 +195,13 @@ class HcomObserver:
         observation = self.roster((binding,))
         if not observation.available:
             raise CommunicationError(observation.detail)
-        return self._read(
+        result = self._read(
             ["transcript", binding.name, "--last", str(min(max(last, 1), 20)), "--json"]
         )
+        after = self.roster((binding,))
+        if not after.available:
+            raise CommunicationError(after.detail)
+        return result
 
 
 def sibling_context(units: list[dict], *, own_unit: str, campaign_id: str) -> dict:

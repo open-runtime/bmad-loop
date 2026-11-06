@@ -210,6 +210,151 @@ def test_status_and_list_are_observer_projections_without_private_config(runtime
     assert calls == []
 
 
+def test_history_reads_saved_events_without_starting_runtime(runtime, capsys):
+    from bmad_loop.campaign_store import add_event
+
+    store, snapshot, calls = runtime
+    add_event(snapshot, "review-observed", unit="s:e:u", role="review", secret="private payload")
+    snapshot = store.save(snapshot, snapshot.revision)
+    assert (
+        cli.main(
+            [
+                "campaign",
+                "history",
+                snapshot.id,
+                "--unit",
+                "s:e:u",
+                "--role",
+                "review",
+                "--limit",
+                "10",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    output = capsys.readouterr().out
+    result = json.loads(output)
+    assert result["events"][-1]["kind"] == "review-observed"
+    assert result["next_after"] > 0
+    assert "private payload" not in output
+    assert calls == []
+
+
+def test_normal_cli_runtime_binds_transcript_provider(runtime):
+    from bmad_loop import campaign_runtime
+    from bmad_loop.campaign_cli import _runtime
+    from bmad_loop.campaign_history_sources import TranscriptEvidenceProvider
+
+    store, _, _ = runtime
+    driver = _runtime(campaign_runtime, store.root, store)
+    assert isinstance(driver.evidence_providers["transcript"], TranscriptEvidenceProvider)
+
+
+def test_jobs_reads_persisted_request_without_exposing_prompt(runtime, capsys):
+    import dataclasses
+
+    from bmad_loop.campaign_jobs import JobLimits, JobRequest, prepare
+
+    store, snapshot, calls = runtime
+    snapshot.spec = dataclasses.replace(
+        snapshot.spec, reasoning=dataclasses.replace(snapshot.spec.reasoning, enabled=True)
+    )
+    snapshot.config_revision += 1
+    prepare(
+        snapshot,
+        JobRequest(
+            "job-one",
+            "report",
+            "reporting",
+            {
+                "head": "h",
+                "base": "b",
+                "graph_revision": 1,
+                "config_revision": snapshot.config_revision,
+            },
+            (),
+            "private owner conversation",
+            {"type": "object", "properties": {}},
+            JobLimits(1000, 100),
+            unit="s:e:u",
+        ),
+    )
+    store.save(snapshot, snapshot.revision)
+    assert (
+        cli.main(["campaign", "jobs", snapshot.id, "--job", "job-one", "--details", "--json"]) == 0
+    )
+    output = capsys.readouterr().out
+    result = json.loads(output)
+    assert result["jobs"][0]["id"] == "job-one"
+    assert result["jobs"][0]["purpose"] == "report"
+    assert "private owner conversation" not in output
+    assert calls == []
+
+
+def test_handoff_only_queues_and_preserves_state(runtime, capsys):
+    store, snapshot, calls = runtime
+    assert (
+        cli.main(
+            [
+                "campaign",
+                "handoff",
+                snapshot.id,
+                "--unit",
+                "s:e:u",
+                "--profile",
+                "codex",
+                "--model",
+                "approved-model",
+                "--reason",
+                "quota",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    result = json.loads(capsys.readouterr().out)
+    request = result["request"]
+    assert request["kind"] == "handoff"
+    assert request["payload"]["profile"] == "codex"
+    assert request["payload"]["model"] == "approved-model"
+    assert store.load(snapshot.id).revision == snapshot.revision
+    assert calls == []
+
+
+def test_history_retrieves_role_evicted_from_hot_state(runtime, capsys):
+    from bmad_loop.campaign_store import add_event
+
+    store, snapshot, calls = runtime
+    path = store.directory(snapshot.id) / "reflection-history" / "unit" / "projection.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(
+            {
+                "stage": {
+                    "windows": [
+                        {
+                            "phase": "planning",
+                            "terminal_id": "old",
+                            "task_id": "old-plan",
+                            "state": "stopped",
+                            "log_path": "/retained/planning.log",
+                        }
+                    ]
+                }
+            }
+        )
+    )
+    add_event(snapshot, "reflection-observed", unit="s:e:u", history_path=str(path))
+    store.save(snapshot, snapshot.revision)
+    assert cli.main(["campaign", "history", snapshot.id, "--role", "planning", "--json"]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["sessions"][0]["terminal_id"] == "old"
+    assert result["events"][0]["history_path"] == str(path)
+    assert not result["history_gaps"]
+    assert calls == []
+
+
 @pytest.mark.parametrize(
     "command,flags",
     [

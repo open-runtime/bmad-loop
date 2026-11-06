@@ -487,6 +487,10 @@ def stage(request,session):
     assert name in {"publication_review","admission_review","requirements","architecture","decomposition","planning_review"}
     event("publication-review" if name=="publication_review" else "admission-review" if name=="admission_review" else "planning-"+name,request)
     artifact={"schema_version":1,"status":"done","coordinates":request["coordinates"],"artifacts":[],"verdict":"approved","findings":[],"source_artifact_digest":context.get("source_artifact_digest","")}
+    if name=="publication_review":
+        proof=context["verification"]
+        assert proof["proof"]["head"]==request["coordinates"]["head"]
+        artifact["acceptance_evidence"]=[{"criterion_id":row["id"],"status":"passed","verification_launch_id":proof["launch_id"],"command_indexes":list(range(len(proof["commands"]))),"reason":"Recorded verifier checks original content and every produced story artifact on this candidate."} for row in context["acceptance_ledger"]["criteria"]]
     if name in {"requirements","architecture","decomposition"}:
         workspace=Path(request["workspace"])
         marker=workspace/"docs"/"planning"/(name+".md")

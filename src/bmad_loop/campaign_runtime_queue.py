@@ -438,6 +438,7 @@ def apply_effect(runtime, snapshot, unit, action, data) -> None:
             apply_after_queue_removal(snapshot, unit.id, feedback)
             unit.bindings.pop("merge_request_id", None)
             return
+        candidate_before_removal = asdict(runtime._candidate(snapshot, unit))
         failure = data.get("failure") or state.get("failure")
         reasons = state.get("gate_reasons", [])
         unit.bindings.pop("merge_request_id", None)
@@ -452,15 +453,19 @@ def apply_effect(runtime, snapshot, unit, action, data) -> None:
             add_event(snapshot, "queue-acceptance-restarted", unit=unit.id)
             return
         unit.hold = Hold(
-            "verification_failed" if failure else "approval",
+            "verification_failed" if failure else "remote_wait",
             (
                 failure.get("reason", "combined candidate verification failed")
                 if failure
                 else "; ".join(reasons)
             ),
             id=action.id,
-            actor="campaign",
-            evidence={"queue": state, "dequeue_confirmed": True},
+            actor="campaign" if failure else "github",
+            evidence={
+                "queue": state,
+                "dequeue_confirmed": True,
+                "candidate": candidate_before_removal,
+            },
         )
         add_event(
             snapshot,

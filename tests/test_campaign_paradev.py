@@ -82,6 +82,8 @@ class Host:
         if args[:3] == ["tasks", "statuses", "list"]:
             return self.statuses
         if args[:2] == ["tasks", "update"]:
+            row = next(item for item in self.tasks if item["id"] == args[2])
+            row["statusId"] = args[args.index("--status-id") + 1]
             return {"id": args[2]}
         if args[:3] == ["panes", "open", "file"]:
             return {"opened": True}
@@ -326,3 +328,33 @@ def test_pinned_uuid_cannot_be_replaced_by_foreign_row_with_old_marker(provider)
     with pytest.raises(ReflectionError, match="uncertain"):
         p.reconcile("action")
     assert binding.workspace_id != host.workspaces[0]["id"]
+
+
+def test_task_projection_confirms_status_and_prefers_named_hold(provider):
+    p, host = provider
+    host.statuses.append({"id": "held", "name": "Blocked", "type": "started"})
+    binding = p.allocate("held-unit", "campaign-held", "held", "allocate-held")
+    task_id = p.reflect_task(binding, campaign_id="campaign", title="Held work", state="held")
+    assert next(row for row in host.tasks if row["id"] == task_id)["statusId"] == "held"
+    assert host.workspaces[0]["taskId"] == task_id
+
+
+def test_task_success_ack_without_changed_remote_status_is_not_confirmed(provider, monkeypatch):
+    p, host = provider
+    binding = p.allocate("unit", "campaign-unit", "unit", "allocate")
+    original = host.cli
+
+    def no_update(args):
+        if args[:2] == ["tasks", "update"]:
+            return {"id": args[2]}
+        return original(args)
+
+    monkeypatch.setattr(host, "cli", no_update)
+    with pytest.raises(ReflectionError, match="status update remains pending"):
+        p.reflect_task(binding, campaign_id="campaign", title="Work", state="running")
+    monkeypatch.setattr(host, "cli", original)
+    assert (
+        p.reflect_task(binding, campaign_id="campaign", title="Work", state="running")
+        == host.tasks[0]["id"]
+    )
+    assert len(host.tasks) == 1

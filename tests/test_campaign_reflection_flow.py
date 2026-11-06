@@ -158,6 +158,160 @@ def test_native_binding_uses_run_environment_not_terminal_title(flow):
     assert not wrong["actors_quiescent"]
 
 
+def test_reflection_projects_enabled_tasks_through_normal_flow(flow):
+    from bmad_loop.campaign_reflection_flow import reflect
+
+    snapshot, unit, claim, _, run_dir, mux = flow
+    snapshot.spec = dataclasses.replace(
+        snapshot.spec, paradev=dataclasses.replace(snapshot.spec.paradev, tasks=True)
+    )
+    calls = []
+    provider = SimpleNamespace(
+        reflect=lambda *args, **kwargs: {"state": "observed"},
+        reflect_task=lambda *args, **kwargs: calls.append(kwargs) or "task-id",
+        bind_terminal=lambda *args, **kwargs: {},
+    )
+    result = reflect(snapshot, unit, claim, provider=provider, mux=mux, run_directories=(run_dir,))
+    assert result["task"] == {"state": "confirmed", "task_id": "task-id"}
+    assert calls[0]["title"] == unit.spec.title
+    assert calls[0]["state"] == unit.state.value
+
+
+def test_sibling_prompt_is_scoped_and_bounded(flow):
+    from bmad_loop.campaign_model import UnitState
+
+    snapshot, unit, *_ = flow
+    unit.spec = dataclasses.replace(unit.spec, scopes=("own/",))
+    snapshot.spec = dataclasses.replace(
+        snapshot.spec, communication=CommunicationSpec(max_context_events=1)
+    )
+    for index in range(3):
+        peer = CampaignUnit(UnitSpec(f"peer-{index}", "source", "epic", "Peer", scopes=("other/",)))
+        snapshot.units[peer.id] = peer
+    snapshot.units["done"] = CampaignUnit(
+        UnitSpec("done", "source", "epic", "Done"), state=UnitState.DELIVERED
+    )
+    context = json.loads(compose_context(snapshot, unit).split("(advisory):\n", 1)[1])
+    assert len(context["siblings"]) == 1
+    assert context["omitted_siblings"] == 2
+    assert context["coverage"] == "bounded"
+
+
+def test_communication_collects_events_and_transcripts_without_reflection(flow, tmp_path):
+    from bmad_loop.campaign_communication import Observation, PeerBinding
+    from bmad_loop.campaign_reflection_flow import observe_communication
+
+    snapshot, unit, claim, *_ = flow
+    snapshot.spec = dataclasses.replace(
+        snapshot.spec,
+        paradev=ParadevSpec(),
+        communication=CommunicationSpec(mode="observe", room=str(tmp_path), max_context_events=2),
+    )
+    peer = PeerBinding(
+        snapshot.id, unit.id, claim.attempt, "nava", "pid", "session", "term", str(tmp_path)
+    )
+    unit.bindings["hcom"] = dataclasses.asdict(peer)
+    calls = []
+    observer = SimpleNamespace(
+        roster=lambda bindings: Observation(True),
+        events=lambda binding, **kwargs: calls.append(kwargs)
+        or Observation(True, events=({"id": 5, "data": {"session": "session"}},), cursor=5),
+        transcript=lambda binding, **kwargs: {"messages": ["bounded transcript"]},
+    )
+    first = observe_communication(snapshot, observer=observer)
+    assert first["available"] and first["events"][0]["id"] == 5
+    assert first["transcripts"][unit.id]["messages"] == ["bounded transcript"]
+    snapshot.bindings["communication"] = first
+    observe_communication(snapshot, observer=observer)
+    assert calls[0] == {"cursor": 0, "limit": 2}
+    assert calls[1]["cursor"] == 5
+
+
+def test_runtime_reflects_completed_tasks_and_persists_history(flow, tmp_path, monkeypatch):
+    from bmad_loop import campaign_paradev
+    from bmad_loop.campaign_cli import status_document
+    from bmad_loop.campaign_runtime import CampaignRuntime
+    from bmad_loop.campaign_store import CampaignStore, add_action
+
+    snapshot, unit, claim, _, _, mux = flow
+    unit.claim = dataclasses.replace(claim, quiescent=True)
+    snapshot.spec = dataclasses.replace(
+        snapshot.spec,
+        units=(unit.spec,),
+        paradev=dataclasses.replace(snapshot.spec.paradev, tasks=True),
+    )
+    mux.status = lambda **kwargs: {"windows": []}
+    calls = []
+    provider = SimpleNamespace(
+        reflect=lambda *args, **kwargs: {"state": "observed"},
+        reflect_task=lambda *args, **kwargs: calls.append(kwargs) or "native-task",
+    )
+    monkeypatch.setattr(campaign_paradev, "ParadevWorkspaceProvider", lambda **kwargs: provider)
+    store = CampaignStore(tmp_path / "runtime-state")
+    snapshot = store.create(snapshot)
+    runtime = CampaignRuntime(Path(claim.workspace), store, clock=lambda: 100)
+    monkeypatch.setattr(runtime, "_native_mux", lambda snapshot: mux)
+    monkeypatch.setattr(
+        runtime,
+        "_lifecycle_bridge",
+        lambda *args, **kwargs: SimpleNamespace(observe=lambda *a, **k: {"state": "observed"}),
+    )
+    proposal = next(row for row in runtime.observe_workers(snapshot) if row.kind == "reflection")
+    action = add_action(snapshot, proposal.kind, proposal.unit, proposal.payload)
+    snapshot = store.save(snapshot, snapshot.revision)
+    action = next(row for row in snapshot.outbox if row.id == action.id)
+    result = runtime.perform(snapshot, action)
+    assert result.state == "confirmed"
+    action.state, action.receipt = result.state, result.data
+    runtime.apply(snapshot, action, result)
+    saved = store.save(snapshot, snapshot.revision)
+    assert calls and Path(saved.units[unit.id].bindings["reflection"]["history_path"]).is_file()
+    assert (
+        status_document(saved)["units"][0]["operator"]["reflection"]["task"]["task_id"]
+        == "native-task"
+    )
+
+
+def test_runtime_persists_hcom_cursor_with_reflection_disabled(flow, tmp_path, monkeypatch):
+    from bmad_loop.campaign_communication import Observation, PeerBinding
+    from bmad_loop.campaign_runtime import CampaignRuntime
+    from bmad_loop.campaign_store import CampaignStore, add_action
+
+    snapshot, unit, claim, *_ = flow
+    snapshot.spec = dataclasses.replace(
+        snapshot.spec,
+        units=(unit.spec,),
+        paradev=ParadevSpec(),
+        communication=CommunicationSpec(mode="observe", room=str(tmp_path)),
+    )
+    unit.bindings["hcom"] = dataclasses.asdict(
+        PeerBinding(
+            snapshot.id, unit.id, claim.attempt, "nava", "pid", "session", "term", str(tmp_path)
+        )
+    )
+    observer = SimpleNamespace(
+        roster=lambda bindings: Observation(True),
+        events=lambda *a, **k: Observation(True, cursor=5),
+        transcript=lambda *a, **k: {"messages": []},
+    )
+    store = CampaignStore(tmp_path / "runtime-state")
+    snapshot = store.create(snapshot)
+    runtime = CampaignRuntime(Path(claim.workspace), store, clock=lambda: 100)
+    monkeypatch.setattr(runtime, "_hcom_observer", lambda snapshot: observer)
+    proposal = next(row for row in runtime.observe_workers(snapshot) if row.kind == "communication")
+    action = add_action(snapshot, proposal.kind, proposal.unit, proposal.payload)
+    snapshot = store.save(snapshot, snapshot.revision)
+    action = next(row for row in snapshot.outbox if row.id == action.id)
+    result = runtime.perform(snapshot, action)
+    action.state, action.receipt = result.state, result.data
+    runtime.apply(snapshot, action, result)
+    saved = store.save(snapshot, snapshot.revision)
+    assert list(saved.bindings["communication"]["cursors"].values()) == [5]
+    assert not any(row.kind == "communication" for row in runtime.observe_workers(saved))
+    runtime.clock = lambda: 116
+    assert any(row.kind == "communication" for row in runtime.observe_workers(saved))
+
+
 def test_actual_adapter_handle_proves_phase_and_cli_pin(flow):
     snapshot, unit, claim, _, run_dir, mux = flow
 

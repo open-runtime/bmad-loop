@@ -416,7 +416,11 @@ def _execution(request: dict[str, Any], envelope: CampaignExecution) -> dict[str
                     "kind": source.kind,
                 }
             )
+    sessions = [record.to_dict() for task in state.tasks.values() for record in task.sessions]
+    from .campaign_interruptions import execution_interruption
+
     return {
+        "interruption": execution_interruption(sessions) if not done else None,
         "outcome": (
             "recovery_required"
             if recovery.exists()
@@ -433,7 +437,7 @@ def _execution(request: dict[str, Any], envelope: CampaignExecution) -> dict[str
         "run_dir": str(composed.run_dir),
         "run_id": run_id,
         "summary": dataclasses.asdict(summary),
-        "sessions": [record.to_dict() for task in state.tasks.values() for record in task.sessions],
+        "sessions": sessions,
         "source_artifacts": source_artifacts,
     }
 
@@ -446,7 +450,46 @@ def _adapters(
     policy,
     **kwargs,
 ):
+    from .adapters.headless import HeadlessAdapter
+    from .campaign_headless import capability_for
+
+    permission = "no-tools" if request.get("read_only") else "workspace-tools"
+    routes = request.get("headless_capabilities", {})
+    profiles = dict(kwargs.get("profiles") or envelope.profiles)
+    selected_caps = {}
+    for role in ("dev", "review", "triage", "retro"):
+        selected = policy.adapter.resolved(role)
+        key = selected.name + ":" + selected.model
+        if key not in routes:
+            continue
+        modes = routes[key]
+        mode = "reasoning" if permission == "no-tools" else "execution"
+        if ("reasoning" in modes or "execution" in modes) and mode not in modes:
+            continue
+        if "permissions" in modes and modes["permissions"] != permission:
+            continue
+        selected_caps[role] = capability_for(routes, selected.name, selected.model, permission)
+        profiles[role] = dataclasses.replace(profiles[role], adapter="bounded-headless")
+    handoff_role = "triage" if request.get("kind") == "stage" else "dev"
+    if request.get("handoff_packet") and handoff_role not in selected_caps:
+        raise CampaignError(
+            "Handoff requires a qualified execution route with inline input delivery"
+        )
+    kwargs["profiles"] = profiles
     adapters = runsetup.make_adapters(project, run_dir, policy, **kwargs)
+    for role, adapter in adapters.items():
+        if not isinstance(adapter, HeadlessAdapter):
+            continue
+        selected = policy.adapter.resolved(role)
+        cap = selected_caps.get(role) or capability_for(
+            routes, selected.name, selected.model, permission
+        )
+        adapter.set_capability(
+            cap,
+            request.get("headless_grants"),
+            request.get("headless_coordinates"),
+            request.get("handoff_packet"),
+        )
     if request.get("claim"):
         from .campaign_model import WorkerClaim
         from .campaign_reflection_flow import observe_adapter
@@ -522,12 +565,33 @@ def _stage(request: dict[str, Any], envelope: CampaignExecution) -> dict[str, An
     stage_dir = envelope.directory / request["run_id"]
     stage_dir.mkdir(parents=True, exist_ok=True)
     adapter = _adapters(request, envelope, workspace, stage_dir, pol, profiles=profiles)["triage"]
+    from .journal import Journal
+    from .model import RunState
+    from .platform_util import root_identity_record
+
+    stage_pin = RunState(
+        request["launch_id"],
+        request["workspace"],
+        "",
+        run_dir_identity=root_identity_record(stage_dir),
+    )
+    stage_journal = Journal(stage_dir, pin=stage_pin)
+    if hasattr(adapter, "journal"):
+        adapter.journal = stage_journal
     task_id = session_task_id("campaign", role, envelope.attempt, envelope.generation)
     result_path = stage_dir / "tasks" / task_id / TASK_CYCLE_ARTIFACTS[0]
-    prompt = request["prompt"] + (
-        f"\n\nWrite the structured completion result to {result_path}. "
-        'It must be one JSON object with "status":"done" and the requested artifact fields. '
-        "Do not change orchestration policy, publish, merge, or start other agents."
+    completion_instruction = (
+        "\n\nReturn the structured completion result through native JSON output. "
+        if getattr(adapter, "requires_inline_context", False)
+        else f"\n\nWrite the structured completion result to {result_path}. "
+    )
+    prompt = (
+        request["prompt"]
+        + completion_instruction
+        + (
+            'It must be one JSON object with "status":"done" and the requested artifact fields. '
+            "Do not change orchestration policy, publish, merge, or start other agents."
+        )
     )
     if not request.get("read_only"):
         from .campaign_checkpoint import instruction as checkpoint_instruction
@@ -539,7 +603,11 @@ def _stage(request: dict[str, Any], envelope: CampaignExecution) -> dict[str, An
     spec = SessionSpec(
         task_id=task_id,
         role=role,
-        prompt=instruction(input_packet),
+        prompt=(
+            prompt
+            if getattr(adapter, "requires_inline_context", False)
+            else instruction(input_packet)
+        ),
         cwd=workspace,
         env={
             "BMAD_LOOP_MODE": "1",
@@ -572,7 +640,25 @@ def _stage(request: dict[str, Any], envelope: CampaignExecution) -> dict[str, An
     save_stage_usage(request, envelope.directory, usage, result)
     input_packet.verify()
     models = tuple(usage.models or ()) if usage else ()
-    observed = models[0] if len(models) == 1 else ""
+    observed = models[0] if models else ""
+    model_source = "transcript_primary" if observed else ""
+    if not observed:
+        observed = next(
+            (
+                row["model"]
+                for row in stage_journal.entries()
+                if row.get("kind") == "session-model"
+                and row.get("task_id") == task_id
+                and isinstance(row.get("model"), str)
+            ),
+            "",
+        )
+        model_source = "native_session_hook" if observed else ""
+    from .campaign_interruptions import CampaignStageInterrupted, session_interruption
+
+    interruption = session_interruption(result)
+    if interruption is not None:
+        raise CampaignStageInterrupted(role, interruption)
     actual = result.result_json
     if (
         result.status != "completed"
@@ -614,11 +700,9 @@ def _stage(request: dict[str, Any], envelope: CampaignExecution) -> dict[str, An
         paths, artifact_mirrors = mirror_artifacts(workspace, envelope.unit_id, artifacts)
         if paths:
             verify.commit_paths(workspace, f"docs: record campaign {role} artifacts", paths)
-    family = (
-        "openai"
-        if observed.startswith(("gpt-", "o1", "o3", "o4"))
-        else "anthropic" if observed.startswith("claude-") else ""
-    )
+    from .campaign_headless import provider_family
+
+    family = provider_family(observed)
     if candidate.get("provider_family") and candidate["provider_family"] != family:
         raise CampaignError("observed provider family differs from the selected role")
     return {
@@ -627,7 +711,14 @@ def _stage(request: dict[str, Any], envelope: CampaignExecution) -> dict[str, An
         "artifact": actual,
         "selected_model": candidate.get("model", ""),
         "observed_model": observed,
+        "observed_model_source": model_source,
+        "observed_models": list(models),
         "provider_family": family,
+        "provider_families": sorted(
+            {provider_family(model) for model in models if provider_family(model)}
+            | ({family} if family else set())
+        ),
+        "native_binding": result.native_binding,
         "session_id": result.session_id,
         "input_packet": {
             "path": str(input_packet.path),
@@ -644,6 +735,7 @@ def _stage(request: dict[str, Any], envelope: CampaignExecution) -> dict[str, An
 
 
 def _verify(request: dict[str, Any], envelope: CampaignExecution) -> dict[str, Any]:
+    from .campaign_acceptance import provenance
     from .campaign_fingerprint import capture
     from .campaign_resolution import diagnosis_unchanged
 
@@ -651,6 +743,19 @@ def _verify(request: dict[str, Any], envelope: CampaignExecution) -> dict[str, A
     before = verify.rev_parse_head(workspace)
     protected = _protected_sources(workspace, request)
     fingerprint = capture(workspace, source_roots=protected, exclude_paths=(envelope.directory,))
+    proof = provenance(
+        workspace,
+        before,
+        (
+            list(envelope.policy.verify.commands)
+            if request.get("legacy_verify")
+            else request["commands"]
+        ),
+        config_revision=str(request.get("config_revision", "")),
+    )
+
+    def receipt(outcome, records):
+        return {"outcome": outcome, "commands": records, "base": before, "proof": proof}
 
     def unchanged() -> None:
         current = capture(workspace, source_roots=protected, exclude_paths=(envelope.directory,))
@@ -661,10 +766,10 @@ def _verify(request: dict[str, Any], envelope: CampaignExecution) -> dict[str, A
         records = [dataclasses.asdict(row) for row in results]
         unchanged()
         if any(row.returncode != 0 for row in results):
-            return {"outcome": "verification_failed", "commands": records, "base": before}
+            return receipt("verification_failed", records)
         if verify.rev_parse_head(workspace) != before or not verify.worktree_clean(workspace):
             raise CampaignError("verification changed the candidate")
-        return {"outcome": "verified", "commands": records, "base": before}
+        return receipt("verified", records)
     records = []
     for command in request["commands"]:
         result = childrun.run_argv(
@@ -681,10 +786,10 @@ def _verify(request: dict[str, Any], envelope: CampaignExecution) -> dict[str, A
         )
         unchanged()
         if result.returncode != 0 or result.timed_out:
-            return {"outcome": "verification_failed", "commands": records, "base": before}
+            return receipt("verification_failed", records)
     if verify.rev_parse_head(workspace) != before or not verify.worktree_clean(workspace):
         raise CampaignError("verification changed the candidate")
-    return {"outcome": "verified", "commands": records, "base": before}
+    return receipt("verified", records)
 
 
 def _integrate(request: dict[str, Any], envelope: CampaignExecution) -> dict[str, Any]:
@@ -841,9 +946,11 @@ def child_main(request_path: Path) -> int:
     from . import campaign_hold
 
     hold_probe = campaign_hold.install(
-        lambda: bool(request.get("hold_channel"))
-        and campaign_hold.active(
-            Path(request["hold_channel"]), campaign=envelope.campaign_id, unit=envelope.unit_id
+        lambda: (
+            bool(request.get("hold_channel"))
+            and campaign_hold.active(
+                Path(request["hold_channel"]), campaign=envelope.campaign_id, unit=envelope.unit_id
+            )
         )
     )
     result: dict[str, Any]
@@ -871,10 +978,14 @@ def child_main(request_path: Path) -> int:
             raise CampaignError("unsupported campaign worker kind")
         result = action(request, envelope)
     except Exception as exc:
+        from .campaign_interruptions import CampaignStageInterrupted
+
         result = {
             "outcome": "operator_held" if "campaign operator hold" in str(exc) else "failed",
             "error": f"{type(exc).__name__}: {exc}",
         }
+        if isinstance(exc, CampaignStageInterrupted):
+            result["interruption"] = exc.interruption
     finally:
         if monitor is not None:
             monitor.stop(result)

@@ -12,6 +12,7 @@ import copy
 import math
 import re
 import tomllib
+from collections.abc import MutableSequence
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -100,6 +101,9 @@ class GitHubSpec:
     candidate_producer_probe: tuple[str, ...] = ()
     candidate_publish: str = "native"
     merge_command: tuple[str, ...] = ()
+    merge_executor: tuple[str, ...] = ()
+    review_users: tuple[str, ...] = ()
+    review_teams: tuple[str, ...] = ()
     recent_days: int = 30
     max_base_refreshes: int = 8
     allow_publication_wait: bool = False
@@ -164,6 +168,28 @@ class PlanningSpec:
 
 
 @dataclass(frozen=True)
+class ReasoningSpec:
+    enabled: bool = False
+    capabilities: str = ""
+    max_sessions: int = 4
+    max_attempts: int = 2
+    max_turns: int = 4
+    timeout_s: int = 1800
+    packet_token_limit: int = 160000
+    purposes: tuple[str, ...] = (
+        "routing",
+        "triage",
+        "semantic_sync",
+        "priority",
+        "graph_review",
+        "report",
+        "handoff_map",
+        "handoff_reduce",
+        "handoff_audit",
+    )
+
+
+@dataclass(frozen=True)
 class UnitSpec:
     id: str
     source: str
@@ -202,6 +228,7 @@ class CampaignSpec:
     intake: IntakeSpec = field(default_factory=IntakeSpec)
     communication: CommunicationSpec = field(default_factory=CommunicationSpec)
     planning: PlanningSpec = field(default_factory=PlanningSpec)
+    reasoning: ReasoningSpec = field(default_factory=ReasoningSpec)
     role_pools: tuple[tuple[str, tuple[RoleCandidate, ...]], ...] = ()
     roles: tuple[tuple[str, RoleSpec], ...] = ()
     verify_commands: tuple[tuple[str, ...], ...] = ()
@@ -315,11 +342,12 @@ class CampaignSnapshot:
     config_revision: int = 1
     phase: str = "active"
     outbox: list[OutboxAction] = field(default_factory=list)
-    events: list[dict[str, Any]] = field(default_factory=list)
+    events: MutableSequence[dict[str, Any]] = field(default_factory=list)
     processed_commands: list[str] = field(default_factory=list)
     config_snapshot: dict[str, Any] = field(default_factory=dict)
     bindings: dict[str, Any] = field(default_factory=dict)
     last_epic: str = ""
+    jobs: dict[str, dict[str, Any]] = field(default_factory=dict)
     common_dir: str = ""
     root: str = ""
     remote_url: str = ""
@@ -368,10 +396,14 @@ def _construct(cls: Any, value: Any, name: str) -> Any:
             "candidate_command",
             "candidate_producer_probe",
             "merge_command",
+            "merge_executor",
+            "review_users",
+            "review_teams",
             "sources",
             "transcript_sources",
             "labels",
             "stages",
+            "purposes",
         }:
             out[key] = _strings(item, f"{name}.{key}")
         elif key == "candidate_check_app_id":
@@ -392,6 +424,9 @@ def _construct(cls: Any, value: Any, name: str) -> Any:
             "max_triage_attempts",
             "timeout_s",
             "max_tokens",
+            "max_turns",
+            "max_attempts",
+            "packet_token_limit",
         }:
             if item is not None:
                 _positive(item, f"{name}.{key}")
@@ -557,6 +592,7 @@ def spec_from_dict(value: Mapping[str, Any]) -> CampaignSpec:
         "intake": IntakeSpec,
         "communication": CommunicationSpec,
         "planning": PlanningSpec,
+        "reasoning": ReasoningSpec,
     }
     for name, cls in sections.items():
         raw[name] = _construct(cls, raw.get(name, {}), name)
@@ -638,6 +674,16 @@ def spec_from_dict(value: Mapping[str, Any]) -> CampaignSpec:
         "decision_review",
         "conflict_repair",
         "publication_review",
+        "execution",
+        "execution_review",
+        "reasoning",
+        "routing",
+        "summarization",
+        "handoff_map",
+        "handoff_reduce",
+        "reporting",
+        "handoff_audit",
+        "graph_review",
     }
     for name, value in roles.items():
         if name not in allowed_roles:
@@ -681,6 +727,10 @@ def spec_from_dict(value: Mapping[str, Any]) -> CampaignSpec:
         raise CampaignError("github.merge_mode must be direct-strict, queue or project-command")
     if spec.github.merge_mode == "project-command" and not spec.github.merge_command:
         raise CampaignError("project-command requires a configured maintained publication gate")
+    if spec.github.merge_executor and spec.github.merge_mode != "project-command":
+        raise CampaignError("github.merge_executor requires project-command mode")
+    if set(spec.reasoning.purposes) - set(ReasoningSpec().purposes):
+        raise CampaignError("unknown reasoning purpose")
     if spec.github.candidate_publish not in {"native", "external"}:
         raise CampaignError("github.candidate_publish must be native or external")
     if spec.github.merge_method != "merge":
@@ -734,8 +784,14 @@ def spec_to_dict(spec: CampaignSpec) -> dict[str, Any]:
     return raw
 
 
-def snapshot_to_dict(snapshot: CampaignSnapshot) -> dict[str, Any]:
-    raw = asdict(snapshot)
+def snapshot_to_dict(snapshot: CampaignSnapshot, *, include_events: bool = True) -> dict[str, Any]:
+    # The persisted journal can be lazy. Never traverse it just to serialize hot
+    # authority; explicit exports still include the complete event history.
+    hot = copy.copy(snapshot)
+    hot.events = []
+    raw = asdict(hot)
+    if include_events:
+        raw["events"] = list(snapshot.events)
     raw["spec"] = spec_to_dict(snapshot.spec)
     return raw
 

@@ -167,6 +167,8 @@ def _context_current(snapshot: CampaignSnapshot, unit_id: str, packet: Mapping[s
         and packet.get("hold", {}).get("id") == (hold.id if hold else None)
         and packet.get("github_input_revision", "")
         == snapshot.units[unit_id].evidence.get("github_input_revision", "")
+        and packet.get("decision_input_revision", "")
+        == snapshot.units[unit_id].evidence.get("decision_input_revision", "")
     )
 
 
@@ -245,6 +247,7 @@ def proposals(
             not isinstance(saved, dict)
             or saved.get("mode") != mode
             or not _context_current(snapshot, key, saved["packet"])
+            or (mode == "decision" and "observed_at" in saved and now - saved["observed_at"] >= 60)
         ):
             output.append(
                 Proposal(
@@ -389,6 +392,7 @@ def collect_context(
     else:
         raise CampaignError("unknown recovery context mode")
     packet["github_input_revision"] = unit.evidence.get("github_input_revision", "")
+    packet["decision_input_revision"] = unit.evidence.get("decision_input_revision", "")
     return {"mode": mode, "packet": packet}
 
 

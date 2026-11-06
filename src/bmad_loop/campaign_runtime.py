@@ -12,7 +12,6 @@ import hashlib
 import json
 import os
 import shutil
-import subprocess
 import threading
 import time
 import uuid
@@ -44,6 +43,7 @@ from .campaign_model import (
     UnitSpec,
     UnitState,
     WorkerClaim,
+    scopes_overlap,
 )
 from .campaign_planning import StageCoordinates, execution_spec, stage_packet, validate_result
 from .campaign_preflight import repository_name, resolve_roles
@@ -101,7 +101,7 @@ def create(project: Path, spec: CampaignSpec) -> tuple[CampaignStore, CampaignSn
         raise CampaignError("ambient transport override conflicts with native reflection")
     pol = dataclasses.replace(pol, mux=dataclasses.replace(pol.mux, backend=resolved_backend))
     profiles = runsetup.resolve_profiles(pol, project)
-    for role in (
+    for role in set(dict(spec.roles)) | {
         "planning",
         "planning_review",
         "triage",
@@ -109,7 +109,7 @@ def create(project: Path, spec: CampaignSpec) -> tuple[CampaignStore, CampaignSn
         "decision_review",
         "conflict_repair",
         "publication_review",
-    ):
+    }:
         for candidate in spec.candidates(role):
             if candidate.profile:
                 profiles["campaign:" + candidate.profile] = get_profile(candidate.profile, project)
@@ -139,6 +139,15 @@ def create(project: Path, spec: CampaignSpec) -> tuple[CampaignStore, CampaignSn
         config_snapshot={"policy": pol.to_dict(), "configuration_revision": 1},
     )
     snapshot.bindings["source_observations"] = graph.observations
+    if spec.reasoning.enabled:
+        from .campaign_headless import load_capabilities
+
+        if not spec.reasoning.capabilities:
+            raise CampaignError("reasoning requires a qualified capabilities manifest")
+        manifest = Path(spec.reasoning.capabilities).expanduser()
+        if not manifest.is_absolute():
+            manifest = project / manifest
+        snapshot.config_snapshot["reasoning_capabilities"] = load_capabilities(manifest)
     snapshot.bindings["source_freshness"] = dataclasses.asdict(source_freshness)
     ownership = dict(spec.ownership)
     unknown = set(ownership) - set(snapshot.units)
@@ -296,13 +305,37 @@ class CampaignRuntime:
         role: str,
         *,
         developer_family: str = "",
+        developer_families: tuple[str, ...] = (),
         provisional: tuple[tuple[str, RoleCandidate], ...] = (),
+        allowed_candidates: tuple[RoleCandidate, ...] | None = None,
     ) -> RoleCandidate | None:
         rows = snapshot.bindings.get("capacity", {})
         capacities = {
             (row["profile"], row["model"]): CapacityObservation(**row["capacity"])
             for row in rows.get("observations", [])
         }
+        from .campaign_scheduler import route_unavailable
+
+        for identity, observation in capacities.items():
+            # Older/injected observers inherit the observation batch's bounded
+            # lifetime, never a fresh timestamp on every scheduler pass.
+            stamped = dataclasses.replace(
+                observation,
+                observed_at=(
+                    observation.observed_at
+                    if observation.observed_at is not None
+                    else rows.get("observed_at", 0)
+                ),
+                expires_at=(
+                    observation.expires_at
+                    if observation.expires_at is not None
+                    else rows.get("observed_at", 0) + 120
+                ),
+            )
+            reason = route_unavailable(stamped, now=self.clock())
+            capacities[identity] = (
+                dataclasses.replace(stamped, available=False, reason=reason) if reason else stamped
+            )
         unobserved = Counter((candidate.profile, candidate.model) for _, candidate in provisional)
         observed_at = rows.get("observed_at", 0)
         for unit in snapshot.units.values():
@@ -324,19 +357,31 @@ class CampaignRuntime:
                 capacities[identity] = dataclasses.replace(
                     capacities[identity], active=capacities[identity].active + count
                 )
+        for job in snapshot.jobs.values():
+            claim = job.get("claim")
+            candidate = job.get("selection")
+            if (
+                claim
+                and not claim["quiescent"]
+                and candidate
+                and claim.get("started_at", 0) >= observed_at
+            ):
+                identity = (candidate["profile"], candidate["model"])
+                if identity in capacities:
+                    capacities[identity] = dataclasses.replace(
+                        capacities[identity], active=capacities[identity].active + 1
+                    )
         if (
             role == "publication_review"
             and snapshot.spec.github.require_independent_review
-            and developer_family
+            and (developer_family or developer_families)
         ):
             for candidate in snapshot.spec.candidates(role):
-                family = candidate.provider_family or (
-                    "anthropic"
-                    if candidate.model.startswith("claude-")
-                    else "openai" if candidate.model.startswith("gpt-") else ""
-                )
+                from .campaign_headless import provider_family
+
+                family = candidate.provider_family or provider_family(candidate.model)
                 key = (candidate.profile, candidate.model)
-                if family == developer_family and key in capacities:
+                if family in {developer_family, *developer_families} and key in capacities:
                     capacities[key] = dataclasses.replace(
                         capacities[key],
                         available=False,
@@ -345,6 +390,14 @@ class CampaignRuntime:
         active_role = sum(
             bool(unit.claim and not unit.claim.quiescent and unit.claim.role == role)
             for unit in snapshot.units.values()
+        )
+        active_role += sum(
+            bool(
+                job.get("claim")
+                and not job["claim"]["quiescent"]
+                and job["request"]["role"] == role
+            )
+            for job in snapshot.jobs.values()
         )
         if (
             active_role + sum(saved_role == role for saved_role, _ in provisional)
@@ -364,7 +417,20 @@ class CampaignRuntime:
                 for key, count in snapshot.bindings.get("role_selections", {}).items()
             },
             spent_usd=snapshot.bindings.get("role_spend", {}).get(role, 0),
+            allowed_candidates=allowed_candidates,
         )
+        if selected is not None:
+            from .campaign_reasoning_results import preferred_candidate
+
+            eligible = tuple(
+                candidate
+                for candidate in snapshot.spec.candidates(role)
+                if (allowed_candidates is None or candidate in allowed_candidates)
+                and not route_unavailable(
+                    capacities.get((candidate.profile, candidate.model)), now=self.clock()
+                )
+            )
+            selected = preferred_candidate(snapshot, role, eligible) or selected
         return selected
 
     def _units_settled(self, snapshot) -> bool:
@@ -380,6 +446,10 @@ class CampaignRuntime:
         )
 
     def completion_ready(self, snapshot) -> bool:
+        from .campaign_reasoning_flow import outstanding
+
+        if outstanding(snapshot):
+            return False
         return snapshot.bindings.get(
             "hierarchy_finalized_graph"
         ) == snapshot.graph_revision and snapshot.bindings.get("intake", {}).get(
@@ -404,7 +474,26 @@ class CampaignRuntime:
     def prepare_resume(self, snapshot: CampaignSnapshot) -> bool:
         from .campaign_attribution import restore
 
-        return restore(snapshot)
+        changed = restore(snapshot)
+        for unit in snapshot.units.values():
+            hold = unit.hold
+            if (
+                hold
+                and hold.kind == "approval"
+                and hold.actor == "campaign"
+                and hold.evidence.get("dequeue_confirmed")
+            ):
+                candidate = hold.evidence.get("queue", {}).get("candidate")
+                if candidate:
+                    unit.hold = dataclasses.replace(
+                        hold,
+                        kind="remote_wait",
+                        actor="github",
+                        evidence={**hold.evidence, "candidate": candidate},
+                    )
+                    add_event(snapshot, "legacy-queue-wait-restored", unit=unit.id)
+                    changed = True
+        return changed
 
     def proposals(self, snapshot: CampaignSnapshot) -> tuple[Proposal, ...]:
         if self._units_settled(snapshot) and self.completion_ready(snapshot):
@@ -466,7 +555,8 @@ class CampaignRuntime:
             )
         ) and not self._pending(snapshot, "", "intake"):
             proposals.append(Proposal("intake", ""))
-        selected = set(admit(snapshot, now=now).units)
+        admission = admit(snapshot, now=now)
+        selected = set(admission.units)
         reserved = Counter(
             claim.resource
             for row in snapshot.units.values()
@@ -506,7 +596,17 @@ class CampaignRuntime:
             and not row.bindings.get("workspace")
             for row in snapshot.units.values()
         )
-        for key, unit in snapshot.units.items():
+        from .campaign_scheduler import allocation_order
+
+        allocation_reservations = [
+            row.id
+            for row in snapshot.units.values()
+            if (row.bindings.get("workspace") or row.state == UnitState.PLANNING)
+            and row.state not in {UnitState.DELIVERED, UnitState.CANCELED}
+            and not delegates_tracking_slot(snapshot, row)
+        ]
+        for key in allocation_order(snapshot):
+            unit = snapshot.units[key]
             adoption = unit.bindings.get("adoption")
             if adoption and adoption["state"] in {
                 "retire_pending",
@@ -608,9 +708,31 @@ class CampaignRuntime:
                 continue
             if (
                 unit.hold
+                and unit.hold.kind in {"remote_wait", "external_wait"}
+                and unit.hold.actor == "github"
+                and (unit.retry_at is None or now >= unit.retry_at)
+                and not self._pending(snapshot, key)
+                and (not unit.claim or unit.claim.quiescent)
+            ):
+                proposals.append(Proposal("remote-wait", key, {"hold_id": unit.hold.id}))
+                continue
+            if (
+                unit.hold
                 or self._pending(snapshot, key)
                 or (unit.claim and not unit.claim.quiescent)
             ):
+                continue
+            from .campaign_handoff_flow import resume_proposal
+
+            continuation = resume_proposal(snapshot, unit)
+            if continuation is not None:
+                resource = (
+                    "execution" if continuation.payload["kind"] == "execution" else "planning"
+                )
+                if continuation.payload.get("role") == "publication_review":
+                    resource = "review"
+                if reserve(resource):
+                    proposals.append(continuation)
                 continue
             if unit.spec.kind == "planning" and (
                 unit.state == UnitState.RUNNING
@@ -655,10 +777,19 @@ class CampaignRuntime:
                     proposals.append(Proposal("reconcile-existing", key))
                     continue
                 reservation = 0 if unit.spec.kind == "tracking" else tracking_reservations
-                if workspace_count + reservation < snapshot.spec.max_in_flight_units and all(
-                    snapshot.units[key].state == UnitState.DELIVERED for key in unit.spec.after
+                if (
+                    workspace_count + reservation < snapshot.spec.max_in_flight_units
+                    and all(
+                        snapshot.units[key].state == UnitState.DELIVERED for key in unit.spec.after
+                    )
+                    and not any(
+                        scopes_overlap(unit.spec.scopes, snapshot.units[other].spec.scopes)
+                        for other in allocation_reservations
+                        if other != key
+                    )
                 ):
                     proposals.append(Proposal("prepare-unit", key))
+                    allocation_reservations.append(key)
                     workspace_count += 1
                     if unit.spec.kind == "tracking":
                         tracking_reservations -= 1
@@ -710,6 +841,20 @@ class CampaignRuntime:
                                     },
                                 )
                             )
+                    elif "execution" in dict(snapshot.spec.roles):
+                        candidate = self._role(snapshot, "execution")
+                        if candidate and reserve("execution"):
+                            proposals.append(
+                                Proposal(
+                                    "launch",
+                                    key,
+                                    {
+                                        "kind": "execution",
+                                        "role": "execution",
+                                        "candidate": dataclasses.asdict(candidate),
+                                    },
+                                )
+                            )
                     elif reserve("execution"):
                         proposals.append(Proposal("launch", key, {"kind": "execution"}))
             elif unit.state == UnitState.LOCALLY_COMPLETE:
@@ -730,6 +875,7 @@ class CampaignRuntime:
                     snapshot,
                     "publication_review",
                     developer_family=unit.evidence.get("developer_family", ""),
+                    developer_families=tuple(unit.evidence.get("developer_families", [])),
                 )
                 if candidate and reserve("review"):
                     proposals.append(
@@ -748,7 +894,9 @@ class CampaignRuntime:
                 if not unit.bindings.get("ready_for_review"):
                     proposals.append(Proposal("prepare-ready", key))
                 else:
-                    proposals.append(Proposal("prepare-merge", key))
+                    from .campaign_publication_flow import proposals as publication_proposals
+
+                    proposals.extend(publication_proposals(self, snapshot, unit, reserve))
             elif unit.state == UnitState.MERGE_REQUESTED:
                 if snapshot.spec.github.merge_mode == "queue":
                     from .campaign_runtime_queue import proposals as queue_proposals
@@ -784,9 +932,15 @@ class CampaignRuntime:
             ):
                 continue
             proposals.append(proposal)
+        from .campaign_reasoning_plan import defer_intake
         from .campaign_runtime_intake import proposals as intake_proposals
 
-        proposals.extend(intake_proposals(snapshot, self._role(snapshot, "triage")))
+        defer_triage = defer_intake(snapshot, now=self.clock())
+        proposals.extend(
+            proposal
+            for proposal in intake_proposals(snapshot, self._role(snapshot, "triage"))
+            if not defer_triage or proposal.kind != "triage"
+        )
         if (
             self._units_settled(snapshot)
             and not self.completion_ready(snapshot)
@@ -827,7 +981,22 @@ class CampaignRuntime:
                     snapshot,
                     role,
                     developer_family=unit.evidence.get("developer_family", ""),
+                    developer_families=tuple(unit.evidence.get("developer_families", [])),
                     provisional=tuple(role_reservations),
+                    allowed_candidates=(
+                        (
+                            RoleCandidate(
+                                **{
+                                    **proposal.payload["candidate"],
+                                    "capacity_command": tuple(
+                                        proposal.payload["candidate"].get("capacity_command", ())
+                                    ),
+                                }
+                            ),
+                        )
+                        if proposal.payload.get("handoff_id")
+                        else None
+                    ),
                 )
                 if candidate is None:
                     continue
@@ -844,9 +1013,40 @@ class CampaignRuntime:
         return tuple(before_proposal(self, snapshot, proposal) for proposal in admitted)
 
     def observe_workers(self, snapshot: CampaignSnapshot) -> tuple[Proposal, ...]:
-        proposals = []
+        from .campaign_handoff_flow import proposals as handoff_proposals
+        from .campaign_reasoning_flow import proposals as reasoning_proposals
+        from .campaign_reasoning_plan import proposals as semantic_proposals
+
+        proposals = (
+            list(reasoning_proposals(self, snapshot))
+            + list(semantic_proposals(self, snapshot))
+            + list(handoff_proposals(self, snapshot))
+        )
+        if (
+            snapshot.spec.communication.mode == "observe"
+            and any(unit.claim and not unit.claim.quiescent for unit in snapshot.units.values())
+            and self.clock() - snapshot.bindings.get("communication", {}).get("observed_at", 0)
+            >= 15
+            and not self._pending(snapshot, "", "communication")
+        ):
+            proposals.append(Proposal("communication", ""))
         for key, unit in snapshot.units.items():
             claim = unit.claim
+            reflected = unit.bindings.get("reflection", {})
+            if (
+                snapshot.spec.paradev.reflect
+                and unit.bindings.get("native")
+                and not self._pending(snapshot, key, "reflection")
+                and (
+                    reflected.get("fingerprint") != self._reflection_fingerprint(unit)
+                    or (
+                        claim
+                        and not claim.quiescent
+                        and self.clock() - reflected.get("observed_at", 0) >= 5
+                    )
+                )
+            ):
+                proposals.append(Proposal("reflection", key))
             if not claim or claim.quiescent:
                 continue
             launch = next((row for row in snapshot.outbox if row.id == claim.launch_id), None)
@@ -861,8 +1061,6 @@ class CampaignRuntime:
                     proposals.append(
                         Proposal("terminate-worker", key, {"launch_id": claim.launch_id})
                     )
-            if snapshot.spec.paradev.reflect and not self._pending(snapshot, key, "reflection"):
-                proposals.append(Proposal("reflection", key))
             if not self._pending(snapshot, key, "observe-worker"):
                 proposals.append(Proposal("observe-worker", key, {"launch_id": claim.launch_id}))
             writable_session = launch.payload.get("kind") == "execution" or (
@@ -910,8 +1108,19 @@ class CampaignRuntime:
 
     def control(self, snapshot: CampaignSnapshot, command: dict[str, Any]) -> None:
         kind, key = command["kind"], command.get("unit", "")
+        if kind == "handoff":
+            from .campaign_handoff_flow import control
+
+            control(self, snapshot, command)
+            return
         if kind == "prepare-effect":
             action = command["action"]
+            if action["kind"].startswith("reasoning-"):
+                from .campaign_reasoning_flow import prepare_effect
+
+                owned = next(row for row in snapshot.outbox if row.id == action["id"])
+                prepare_effect(self, snapshot, owned)
+                return
             unit = snapshot.units.get(action["unit"])
             if unit is None:
                 return
@@ -1028,6 +1237,14 @@ class CampaignRuntime:
                 unit.claim.run_dir = str(
                     self.store.directory(snapshot.id) / "workers" / action["id"]
                 )
+                from .campaign_handoff_flow import adopt_launch
+
+                adopt_launch(snapshot, unit, payload, unit.claim)
+                from .campaign_scheduler import epic_key
+
+                snapshot.last_epic = epic_key(
+                    unit.spec.source, unit.spec.initiative, unit.spec.epic
+                )
                 if unit.state == UnitState.READY:
                     transition(snapshot, unit.id, UnitState.CLAIMED)
                 elif unit.state == UnitState.LOCALLY_COMPLETE:
@@ -1098,6 +1315,18 @@ class CampaignRuntime:
     def perform(self, snapshot: CampaignSnapshot, action) -> Observation:
         if action.generation != snapshot.generation:
             return Observation("rejected", reason="stale effect generation")
+        if action.kind.startswith("handoff-"):
+            from .campaign_handoff_flow import perform
+
+            return perform(self, snapshot, action)
+        if action.kind == "semantic-plan":
+            from .campaign_reasoning_plan import perform
+
+            return perform(self, snapshot, action)
+        if action.kind.startswith("reasoning-"):
+            from .campaign_reasoning_flow import perform
+
+            return perform(self, snapshot, action)
         if action.unit in snapshot.units and action.kind not in {
             "launch",
             "observe-worker",
@@ -1132,11 +1361,37 @@ class CampaignRuntime:
         return handler(snapshot, action)
 
     def reconcile_action(self, snapshot: CampaignSnapshot, action) -> Observation:
+        if action.kind.startswith("handoff-"):
+            from .campaign_handoff_flow import perform
+
+            return perform(self, snapshot, action)
+        if action.kind == "semantic-plan":
+            from .campaign_reasoning_plan import perform
+
+            return perform(self, snapshot, action)
+        if action.kind.startswith("reasoning-"):
+            from .campaign_reasoning_flow import perform
+
+            return perform(self, snapshot, action, reconcile=True)
         if action.kind.startswith("github"):
             intent = MutationIntent.from_dict(
                 action.receipt.get("intent") or action.payload["intent"]
             )
             gateway = self.gateway(snapshot)
+            if intent.kind in {"project_merge", "review_request"}:
+                from .campaign_publication_flow import execute_special
+
+                category = (
+                    "merge-submissions" if intent.kind == "project_merge" else "review-submissions"
+                )
+                submitted = (
+                    self.store.directory(snapshot.id)
+                    / category
+                    / (safe_segment(action.id) + ".json")
+                )
+                if not submitted.exists():
+                    return self._perform_github(snapshot, action)
+                return execute_special(self, snapshot, action, intent, reconcile=True)
             if intent.kind == "merge":
                 submitted = (
                     self.store.directory(snapshot.id)
@@ -1225,6 +1480,9 @@ class CampaignRuntime:
             "hierarchy-close",
             "prepare-pr",
             "prepare-ready",
+            "prepare-review-requests",
+            "pr-head-checkout",
+            "pr-head-publish",
             "prepare-draft",
             "ready",
             "prepare-unit",
@@ -1243,6 +1501,7 @@ class CampaignRuntime:
             "queue-dequeue",
             "sync-tracking",
             "reflection",
+            "communication",
             "lifecycle",
             "planning-complete",
             "intake-control",
@@ -1253,6 +1512,7 @@ class CampaignRuntime:
             "intake-completion-note",
             "usage-hold",
             "resolution-context",
+            "remote-wait",
             "decision-project",
             "resolution-backoff",
             "resolution-reprobe",
@@ -1348,6 +1608,10 @@ class CampaignRuntime:
         if not action.kind.startswith("github"):
             return
         intent = action.receipt.get("intent") or action.payload["intent"]
+        if intent["kind"] in {"project_merge", "review_request"}:
+            # Their reconciliation protocols are observation-only. Never grant
+            # generic update retry permission to another outbound submission.
+            return
         if intent["kind"] in {"issue", "milestone", "pr", "comment", "queue_check"}:
             return
         unit = snapshot.units[action.unit]
@@ -1390,13 +1654,34 @@ class CampaignRuntime:
 
         return ParadevMultiplexer(state_dir=self.store.directory(snapshot.id) / "native-transport")
 
+    @staticmethod
+    def _reflection_fingerprint(unit) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                {
+                    "state": str(unit.state),
+                    "hold": dataclasses.asdict(unit.hold) if unit.hold else None,
+                    "claim": dataclasses.asdict(unit.claim) if unit.claim else None,
+                    "pr": unit.bindings.get("pr"),
+                },
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()
+
+    def _perform_communication(self, snapshot, action) -> Observation:
+        from .campaign_reflection_flow import observe_communication
+
+        observer = self._hcom_observer(snapshot)
+        if observer is None:
+            return Observation("confirmed", {"mode": "off", "observed_at": self.clock()})
+        result = observe_communication(snapshot, observer=observer)
+        return Observation("confirmed", {**result, "observed_at": self.clock()})
+
     def _perform_reflection(self, snapshot, action) -> Observation:
         from .campaign_paradev import ParadevWorkspaceProvider
         from .campaign_reflection_flow import reflect
 
         unit = snapshot.units[action.unit]
-        if not unit.claim:
-            return Observation("rejected", reason="reflection has no owned worker")
         provider = ParadevWorkspaceProvider(
             project_id=snapshot.spec.paradev.project_id,
             allowed_root=Path(snapshot.spec.paradev.worktree_root),
@@ -1416,6 +1701,14 @@ class CampaignRuntime:
                 "workspace_retained": True,
                 "detail": "Lifecycle observation unavailable: " + type(exc).__name__,
             }
+        result["observed_at"] = self.clock()
+        result["fingerprint"] = self._reflection_fingerprint(unit)
+        payload = json.dumps(result, sort_keys=True)
+        history = self.store.directory(snapshot.id) / "reflection-history" / safe_segment(unit.id)
+        history.mkdir(parents=True, exist_ok=True)
+        path = history / (hashlib.sha256(payload.encode()).hexdigest() + ".json")
+        atomic_write_text(path, payload, follow_symlinks=False)
+        result["history_path"] = str(path)
         return Observation("confirmed", result)
 
     def _hcom_observer(self, snapshot):
@@ -1592,9 +1885,10 @@ class CampaignRuntime:
         )
 
     def _perform_capacity(self, snapshot, action) -> Observation:
+        observed_at = self.clock()
         observations = []
         seen = set()
-        for role in (
+        for role in set(dict(snapshot.spec.roles)) | {
             "planning",
             "planning_review",
             "triage",
@@ -1602,7 +1896,7 @@ class CampaignRuntime:
             "decision_review",
             "conflict_repair",
             "publication_review",
-        ):
+        }:
             for candidate in snapshot.spec.candidates(role):
                 identity = (candidate.profile, candidate.model)
                 if identity in seen:
@@ -1616,7 +1910,7 @@ class CampaignRuntime:
                         "capacity": dataclasses.asdict(result),
                     }
                 )
-        return Observation("confirmed", {"observations": observations, "observed_at": self.clock()})
+        return Observation("confirmed", {"observations": observations, "observed_at": observed_at})
 
     def _perform_intake(self, snapshot, action) -> Observation:
         from .campaign_runtime_intake import collect
@@ -1724,6 +2018,7 @@ class CampaignRuntime:
         base = verify.rev_parse_revision(self.project, observation_ref)
         if snapshot.spec.paradev.reflect:
             from .campaign_paradev import ParadevWorkspaceProvider
+            from .campaign_reflection_flow import group_identity
 
             provider = ParadevWorkspaceProvider(
                 project_id=snapshot.spec.paradev.project_id,
@@ -1737,11 +2032,7 @@ class CampaignRuntime:
                 unit.spec.title,
                 action_id=action.id,
                 target=snapshot.spec.target,
-                group=(
-                    unit.spec.epic
-                    if snapshot.spec.paradev.group_by == "epic"
-                    else unit.spec.parent or unit.id
-                ),
+                group=group_identity(unit.spec, snapshot.spec.paradev.group_by),
             )
             workspace = Path(binding.path)
             native = dataclasses.asdict(binding)
@@ -2039,12 +2330,19 @@ class CampaignRuntime:
             facts=mapped.facts,
             mapped_unavailable=mapped.unavailable,
         )
+        result["observed_at"] = self.clock()
         return Observation("confirmed", result)
 
     def _perform_decision_project(self, snapshot, action) -> Observation:
         from .campaign_runtime_decisions import project
 
         return Observation("confirmed", project(self, snapshot, action))
+
+    def _perform_remote_wait(self, snapshot, action) -> Observation:
+        from .campaign_remote_waits import observe
+
+        data = observe(self, snapshot, action)
+        return Observation("confirmed", data)
 
     def _perform_resolution_backoff(self, snapshot, action) -> Observation:
         return Observation("confirmed")
@@ -2105,7 +2403,7 @@ class CampaignRuntime:
 
     def _perform_github(self, snapshot, action) -> Observation:
         intent = MutationIntent.from_dict(action.payload["intent"])
-        if intent.kind != "merge":
+        if intent.kind not in {"merge", "project_merge"}:
             return self._perform_github_submission(snapshot, action)
         # CI/model/test waits happen in independent prepare effects. Serialize
         # only the last fresh gate and bounded request, never their wait period.
@@ -2122,7 +2420,7 @@ class CampaignRuntime:
             from .campaign_adoption import guard_retire_submission
 
             guard_retire_submission(self, self.store.load(snapshot.id), action.unit, intent)
-        if intent.kind == "merge":
+        if intent.kind in {"merge", "project_merge"}:
             current = self.store.load(snapshot.id)
             from . import campaign_hold
 
@@ -2159,8 +2457,9 @@ class CampaignRuntime:
                 )
             unit = current.units[action.unit]
             candidate = self._candidate(current, unit)
+            coordinates = intent.coordinates or {}
             if any(
-                (intent.coordinates or {}).get(key) != value
+                coordinates.get(key) != value
                 for key, value in dataclasses.asdict(candidate).items()
             ):
                 return Observation(
@@ -2197,14 +2496,21 @@ class CampaignRuntime:
                 )
         if intent.state == "confirmed":
             return Observation("confirmed", {"intent": intent.to_dict()})
-        if intent.kind == "merge":
-            submitted = self.store.directory(snapshot.id) / "merge-submissions"
+        if intent.kind in {"merge", "project_merge", "review_request"}:
+            category = (
+                "review-submissions" if intent.kind == "review_request" else "merge-submissions"
+            )
+            submitted = self.store.directory(snapshot.id) / category
             submitted.mkdir(parents=True, exist_ok=True)
             atomic_write_text(
                 submitted / (safe_segment(action.id) + ".json"),
                 json.dumps({"action_id": action.id, "coordinates": intent.coordinates}),
                 follow_symlinks=False,
             )
+        if intent.kind in {"project_merge", "review_request"}:
+            from .campaign_publication_flow import execute_special
+
+            return execute_special(self, snapshot, action, intent)
         result = self.gateway(snapshot).execute(
             dataclasses.replace(intent, state="sent_unknown"), generation=snapshot.generation
         )
@@ -2510,6 +2816,27 @@ class CampaignRuntime:
                     ),
                 ),
             )
+            if action.payload.get("candidate"):
+                candidate = action.payload["candidate"]
+                selection = dataclasses.replace(
+                    envelope.policy.adapter.dev,
+                    name=candidate["profile"],
+                    model=candidate.get("model", ""),
+                    effort=candidate.get("effort", ""),
+                )
+                profiles = dict(envelope.profiles)
+                profiles["dev"] = profiles["campaign:" + candidate["profile"]]
+                envelope = dataclasses.replace(
+                    envelope,
+                    profiles=profiles,
+                    policy=dataclasses.replace(
+                        envelope.policy,
+                        adapter=dataclasses.replace(
+                            envelope.policy.adapter,
+                            dev=selection,
+                        ),
+                    ),
+                )
         workspace = Path(action.payload.get("verification_workspace", unit.bindings["workspace"]))
         request = {
             **action.payload,
@@ -2528,6 +2855,32 @@ class CampaignRuntime:
             "private_paths": unit.bindings.get("private_paths", []),
             "checkpoint_interval_s": snapshot.spec.checkpoints.target_interval_s,
         }
+        from .campaign_jobs import digest as configuration_digest
+
+        request["headless_capabilities"] = snapshot.config_snapshot.get(
+            "reasoning_capabilities", {}
+        )
+        request["headless_coordinates"] = {
+            "campaign": snapshot.id,
+            "unit": unit.id,
+            "head": unit.bindings["head"],
+            "base": unit.bindings["base"],
+            "graph_revision": snapshot.graph_revision,
+            "config_revision": snapshot.config_revision,
+        }
+        request["headless_grants"] = {
+            "schema_version": 1,
+            "workspace": str(workspace.resolve()),
+            "scopes": list(unit.spec.scopes or unit.spec.paths or (".",)),
+            "config_digest": configuration_digest(snapshot.config_snapshot),
+            "generation": claim.generation,
+            "plugin_grants": json.loads(
+                json.dumps(dataclasses.asdict(envelope.grants), default=str)
+            ),
+        }
+        from .campaign_handoff_flow import decorate_launch
+
+        decorate_launch(snapshot, unit, request)
         from .campaign_hold import channel
 
         request["hold_channel"] = str(channel(self.store.directory(snapshot.id), unit.id))
@@ -2546,11 +2899,13 @@ class CampaignRuntime:
             and not amendments[-1].get("first_execution")
         ):
             request["initial_source"] = amendments[-1]["receipt"]["initial_source"]
-        from .campaign_reflection_flow import compose_context
+        from .campaign_reflection_flow import compose_context, sanitized_actor_env
 
         request["claim"] = dataclasses.asdict(claim)
         request["sibling_context"] = compose_context(snapshot, unit)
-        request["reflection_environment"] = {}
+        request["reflection_environment"] = sanitized_actor_env(
+            {}, communication=snapshot.spec.communication
+        )
         if snapshot.spec.paradev.reflect:
             from .campaign_reflection_flow import sanitized_worker_env, workspace_binding
 
@@ -2577,6 +2932,7 @@ class CampaignRuntime:
                 allowed_paths=list(unit.spec.paths or unit.spec.scopes or (".",)),
             )
         elif request["kind"] in {"verify", "verify_existing"}:
+            request["config_revision"] = str(snapshot.config_revision)
             request["timeout_s"] = template.policy.verify.command_timeout_min * 60
             request["commands"] = request.get("commands") or [
                 list(command) for command in snapshot.spec.verify_commands
@@ -2625,6 +2981,9 @@ class CampaignRuntime:
             from .campaign_runtime_intake import stage_context as intake_stage_context
 
             context.update(intake_stage_context(snapshot, unit.id))
+            from .campaign_reasoning_results import merge_into_stage_context
+
+            context.update(merge_into_stage_context(self, snapshot, unit, stage))
             if unit.spec.kind == "planning":
                 from .campaign_planning_flow import context as planning_context
 
@@ -2665,6 +3024,9 @@ class CampaignRuntime:
                 )
                 context.update(closure_context(request["closure_manifest"]))
             if stage == "publication_review":
+                from .campaign_acceptance import context as acceptance_context
+
+                context["acceptance_ledger"] = acceptance_context(unit)
                 context["diff"] = git(
                     workspace, "diff", "--stat", coordinates.base + "..." + coordinates.head
                 )
@@ -2718,7 +3080,7 @@ class CampaignRuntime:
                     reason="checkpoint scope/baseline must match the durable launch and exact accepted head",
                 )
         path = prepare_launch(envelope, request)
-        launch_env = None
+        launch_env = sanitized_actor_env(os.environ, communication=snapshot.spec.communication)
         if snapshot.spec.paradev.reflect:
             from .campaign_reflection_flow import sanitized_worker_env, workspace_binding
 
@@ -2904,6 +3266,12 @@ class CampaignRuntime:
                 inventory = CoverageReceipt(**inventory_data)
                 validate_overlap(disposition, inventory, owned_pr=unit.bindings["pr"]["number"])
                 receipt["validated_admission"] = raw
+            if coordinates.stage == "publication_review":
+                from .campaign_acceptance import evaluate as evaluate_acceptance
+
+                receipt["validated_acceptance"] = evaluate_acceptance(
+                    unit, self._candidate(snapshot, unit), review=receipt
+                )
         receipt["stage"] = coordinates.stage
         receipt["result_contract"] = request.get("result_contract", "")
 
@@ -2922,12 +3290,15 @@ class CampaignRuntime:
         )
 
     def _publication_evidence(self, snapshot, unit) -> PublicationEvidence:
+        from .campaign_acceptance import evaluate as acceptance_evaluate
+
         candidate = self._candidate(snapshot, unit)
         verification = unit.evidence.get("verification", {})
         review = unit.evidence.get("review", {})
         return PublicationEvidence(
             candidate,
-            verification.get("outcome") == "verified",
+            verification.get("outcome") == "verified"
+            and acceptance_evaluate(unit, candidate)["complete"],
             review.get("validated", {}).get("verdict") == "approved",
             bool(unit.claim and unit.claim.quiescent),
             verify.worktree_clean(Path(unit.bindings["workspace"]))
@@ -2940,6 +3311,10 @@ class CampaignRuntime:
             verification_receipts=(verification.get("launch_id", ""),),
             review_receipt=review.get("launch_id", ""),
             existing_canonical=bool(unit.evidence.get("existing_source_verified")),
+            developer_families=tuple(unit.evidence.get("developer_families", ())),
+            attribution_incomplete=bool(
+                unit.evidence.get("developer_attribution_incomplete", False)
+            ),
         )
 
     def _perform_prepare_ready(self, snapshot, action) -> Observation:
@@ -3071,6 +3446,20 @@ class CampaignRuntime:
                     project_gate.reason or project_gate.state,
                     self.clock() + 15,
                 )
+        if snapshot.spec.github.merge_executor:
+            from .campaign_merge_adapter import prepare_execution
+
+            intent = prepare_execution(
+                snapshot.spec.github.merge_executor,
+                self.project,
+                candidate,
+                evidence,
+                controller,
+                action_id=action.id + "-merge",
+                generation=snapshot.generation,
+                independent_families=snapshot.spec.github.require_independent_review,
+            )
+            return Observation("confirmed", {"intent": intent.to_dict(), "purpose": "merge"})
         intent = controller.prepare_merge(
             candidate,
             evidence,
@@ -3082,6 +3471,21 @@ class CampaignRuntime:
             queue_evidence_context=snapshot.spec.github.candidate_check_context,
         )
         return Observation("confirmed", {"intent": intent.to_dict(), "purpose": "merge"})
+
+    def _perform_prepare_review_requests(self, snapshot, action) -> Observation:
+        from .campaign_publication_flow import prepare_review_effect
+
+        return prepare_review_effect(self, snapshot, action)
+
+    def _perform_pr_head_checkout(self, snapshot, action) -> Observation:
+        from .campaign_publication_flow import head_checkout_effect
+
+        return head_checkout_effect(self, snapshot, action)
+
+    def _perform_pr_head_publish(self, snapshot, action) -> Observation:
+        from .campaign_publication_flow import head_publish_effect
+
+        return head_publish_effect(self, snapshot, action)
 
     def _perform_queue_observe(self, snapshot, action) -> Observation:
         from .campaign_runtime_queue import observe_effect
@@ -3109,9 +3513,35 @@ class CampaignRuntime:
             self.gateway(snapshot),
             requirements=PublicationRequirements.from_spec(snapshot.spec.github),
         )
+        if unit.bindings.get("project_merge_intent"):
+            from .campaign_publication_flow import execute_special
+
+            intent = MutationIntent.from_dict(unit.bindings["project_merge_intent"])
+            result = execute_special(self, snapshot, action, intent, reconcile=True)
+            data = (result.data.get("intent") or {}).get("receipt") or {}
+            if result.state == "rejected":
+                return Observation(
+                    "confirmed",
+                    {
+                        "project_merge_rejected": True,
+                        "intent": result.data["intent"],
+                        "reason": result.reason,
+                    },
+                )
+            if result.state != "confirmed" or data.get("status") != "merged":
+                return Observation(
+                    "waiting",
+                    result.data,
+                    result.reason or "project executor merge pending",
+                    self.clock() + 5,
+                )
         receipt = controller.merge_status(
             unit.bindings["pr"]["number"],
-            request_id=unit.bindings.get("merge_request_id", ""),
+            request_id=(
+                ""
+                if unit.bindings.get("project_merge_intent")
+                else unit.bindings.get("merge_request_id", "")
+            ),
             expected_head=unit.evidence["integrated"]["head"],
         )
         if receipt.state != "merged_pending_sync":
@@ -3443,6 +3873,21 @@ class CampaignRuntime:
                 )
 
     def _apply_effect(self, snapshot, action, observation: Observation) -> None:
+        if action.kind.startswith("handoff-"):
+            from .campaign_handoff_flow import apply
+
+            apply(self, snapshot, action, observation)
+            return
+        if action.kind == "semantic-plan":
+            from .campaign_reasoning_plan import apply
+
+            apply(self, snapshot, action, observation)
+            return
+        if action.kind.startswith("reasoning-"):
+            from .campaign_reasoning_flow import apply
+
+            apply(self, snapshot, action, observation)
+            return
         data = observation.data
         unit = snapshot.units.get(action.unit)
         kind = action.kind
@@ -3562,9 +4007,33 @@ class CampaignRuntime:
             snapshot.bindings["source_refresh_at"] = data["observed_at"]
         elif kind == "capacity":
             snapshot.bindings["capacity"] = data
+        elif kind == "communication":
+            snapshot.bindings["communication"] = data
+            for peer in data.get("peer_bindings", ()):
+                observed_unit = snapshot.units.get(peer["unit_id"])
+                if (
+                    observed_unit
+                    and observed_unit.claim
+                    and peer["attempt"] == observed_unit.claim.attempt
+                ):
+                    observed_unit.bindings["hcom"] = peer
+            if not data.get("available", True):
+                add_event(snapshot, "communication-unavailable", detail=data.get("detail", ""))
         elif kind == "reflection":
             if unit is not None:
+                prior = unit.bindings.get("reflection")
+                if prior and prior.get("stage") != data.get("stage"):
+                    history = unit.bindings.setdefault("reflection_history", [])
+                    history.append(prior)
+                    unit.bindings["reflection_history"] = history[-20:]
                 unit.bindings["reflection"] = data
+                if data.get("history_path"):
+                    add_event(
+                        snapshot,
+                        "reflection-history",
+                        unit=unit.id,
+                        history_path=data["history_path"],
+                    )
                 windows = data.get("lifecycle", {}).get("stage", {}).get("windows", [])
                 peers = [
                     window["hcom_binding"]
@@ -3663,6 +4132,7 @@ class CampaignRuntime:
         elif kind in {
             "prepare-pr",
             "prepare-ready",
+            "prepare-review-requests",
             "prepare-draft",
             "sync-tracking",
             "intake-cancel",
@@ -3715,6 +4185,15 @@ class CampaignRuntime:
                 return
 
             apply_context(snapshot, unit.id, data)
+        elif kind == "remote-wait":
+            if unit.hold and unit.hold.id == data["hold_id"]:
+                unit.evidence["remote_wait_observation"] = data
+                if data.get("ready_to_reaccept"):
+                    unit.hold = None
+                    unit.retry_at = None
+                    add_event(snapshot, "remote-wait-cleared", unit=unit.id)
+                else:
+                    unit.retry_at = self.clock() + 15
         elif kind == "resolution-backoff":
             from .campaign_resolution_flow import apply_backoff
 
@@ -3775,6 +4254,14 @@ class CampaignRuntime:
                 }
             elif purpose == "ready":
                 unit.bindings["ready_for_review"] = True
+            elif purpose == "review-requests":
+                unit.bindings["recruited_head"] = intent["coordinates"]["candidate"]["head"]
+                unit.evidence.setdefault("review_recruitment", []).append(intent)
+            elif purpose == "pr-head-check":
+                state = unit.evidence.setdefault("pr_head_check", {})
+                if intent["coordinates"]["candidate"] == state.get("candidate"):
+                    state["published"] = True
+                    state["hosted_check"] = receipt
             elif purpose == "adoption-draft":
                 unit.bindings["adoption"]["state"] = "draft_confirmed"
             elif purpose == "adoption-retire":
@@ -3787,6 +4274,8 @@ class CampaignRuntime:
                 unit.bindings["ready_for_review"] = False
             elif purpose == "merge":
                 unit.bindings["merge_request_id"] = receipt.get("details", {}).get("uuid", "")
+                if intent["kind"] == "project_merge":
+                    unit.bindings["project_merge_intent"] = intent
                 if snapshot.spec.github.merge_mode == "queue":
                     prior_queue = unit.evidence.pop("queue", None)
                     if prior_queue and prior_queue.get("workspace"):
@@ -3902,6 +4391,19 @@ class CampaignRuntime:
             from .campaign_runtime_queue import apply_effect
 
             apply_effect(self, snapshot, unit, action, data)
+        elif kind in {"pr-head-checkout", "pr-head-publish"}:
+            if data.get("needs_integration"):
+                from .campaign_publication_retry import invalidate
+
+                held = invalidate(snapshot, unit.id, action.id, data.get("base", ""))
+                if held:
+                    self._set_hold(unit, held)
+            elif data.get("invalidate_head_check"):
+                unit.evidence.pop("pr_head_check", None)
+            elif kind == "pr-head-checkout":
+                unit.evidence["pr_head_check"] = data
+            else:
+                self._queue_intent(snapshot, unit, data)
         elif kind == "prepare-merge":
             if data.get("remote_feedback"):
                 from .campaign_remote_feedback import RemoteFeedback
@@ -3950,6 +4452,29 @@ class CampaignRuntime:
             else:
                 self._queue_intent(snapshot, unit, data)
         elif kind == "observe-merge":
+            if data.get("project_merge_rejected"):
+                intent = data["intent"]
+                unit.evidence.setdefault("project_merge_history", []).append(intent)
+                receipt = intent.get("receipt") or {}
+                if (
+                    receipt.get("submission") == "not-submitted"
+                    and receipt.get("definitive") is True
+                ):
+                    unit.bindings.pop("project_merge_intent", None)
+                    unit.bindings.pop("merge_request_id", None)
+                    transition(snapshot, unit.id, UnitState.READY_TO_PUBLISH)
+                else:
+                    self._set_hold(
+                        unit,
+                        Hold(
+                            "external_wait",
+                            data["reason"],
+                            id=action.id,
+                            actor="project-executor",
+                            evidence={"intent": intent},
+                        ),
+                    )
+                return
             unit.evidence["merge"] = data
             transition(snapshot, unit.id, UnitState.MERGED_PENDING_SYNC)
         elif kind == "observe-worker":
@@ -3971,8 +4496,17 @@ class CampaignRuntime:
             from .campaign_usage import apply as apply_usage
 
             apply_usage(snapshot, unit, data, role=claim.role)
+            from .campaign_handoff_flow import intercept_terminal
+
+            if intercept_terminal(self, snapshot, unit, data):
+                unit.bindings["head"] = data["head"]
+                return
             if claim.role == "queue_verify":
-                from .campaign_runtime_queue import apply_worker
+                launched = next((row for row in snapshot.outbox if row.id == claim.launch_id), None)
+                if launched and launched.payload.get("candidate_kind") == "pr-head":
+                    from .campaign_publication_flow import apply_head_worker as apply_worker
+                else:
+                    from .campaign_runtime_queue import apply_worker
 
                 apply_worker(
                     self,
@@ -4007,6 +4541,12 @@ class CampaignRuntime:
         claim.status = "finished"
         receipt = data["receipt"]
         if claim.role == "queue_verify":
+            if receipt.get("candidate_kind") == "pr-head":
+                from .campaign_publication_flow import apply_head_worker
+
+                unit.evidence.setdefault("worker_history", []).append(receipt)
+                apply_head_worker(self, snapshot, unit, receipt)
+                return
             from .campaign_runtime_queue import apply_worker
 
             unit.evidence.setdefault("worker_history", []).append(receipt)
@@ -4022,6 +4562,15 @@ class CampaignRuntime:
         from .campaign_usage import apply as apply_usage
 
         apply_usage(snapshot, unit, receipt, role=claim.role)
+        from .campaign_handoff_flow import intercept_terminal
+
+        if receipt.get("sessions"):
+            from .campaign_attribution import record as record_contributors
+
+            if any(row.get("role") == "dev" for row in receipt["sessions"]):
+                record_contributors(snapshot, unit, receipt)
+        if intercept_terminal(self, snapshot, unit, receipt):
+            return
         outcome = receipt["outcome"]
         if outcome == "stage_complete":
             directory = self.store.directory(snapshot.id) / "workers" / claim.launch_id
@@ -4169,7 +4718,9 @@ class CampaignRuntime:
                 raise CampaignError("closure lacks exact native artifacts and child reconciliation")
             unit.evidence["source_artifacts"] = receipt["validated_closure"]
             unit.evidence["closure_manifest"] = receipt["closure_manifest"]
-            unit.evidence["developer_family"] = receipt.get("provider_family", "")
+            from .campaign_publication_flow import record_stage_writer
+
+            record_stage_writer(unit, receipt)
             unit.evidence.pop("existing_source_verified", None)
             unit.bindings["source_revision"] = hashlib.sha256(
                 json.dumps(unit.evidence["source_artifacts"], sort_keys=True).encode()
@@ -4181,7 +4732,9 @@ class CampaignRuntime:
         elif receipt.get("result_contract") == "repair-v1":
             unit.evidence["repair_candidate"] = receipt["validated_repair"]
             unit.evidence.pop("existing_source_verified", None)
-            unit.evidence["developer_family"] = receipt.get("provider_family", "")
+            from .campaign_publication_flow import record_stage_writer
+
+            record_stage_writer(unit, receipt)
         elif receipt.get("result_contract") in {"decision-v1", "resolution-v1"}:
             from .campaign_resolution_flow import apply_diagnosis
 
@@ -4212,13 +4765,28 @@ class CampaignRuntime:
                 committed_head=receipt["head"],
             )
             if stage != "planning_review":
-                unit.evidence["developer_family"] = receipt.get("provider_family", "")
+                from .campaign_publication_flow import record_stage_writer
+
+                record_stage_writer(unit, receipt)
         elif stage == "publication_review":
+            from .campaign_acceptance import record as record_acceptance
+
             unit.evidence["review"] = receipt
-            if receipt["validated"]["verdict"] == "approved":
+            acceptance = record_acceptance(unit, self._candidate(snapshot, unit), review=receipt)
+            if receipt["validated"]["verdict"] == "approved" and acceptance["complete"]:
                 transition(snapshot, unit.id, UnitState.READY_TO_PUBLISH)
             else:
                 unit.evidence["required_findings"] = receipt["artifact"].get("findings", [])
+                unit.evidence["required_findings"].extend(
+                    {
+                        "id": row["id"],
+                        "required": True,
+                        "resolved": False,
+                        "reason": f"Acceptance {row['status']}: {row['text']}: {row['reason']}",
+                    }
+                    for row in acceptance["criteria"]
+                    if row["required"] and row["status"] != "passed"
+                )
                 unit.resume_state = UnitState.SYNCING
                 self._set_hold(
                     unit,
@@ -4243,13 +4811,6 @@ class CampaignRuntime:
         self.prepare_resume(snapshot)
 
     def attach(self, campaign_id: str, unit_id: str, role: str = "execution") -> int:
-        snapshot = self.store.load(campaign_id)
-        unit = snapshot.units[unit_id]
-        if not unit.claim or unit.claim.quiescent or not unit.claim.run_id:
-            raise CampaignError("unit has no live bound session to attach")
-        if snapshot.spec.paradev.reflect:
-            mux = self._native_mux(snapshot)
-            return subprocess.call(
-                mux.attach_target_argv(mux.target(runs.session_name(unit.claim.run_id)))
-            )
-        return subprocess.call(runs.attach_argv(unit.claim.run_id))
+        from .campaign_operator import attach
+
+        return attach(self, campaign_id, unit_id, role)

@@ -132,6 +132,16 @@ def apply_batch(
                             actor="intake",
                         )
             state["latest"][object_key] = version
+            for unit in snapshot.units.values():
+                numbers = {
+                    binding.get("number") if isinstance(binding, dict) else binding
+                    for name in ("issue", "pr", "epic_issue")
+                    if (binding := unit.bindings.get(name)) is not None
+                }
+                if observation.number in numbers:
+                    # Observation only: this wakes evidence collection, never
+                    # treats the comment itself as authority or changes scope.
+                    unit.evidence["decision_input_revision"] = version
         inserted += 1
     prior = snapshot.bindings.get("intake", {})
     snapshot.bindings[INBOX] = state

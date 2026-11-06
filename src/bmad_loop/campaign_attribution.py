@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from .campaign_headless import provider_family
 from .campaign_model import CampaignSnapshot, CampaignUnit, UnitState
 from .campaign_store import add_event, transition
 
@@ -28,13 +29,28 @@ def development(receipt: dict[str, Any]) -> dict[str, Any]:
     observed = (
         models[0]
         if isinstance(models, (list, tuple)) and models and isinstance(models[0], str)
-        else ""
+        else (selected.get("native_binding") or {}).get("observed_model", "") if selected else ""
     )
-    family = (
-        "openai"
-        if observed.startswith(("gpt-", "o1", "o3", "o4"))
-        else "anthropic" if observed.startswith("claude-") else ""
-    )
+    family = provider_family(observed)
+    contributors = []
+    for session in receipt.get("sessions", []):
+        if session.get("role") != "dev" or session.get("label"):
+            continue
+        native = session.get("native_binding") or {}
+        seen = (
+            session.get("models")
+            or native.get("observed_models")
+            or [native.get("observed_model", "")]
+        )
+        contributors.append(
+            {
+                "session_id": session.get("session_id"),
+                "observed_models": list(seen),
+                "provider_families": sorted(
+                    {provider_family(model) for model in seen if provider_family(model)}
+                ),
+            }
+        )
     return {
         "schema_version": 1,
         "launch_id": receipt.get("launch_id", ""),
@@ -42,6 +58,10 @@ def development(receipt: dict[str, Any]) -> dict[str, Any]:
         "session_id": selected.get("session_id") if selected else None,
         "observed_model": observed,
         "provider_family": family,
+        "contributors": contributors,
+        "provider_families": sorted(
+            {family for row in contributors for family in row["provider_families"]}
+        ),
         "reason": (
             ""
             if family
@@ -54,6 +74,12 @@ def record(snapshot: CampaignSnapshot, unit: CampaignUnit, receipt: dict[str, An
     attribution = development(receipt)
     unit.evidence["developer_attribution"] = attribution
     unit.evidence["developer_family"] = attribution["provider_family"]
+    unit.evidence["developer_families"] = sorted(
+        set(unit.evidence.get("developer_families", [])) | set(attribution["provider_families"])
+    )
+    unit.evidence["developer_attribution_incomplete"] = unit.evidence.get(
+        "developer_attribution_incomplete", False
+    ) or any(not row["provider_families"] for row in attribution["contributors"])
     if not attribution["provider_family"]:
         add_event(
             snapshot,

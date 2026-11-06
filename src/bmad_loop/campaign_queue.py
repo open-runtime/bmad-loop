@@ -88,8 +88,9 @@ def observe_group(
     if entry is None:
         return None
     member = entry.get("pullRequest") or {}
-    head, base = (entry.get("headCommit") or {}).get("oid"), (entry.get("baseCommit") or {}).get(
-        "oid"
+    head, base = (
+        (entry.get("headCommit") or {}).get("oid"),
+        (entry.get("baseCommit") or {}).get("oid"),
     )
     if (
         member.get("number") != candidate.pr_number
@@ -304,6 +305,7 @@ def run_verification(request: dict[str, Any], envelope) -> dict[str, Any]:
         context=request["check_context"],
         rules_fingerprint=request["rules_fingerprint"],
         timeout_s=request.get("timeout_s", 600),
+        candidate_kind=request.get("candidate_kind", "merge-group"),
     )
     return {
         "outcome": "queue_verified" if receipt.state == "ready" else "queue_verification_waiting",
@@ -311,6 +313,7 @@ def run_verification(request: dict[str, Any], envelope) -> dict[str, Any]:
         "verification": asdict(receipt),
         "head": group.head,
         "reason": receipt.reason,
+        "candidate_kind": request.get("candidate_kind", "merge-group"),
     }
 
 
@@ -357,6 +360,8 @@ def prepare_check(
         or receipt.context != capability.context
         or (conclusion == "success" and not receipt.hosted_check_pending)
         or group.pr_head != candidate.head
+        or group.repository != candidate.repository
+        or group.pr_number != candidate.pr_number
         or gateway.repository != candidate.repository
         or group.target != candidate.target
         or not 0 <= now - group.observed_at <= 120
@@ -365,6 +370,7 @@ def prepare_check(
     external_id = (
         "bmad-campaign-queue:" + hashlib.sha256((action_id + group.digest).encode()).hexdigest()
     )
+
     return MutationIntent(
         action_id,
         "queue_check",
@@ -393,6 +399,68 @@ def prepare_check(
             "group_digest": group.digest,
             "rules_fingerprint": receipt.rules_fingerprint,
             "app_id": capability.app_id,
+        },
+    )
+
+
+def head_candidate(candidate: Candidate, *, observed_at: float) -> QueueGroup:
+    """Local H verification coordinates, explicitly not server queue membership."""
+    return QueueGroup(
+        candidate.repository,
+        candidate.pr_number,
+        candidate.target,
+        "pr-head:" + candidate.head,
+        candidate.head,
+        candidate.base,
+        candidate.head,
+        "PR_HEAD",
+        observed_at,
+    )
+
+
+def prepare_pr_check(
+    candidate: Candidate,
+    receipt: AdapterReceipt,
+    capability: CheckCapability,
+    gateway: GithubGateway,
+    *,
+    action_id: str,
+    generation: int,
+    now: float | None = None,
+    conclusion: str = "success",
+) -> MutationIntent:
+    """Publish the required App/context on H before enqueue, using exact H/B proof.
+
+    Shares the durable check identity/readback protocol with G publication. The
+    candidate-kind coordinate prevents treating this local record as evidence of
+    actual merge-queue membership or combined-candidate verification.
+    """
+    from dataclasses import replace
+
+    intent = prepare_check(
+        candidate,
+        head_candidate(candidate, observed_at=receipt.observed_at),
+        receipt,
+        capability,
+        gateway,
+        action_id=action_id,
+        generation=generation,
+        now=now,
+        conclusion=conclusion,
+    )
+    return replace(
+        intent,
+        coordinates={**(intent.coordinates or {}), "candidate_kind": "pr-head"},
+        payload={
+            **intent.payload,
+            "output": {
+                "title": (
+                    "PR candidate verified"
+                    if conclusion == "success"
+                    else "PR candidate verification failed"
+                ),
+                "summary": "Exact H/B command receipt " + receipt.request_digest,
+            },
         },
     )
 

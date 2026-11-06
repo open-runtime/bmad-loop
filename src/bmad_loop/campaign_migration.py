@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Literal, Protocol
 
 from . import runs
+from .campaign_database import MARKER, CampaignDatabase
 from .campaign_github import GithubGateway
 from .campaign_model import CampaignError, CampaignSnapshot, Hold, snapshot_from_dict
 from .campaign_store import add_event
@@ -290,6 +291,8 @@ def inventory(
                 if directory.is_symlink():
                     raise MigrationError("native snapshot directory is symlinked")
                 data, _ = _read_json(directory / "snapshot.json", bound=max_bytes)
+                if data == MARKER:
+                    data, _ = CampaignDatabase(directory).read(max_bytes=max_bytes)
                 snapshot = snapshot_from_dict(data)
                 if snapshot.id != directory.name:
                     raise MigrationError("native campaign snapshot ID differs from directory")

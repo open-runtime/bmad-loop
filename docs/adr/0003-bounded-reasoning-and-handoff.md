@@ -378,6 +378,42 @@ histories. Measure input/output work, latency, failure recovery, delivered
 throughput and working-context size before advertising scale. Original merge,
 exact-install and selected REM-delivery gates still apply.
 
+## Implemented semantic and operator boundaries
+
+The campaign runtime now schedules `semantic-plan` effects from changed canonical
+context and submits bounded jobs for routing, bulk triage, semantic synchronization,
+priority, graph review and reporting. These jobs require enabled purposes and a
+qualified frozen role route. Missing qualification or oversized context appears in
+operator status; it never silently selects an unqualified model. Observation clocks
+do not trigger duplicate analyses. Graph/configuration revisions and exact current
+unit/source references are checked again before application.
+
+Routing recommendations only reorder candidates that pass existing admission,
+capacity, independence and budget gates. Priority changes only existing unit order,
+preserves dependency/ownership/acceptance fields and advances the graph revision.
+Bulk triage groups exact incoming versions into ordinary intake controls; their
+existing triage stages validate disposition authority. Graph and synchronization
+recommendations create ordinary planning controls with cited context. Requirements,
+architecture, decomposition, independent review, PR delivery and canonical-source
+reconciliation remain mandatory before a changed source graph activates. Report
+claims reproduce exact unit state and commit coordinates; narrative is explicitly
+context, not completion evidence.
+
+The normal CLI binds bounded owner-evidence readers for explicitly selected native
+Codex and Claude records. Other transcript readers do not yet grant owner authority.
+Operator commands expose paginated jobs/history, queued handoff, role-specific
+attachment, retained terminal history and nested diagnostics. Reflection invokes
+native task projection; held tasks prefer an installed held/blocked status and
+otherwise remain started while workspace tags and BMAD status expose their hold.
+Hcom observations have bounded event/transcript cursors and operate independently
+of Paradev reflection without peer wakeups.
+
+Zero-token tests exercise production runtime effect dispatch, persistent job/result
+application, ordinary intake control reservation and planning activation refusal,
+plus operator task/history/communication paths. They establish wiring and deterministic
+guards. Native route, sidebar/session and semantic-fidelity qualifications remain
+separate gates; these fixture results do not establish autonomous REM readiness.
+
 ## Capability evidence and limits
 
 These references inform qualification; public API limits are not proof of the

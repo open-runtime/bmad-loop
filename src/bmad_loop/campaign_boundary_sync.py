@@ -111,9 +111,16 @@ def metadata_owned(snapshot, row):
 
 def metadata_preimage(snapshot, row, value):
     """Recognize an immutable older read only through a later known own write."""
+    from .campaign_database import EventJournal
+
+    events = (
+        snapshot.events.matching("effect-confirmed")
+        if isinstance(snapshot.events, EventJournal)
+        else snapshot.events
+    )
     confirmed = {
         event.get("action"): event.get("revision", -1)
-        for event in snapshot.events
+        for event in events
         if event.get("kind") == "effect-confirmed"
     }
     for action in snapshot.outbox:

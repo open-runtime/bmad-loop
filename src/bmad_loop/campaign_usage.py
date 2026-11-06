@@ -44,6 +44,11 @@ def legacy_receipt(state: RunState, *, origin_run_id: str | None = None) -> dict
             "dev_attempts": counters[0],
             "review_cycles": counters[1],
             "tokens": task.tokens.to_dict(),
+            "raw_counters": {"dev_attempts": task.attempt, "review_cycles": task.review_cycle},
+            "native_refunds": {
+                "dev_attempts": task.dev_usage_relaunches,
+                "review_cycles": task.review_usage_relaunches + task.review_unlaunched_cycles,
+            },
         }
         for index, session in enumerate(task.sessions):
             # Logical task IDs can recur on a stopped-native continuation. Its
@@ -150,7 +155,9 @@ def worker_accounting(
                 raise CampaignError("legacy usage replay lineage is cyclic or unbounded")
             seen.add(origin.run_id)
             origin = load_state(runs.run_dir_for(workspace, origin.replay_of))
-        return legacy_receipt(state, origin_run_id=origin.run_id)
+        sample = legacy_receipt(state, origin_run_id=origin.run_id)
+        credit_interruption(sample, state, directory, result)
+        return sample
     except (OSError, ValueError, KeyError, TypeError, CampaignError) as exc:
         if kind == "execution":
             directory = runs.run_dir_for(Path(request["workspace"]), request["run_id"])
@@ -168,6 +175,54 @@ def worker_accounting(
             "legacy_counters_unknown": kind in {"execution", "recovery"},
             "usage_complete": False,
             "unavailable": type(exc).__name__ + ": native usage/counter receipt unavailable",
+        }
+
+
+def credit_interruption(sample, state, directory: Path, result) -> None:
+    """Credit one observed interrupted attempt, accounting for native refunds.
+
+    Tokens are unaffected. A torn legacy refund record is exposed as unknown,
+    never guessed into a second credit or used to erase earlier genuine failures.
+    """
+    if (result.get("interruption") or {}).get("kind") not in {"quota", "transport"}:
+        return
+    from .journal import Journal
+
+    entries = Journal(directory, pin=state).entries()
+    for key, task in state.tasks.items():
+        if not task.sessions:
+            continue
+        session = task.sessions[-1]
+        if session.status == "completed" or session.label or session.role not in {"dev", "review"}:
+            continue
+        if session.ended not in {"usage", "pool", "transport"} and (
+            session.native_binding or {}
+        ).get("outcome") not in {"quota", "transport"}:
+            continue
+        counter = "dev_attempts" if session.role == "dev" else "review_cycles"
+        identity = session.artifact_task_id or session.task_id
+        native_refunds = (
+            task.dev_usage_relaunches if session.role == "dev" else task.review_usage_relaunches
+        )
+        kinds = {"dev-decision", "fix-decision"} if session.role == "dev" else {"review-retry"}
+        credited = {
+            entry.get("log_task")
+            for entry in entries
+            if entry.get("kind") in kinds
+            and entry.get("uncharged") is True
+            and entry.get("log_task")
+        }
+        incoming = sample["tasks"][key]
+        if identity in credited:
+            additional = False
+        elif len(credited) == native_refunds:
+            additional = True
+        else:
+            sample["legacy_counters_unknown"] = True
+            sample["unavailable"] = "Native administrative refund lacks exact attempt identity"
+            continue
+        incoming["administrative_credits"] = {
+            identity: {"counter": counter, "additional": additional}
         }
 
 
@@ -215,6 +270,7 @@ def apply(
         }
     )
     row["usage_complete"] = sample.get("usage_complete") is True
+    row["legacy_counters_unknown"] = sample.get("legacy_counters_unknown", False)
     row["observed_runs"] = sorted(
         set(row.get("observed_runs", [])) | ({sample["run_id"]} if sample.get("run_id") else set())
     )
@@ -227,6 +283,40 @@ def apply(
                 if type(value) is not int or value < 0:
                     raise CampaignError("native campaign attempt counter is invalid")
                 values[counter] = max(saved.get(counter, 0), value)
+            if "raw_counters" in incoming:
+                raw = {
+                    counter: max(
+                        saved.get("raw_counters", {}).get(counter, 0),
+                        incoming["raw_counters"][counter],
+                    )
+                    for counter in ("dev_attempts", "review_cycles")
+                }
+                refunds = {
+                    counter: max(
+                        saved.get("native_refunds", {}).get(counter, 0),
+                        incoming["native_refunds"][counter],
+                    )
+                    for counter in raw
+                }
+                credits = dict(saved.get("administrative_credits", {}))
+                for identity, credit in incoming.get("administrative_credits", {}).items():
+                    prior = credits.get(identity)
+                    # Once the native engine confirms its own refund, a delayed
+                    # older receipt cannot revive the campaign's extra credit.
+                    if prior and prior["additional"] is False:
+                        continue
+                    credits[identity] = credit
+                for counter in raw:
+                    extra = sum(
+                        credit["counter"] == counter and credit["additional"] is True
+                        for credit in credits.values()
+                    )
+                    if not 0 <= refunds[counter] + extra <= raw[counter]:
+                        raise CampaignError("Administrative credits exceed actual native attempts")
+                    values[counter] = raw[counter] - refunds[counter] - extra
+                values.update(
+                    raw_counters=raw, native_refunds=refunds, administrative_credits=credits
+                )
             values["tokens"] = _maximum(saved.get("tokens", {}), incoming["tokens"])
             row["tasks"][task_id] = values
         for session_id, session in sample["sessions"].items():
@@ -343,7 +433,12 @@ def finalize_stage_usage(
         receipt.get("outcome") == "stage_complete"
         and receipt.get("validated", {}).get("verdict") == "approved"
     )
-    state = "inputs_changed" if administrative else "approved" if approved else "fault"
+    native_interruption = (receipt.get("interruption") or {}).get("kind") in {"quota", "transport"}
+    state = (
+        "interrupted"
+        if native_interruption
+        else "inputs_changed" if administrative else "approved" if approved else "fault"
+    )
     faults = ledger.setdefault("publication_faults", {}).setdefault(unit.id, [])
     if state != "fault":
         faults[:] = [item for item in faults if item != key]

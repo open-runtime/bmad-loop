@@ -62,6 +62,24 @@ def stage_packet(coordinates: StageCoordinates, *, context: dict[str, Any], skil
         },
     }
     prefix = f"Use the installed {skill} skill.\n" if skill else ""
+    if coordinates.stage == "publication_review":
+        body["instruction"] += (
+            " For every required acceptance_ledger criterion return acceptance_evidence with "
+            "criterion_id, status (passed|failed|not_run), verification_launch_id, command_indexes "
+            "(zero-based indexes into context.verification.commands), and a reason explaining "
+            "why those actual results prove this criterion. Never invent execution evidence. "
+            "Use not_run for absent proof; passing unrelated tests cannot prove a criterion. "
+            "Do not waive criteria, defer required scope, or count a follow-up as completion."
+        )
+        body["result_contract"]["acceptance_evidence"] = [
+            {
+                "criterion_id": "exact ledger id",
+                "status": "passed|failed|not_run",
+                "verification_launch_id": "exact verifier launch id",
+                "command_indexes": [0],
+                "reason": "specific relevance of recorded proof",
+            }
+        ]
     return prefix + json.dumps(body, ensure_ascii=False, indent=2)
 
 

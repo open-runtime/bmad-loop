@@ -7,6 +7,23 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Added
+
+- Add durable reasoning jobs, qualified headless adapters and portable transcript handoff contracts.
+- Bind required acceptance evidence to exact candidates and recruit configured GitHub reviewers.
+- Expose campaign job history, retained terminal history and scoped operator evidence.
+
+### Changed
+
+- Store new campaign authority transactionally with an append-only event journal and explicit legacy migration.
+- Execute maintained project merge commands and produce both PR-head and merge-group checks.
+
+### Fixed
+
+- Resume temporary GitHub waits and reconsider owner decisions when their evidence changes.
+- Preserve contributor attribution and admit independent work fairly using fresh provider capacity.
+- Reflect native task status and observe bounded hcom context through normal campaign operation.
+
 ## [0.14.0] — 2026-11-05
 
 ### Added

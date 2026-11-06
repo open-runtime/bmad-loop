@@ -1235,6 +1235,11 @@ class BaseTmuxBackend(TerminalMultiplexer):
         return self._version_error
 
 
+def native_window_command(argv: list[str]) -> str:
+    """Render literal argv for the mux seam; each backend chooses its shell."""
+    return shlex.join(argv)
+
+
 def posix_exec_command(argv: list[str]) -> str:
     """Exec a bundled bootstrap in the host's POSIX initial-command field."""
     return "exec " + shlex.join(argv)

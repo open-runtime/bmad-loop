@@ -437,7 +437,9 @@ def test_repository_coordinator_lock_shared_across_state_roots(tmp_path, project
 
 
 def test_atomic_write_failure_preserves_previous_authority(tmp_path, monkeypatch):
-    store = CampaignStore(tmp_path)
+    # Legacy v1 continues to use atomic JSON writes until explicitly migrated.
+    # SQLite transaction fault injection lives in test_campaign_database.py.
+    store = CampaignStore(tmp_path, storage="json")
     snapshot = store.create(make_snapshot())
     add_event(snapshot, "prepared", head="abc")
     add_action(snapshot, "push", "source:a:0", {"head": "abc"})

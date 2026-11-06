@@ -118,6 +118,15 @@ def _generic_builder() -> AdapterBuilder:
     return AdapterBuilder(plain=GenericAdapter, dev=GenericDevAdapter, construct_error=())
 
 
+def _headless_builder() -> AdapterBuilder:
+    from ..campaign_model import CampaignError
+    from .headless import HeadlessAdapter, HeadlessDevAdapter
+
+    return AdapterBuilder(
+        plain=HeadlessAdapter, dev=HeadlessDevAdapter, construct_error=(CampaignError,)
+    )
+
+
 def _opencode_http_builder() -> AdapterBuilder:
     from .opencode_http import (
         OpencodeDevAdapter,
@@ -139,6 +148,7 @@ def _opencode_http_builder() -> AdapterBuilder:
 _BUILTIN_ADAPTERS: tuple[tuple[str, bool, Callable[[], AdapterBuilder]], ...] = (
     (GENERIC, True, _generic_builder),
     (OPENCODE_HTTP, False, _opencode_http_builder),
+    ("bounded-headless", True, _headless_builder),
 )
 _BUILTIN_NAMES = frozenset(name for name, _, _ in _BUILTIN_ADAPTERS)
 

@@ -350,8 +350,17 @@ Configure documents in `[decisions] sources`. Explicit GitHub sources use
 an adopted person can be pinned with `@NUMERIC_AUTHOR_ID`. Native author and
 editor identities, unchanged content, repository ownership and source revision
 are checked before evidence can establish authority. Organization membership
-alone does not make a comment an owner decision. Private transcript sources need
-an authenticated provider; unavailable history remains visible.
+alone does not make a comment an owner decision.
+
+`[decisions] transcript_sources` accepts explicit native bindings such as
+`codex:/absolute/native.jsonl#SESSION_ID:line-42` or
+`claude:/absolute/native.jsonl#SESSION_ID:MESSAGE_UUID`. The normal CLI binds
+the source provider. Sources must be regular files in the configured account's
+native session store with matching session metadata and original user-input
+records. Native event IDs, one-based `line-N`, and `sha256-HEX` record hashes are
+supported selectors. Assistant, synthetic and tool records cannot establish
+owner authority. Imported arbitrary JSON and unqualified harness stores are
+refused; unavailable or oversized evidence remains visible.
 
 Existing decisions and delegated choices can settle routine product questions.
 A specific owner stop needs a later authorized release or its verified release
@@ -400,6 +409,11 @@ behavior is qualified; preexisting hcom hooks can still deliver messages.
 ```bash
 bmad-loop campaign list --project /path/to/project --json
 bmad-loop campaign status CAMPAIGN_ID --project /path/to/project --json
+bmad-loop campaign jobs CAMPAIGN_ID --unit QUALIFIED_UNIT --limit 100 --json
+bmad-loop campaign jobs CAMPAIGN_ID --job JOB_ID --details --json
+bmad-loop campaign history CAMPAIGN_ID --unit QUALIFIED_UNIT --role review --after 0 --limit 100 --json
+bmad-loop campaign handoff CAMPAIGN_ID --unit QUALIFIED_UNIT --profile codex --reason "capacity wait" --json
+bmad-loop campaign migrate-state CAMPAIGN_ID --json
 bmad-loop campaign hold CAMPAIGN_ID --unit QUALIFIED_UNIT --reason "Inspect this change" --json
 bmad-loop campaign release CAMPAIGN_ID --unit QUALIFIED_UNIT --json
 bmad-loop campaign stop CAMPAIGN_ID --json
@@ -423,6 +437,18 @@ Use hold before taking over edits. Resume checks ownership and invalidates
 candidate evidence affected by operator changes. Closing a view is a presentation
 event, not proof that an agent exited or that its work landed. Campaign status
 omits frozen private configuration, raw decision evidence and transcripts.
+
+Jobs expose lifecycle, validation and application separately; detailed receipts
+omit private prompts, input contents and model result bodies. Jobs paginate with
+the returned `next_after` ID; history uses a sequence cursor and reports missing
+retained artifacts explicitly. History includes old role/session references even
+after their projections leave hot campaign state. Handoff queues a request; only
+the coordinator may select an approved candidate and transfer writer ownership.
+
+State migration requires quiescent workers and reconciled external effects. It
+preserves a v1 backup and switches authority atomically to SQLite; older binaries
+reject the migrated marker. This command does not perform automation migration
+or activate a project. New read-only commands understand both storage formats.
 
 ## Project activation
 
@@ -504,3 +530,19 @@ uv tool install --force "bmad-loop[tui,paradev] @ git+https://github.com/open-ru
 
 Preserve environments used by older live workers. Installation, canonical base
 update, loaded-process provenance and target-project preflight are separate checks.
+
+### Bounded semantic decisions
+
+When reasoning is enabled, changed campaign facts trigger qualified jobs for model
+routing, bulk triage, priority, graph review, GitHub/source reconciliation and
+reports. `campaign status --json` includes unavailable-route/input-bound errors and
+the latest report. `campaign jobs` shows their execution and application state.
+Polling timestamps alone do not trigger another analysis.
+
+A routing recommendation cannot bypass capacity or review independence. Priority
+changes preserve acceptance, dependencies and ownership. Bulk triage feeds ordinary
+intake controls; graph recommendations feed ordinary planning draft PRs and cannot
+activate before reviewed delivery. Report narratives are advisory; typed unit-state
+and commit claims are checked against current campaign facts. Missing native route
+qualification is reported explicitly. Fixture tests do not qualify native models or
+semantic handoff fidelity.

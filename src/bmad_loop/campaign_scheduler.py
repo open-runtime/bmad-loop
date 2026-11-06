@@ -59,12 +59,20 @@ class CapacityObservation:
     budget_remaining: float | None = None
     known: bool = True
     concurrency_known: bool = True
+    observed_at: float | None = None
+    expires_at: float | None = None
 
 
-def route_unavailable(observation: CapacityObservation | None) -> str:
+def route_unavailable(observation: CapacityObservation | None, *, now: float | None = None) -> str:
     """One route gate for startup and admission; missing slot telemetry is not zero."""
     if observation is None or not observation.known:
         return "capacity unknown"
+    if now is not None and (
+        observation.observed_at is None
+        or observation.expires_at is None
+        or not observation.observed_at <= now <= observation.expires_at
+    ):
+        return "capacity observation expired or unversioned"
     if (
         not observation.available
         or not observation.model_access
@@ -136,6 +144,9 @@ def admit(snapshot: CampaignSnapshot, *, now: float = 0) -> Admission:
     execution = len(writers)
     sessions = sum(unit.claim.resource != "verify" for unit in active if unit.claim) + len(
         uncertain
+    )
+    sessions += sum(
+        bool(job.get("claim") and not job["claim"]["quiescent"]) for job in snapshot.jobs.values()
     )
     # Code already merged; the real source-repair child inherits its original's
     # slot. Counting both would deadlock a campaign whose configured limit is 1.
@@ -212,6 +223,23 @@ def admit(snapshot: CampaignSnapshot, *, now: float = 0) -> Admission:
     return Admission(tuple(selected), waits, next_epic)
 
 
+def allocation_order(snapshot: CampaignSnapshot) -> tuple[str, ...]:
+    """Round-robin epics before reserving workspaces, not only at dispatch."""
+    grouped: dict[str, list[str]] = defaultdict(list)
+    for key, unit in sorted(snapshot.units.items(), key=lambda item: (item[1].spec.order, item[0])):
+        grouped[epic_key(unit.spec.source, unit.spec.initiative, unit.spec.epic)].append(key)
+    epics = list(grouped)
+    if snapshot.last_epic in epics:
+        split = epics.index(snapshot.last_epic) + 1
+        epics = epics[split:] + epics[:split]
+    result: list[str] = []
+    while epics:
+        for epic in epics:
+            result.append(grouped[epic].pop(0))
+        epics = [epic for epic in epics if grouped[epic]]
+    return tuple(result)
+
+
 def resource_available(snapshot: CampaignSnapshot, resource: str) -> bool:
     """Separate phase limits; CI/merge/tracking waits use no session slot."""
     claims = [
@@ -220,6 +248,10 @@ def resource_available(snapshot: CampaignSnapshot, resource: str) -> bool:
     if resource in {"execution", "review", "resolution", "planning"}:
         if (
             sum(claim.resource != "verify" for claim in claims)
+            + sum(
+                bool(job.get("claim") and not job["claim"]["quiescent"])
+                for job in snapshot.jobs.values()
+            )
             >= snapshot.spec.resources.max_sessions
         ):
             return False
@@ -243,6 +275,7 @@ def select_role(
     *,
     selections: Mapping[tuple[str, str], int] | None = None,
     spent_usd: float | None = 0,
+    allowed_candidates: tuple[RoleCandidate, ...] | None = None,
 ) -> tuple[RoleCandidate | None, str]:
     """Pick an eligible authorized model fairly, with configured stable ties."""
     role_spec = spec.role(role)
@@ -250,7 +283,11 @@ def select_role(
         spent_usd is None or spent_usd >= role_spec.budget_usd
     ):
         return None, "role budget unknown or exhausted"
-    options = spec.candidates(role)
+    options = tuple(
+        candidate
+        for candidate in spec.candidates(role)
+        if allowed_candidates is None or candidate in allowed_candidates
+    )
     eligible = []
     reasons = []
     for index, candidate in enumerate(options):

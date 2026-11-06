@@ -70,6 +70,8 @@ class PublicationEvidence:
     verification_receipts: tuple[str, ...] = ()
     review_receipt: str = ""
     existing_canonical: bool = False
+    developer_families: tuple[str, ...] = ()
+    attribution_incomplete: bool = False
 
 
 @dataclass(frozen=True)
@@ -339,15 +341,14 @@ class PublicationController:
             reasons.append("Required local review findings remain")
         if evidence.held:
             reasons.append("Unit has an active hold")
+        writers = set(evidence.developer_families)
+        if evidence.developer_family:
+            writers.add(evidence.developer_family)
         if independent_families and (
             not evidence.reviewer_family
-            or (
-                not evidence.existing_canonical
-                and (
-                    not evidence.developer_family
-                    or evidence.developer_family == evidence.reviewer_family
-                )
-            )
+            or evidence.attribution_incomplete
+            or evidence.reviewer_family in writers
+            or (not evidence.existing_canonical and not writers)
         ):
             reasons.append("Independent provider-family review is required")
         pr = observation.pr

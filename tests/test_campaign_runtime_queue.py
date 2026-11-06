@@ -4,6 +4,7 @@ import sys
 from dataclasses import replace
 from urllib.parse import urlsplit
 
+import pytest
 from conftest import git
 from test_campaign_merge_adapter import source
 from test_campaign_runtime import diagnose
@@ -164,6 +165,12 @@ class QueuedServer:
                 assert payload["merge_action"] == "merge_queue" and payload["bypass_rules"] is False
                 number = int(route.split("/")[1])
                 assert payload["sha"] == service._pull(number)["head"]["sha"]
+                assert any(
+                    row["head_sha"] == payload["sha"]
+                    and row["app"]["id"] == 7
+                    and row["conclusion"] == "success"
+                    for row in self.checks
+                ), "PR-head App check must exist before queue submission"
                 self._build(number, service._base())
                 service.calls.append((method, path, payload))
                 return self._reply(
@@ -182,10 +189,9 @@ class QueuedServer:
                 return self._reply({"status": "enqueued", "details": {"bypass_rules": False}})
             if method == "GET" and route.startswith("commits/") and route.endswith("/check-runs"):
                 head = route.split("/")[1]
-                if any(group[1] == head for group in self.groups):
-                    return self._reply(
-                        {"check_runs": [row for row in self.checks if row["head_sha"] == head]}
-                    )
+                return self._reply(
+                    {"check_runs": [row for row in self.checks if row["head_sha"] == head]}
+                )
             if method == "POST" and route == "check-runs":
                 service.calls.append((method, path, payload))
                 self.check_creates += 1
@@ -199,12 +205,27 @@ class QueuedServer:
             return self.original(method, path, payload)
 
 
+@pytest.mark.parametrize("late_hold", [False, True])
 def test_production_campaign_queue_checks_exact_g_and_preserves_h_on_lost_ack(
-    production_case, tmp_path, monkeypatch
+    production_case, tmp_path, monkeypatch, late_hold
 ):
     case = production_case
     server = QueuedServer(case.service)
-    monkeypatch.setattr(case.service, "request", server.request)
+    held_number = None
+    removed = []
+
+    def request(method, path, payload=None):
+        nonlocal held_number
+        result = server.request(method, path, payload)
+        if late_hold and held_number is None and method == "PUT" and path.endswith("/merge-async"):
+            held_number = int(path.split("/")[-2])
+            case.service.issues[held_number]["labels"] = [{"name": "bmad:hold"}]
+        if path == "graphql" and "dequeuePullRequest" in payload.get("query", ""):
+            removed.append(held_number)
+            case.service.issues[held_number]["labels"] = []
+        return result
+
+    monkeypatch.setattr(case.service, "request", request)
     script = tmp_path / "qualified-combined-verifier.py"
     script.write_text(source())
     probe = tmp_path / "authenticated-app-producer.py"
@@ -228,6 +249,8 @@ def test_production_campaign_queue_checks_exact_g_and_preserves_h_on_lost_ack(
     case.snapshot = snapshot
     result = run_case(case)
     assert result.phase == "delivered", diagnose(result)
+    if late_hold:
+        assert removed == [held_number]
     assert all(unit.state == UnitState.DELIVERED for unit in result.units.values())
     assert len(server.group_numbers) >= 3
     assert server.checks and all(row["app"]["id"] == 7 for row in server.checks)

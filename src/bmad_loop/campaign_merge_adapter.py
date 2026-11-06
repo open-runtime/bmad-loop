@@ -1,9 +1,11 @@
-"""Bounded project publication gates and exact merge-group verification.
+"""Bounded project publication gates, executors and exact candidate verification.
 
-Commands add requirements; they never waive native publication gates or perform
-the merge. REM's maintained merge_pr.py is called only with --dry-run, with a
+Legacy gate commands add requirements; they never waive publication gates or
+perform the merge. REM's maintained merge_pr.py is called only with --dry-run, with a
 zero polling window. Native submission still uses the durable GitHub gateway and
-bypass_rules=false. Queue command output is local evidence, not a hosted check.
+bypass_rules=false. An explicitly configured executor uses a separate durable
+submit/reconcile protocol, never the legacy gate or native merge fallback.
+Queue command output is local evidence, not a hosted check.
 """
 
 from __future__ import annotations
@@ -12,14 +14,16 @@ import hashlib
 import json
 import re
 import shutil
+import subprocess
 import time
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
 from . import verify
 from .campaign_fingerprint import capture
+from .campaign_github import MutationIntent
 from .campaign_model import CampaignError
 from .campaign_publication import Candidate, PublicationController, PublicationEvidence
 from .childrun import run_argv
@@ -330,6 +334,7 @@ def verify_queue_candidate(
     max_output_bytes: int = 1024 * 1024,
     source_roots: tuple[Path, ...] = (),
     clock: Callable[[], float] = time.time,
+    candidate_kind: str = "merge-group",
 ) -> AdapterReceipt:
     """Verify exact combined G; caller publishes/observes required app check at G.
 
@@ -337,9 +342,12 @@ def verify_queue_candidate(
     never checks out, resets or modifies another branch/worktree and never treats
     a head-only H test as evidence about G.
     """
+    if candidate_kind not in {"merge-group", "pr-head"}:
+        raise MergeAdapterError("unknown candidate verification kind")
     if (
         not re.fullmatch(r"[0-9a-f]{40,64}", group_head)
-        or group_head == candidate.head
+        or (group_head == candidate.head) != (candidate_kind == "pr-head")
+        or (candidate_kind == "pr-head" and group_base != candidate.base)
         or not context
         or not rules_fingerprint
         or verify.rev_parse_head(workspace) != group_head
@@ -350,7 +358,11 @@ def verify_queue_candidate(
         raise MergeAdapterError("queue verifier must own the exact combined candidate G over H/B")
     before = capture(workspace, source_roots=source_roots)
     payload = {
-        "operation": "queue-candidate-verification",
+        "operation": (
+            "queue-candidate-verification"
+            if candidate_kind == "merge-group"
+            else "pr-head-verification"
+        ),
         "candidate": asdict(candidate),
         "group": {"head": group_head, "base": group_base, "context": context},
         "rules_fingerprint": rules_fingerprint,
@@ -401,4 +413,249 @@ def verify_queue_candidate(
         context,
         hosted_check_pending=state == "ready",
         group_base=group_base,
+    )
+
+
+def verify_pr_candidate(
+    command: tuple[str, ...], workspace: Path, state_dir: Path, candidate: Candidate, **kwargs: Any
+) -> AdapterReceipt:
+    """Run the same verifier on exact H/B before native queue admission."""
+    return verify_queue_candidate(
+        command,
+        workspace,
+        state_dir,
+        candidate,
+        group_head=candidate.head,
+        group_base=candidate.base,
+        candidate_kind="pr-head",
+        **kwargs,
+    )
+
+
+def prepare_execution(
+    command: tuple[str, ...],
+    project: Path,
+    candidate: Candidate,
+    evidence: PublicationEvidence,
+    controller: PublicationController,
+    *,
+    action_id: str,
+    generation: int,
+    independent_families: bool = True,
+) -> MutationIntent:
+    """Prepare an actual executor intent; caller persists before dispatching it.
+
+    The executor must enforce the supplied expected head/base and non-bypass
+    merge policy atomically at its submission boundary. Existing REM dry-run
+    scripts are not silently treated as implementations of this protocol.
+    """
+    command, digest, rem = _command(command, project)
+    if rem:
+        raise MergeAdapterError(
+            "maintained REM gate needs a qualified submit/reconcile executor bridge"
+        )
+    observation = controller.inspect(candidate.pr_number)
+    gate = controller.evaluate(
+        candidate,
+        evidence,
+        observation,
+        merge_mode="project-command",
+        independent_families=independent_families,
+    )
+    if not gate.ready:
+        raise MergeAdapterError("project publication held: " + "; ".join(gate.reasons))
+    return MutationIntent(
+        action_id,
+        "project_merge",
+        "COMMAND",
+        "",
+        {
+            "command": list(command),
+            "command_digest": digest,
+            "candidate": asdict(candidate),
+            "target": candidate.target,
+            "rules_fingerprint": gate.rules_fingerprint,
+            "bypass_rules": False,
+            "merge_method": "merge",
+            "request_id": action_id,
+        },
+        generation=generation,
+        coordinates={**asdict(candidate), "rules_fingerprint": gate.rules_fingerprint},
+    )
+
+
+def _project_execution(
+    intent: MutationIntent,
+    project: Path,
+    state_dir: Path,
+    controller: PublicationController,
+    *,
+    generation: int,
+    reconcile: bool,
+    evidence: PublicationEvidence | None = None,
+    independent_families: bool = True,
+    runner: Callable = run_argv,
+    timeout_s: float = 120,
+    max_output_bytes: int = 1024 * 1024,
+) -> MutationIntent:
+    if (
+        intent.kind != "project_merge"
+        or intent.state != "sent_unknown"
+        or intent.generation != generation
+    ):
+        raise MergeAdapterError(
+            "persist current-generation uncertain project intent before execution"
+        )
+    payload = intent.payload
+    candidate = Candidate(**payload["candidate"])
+    command = tuple(payload["command"])
+    if (
+        controller.gateway.repository != candidate.repository
+        or payload.get("request_id") != intent.action_id
+        or payload.get("bypass_rules") is not False
+        or payload.get("merge_method") != "merge"
+        or payload.get("target") != candidate.target
+        or intent.coordinates
+        != {**asdict(candidate), "rules_fingerprint": payload["rules_fingerprint"]}
+        or _command(command, project)[1] != payload["command_digest"]
+    ):
+        raise MergeAdapterError("project merge intent identity/policy changed")
+    remote = controller.merge_status(candidate.pr_number, expected_head=candidate.head)
+    if remote.state == "merged_pending_sync":
+        return replace(
+            intent,
+            state="confirmed",
+            receipt={
+                "status": "merged",
+                "details": {"sha": remote.merge_commit},
+                "project_executor": True,
+            },
+            error="",
+        )
+    if remote.state == "held":
+        return replace(intent, state="rejected", error=remote.reason)
+    if not reconcile:
+        if evidence is None:
+            raise MergeAdapterError("project submission requires final publication evidence")
+        fresh = prepare_execution(
+            command,
+            project,
+            candidate,
+            evidence,
+            controller,
+            action_id=intent.action_id,
+            generation=generation,
+            independent_families=independent_families,
+        )
+        if fresh.payload != payload:
+            return replace(
+                intent,
+                state="rejected",
+                error="publication authority changed before project submission",
+            )
+    before = capture(project)
+    operation = "merge-reconcile" if reconcile else "merge-submit"
+    try:
+        state, record, _, _ = _invoke(
+            command,
+            project,
+            state_dir,
+            {**payload, "operation": operation},
+            runner=runner,
+            timeout_s=timeout_s,
+            max_output_bytes=max_output_bytes,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError, MergeAdapterError) as exc:
+        # The command might have submitted before any malformed/lost receipt.
+        return replace(
+            intent, error=f"project merge outcome uncertain: {type(exc).__name__}: {exc}"
+        )
+    if capture(project) != before:
+        return replace(
+            intent, error="project merge command changed checkout; reconcile remote outcome"
+        )
+    remote = controller.merge_status(candidate.pr_number, expected_head=candidate.head)
+    if remote.state == "merged_pending_sync":
+        return replace(
+            intent,
+            state="confirmed",
+            receipt={
+                "status": "merged",
+                "details": {"sha": remote.merge_commit},
+                "project_executor": True,
+            },
+            error="",
+        )
+    if remote.state == "held":
+        return replace(intent, state="rejected", error=remote.reason)
+    if state == "unknown" or record.get("request_id") != intent.action_id:
+        return replace(
+            intent, error="project merge acknowledgement missing; reconcile without resubmission"
+        )
+    submission = record.get("submission")
+    if submission == "not-submitted" and reconcile and record.get("definitive") is True:
+        return replace(
+            intent,
+            state="rejected",
+            receipt=record,
+            error="executor confirms request was not submitted",
+        )
+    if submission in {"submitted", "pending"}:
+        return replace(
+            intent,
+            state="confirmed",
+            receipt={
+                "status": "pending",
+                "details": {"uuid": intent.action_id},
+                "project_executor": True,
+                "executor_receipt": record,
+            },
+            error="",
+        )
+    # A command's merged claim alone cannot establish completion.
+    return replace(
+        intent, error="project merge needs independent remote confirmation", receipt=record
+    )
+
+
+def execute_project_merge(
+    intent: MutationIntent,
+    project: Path,
+    state_dir: Path,
+    controller: PublicationController,
+    *,
+    evidence: PublicationEvidence,
+    generation: int,
+    **kwargs: Any,
+) -> MutationIntent:
+    return _project_execution(
+        intent,
+        project,
+        state_dir,
+        controller,
+        evidence=evidence,
+        generation=generation,
+        reconcile=False,
+        **kwargs,
+    )
+
+
+def reconcile_project_merge(
+    intent: MutationIntent,
+    project: Path,
+    state_dir: Path,
+    controller: PublicationController,
+    *,
+    generation: int,
+    **kwargs: Any,
+) -> MutationIntent:
+    """Observe executor request identity; this never invokes merge-submit again."""
+    return _project_execution(
+        replace(intent, state="sent_unknown"),
+        project,
+        state_dir,
+        controller,
+        generation=generation,
+        reconcile=True,
+        **kwargs,
     )

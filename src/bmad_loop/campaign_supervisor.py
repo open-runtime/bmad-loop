@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
 from typing import Any, Protocol
 
 from .campaign_model import CampaignError, CampaignSnapshot, Hold, OutboxAction, UnitState
@@ -60,6 +61,19 @@ class CampaignSupervisor:
         self.io_workers = io_workers
         self._active: dict[str, Future[Observation]] = {}
         self._wake = threading.Event()
+        self._control_executor: ThreadPoolExecutor | None = None
+
+    @contextmanager
+    def _executors(self):
+        # Git/source observations can be slow. They must not occupy the slots
+        # needed to observe or stop already-owned native coding processes.
+        with ThreadPoolExecutor(max_workers=2) as controls:
+            with ThreadPoolExecutor(max_workers=self.io_workers) as effects:
+                self._control_executor = controls
+                try:
+                    yield effects
+                finally:
+                    self._control_executor = None
 
     def _save(self, snapshot: CampaignSnapshot) -> CampaignSnapshot:
         return self.store.save(snapshot, snapshot.revision, expected_generation=snapshot.generation)
@@ -118,6 +132,13 @@ class CampaignSupervisor:
         frozen = snapshot.clone()
         owned_action = next(row for row in frozen.outbox if row.id == action.id)
         operation = self.driver.reconcile_action if reconcile else self.driver.perform
+        if self._control_executor is not None and action.kind in {
+            "observe-worker",
+            "terminate-worker",
+            "reasoning-observe",
+            "reasoning-terminate",
+        }:
+            executor = self._control_executor
         self._active[action.id] = executor.submit(operation, frozen, owned_action)
         return snapshot
 
@@ -203,6 +224,7 @@ class CampaignSupervisor:
             if any(
                 row.unit == proposal.unit
                 and row.kind == proposal.kind
+                and row.payload.get("job_id") == proposal.payload.get("job_id")
                 and row.state in {"prepared", "sent_unknown"}
                 for row in snapshot.outbox
             ):
@@ -231,6 +253,23 @@ class CampaignSupervisor:
             if action.state == "sent_unknown":
                 snapshot = self._submit(snapshot, action, executor, reconcile=True)
         while self._active:
+            snapshot = self._commands(snapshot)
+            if snapshot.bindings.get("terminate_requested"):
+                observations = getattr(self.driver, "observe_workers", lambda _: ())(snapshot)
+                snapshot = self._queue(
+                    snapshot,
+                    tuple(
+                        proposal
+                        for proposal in observations
+                        if proposal.kind in {"terminate-worker", "reasoning-terminate"}
+                    ),
+                )
+                for action in tuple(snapshot.outbox):
+                    if action.state == "prepared" and action.kind in {
+                        "terminate-worker",
+                        "reasoning-terminate",
+                    }:
+                        snapshot = self._submit(snapshot, action, executor, reconcile=False)
             snapshot = self._harvest(snapshot)
             if self._active:
                 self._wake.wait(0.05)
@@ -241,7 +280,7 @@ class CampaignSupervisor:
         with self.store.coordinator(
             snapshot.common_dir, snapshot.spec.target, campaign_id=campaign_id
         ):
-            with ThreadPoolExecutor(max_workers=self.io_workers) as executor:
+            with self._executors() as executor:
                 snapshot = self._reconciled(campaign_id, executor)
                 snapshot = self._commands(snapshot)
                 observations = getattr(self.driver, "reconciliation_observations", None)
@@ -268,7 +307,7 @@ class CampaignSupervisor:
         ):
             # Reconcile old effects under their original coordinates before a
             # new coordinator generation can admit fresh work.
-            with ThreadPoolExecutor(max_workers=self.io_workers) as executor:
+            with self._executors() as executor:
                 snapshot = self._reconciled(campaign_id, executor)
                 snapshot.generation += 1
                 if snapshot.phase == "stopped":
@@ -292,6 +331,9 @@ class CampaignSupervisor:
                         unit = snapshot.units.get(action.unit)
                         if unit and unit.claim and unit.claim.status == "prepared":
                             unit.claim.generation = snapshot.generation
+                        job = snapshot.jobs.get(action.payload.get("job_id", ""))
+                        if job and job.get("claim") and job["claim"]["status"] == "prepared":
+                            job["claim"]["generation"] = snapshot.generation
                 add_event(snapshot, "coordinator-start", generation=snapshot.generation)
                 # Generation ownership advances atomically; no prior actor may
                 # be treated as dead merely because this generation is new.
@@ -308,6 +350,10 @@ class CampaignSupervisor:
                             and not any(
                                 unit.claim and not unit.claim.quiescent
                                 for unit in snapshot.units.values()
+                            )
+                            and not any(
+                                job.get("claim") and not job["claim"]["quiescent"]
+                                for job in snapshot.jobs.values()
                             )
                         ):
                             # Leave durable API debt for resume. Retrying it
@@ -353,6 +399,10 @@ class CampaignSupervisor:
                             unit.claim and not unit.claim.quiescent
                             for unit in snapshot.units.values()
                         )
+                        live = live or any(
+                            job.get("claim") and not job["claim"]["quiescent"]
+                            for job in snapshot.jobs.values()
+                        )
                         unsettled = any(
                             action.state in {"prepared", "sent_unknown"}
                             for action in snapshot.outbox
@@ -366,9 +416,21 @@ class CampaignSupervisor:
                                 for unit in snapshot.units.values()
                             )
                             and not unsettled
+                            and not live
                             and settled(snapshot)
                             and getattr(self.driver, "completion_ready", lambda _: True)(snapshot)
                         ):
+                            for job in snapshot.jobs.values():
+                                if not job["request"]["required"] and job["state"] not in {
+                                    "applied",
+                                    "stale",
+                                    "canceled",
+                                }:
+                                    job["state"] = "canceled"
+                                    job["reason"] = (
+                                        "optional background job canceled after delivery"
+                                    )
+                                    add_event(snapshot, "optional-job-canceled", job_id=job["id"])
                             snapshot.phase = "delivered"
                             add_event(snapshot, "campaign-delivered")
                             snapshot = self._save(snapshot)

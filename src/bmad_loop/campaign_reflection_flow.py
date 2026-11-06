@@ -10,6 +10,7 @@ identity, never a title, timing guess or the workspace's last active agent.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -20,7 +21,13 @@ from .adapters.base import CodingCLIAdapter, SessionHandle, SessionSpec
 from .adapters.paradev_backend import ParadevMultiplexer, ParadevTransportError
 from .adapters.paradev_runtime import read_private_json
 from .campaign_communication import CommunicationError, HcomObserver, PeerBinding, sibling_context
-from .campaign_model import CampaignSnapshot, CampaignUnit, CommunicationSpec, WorkerClaim
+from .campaign_model import (
+    CampaignSnapshot,
+    CampaignUnit,
+    CommunicationSpec,
+    WorkerClaim,
+    scopes_overlap,
+)
 from .campaign_paradev import ParadevWorkspaceProvider, ReflectionError, WorkspaceBinding
 from .platform_util import atomic_write_text, is_link_like, safe_segment
 from .policy import Policy
@@ -83,6 +90,17 @@ def sanitized_worker_env(
     """
     if not state_dir.is_absolute():
         raise ReflectionError("Native transport registry must be an absolute external path")
+    result = sanitized_actor_env(source, communication=communication)
+    result.update(binding.worker_env())
+    result[envvars.PARADEV_STATE_DIR] = str(state_dir.resolve())
+    result[envvars.MUX_BACKEND] = "paradev"
+    return result
+
+
+def sanitized_actor_env(
+    source: Mapping[str, str], *, communication: CommunicationSpec
+) -> dict[str, str]:
+    """Separate worker attribution and the configured hcom room for every transport."""
     result = {}
     for key, value in source.items():
         if key.startswith("SUPERSET_") or key in _NATIVE_ACTOR_KEYS:
@@ -92,9 +110,6 @@ def sanitized_worker_env(
         if key.startswith("BMAD_LOOP_") and key != envvars.STATE_DIR:
             continue
         result[key] = value
-    result.update(binding.worker_env())
-    result[envvars.PARADEV_STATE_DIR] = str(state_dir.resolve())
-    result[envvars.MUX_BACKEND] = "paradev"
     if communication.room:
         room = Path(communication.room)
         if not room.is_absolute():
@@ -475,6 +490,13 @@ def _pr_url(unit: CampaignUnit) -> str:
     return raw.get("url", raw.get("html_url", "")) if isinstance(raw, dict) else ""
 
 
+def group_identity(spec, group_by: str) -> str:
+    """Flat managed groups retain source/initiative identity even with equal slugs."""
+    label = spec.epic if group_by == "epic" else spec.parent or spec.id
+    identity = json.dumps([spec.source, spec.initiative, label], separators=(",", ":"))
+    return safe_segment(label)[:64] + "-" + hashlib.sha256(identity.encode()).hexdigest()[:16]
+
+
 def reflect(
     snapshot: CampaignSnapshot,
     unit: CampaignUnit,
@@ -487,6 +509,9 @@ def reflect(
 ) -> dict:
     """Reconcile views of existing actors; never launch a terminal to show logs."""
     binding = workspace_binding(unit)
+    binding = dataclasses.replace(
+        binding, group=group_identity(unit.spec, snapshot.spec.paradev.group_by)
+    )
     metadata = provider.reflect(
         binding,
         campaign_id=snapshot.id,
@@ -496,6 +521,22 @@ def reflect(
         pr_url=_pr_url(unit),
         held=unit.hold is not None,
     )
+    task = {"state": "off"}
+    if snapshot.spec.paradev.tasks:
+        try:
+            links = tuple(
+                value for value in (_pr_url(unit), unit.bindings.get("issue_url", "")) if value
+            )
+            task_id = provider.reflect_task(
+                binding,
+                campaign_id=snapshot.id,
+                title=unit.spec.title,
+                state="held" if unit.hold else unit.state.value,
+                links=links,
+            )
+            task = {"state": "confirmed", "task_id": task_id}
+        except ReflectionError as exc:
+            task = {"state": "pending", "detail": str(exc)}
     projection = (
         stage_binding(snapshot, unit, claim, mux=mux, run_directories=run_directories)
         if claim
@@ -514,14 +555,29 @@ def reflect(
             window.update(observed)
         elif show_history and claim and claim.quiescent and Path(window["log_path"]).is_file():
             provider.history_view(binding, Path(window["log_path"]))
-    return {"schema_version": 1, "workspace": metadata, "stage": projection}
+    return {"schema_version": 1, "workspace": metadata, "stage": projection, "task": task}
 
 
 def compose_context(snapshot: CampaignSnapshot, unit: CampaignUnit) -> str:
     """Inject scoped siblings and PR/interface links even without hcom."""
+    relevant = [
+        peer
+        for peer in snapshot.units.values()
+        if peer.id != unit.id
+        and peer.state.value not in {"delivered", "canceled"}
+        and (
+            peer.id in unit.spec.after
+            or unit.id in peer.spec.after
+            or (peer.spec.source, peer.spec.initiative, peer.spec.epic)
+            == (unit.spec.source, unit.spec.initiative, unit.spec.epic)
+            or scopes_overlap(unit.spec.scopes, peer.spec.scopes)
+        )
+    ]
+    relevant.sort(key=lambda peer: (peer.id not in unit.spec.after, peer.id))
+    limit = min(snapshot.spec.communication.max_context_events, 100)
     rows = [
         {
-            "id": key,
+            "id": peer.id,
             "epic": peer.spec.epic,
             "state": peer.state.value,
             "role": peer.claim.role if peer.claim else "",
@@ -531,40 +587,198 @@ def compose_context(snapshot: CampaignSnapshot, unit: CampaignUnit) -> str:
             "interfaces": list(peer.spec.acceptance),
             "hcom_binding": peer.bindings.get("hcom"),
         }
-        for key, peer in snapshot.units.items()
+        for peer in relevant[:limit]
     ]
     context = sibling_context(rows, own_unit=unit.id, campaign_id=snapshot.id)
+    context["omitted_siblings"] = max(0, len(relevant) - limit)
+    context["coverage"] = "bounded" if len(relevant) > limit else "complete"
     context["communication_mode"] = snapshot.spec.communication.mode
     context["automatic_peer_delivery"] = False
     context["incoming_hooks_muted"] = False
+    # A large acceptance clause must not make the entire campaign a prompt tax.
+    while len(json.dumps(context).encode()) > 64000 and context["siblings"]:
+        context["siblings"].pop()
+        context["omitted_siblings"] += 1
+        context["coverage"] = "bounded"
     return "\n\nCampaign sibling context (advisory):\n" + json.dumps(context, sort_keys=True)
+
+
+def _standalone_peer(snapshot, unit, observer):
+    """Join recorded adapter hook identity to hcom even without Paradev reflection."""
+    claim = unit.claim
+    if not claim or claim.quiescent or not claim.run_dir:
+        return None
+    directories = _run_directories(snapshot, unit, claim, ())
+    paths = sorted((Path(claim.run_dir) / "native-sessions").glob("*.json"))
+    if len(paths) > 100:
+        raise ReflectionError("Native peer handles exceed observation bound")
+    matches = []
+    for path in paths:
+        handle = _read_document(path)
+        if any(
+            handle.get(key) != value
+            for key, value in {
+                "campaign_id": snapshot.id,
+                "unit_id": unit.id,
+                "attempt": claim.attempt,
+                "generation": claim.generation,
+                "launch_id": claim.launch_id,
+                "workspace": claim.workspace,
+                "branch": claim.branch,
+            }.items()
+        ):
+            raise ReflectionError("Peer handle differs from current worker ownership")
+        run = Path(handle.get("run_dir", ""))
+        if not run.is_absolute() or run.resolve() not in directories:
+            raise ReflectionError("Peer handle run directory is not owned")
+        hook = _hook_identity(
+            {
+                "env": {
+                    "BMAD_LOOP_EVENTS_DIR": str(
+                        runs.events_dir_for(Path(claim.workspace), run.name)
+                    )
+                }
+            },
+            handle,
+            handle["task_id"],
+        )
+        name, session, room = (
+            hook.get("hcom_name"),
+            hook.get("cli_session_id"),
+            hook.get("hcom_room"),
+        )
+        if not name or not session or not room:
+            continue
+        if Path(room).resolve() != observer.room:
+            raise ReflectionError("Peer hook names a different hcom room")
+        roster = observer._read(["list", "--json"])
+        if not isinstance(roster, list):
+            raise ReflectionError("hcom roster is unavailable")
+        rows = [
+            row
+            for row in roster
+            if isinstance(row, dict)
+            and row.get("name") == name
+            and row.get("session_id") == session
+        ]
+        if len(rows) != 1:
+            raise ReflectionError("Peer hook actor has no unique current native session")
+        context = rows[0].get("launch_context") or {}
+        process = context.get("process_id")
+        if not isinstance(process, str) or not process:
+            raise ReflectionError("Peer hook actor lacks process identity")
+        binding = PeerBinding(
+            snapshot.id,
+            unit.id,
+            claim.attempt,
+            name,
+            process,
+            session,
+            context.get("env", {}).get("SUPERSET_TERMINAL_ID") or "",
+            room,
+        )
+        checked = observer.roster((binding,))
+        if not checked.available:
+            raise ReflectionError(checked.detail)
+        matches.append(binding)
+    unique = {binding.session_id: binding for binding in matches}
+    if len(unique) > 1:
+        raise ReflectionError("Multiple live peer identities require reconciliation")
+    return next(iter(unique.values()), None)
 
 
 def observe_communication(snapshot: CampaignSnapshot, *, observer: HcomObserver) -> dict:
     """Optional peer observation retains gaps; it never sends or schedules work."""
     if snapshot.spec.communication.mode == "off":
         return {"mode": "off", "available": True, "peers": [], "detail": ""}
-    bindings = []
+    bindings, discovery_problems = [], []
     for unit in snapshot.units.values():
+        if not unit.claim or unit.claim.quiescent:
+            continue
         raw = unit.bindings.get("hcom")
         if not raw:
-            continue
+            try:
+                discovered = _standalone_peer(snapshot, unit, observer)
+            except (ReflectionError, CommunicationError, OSError, ValueError) as exc:
+                discovery_problems.append({"unit": unit.id, "detail": str(exc)})
+                continue
+            if discovered is None:
+                continue
+            raw = dataclasses.asdict(discovered)
         try:
             binding = PeerBinding(**raw)
         except TypeError:
             raise ReflectionError("Peer communication binding is malformed") from None
         if binding.campaign_id != snapshot.id or binding.unit_id != unit.id:
             raise ReflectionError("Peer communication binding belongs to another campaign unit")
+        if binding.attempt != unit.claim.attempt:
+            discovery_problems.append(
+                {"unit": unit.id, "detail": "Peer binding belongs to an earlier attempt"}
+            )
+            continue
         bindings.append(binding)
+    prior = snapshot.bindings.get("communication", {})
+    cursors = dict(prior.get("cursors", {}))
     observation = observer.roster(tuple(bindings))
+    events, transcripts, problems = [], {}, discovery_problems
+    remaining = min(snapshot.spec.communication.max_context_events, 500)
+    total_bytes = 0
+    offset = int(prior.get("next_peer", 0)) % max(1, len(bindings))
+    ordered = bindings[offset:] + bindings[:offset]
+    visited = 0
+    for binding in ordered:
+        if not observation.available or remaining <= 0:
+            break
+        identity = f"{binding.unit_id}:{binding.attempt}:{binding.session_id}:{binding.process_id}"
+        saved = cursors.get(identity, 0)
+        visited += 1
+        observed = observer.events(binding, cursor=saved, limit=remaining)
+        if not observed.available:
+            problems.append(
+                {"unit": binding.unit_id, "detail": observed.detail, "reset": observed.reset}
+            )
+            continue
+        event_bytes = len(json.dumps(observed.events).encode())
+        if total_bytes + event_bytes > 64000:
+            problems.append(
+                {
+                    "unit": binding.unit_id,
+                    "detail": "Peer event context exceeds bound; cursor retained",
+                }
+            )
+            break
+        cursors[identity] = observed.cursor
+        events.extend({"unit": binding.unit_id, **event} for event in observed.events)
+        total_bytes += event_bytes
+        remaining -= max(1, len(observed.events))
+        try:
+            transcript = observer.transcript(binding, last=min(remaining or 1, 5))
+            size = len(json.dumps(transcript).encode())
+            if total_bytes + size > 64000:
+                raise CommunicationError("Peer transcript exceeds remaining context bound")
+            transcripts[binding.unit_id] = transcript
+            total_bytes += size
+        except CommunicationError as exc:
+            problems.append({"unit": binding.unit_id, "detail": str(exc)})
     return {
         "mode": "observe",
         **dataclasses.asdict(observation),
+        "available": observation.available and not problems,
+        "events": events,
+        "transcripts": transcripts,
+        "cursors": cursors,
+        "next_peer": (offset + visited) % max(1, len(bindings)),
+        "peer_bindings": [dataclasses.asdict(binding) for binding in bindings],
+        "problems": problems,
+        "detail": observation.detail
+        or ("Some peer observations are unavailable" if problems else ""),
         "automatic_peer_delivery": False,
         "incoming_hooks_muted": False,
         "missing_bindings": [
             unit.id
             for unit in snapshot.units.values()
-            if unit.claim and not unit.claim.quiescent and not unit.bindings.get("hcom")
+            if unit.claim
+            and not unit.claim.quiescent
+            and unit.id not in {binding.unit_id for binding in bindings}
         ],
     }

@@ -19,6 +19,43 @@ from bmad_loop.campaign_runtime import CampaignRuntime
 from bmad_loop.campaign_store import CampaignStore
 
 
+def publication_receipt(runtime, snapshot, unit, reviewer_family):
+    from pathlib import Path
+
+    from bmad_loop import verify
+    from bmad_loop.campaign_acceptance import provenance
+
+    unit.bindings.setdefault("workspace", str(runtime.project))
+    head = verify.rev_parse_head(Path(unit.bindings["workspace"]))
+    unit.bindings["head"] = head
+    unit.bindings.setdefault("base", head)
+    unit.bindings.setdefault("pr", {"number": 1})
+    unit.evidence["integrated"] = {"head": head, "base": unit.bindings.get("base", head)}
+    unit.evidence["verification"] = {
+        "outcome": "verified",
+        "launch_id": "verification",
+        "head": head,
+        "commands": [],
+        "proof": provenance(
+            runtime.project, head, [], config_revision=str(snapshot.config_revision)
+        ),
+    }
+    return {
+        "outcome": "stage_complete",
+        "launch_id": unit.claim.launch_id,
+        "head": head,
+        "stage": "publication_review",
+        "provider_family": reviewer_family,
+        "artifact": {"acceptance_evidence": []},
+        "validated": {
+            "verdict": "approved",
+            "coordinates": dataclasses.asdict(
+                runtime._coordinates(snapshot, unit, "publication_review")
+            ),
+        },
+    }
+
+
 def session(role, models, *, status="completed", label=""):
     return {
         "role": role,
@@ -194,14 +231,7 @@ def test_resumed_live_review_restores_attribution_only_after_accepted_result(
     ]
     assert not runtime.prepare_resume(snapshot)
     assert unit.evidence["developer_family"] == ""
-    receipt = {
-        "outcome": "stage_complete",
-        "launch_id": unit.claim.launch_id,
-        "head": unit.bindings["head"],
-        "stage": "publication_review",
-        "provider_family": reviewer_family,
-        "validated": {"verdict": "approved"},
-    }
+    receipt = publication_receipt(runtime, snapshot, unit, reviewer_family)
     if deferred:
         before = boundary.collect(runtime, snapshot, unit, action_id="before")
         directory = runtime.store.directory(snapshot.id) / "workers" / unit.claim.launch_id
@@ -257,14 +287,7 @@ def test_completed_live_review_preserves_later_writer_attribution(project, tmp_p
     )
     unit.state = UnitState.REVIEWING
     unit.claim = WorkerClaim(unit.id, 1, 0, "live-review", role="publication_review")
-    receipt = {
-        "outcome": "stage_complete",
-        "launch_id": unit.claim.launch_id,
-        "head": unit.bindings["head"],
-        "stage": "publication_review",
-        "provider_family": "openai",
-        "validated": {"verdict": "approved"},
-    }
+    receipt = publication_receipt(runtime, snapshot, unit, "openai")
     action = OutboxAction(
         "observe", "observe-worker", unit.id, {"launch_id": unit.claim.launch_id}, 0
     )

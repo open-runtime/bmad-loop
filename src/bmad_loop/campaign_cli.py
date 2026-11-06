@@ -38,6 +38,10 @@ def register(subparsers: Any) -> None:
         ("resume", "reconcile and supervise an existing campaign"),
         ("list", "list repository campaigns"),
         ("status", "show campaign units, holds and links"),
+        ("history", "read bounded campaign events and retained role history"),
+        ("jobs", "read bounded reasoning job state and lifecycle receipts"),
+        ("handoff", "queue continuation through approved harness candidates"),
+        ("migrate-state", "migrate quiescent campaign storage with a preserved backup"),
         ("stop", "close admissions and drain existing bounded stages"),
         ("hold", "hold one unit at a safe stage boundary"),
         ("release", "release an explicit operator hold"),
@@ -60,7 +64,7 @@ def register(subparsers: Any) -> None:
             child.add_argument("campaign_id", metavar="ID")
         if command == "provenance":
             child.add_argument("--expected-commit", default="", metavar="SHA")
-        if command in {"hold", "release", "attach", "adopt", "adoption-proposal"}:
+        if command in {"hold", "release", "attach", "adopt", "adoption-proposal", "handoff"}:
             child.add_argument("--unit", required=True, metavar="UNIT")
         if command in {"adopt", "adoption-proposal"}:
             child.add_argument(
@@ -85,6 +89,21 @@ def register(subparsers: Any) -> None:
             child.add_argument("--role", default="execution")
         else:
             machine.add_json_flag(child, "versioned campaign result")
+        if command == "history":
+            child.add_argument("--unit", default="", metavar="UNIT")
+            child.add_argument("--role", default="", metavar="ROLE")
+            child.add_argument("--after", type=int, default=0)
+            child.add_argument("--limit", type=int, default=100)
+        if command == "jobs":
+            child.add_argument("--unit", default="", metavar="UNIT")
+            child.add_argument("--job", default="", metavar="JOB")
+            child.add_argument("--after", default="")
+            child.add_argument("--limit", type=int, default=100)
+            child.add_argument("--details", action="store_true")
+        if command == "handoff":
+            child.add_argument("--profile", default="")
+            child.add_argument("--model", default="")
+            child.add_argument("--reason", default="operator requested continuation")
         if command == "run":
             child.add_argument("--paradev-reflect", action="store_true", default=None)
             child.add_argument("--paradev-project", metavar="PROJECT_ID")
@@ -92,6 +111,61 @@ def register(subparsers: Any) -> None:
 
 def _result(command: str, *, ok: bool = True, **fields: Any) -> dict[str, Any]:
     return {"schema_version": SCHEMA_VERSION, "command": f"campaign.{command}", "ok": ok, **fields}
+
+
+def _job_document(row, *, details=False):
+    from .sanitize import scrub_json
+
+    result = {
+        key: row.get(key)
+        for key in (
+            "id",
+            "state",
+            "attempt",
+            "validation",
+            "application",
+            "reason",
+            "retry_at",
+            "usage",
+            "updated_at",
+        )
+    }
+    request = row.get("request") or {}
+    result.update(
+        {
+            key: request.get(key)
+            for key in ("purpose", "role", "unit", "dependencies", "required", "limits")
+        }
+    )
+    selection = row.get("selection") or {}
+    result["selection"] = {
+        key: selection.get(key)
+        for key in ("profile", "model", "effort", "provider_family")
+        if key in selection
+    }
+    if details:
+        receipt = row.get("receipt") or {}
+        result["receipt"] = {
+            key: receipt[key]
+            for key in (
+                "job_id",
+                "launch_id",
+                "generation",
+                "outcome",
+                "quiescent",
+                "input_complete",
+                "reason",
+                "usage",
+                "model",
+                "effort",
+                "native_session_id",
+                "session_id",
+                "output_hash",
+            )
+            if key in receipt
+        }
+        result["request_digest"] = row.get("request_digest")
+    return scrub_json(result)
 
 
 def _checkpoint_document(snapshot, unit, now: float) -> dict[str, Any]:
@@ -158,6 +232,8 @@ def _checkpoint_document(snapshot, unit, now: float) -> dict[str, Any]:
 def status_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
     """Project execution identities; omit private configuration and evidence."""
     from .campaign_metrics import document as timing_document
+    from .campaign_operator import diagnostics
+    from .sanitize import scrub_json
 
     units = []
     public_bindings = {
@@ -211,6 +287,7 @@ def status_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
                     name: value for name, value in unit.bindings.items() if name in public_bindings
                 },
                 "legacy_outcome": unit.legacy_outcome,
+                "operator": diagnostics(unit),
                 "github_sync": (
                     {
                         "phase": "after-stage",
@@ -234,6 +311,14 @@ def status_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
             }
         )
     counts = dict(Counter(str(unit.state) for unit in snapshot.units.values()))
+    report = snapshot.bindings.get("reasoning_decisions", {}).get("report")
+    if report:
+        from .campaign_reasoning_plan import fingerprint
+
+        report = {
+            **report,
+            "current": report.get("context_digest") == fingerprint(snapshot, "report"),
+        }
     return {
         "id": snapshot.id,
         "name": snapshot.spec.name,
@@ -259,6 +344,8 @@ def status_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
             "remaining_external_scope": snapshot.bindings.get("hierarchy_remaining_scope", ""),
         },
         "resources": {
+            "max_workers": snapshot.spec.max_workers,
+            "max_active_epics": snapshot.spec.max_active_epics,
             "max_in_flight_units": snapshot.spec.max_in_flight_units,
             "verify_slots": snapshot.spec.resources.verify_slots,
             "active_queue_views": sum(
@@ -278,6 +365,16 @@ def status_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
             ),
         },
         "units": units,
+        "jobs": [_job_document(row) for row in list(snapshot.jobs.values())[:100]],
+        "reasoning": {
+            "errors": scrub_json(snapshot.bindings.get("semantic_jobs", {}).get("errors", {})),
+            "report": scrub_json(report),
+        },
+        "communication": {
+            key: snapshot.bindings.get("communication", {}).get(key)
+            for key in ("mode", "available", "detail", "missing_bindings", "observed_at")
+            if key in snapshot.bindings.get("communication", {})
+        },
         "outbox": {
             state: sum(action.state == state for action in snapshot.outbox)
             for state in ("prepared", "sent_unknown", "confirmed", "rejected")
@@ -302,6 +399,20 @@ def _emit(args: argparse.Namespace, result: dict[str, Any]) -> int:
                 print(f"{campaign['id']}: {campaign['phase']} ({campaign['name']})")
         elif "request" in result:
             print(f"{result['command']}: request {result['request']['id']} queued")
+        elif "jobs" in result:
+            for job in result["jobs"]:
+                print(f"{job['id']}: {job['state']} ({job['purpose']}) {job.get('reason', '')}")
+        elif "events" in result:
+            for event in result["events"]:
+                print(
+                    f"{event['sequence']}: {event.get('unit', '')} {event.get('kind', '')} {event.get('history_path', '')}"
+                )
+            for session in result.get("sessions", []):
+                print(
+                    f"{session['unit']}: {session.get('phase', '')} {session.get('state', '')} {session.get('log_path', '')}"
+                )
+            for gap in result.get("history_gaps", []):
+                print(f"history unavailable: {gap['detail']}")
         else:
             print(f"{result['command']}: {'ready' if result['ok'] else 'not ready'}")
             for problem in result.get("problems", []):
@@ -311,6 +422,18 @@ def _emit(args: argparse.Namespace, result: dict[str, Any]) -> int:
                 for problem in observation.get("problems", []):
                     print(f"    {problem}")
     return 0 if result.get("ok") else 1
+
+
+def _runtime(module, project, store):
+    """Normal CLI entry binds trusted transcript evidence, not only test injection."""
+    from .campaign_history_sources import TranscriptEvidenceProvider
+
+    runtime = module.CampaignRuntime(project, store)
+    runtime.evidence_providers = {
+        "transcript": TranscriptEvidenceProvider(),
+        **getattr(runtime, "evidence_providers", {}),
+    }
+    return runtime
 
 
 def _spec(args: argparse.Namespace) -> CampaignSpec:
@@ -379,7 +502,7 @@ def dispatch(args: argparse.Namespace) -> int:
         ):
             return _emit(args, {**observed, "command": "campaign.run"})
         store, snapshot = campaign_runtime.create(project, spec)
-        runtime = campaign_runtime.CampaignRuntime(project, store)
+        runtime = _runtime(campaign_runtime, project, store)
         supervisor = CampaignSupervisor(store, runtime)
         result = supervisor.run(snapshot.id)
         return _emit(args, _result(command, campaign=status_document(result)))
@@ -393,15 +516,109 @@ def dispatch(args: argparse.Namespace) -> int:
     snapshot = store.load(campaign_id)
     if command == "status":
         return _emit(args, _result(command, campaign=status_document(snapshot)))
+    if command == "migrate-state":
+        migrated = store.migrate_state(campaign_id)
+        return _emit(args, _result(command, campaign=status_document(migrated)))
+    if command == "jobs":
+        if not 1 <= args.limit <= 1000:
+            raise CampaignError("job page limit must be between 1 and 1000")
+        if args.unit and args.unit not in snapshot.units:
+            raise CampaignError(f"unknown campaign unit {args.unit}")
+        rows = store.jobs(
+            campaign_id, after=args.after, limit=args.limit, unit=args.unit, job_id=args.job
+        )
+        return _emit(
+            args,
+            _result(
+                command,
+                jobs=[_job_document(row, details=args.details) for row in rows],
+                next_after=rows[-1]["id"] if rows else args.after,
+                has_more=len(rows) == args.limit,
+            ),
+        )
+    if command == "history":
+        from .campaign_operator import historical_sessions, sessions
+        from .sanitize import scrub_text
+
+        if args.unit and args.unit not in snapshot.units:
+            raise CampaignError(f"unknown campaign unit {args.unit}")
+        rows = store.history(campaign_id, after=args.after, limit=args.limit, unit=args.unit)
+        selected = [
+            row
+            for row in rows
+            if not args.role
+            or row.get("role", row.get("stage")) == args.role
+            or row.get("history_path")
+        ]
+        events = [
+            {
+                key: row[key]
+                for key in (
+                    "sequence",
+                    "kind",
+                    "unit",
+                    "role",
+                    "stage",
+                    "at",
+                    "time",
+                    "action",
+                    "reason",
+                    "state",
+                    "history_path",
+                    "job_id",
+                    "purpose",
+                )
+                if key in row
+            }
+            for row in selected
+        ]
+        for event in events:
+            if isinstance(event.get("reason"), str):
+                event["reason"] = scrub_text(event["reason"])
+        retained = [
+            {"unit": unit.id, **session}
+            for unit in snapshot.units.values()
+            if not args.unit or unit.id == args.unit
+            for session in sessions(unit, role=args.role)
+        ]
+        older, gaps = historical_sessions(store, snapshot, selected, role=args.role)
+        retained = list(
+            {
+                (row["unit"], row.get("terminal_id"), row.get("task_id")): row
+                for row in [*older, *retained]
+            }.values()
+        )
+        return _emit(
+            args,
+            _result(
+                command,
+                events=events,
+                sessions=retained[: args.limit],
+                history_gaps=gaps,
+                next_after=rows[-1]["sequence"] if rows else args.after,
+                has_more=len(rows) == args.limit,
+                session_coverage="truncated" if len(retained) > args.limit else "complete",
+            ),
+        )
     if (
-        command in {"hold", "release", "attach", "adopt", "adoption-proposal"}
+        command in {"hold", "release", "attach", "adopt", "adoption-proposal", "handoff"}
         and args.unit not in snapshot.units
     ):
         raise CampaignError(f"unknown campaign unit {args.unit}")
+    if command == "handoff":
+        request = store.enqueue(
+            campaign_id,
+            "handoff",
+            unit=args.unit,
+            profile=args.profile,
+            model=args.model,
+            reason=args.reason,
+        )
+        return _emit(args, _result(command, request=request))
     if command in {"adopt", "adoption-proposal"}:
         from .campaign_adoption import prepare_request, propose
 
-        gateway = campaign_runtime.CampaignRuntime(project, store).gateway(snapshot)
+        gateway = _runtime(campaign_runtime, project, store).gateway(snapshot)
         if command == "adoption-proposal":
             proposal = propose(
                 project, snapshot, args.unit, args.pr, args.observer, gateway=gateway
@@ -434,7 +651,7 @@ def dispatch(args: argparse.Namespace) -> int:
             terminate_workers=getattr(args, "terminate_workers", False),
         )
         return _emit(args, _result(command, request=request))
-    runtime = campaign_runtime.CampaignRuntime(project, store)
+    runtime = _runtime(campaign_runtime, project, store)
     if command == "resume":
         runtime.authorize_backup_resume(snapshot)
     if command == "attach":

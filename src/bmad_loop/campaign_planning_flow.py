@@ -456,7 +456,28 @@ def activate(
     source_observations = snapshot.bindings.setdefault("source_observations", {})
     for value in changed:
         if value.id in snapshot.units:
-            snapshot.units[value.id].spec = value
+            member = snapshot.units[value.id]
+            if member.spec.acceptance != value.acceptance:
+                from .campaign_acceptance import ensure
+
+                ledger = ensure(member)
+                ledger["amendments"].append(
+                    {
+                        "before": list(member.spec.acceptance),
+                        "after": list(value.acceptance),
+                        "authority": {
+                            "kind": "delivered-plan",
+                            "id": unit_id,
+                            "pr_number": unit.bindings["pr"]["number"],
+                            "canonical_revision": canonical_revision,
+                            "source": dict(source_bindings[value.id]),
+                        },
+                        "reductions_authorized": False,
+                        "revision": ledger["revision"],
+                    }
+                )
+                ledger["revision"] += 1
+            member.spec = value
         else:
             snapshot.units[value.id] = CampaignUnit(value)
         previous = source_observations.get(value.id, {})

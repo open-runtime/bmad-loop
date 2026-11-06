@@ -38,11 +38,26 @@ ROLES = (
 
 def resolve_roles(spec: CampaignSpec, policy) -> CampaignSpec:
     roles = dict(spec.roles)
-    for role in ROLES:
+    required = set(ROLES) | set(roles)
+    if spec.reasoning.enabled:
+        from .campaign_reasoning_plan import ROLES as semantic_roles
+
+        required.update(
+            semantic_roles[purpose]
+            for purpose in spec.reasoning.purposes
+            if purpose in semantic_roles
+        )
+        if any(purpose.startswith("handoff_") for purpose in spec.reasoning.purposes):
+            required.update(("execution", "summarization", "handoff_audit"))
+    for role in sorted(required):
         selected = roles.get(role, RoleSpec())
         if selected.pool:
             continue
-        inherited = policy.adapter.resolved("review" if role == "publication_review" else "triage")
+        inherited = policy.adapter.resolved(
+            "review"
+            if role in {"publication_review", "execution_review"}
+            else "dev" if role == "execution" else "triage"
+        )
         profile = selected.profile or inherited.name
         model = selected.model or (inherited.model if profile == inherited.name else "")
         effort = selected.effort or (inherited.effort if profile == inherited.name else "")
@@ -154,7 +169,7 @@ def inspect(
         ),
         "historical_queue_views_retained": True,
     }
-    for role in ROLES:
+    for role in sorted(set(ROLES) | set(dict(spec.roles))):
         if role in {"planning", "planning_review"} and not spec.planning.enabled:
             continue
         choices = []
@@ -185,9 +200,53 @@ def inspect(
                 )
             except (ValueError, OSError) as exc:
                 choices.append({"profile": profile_name, "eligible": False, "reason": str(exc)})
-        capabilities["planning"]["observations"][role] = choices
+        area = "execution" if role in {"execution", "execution_review"} else "planning"
+        capabilities[area]["observations"][role] = choices
         if not any(choice["eligible"] for choice in choices):
-            problem("planning", f"{role}: no available authorized model route")
+            problem(area, f"{role}: no available authorized model route")
+    if spec.reasoning.enabled:
+        from .campaign_headless import capability_for, load_capabilities, validate_capability
+        from .campaign_reasoning_plan import ROLES as semantic_roles
+
+        try:
+            if not spec.reasoning.capabilities:
+                raise CampaignError("reasoning requires a qualified capabilities manifest")
+            path = Path(spec.reasoning.capabilities).expanduser()
+            routes = load_capabilities(path if path.is_absolute() else project / path)
+            modes = {
+                (semantic_roles[purpose], "no-tools")
+                for purpose in spec.reasoning.purposes
+                if purpose in semantic_roles
+            }
+            if any(purpose.startswith("handoff_") for purpose in spec.reasoning.purposes):
+                modes.update(
+                    {
+                        ("summarization", "no-tools"),
+                        ("handoff_audit", "no-tools"),
+                        ("execution", "workspace-tools"),
+                    }
+                )
+            observations = {}
+            for role, mode in sorted(modes):
+                qualified = []
+                reasons = []
+                for candidate in spec.candidates(role):
+                    try:
+                        cap = capability_for(routes, candidate.profile, candidate.model, mode)
+                        validate_capability(cap, candidate, permissions=mode)
+                        qualified.append(candidate.profile + ":" + candidate.model)
+                    except (CampaignError, OSError, ValueError) as exc:
+                        reasons.append(str(exc))
+                observations[role] = {
+                    "qualified": qualified,
+                    "permissions": mode,
+                    "problems": reasons,
+                }
+                if not qualified:
+                    problem("planning", f"{role}: no qualified {mode} route for reasoning/handoff")
+            capabilities["planning"]["observations"]["reasoning"] = observations
+        except (CampaignError, OSError, ValueError) as exc:
+            problem("planning", str(exc))
     if spec.planning.enabled or spec.intake.allow_new_units:
         from .campaign_planning_skill import resolve as resolve_planning_skill
 
@@ -221,6 +280,8 @@ def inspect(
                     )
                 if spec.github.merge_mode == "project-command" and not spec.github.merge_command:
                     problem("publication", "project-command requires a maintained publication gate")
+                if spec.github.merge_mode == "project-command" and not spec.github.merge_executor:
+                    problem("publication", "project-command requires a maintained merge executor")
             if spec.github.merge_mode == "queue":
                 from .campaign_queue import capability
 
