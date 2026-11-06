@@ -85,7 +85,10 @@ class Host:
             if isinstance(manifest, (str, Path)):
                 path = Path(manifest)
                 stat = path.stat()
-                if stat.st_size > 65536 or stat.st_uid != os.getuid() or stat.st_mode & 0o022:
+                getuid = getattr(os, "getuid", None)
+                if getuid is None:
+                    raise HostError("HOST_PLATFORM_UNSUPPORTED")
+                if stat.st_size > 65536 or stat.st_uid != getuid() or stat.st_mode & 0o022:
                     raise HostError("HOST_MANIFEST_UNSAFE")
                 manifest = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(manifest, dict):

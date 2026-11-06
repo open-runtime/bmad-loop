@@ -243,6 +243,12 @@ the full PR diff. Changed heads invalidate affected evidence. Draft-to-ready
 transition permits selected remote checks and reviewers to run. Model review
 and an eligible GitHub approval are separate obligations.
 
+`github.max_base_refreshes` bounds repeated acceptance restarts when main moves
+(default eight). Exhaustion leaves a visible operator hold on that unit and
+preserves its lifetime counter. Releasing the hold allows a fresh candidate
+attempt; it cannot restore old review or verification evidence. Other units
+continue independently.
+
 Campaigns preserve every agent checkpoint commit. `github.merge_method` is
 `merge`; squash and rebase methods are rejected. Updating from main adds merge
 commits, and recovery adds compensating commits while retaining original history.

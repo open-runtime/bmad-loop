@@ -88,7 +88,7 @@ def append_private_jsonl(path, value):
     """Append one JSON line to an owner-only, append-only record."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW"), 0o600)
     with os.fdopen(fd, "a", encoding="utf-8") as out:
         out.write(json.dumps(value, sort_keys=True) + "\n")
 
@@ -97,14 +97,14 @@ def read_private_json(path):
     """Read an owner-only regular file in an owner-only directory; anything else is invalid."""
     path = Path(path)
     parent = os.stat(path.parent)
-    if parent.st_uid != os.getuid() or parent.st_mode & 0o077:
+    if parent.st_uid != getattr(os, "getuid")() or parent.st_mode & 0o077:
         raise ValueError("Invalid private transport record")
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW") | getattr(os, "O_NONBLOCK"))
     with os.fdopen(fd, encoding="utf-8") as source:
         stat = os.fstat(source.fileno())
         if (
             not statmod.S_ISREG(stat.st_mode)
-            or stat.st_uid != os.getuid()
+            or stat.st_uid != getattr(os, "getuid")()
             or stat.st_mode & 0o077
             or stat.st_size > MAX_RECORD_BYTES
         ):
@@ -248,7 +248,7 @@ def launch_worker(folder):
     # Keep the real PTY alive for BMAD to observe and dispose explicitly: a normal worker
     # exit must never become stock Paradev's terminal-exit auto-resume.
     while True:
-        signal.pause()
+        getattr(signal, "pause")()
 
 
 class _OutputState:

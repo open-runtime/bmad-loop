@@ -3296,9 +3296,11 @@ class CampaignRuntime:
                     reason="required scope changed before parent closure",
                 )
                 if data.get("needs_integration") and unit.state == UnitState.READY_TO_PUBLISH:
-                    for key in ("integrated", "verification", "review", "pushed"):
-                        unit.evidence.pop(key, None)
-                    transition(snapshot, unit.id, UnitState.SYNCING)
+                    from .campaign_publication_retry import invalidate
+
+                    held = invalidate(snapshot, unit.id, action.id, data.get("base", ""))
+                    if held:
+                        self._set_hold(unit, held)
                 if data.get("planning_drift"):
                     from .campaign_planning_publication import invalidate
 
@@ -3486,11 +3488,11 @@ class CampaignRuntime:
                     id=action.id,
                 )
             elif data.get("needs_integration"):
-                unit.evidence.pop("integrated", None)
-                unit.evidence.pop("verification", None)
-                unit.evidence.pop("review", None)
-                unit.evidence.pop("pushed", None)
-                transition(snapshot, unit.id, UnitState.SYNCING)
+                from .campaign_publication_retry import invalidate
+
+                held = invalidate(snapshot, unit.id, action.id, data.get("base", ""))
+                if held:
+                    self._set_hold(unit, held)
             else:
                 self._queue_intent(snapshot, unit, data)
         elif kind == "observe-merge":

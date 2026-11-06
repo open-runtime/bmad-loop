@@ -101,6 +101,7 @@ class GitHubSpec:
     candidate_publish: str = "native"
     merge_command: tuple[str, ...] = ()
     recent_days: int = 30
+    max_base_refreshes: int = 8
 
 
 @dataclass(frozen=True)
@@ -383,6 +384,7 @@ def _construct(cls: Any, value: Any, name: str) -> Any:
             "retention",
             "max_context_events",
             "recent_days",
+            "max_base_refreshes",
             "max_new_units",
             "max_triage_attempts",
             "timeout_s",
