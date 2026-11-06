@@ -1,0 +1,322 @@
+"""Single-writer campaign supervision with bounded concurrent effect execution.
+
+The OS lock fences coordinator ownership; it is never acquired by workers.
+Durable intents precede effects. The event loop only consumes bounded observations
+and schedules independent work; engines and coding sessions live in child PIDs.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import sys
+import threading
+import time
+from concurrent.futures import Future, ThreadPoolExecutor
+from typing import Any, Protocol
+
+from .campaign_model import CampaignError, CampaignSnapshot, Hold, OutboxAction, UnitState
+from .campaign_store import CampaignStore, add_action, add_event
+
+
+@dataclasses.dataclass(frozen=True)
+class Proposal:
+    kind: str
+    unit: str
+    payload: dict[str, Any] = dataclasses.field(default_factory=dict)
+    action_id: str = ""
+
+
+@dataclasses.dataclass(frozen=True)
+class Observation:
+    state: str
+    data: dict[str, Any] = dataclasses.field(default_factory=dict)
+    reason: str = ""
+    retry_at: float | None = None
+
+
+class CampaignDriver(Protocol):
+    def proposals(self, snapshot: CampaignSnapshot) -> tuple[Proposal, ...]: ...
+    def perform(self, snapshot: CampaignSnapshot, action: OutboxAction) -> Observation: ...
+    def reconcile_action(self, snapshot: CampaignSnapshot, action: OutboxAction) -> Observation: ...
+    def apply(
+        self, snapshot: CampaignSnapshot, action: OutboxAction, observation: Observation
+    ) -> None: ...
+    def observe_workers(self, snapshot: CampaignSnapshot) -> tuple[Proposal, ...]: ...
+    def control(self, snapshot: CampaignSnapshot, command: dict[str, Any]) -> None: ...
+
+
+class CampaignSupervisor:
+    def __init__(
+        self,
+        store: CampaignStore,
+        driver: CampaignDriver,
+        *,
+        clock=time.time,
+        progress=None,
+        io_workers: int = 16,
+    ):
+        self.store, self.driver, self.clock = store, driver, clock
+        self.progress = progress or (lambda message: print(message, file=sys.stderr, flush=True))
+        self.io_workers = io_workers
+        self._active: dict[str, Future[Observation]] = {}
+        self._wake = threading.Event()
+
+    def _save(self, snapshot: CampaignSnapshot) -> CampaignSnapshot:
+        return self.store.save(snapshot, snapshot.revision, expected_generation=snapshot.generation)
+
+    def _commands(self, snapshot: CampaignSnapshot) -> CampaignSnapshot:
+        commands = self.store.commands(snapshot.id, after=snapshot.processed_commands)
+        if not commands:
+            return snapshot
+        for command in commands:
+            try:
+                self.driver.control(snapshot, command)
+            except CampaignError as exc:
+                add_event(
+                    snapshot,
+                    "operator-command-refused",
+                    unit=command.get("unit", ""),
+                    command=command["kind"],
+                    reason=str(exc),
+                )
+                snapshot.processed_commands.append(command["id"])
+                continue
+            snapshot.processed_commands.append(command["id"])
+            add_event(
+                snapshot,
+                "operator-command",
+                unit=command.get("unit", ""),
+                command=command["kind"],
+                actor=command.get("actor", "operator"),
+            )
+        return self._save(snapshot)
+
+    def _submit(
+        self,
+        snapshot: CampaignSnapshot,
+        action: OutboxAction,
+        executor: ThreadPoolExecutor,
+        *,
+        reconcile: bool,
+    ) -> CampaignSnapshot:
+        action = next(row for row in snapshot.outbox if row.id == action.id)
+        if action.id in self._active:
+            return snapshot
+        adoption = getattr(self.driver, "prepare_reconciliation", None)
+        if reconcile and adoption is not None:
+            adoption(snapshot, action)
+            snapshot = self._save(snapshot)
+            action = next(row for row in snapshot.outbox if row.id == action.id)
+        if action.state == "prepared":
+            action.state = "sent_unknown"
+            add_event(
+                snapshot, "effect-submitted", unit=action.unit, action=action.id, effect=action.kind
+            )
+            snapshot = self._save(snapshot)
+            action = next(row for row in snapshot.outbox if row.id == action.id)
+        # Never pass a mutable authority object to an I/O executor.
+        frozen = snapshot.clone()
+        owned_action = next(row for row in frozen.outbox if row.id == action.id)
+        operation = self.driver.reconcile_action if reconcile else self.driver.perform
+        self._active[action.id] = executor.submit(operation, frozen, owned_action)
+        return snapshot
+
+    def _harvest(self, snapshot: CampaignSnapshot) -> CampaignSnapshot:
+        changed = False
+        for action_id, future in tuple(self._active.items()):
+            if not future.done():
+                continue
+            del self._active[action_id]
+            action = next(row for row in snapshot.outbox if row.id == action_id)
+            try:
+                observation = future.result()
+            except Exception as exc:
+                observation = Observation(
+                    "unknown", reason=f"{type(exc).__name__}: {exc}", retry_at=self.clock() + 5
+                )
+            if observation.state not in {"confirmed", "unknown", "rejected", "waiting"}:
+                raise CampaignError("driver returned an invalid effect state")
+            if observation.state == "confirmed":
+                # Driver validates receipt coordinates before any state mutation.
+                self.driver.apply(snapshot, action, observation)
+                action.state = "confirmed"
+                action.receipt = observation.data
+                action.error = ""
+                add_event(
+                    snapshot,
+                    "effect-confirmed",
+                    unit=action.unit,
+                    action=action.id,
+                    effect=action.kind,
+                )
+            elif observation.state == "rejected":
+                action.state = "rejected"
+                action.error = observation.reason
+                if action.unit in snapshot.units:
+                    unit = snapshot.units[action.unit]
+                    unit.hold = Hold(
+                        "effect_refused",
+                        observation.reason,
+                        id=action.id,
+                        actor="campaign",
+                        created_at=self.clock(),
+                    )
+                add_event(
+                    snapshot,
+                    "effect-rejected",
+                    unit=action.unit,
+                    action=action.id,
+                    reason=observation.reason,
+                )
+            else:
+                action.error = observation.reason
+                action.next_retry_at = observation.retry_at or self.clock() + 5
+                action.receipt = {**action.receipt, **observation.data}
+                add_event(
+                    snapshot,
+                    "effect-wait",
+                    unit=action.unit,
+                    action=action.id,
+                    reason=observation.reason,
+                    observation=observation.state,
+                )
+            changed = True
+        return self._save(snapshot) if changed else snapshot
+
+    def _queue(
+        self, snapshot: CampaignSnapshot, proposals: tuple[Proposal, ...]
+    ) -> CampaignSnapshot:
+        changed = False
+        for proposal in proposals:
+            if any(
+                row.unit == proposal.unit
+                and row.kind == proposal.kind
+                and row.state in {"prepared", "sent_unknown"}
+                for row in snapshot.outbox
+            ):
+                continue
+            action = add_action(
+                snapshot,
+                proposal.kind,
+                proposal.unit,
+                proposal.payload,
+                action_id=proposal.action_id or None,
+            )
+            self.driver.control(
+                snapshot, {"kind": "prepare-effect", "action": dataclasses.asdict(action)}
+            )
+            changed = True
+        return self._save(snapshot) if changed else snapshot
+
+    def _reconciled(self, campaign_id: str, executor: ThreadPoolExecutor) -> CampaignSnapshot:
+        snapshot = self.store.load(campaign_id)
+        for action in tuple(snapshot.outbox):
+            if action.state == "sent_unknown":
+                snapshot = self._submit(snapshot, action, executor, reconcile=True)
+        while self._active:
+            snapshot = self._harvest(snapshot)
+            if self._active:
+                self._wake.wait(0.05)
+        return snapshot
+
+    def reconcile(self, campaign_id: str) -> CampaignSnapshot:
+        snapshot = self.store.load(campaign_id)
+        with self.store.coordinator(
+            snapshot.common_dir, snapshot.spec.target, campaign_id=campaign_id
+        ):
+            with ThreadPoolExecutor(max_workers=self.io_workers) as executor:
+                snapshot = self._reconciled(campaign_id, executor)
+                snapshot = self._commands(snapshot)
+                return snapshot
+
+    def run(self, campaign_id: str, *, max_ticks: int | None = None) -> CampaignSnapshot:
+        snapshot = self.store.load(campaign_id)
+        with self.store.coordinator(
+            snapshot.common_dir, snapshot.spec.target, campaign_id=campaign_id
+        ):
+            # Reconcile old effects under their original coordinates before a
+            # new coordinator generation can admit fresh work.
+            with ThreadPoolExecutor(max_workers=self.io_workers) as executor:
+                snapshot = self._reconciled(campaign_id, executor)
+                snapshot.generation += 1
+                if snapshot.phase == "stopped":
+                    snapshot.bindings.pop("terminate_requested", None)
+                snapshot.phase = "active" if snapshot.phase == "stopped" else snapshot.phase
+                for action in snapshot.outbox:
+                    if action.state == "prepared":
+                        # Prepared is durably never sent. Adopt the same intent
+                        # explicitly, retaining its original action ID/history.
+                        add_event(
+                            snapshot,
+                            "prepared-effect-adopted",
+                            unit=action.unit,
+                            action=action.id,
+                            prior_generation=action.generation,
+                            generation=snapshot.generation,
+                        )
+                        action.generation = snapshot.generation
+                        if isinstance(action.payload.get("intent"), dict):
+                            action.payload["intent"]["generation"] = snapshot.generation
+                        unit = snapshot.units.get(action.unit)
+                        if unit and unit.claim and unit.claim.status == "prepared":
+                            unit.claim.generation = snapshot.generation
+                add_event(snapshot, "coordinator-start", generation=snapshot.generation)
+                # Generation ownership advances atomically; no prior actor may
+                # be treated as dead merely because this generation is new.
+                snapshot = self.store.save(snapshot, snapshot.revision)
+                ticks = 0
+                try:
+                    while snapshot.phase not in {"delivered", "stopped"}:
+                        snapshot = self._commands(snapshot)
+                        snapshot = self._harvest(snapshot)
+                        proposals = self.driver.observe_workers(snapshot)
+                        if snapshot.phase == "active":
+                            proposals += self.driver.proposals(snapshot)
+                        snapshot = self._queue(snapshot, proposals)
+                        for action in tuple(snapshot.outbox):
+                            if len(self._active) >= self.io_workers:
+                                break
+                            if (
+                                action.state in {"confirmed", "rejected"}
+                                or action.id in self._active
+                            ):
+                                continue
+                            if action.next_retry_at and action.next_retry_at > self.clock():
+                                continue
+                            snapshot = self._submit(
+                                snapshot, action, executor, reconcile=action.state == "sent_unknown"
+                            )
+                        live = any(
+                            unit.claim and not unit.claim.quiescent
+                            for unit in snapshot.units.values()
+                        )
+                        unsettled = any(
+                            action.state in {"prepared", "sent_unknown"}
+                            for action in snapshot.outbox
+                        )
+                        from .campaign_runtime_intake import optional_canceled, settled
+                        if (
+                            snapshot.units
+                            and all(
+                                unit.state == UnitState.DELIVERED or optional_canceled(unit)
+                                for unit in snapshot.units.values()
+                            )
+                            and not unsettled and settled(snapshot)
+                        ):
+                            snapshot.phase = "delivered"
+                            add_event(snapshot, "campaign-delivered")
+                            snapshot = self._save(snapshot)
+                        elif snapshot.phase == "draining" and not live and not self._active:
+                            snapshot.phase = "stopped"
+                            add_event(snapshot, "campaign-drained")
+                            snapshot = self._save(snapshot)
+                        ticks += 1
+                        if max_ticks is not None and ticks >= max_ticks:
+                            return snapshot
+                        self._wake.wait(snapshot.spec.poll_interval_s)
+                except KeyboardInterrupt:
+                    snapshot.phase = "draining"
+                    add_event(snapshot, "coordinator-interrupted")
+                    self._save(snapshot)
+                    raise
+                return snapshot

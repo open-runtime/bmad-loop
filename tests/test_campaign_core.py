@@ -46,7 +46,7 @@ def make_snapshot(*, workers=4, scopes=None, epics=None):
         {
             "schema_version": 1,
             "name": "parallel",
-            "sources": [{"kind": "explicit"}],
+            "sources": [{"kind": "stories", "path": "specs"}],
             "max_workers": workers,
             "max_active_epics": 4,
             "max_in_flight_units": 12,
@@ -434,3 +434,102 @@ def test_role_budget_unknown_or_exhausted_is_visible():
         result, reason = select_role(spec, "planning", capacity, spent_usd=spent)
         assert result is None
         assert "budget" in reason
+
+
+def test_capacity_commands_and_queue_context_persist_in_resolved_roles():
+    raw = spec_to_dict(make_snapshot().spec)
+    command = ["project-tool", "capacity", "--json"]
+    raw["role_pools"] = {
+        "reasoning": {
+            "candidates": [{"profile": "codex", "model": "astra", "capacity_command": command}]
+        }
+    }
+    raw["roles"] = {
+        "planning": {"pool": "reasoning"},
+        "conflict_repair": {"profile": "codex", "model": "astra", "capacity_command": command},
+    }
+    raw["github"]["candidate_check_context"] = "campaign-candidate-review"
+    spec = spec_from_dict(raw)
+    assert spec.candidates("planning")[0].capacity_command == tuple(command)
+    assert spec.candidates("conflict_repair")[0].capacity_command == tuple(command)
+    assert spec_from_dict(spec_to_dict(spec)) == spec
+    assert spec.github.candidate_check_context == "campaign-candidate-review"
+
+
+def test_ownership_overrides_normalize_paths_and_roundtrip():
+    raw = spec_to_dict(make_snapshot().spec)
+    raw["ownership"] = {"source:a:0": ["./src/./api/", "resource:test-db"]}
+    spec = spec_from_dict(raw)
+    assert dict(spec.ownership)["source:a:0"] == ("src/api", "resource:test-db")
+    assert spec_from_dict(spec_to_dict(spec)) == spec
+    assert scopes_overlap(("src/./api",), ("src/api/routes",))
+    for scopes in ([], ["../escape"], ["/absolute"]):
+        raw["ownership"] = {"source:a:0": scopes}
+        with pytest.raises(CampaignError, match="ownership|scope"):
+            spec_from_dict(raw)
+
+
+@pytest.mark.parametrize("method", ["squash", "rebase"])
+def test_campaign_merge_method_preserves_every_checkpoint_commit(method):
+    raw = spec_to_dict(make_snapshot().spec)
+    raw["github"]["merge_method"] = method
+    with pytest.raises(CampaignError, match="preserve all checkpoint commits"):
+        spec_from_dict(raw)
+
+
+def test_new_intake_requires_explicit_scope_and_bounded_limits():
+    raw = spec_to_dict(make_snapshot().spec)
+    assert spec_from_dict(raw).intake.allow_new_units is False
+    raw["intake"] = {"allow_new_units": True}
+    with pytest.raises(CampaignError, match="explicit allowed_scopes"):
+        spec_from_dict(raw)
+    raw["intake"] = {
+        "allow_new_units": True,
+        "allowed_scopes": ["src/api"],
+        "max_new_units": 20,
+        "max_triage_attempts": 2,
+    }
+    spec = spec_from_dict(raw)
+    assert spec.intake.allowed_scopes == ("src/api",)
+    assert spec_from_dict(spec_to_dict(spec)) == spec
+    for key in ("max_new_units", "max_triage_attempts"):
+        invalid = spec_to_dict(spec)
+        invalid["intake"][key] = 0
+        with pytest.raises(CampaignError, match="positive integer"):
+            spec_from_dict(invalid)
+
+
+def test_offline_dependencies_defer_only_configured_source_identity():
+    raw = spec_to_dict(make_snapshot().spec)
+    raw["sources"] = [
+        {"kind": "stories", "id": "imported", "path": "specs", "initiative": "project"}
+    ]
+    raw["units"][0]["after"] = ["imported:project:prerequisite"]
+    assert spec_from_dict(raw).units[0].after == ("imported:project:prerequisite",)
+    for unknown in [
+        "other:project:prerequisite",
+        "imported:wrong-initiative:prerequisite",
+        "prerequisite",
+    ]:
+        raw["units"][0]["after"] = [unknown]
+        with pytest.raises(CampaignError, match="unknown dependency"):
+            spec_from_dict(raw)
+
+
+def test_versioned_source_publication_has_explicit_remote_branch_configuration():
+    raw = spec_to_dict(make_snapshot().spec)
+    raw["sources"] = [
+        {"kind": "tickets", "id": "tickets", "store_remote": "origin", "store_branch": "main"}
+    ]
+    spec = spec_from_dict(raw)
+    assert spec.sources[0].store_remote == "origin"
+    assert spec.sources[0].store_branch == "main"
+    assert spec_from_dict(spec_to_dict(spec)) == spec
+    for configuration in [
+        {"store_remote": "origin"},
+        {"store_remote": "-unsafe", "store_branch": "main"},
+        {"store_remote": "origin", "store_branch": "main\nother"},
+    ]:
+        raw["sources"] = [{"kind": "tickets", **configuration}]
+        with pytest.raises(CampaignError, match="source publication"):
+            spec_from_dict(raw)

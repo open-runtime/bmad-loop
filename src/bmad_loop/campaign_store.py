@@ -68,6 +68,7 @@ class CampaignStore:
         atomic_write_text(path, _json(value), follow_symlinks=False)
 
     def create(self, snapshot: CampaignSnapshot) -> CampaignSnapshot:
+        snapshot = snapshot_from_dict(json.loads(_json(snapshot_to_dict(snapshot))))
         directory = self.directory(snapshot.id)
         with file_lock(self.root / ".state.lock"):
             if directory.exists():
@@ -109,6 +110,7 @@ class CampaignStore:
         expected_generation: int | None = None,
     ) -> CampaignSnapshot:
         """CAS commit; authority and outbound intents replace as one document."""
+        snapshot = snapshot_from_dict(json.loads(_json(snapshot_to_dict(snapshot))))
         directory = self.directory(snapshot.id)
         with file_lock(self.root / ".state.lock"):
             previous = self.load(snapshot.id)

@@ -14,6 +14,7 @@ the one write bmad-loop makes to a child initiative's own file
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Final, Literal
 
@@ -87,17 +88,68 @@ def advance(task: StoryTask, to: Phase) -> None:
 BOARD_REGRESSIONS: frozenset[tuple[str, str]] = frozenset({("done", "awaiting-operator")})
 
 
-def check_board_regression(story_key: str, current: str, target: str) -> None:
+CAMPAIGN_BOARD_REGRESSIONS: Final[frozenset[tuple[str, str]]] = frozenset(
+    (current, target)
+    for current in ("in-progress", "review", "awaiting-operator", "done")
+    for target in ("backlog", "ready-for-dev", "in-progress")
+    if current != target
+)
+
+
+def check_board_regression(
+    story_key: str, current: str, target: str, *, campaign_recovery: bool = False
+) -> None:
     """Refuse a board regression ``current -> target`` that is not allowlisted.
 
     Called by the sole board writer only for a move it has already classified as
     a regression; a no-op for a pair in :data:`BOARD_REGRESSIONS`, and
     :class:`IllegalTransition` for anything else."""
-    if (current, target) not in BOARD_REGRESSIONS:
+    allowed = (
+        BOARD_REGRESSIONS | CAMPAIGN_BOARD_REGRESSIONS if campaign_recovery else BOARD_REGRESSIONS
+    )
+    if (current, target) not in allowed:
         raise IllegalTransition(
             f"{story_key}: sprint-status {current} -> {target} is a regression "
             f"(allowed: {sorted(BOARD_REGRESSIONS)})"
         )
+
+
+CAMPAIGN_BOARD_PLANNING_TRANSITIONS: Final[frozenset[tuple[str, str]]] = frozenset(
+    {("", "backlog"), ("", "ready-for-dev"), ("", "optional"), ("backlog", "ready-for-dev")}
+)
+
+
+def check_board_planning(
+    before: dict[str, str], after: dict[str, str], owned_rows: tuple[str, ...]
+) -> None:
+    """Admit reviewed planning rows without changing existing unrelated work.
+
+    The sole writer verifies the external receipt and exact board preimage.
+    This table authorizes only new backlog/ready stories, backlog epics, optional
+    retrospectives, and a selected backlog story becoming ready.
+    """
+    if before.keys() - after.keys():
+        raise IllegalTransition("Campaign planning cannot remove sprint-status rows")
+    for key, target in after.items():
+        current = before.get(key, "")
+        if key in before and current == target:
+            continue
+        if key not in owned_rows:
+            raise IllegalTransition(
+                "Campaign planning changed a nonowned sprint-status row: " + key
+            )
+        story = re.fullmatch(r"\d+-\d+[a-z]?-.+", key) is not None
+        epic = re.fullmatch(r"epic-\d+", key) is not None
+        retro = re.fullmatch(r"epic-\d+-retrospective", key) is not None
+        if (
+            (current, target) not in CAMPAIGN_BOARD_PLANNING_TRANSITIONS
+            or (target == "ready-for-dev" and not story)
+            or (target == "backlog" and not (story or epic))
+            or (target == "optional" and not retro)
+        ):
+            raise IllegalTransition(
+                f"Campaign planning cannot move sprint-status {key}: {current} -> {target}"
+            )
 
 
 # ---- BMAD v7 ticket plans ----------------------------------------------------
@@ -134,7 +186,16 @@ OPERATOR_PARK_PREFIX: Final = "awaiting operator: "
 PLAN_AWAITING_OPERATOR: Final = "awaiting-operator"
 
 PlanWriteReason = Literal[
-    "accept", "park", "confirm", "repair", "rearm", "rollback", "replan", "salvage"
+    "accept",
+    "park",
+    "confirm",
+    "repair",
+    "rearm",
+    "rollback",
+    "replan",
+    "salvage",
+    "campaign-publish",
+    "campaign-plan",
 ]
 
 _BUILD_STATUSES: Final = frozenset(PLAN_STATUS_ORDER[1:6])  # draft..built
@@ -155,6 +216,13 @@ class PlanRule:
 PLAN_TRANSITIONS: Final[dict[PlanWriteReason, PlanRule]] = {
     # The orchestrator's acceptance after its own verify and review gates.
     "accept": PlanRule(frozenset({"built"}), frozenset({"done"})),
+    # Import an independently accepted private build after confirmed code merge.
+    # TicketTree.mark requires its external coordinator capability and exact
+    # canonical preimage; no legacy caller can use this to waive acceptance.
+    "campaign-publish": PlanRule(_BUILD_STATUSES | {""}, frozenset({"done"})),
+    "campaign-plan": PlanRule(
+        frozenset({"", "draft", "ready-for-dev"}), frozenset({"draft", "ready-for-dev"})
+    ),
     # A ticket owing the operator something, parked as `blocked` with a reason
     # starting OPERATOR_PARK_PREFIX; re-parking a parked plan updates its reason.
     # PLAN_AWAITING_OPERATOR is the session-declared park this write converts.

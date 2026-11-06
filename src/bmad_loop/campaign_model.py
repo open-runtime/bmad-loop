@@ -9,6 +9,7 @@ resume. Operational integrations must not fill unknown observations with success
 from __future__ import annotations
 
 import copy
+import math
 import re
 import tomllib
 from dataclasses import asdict, dataclass, field
@@ -50,6 +51,9 @@ class SourceSelector:
     path: str = ""
     independent: bool = False
     id: str = ""
+    store_remote: str = ""
+    store_branch: str = ""
+    scheduler_config: str = ""
 
 
 @dataclass(frozen=True)
@@ -91,6 +95,7 @@ class GitHubSpec:
     hold_labels: tuple[str, ...] = ("bmad:hold",)
     require_independent_review: bool = True
     candidate_command: tuple[str, ...] = ()
+    candidate_check_context: str = ""
     merge_command: tuple[str, ...] = ()
     recent_days: int = 30
 
@@ -131,6 +136,10 @@ class IntakeSpec:
     labels: tuple[str, ...] = ()
     issue_numbers: tuple[int, ...] = ()
     batch_size: int = 20
+    allow_new_units: bool = False
+    max_new_units: int = 20
+    max_triage_attempts: int = 2
+    allowed_scopes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -193,6 +202,7 @@ class CampaignSpec:
     archive_roots: tuple[str, ...] = ()
     worktree_root: str = ""
     poll_interval_s: float = 1.0
+    ownership: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
     def role(self, name: str) -> RoleSpec:
         return dict(self.roles).get(name, RoleSpec())
@@ -344,6 +354,7 @@ def _construct(cls: Any, value: Any, name: str) -> Any:
     out = dict(raw)
     for key, item in raw.items():
         if key in {
+            "allowed_scopes",
             "capacity_command",
             "required_checks",
             "hold_labels",
@@ -364,16 +375,27 @@ def _construct(cls: Any, value: Any, name: str) -> Any:
             "retention",
             "max_context_events",
             "recent_days",
+            "max_new_units",
+            "max_triage_attempts",
             "timeout_s",
             "max_tokens",
         }:
             if item is not None:
                 _positive(item, f"{name}.{key}")
-        elif key in {"enabled", "reflect", "tasks", "push", "require_independent_review"}:
+        elif key in {
+            "enabled",
+            "reflect",
+            "tasks",
+            "push",
+            "require_independent_review",
+            "allow_new_units",
+        }:
             if type(item) is not bool:
                 raise CampaignError(f"{name}.{key} must be a boolean")
         elif key == "budget_usd":
-            if item is not None and (type(item) not in (float, int) or item <= 0):
+            if item is not None and (
+                type(item) not in (float, int) or not math.isfinite(item) or item <= 0
+            ):
                 raise CampaignError(f"{name}.{key} must be positive or absent")
         elif key == "issue_numbers":
             if not isinstance(item, (list, tuple)):
@@ -384,7 +406,7 @@ def _construct(cls: Any, value: Any, name: str) -> Any:
             if not all(isinstance(k, str) and isinstance(v, str) and v for k, v in skills.items()):
                 raise CampaignError(f"{name}.skills must map stages to skill names")
             out[key] = tuple(skills.items())
-        elif item is not None and not isinstance(item, str):
+        elif not isinstance(item, str):
             raise CampaignError(f"{name}.{key} must be a string")
     return cls(**out)
 
@@ -409,7 +431,9 @@ def unit_from_dict(raw: Mapping[str, Any]) -> UnitSpec:
     return UnitSpec(**out)
 
 
-def validate_graph(units: tuple[UnitSpec, ...] | list[UnitSpec]) -> None:
+def validate_graph(
+    units: tuple[UnitSpec, ...] | list[UnitSpec], *, external_prefixes: tuple[str, ...] = ()
+) -> None:
     indexed = {unit.id: unit for unit in units}
     if len(indexed) != len(units):
         raise CampaignError("duplicate qualified unit IDs")
@@ -422,6 +446,8 @@ def validate_graph(units: tuple[UnitSpec, ...] | list[UnitSpec]) -> None:
         if key in visited:
             return
         if key not in indexed:
+            if any(key.startswith(prefix) for prefix in external_prefixes):
+                return
             raise CampaignError(f"unknown dependency {key}")
         visiting.add(key)
         for dependency in indexed[key].after:
@@ -432,7 +458,11 @@ def validate_graph(units: tuple[UnitSpec, ...] | list[UnitSpec]) -> None:
     for key in indexed:
         visit(key)
     for unit in units:
-        if unit.parent and unit.parent not in indexed:
+        if (
+            unit.parent
+            and unit.parent not in indexed
+            and not any(unit.parent.startswith(prefix) for prefix in external_prefixes)
+        ):
             raise CampaignError(f"{unit.id}: unknown parent {unit.parent}")
         ancestors = {unit.id}
         parent = unit.parent
@@ -440,6 +470,8 @@ def validate_graph(units: tuple[UnitSpec, ...] | list[UnitSpec]) -> None:
             if parent in ancestors:
                 raise CampaignError(f"parent cycle involving {unit.id}")
             ancestors.add(parent)
+            if parent not in indexed:
+                break
             parent = indexed[parent].parent
 
 
@@ -459,7 +491,8 @@ def normalize_scope(scope: str) -> str:
         or any(part in {"", ".."} for part in scope.split("/"))
     ):
         raise CampaignError(f"invalid ownership scope {scope!r}")
-    return scope.removeprefix("./")
+    normalized = "/".join(part for part in scope.split("/") if part != ".")
+    return normalized or "*"
 
 
 def scopes_overlap(left: tuple[str, ...], right: tuple[str, ...]) -> bool:
@@ -498,7 +531,7 @@ def spec_from_dict(value: Mapping[str, Any]) -> CampaignSpec:
     if raw.get("remote", "origin").startswith("-") or raw.get("target", "main").startswith("-"):
         raise CampaignError("remote and target must not be options")
     interval = raw.get("poll_interval_s", 1.0)
-    if type(interval) not in (float, int) or interval <= 0:
+    if type(interval) not in (float, int) or not math.isfinite(interval) or interval <= 0:
         raise CampaignError("poll_interval_s must be positive")
     sections = {
         "resources": ResourceSpec,
@@ -519,17 +552,36 @@ def spec_from_dict(value: Mapping[str, Any]) -> CampaignSpec:
     for i, value in enumerate(raw.get("sources", [])):
         source = _table(value, "source")
         _fields(source, set(SourceSelector.__dataclass_fields__), "source")
-        if source.get("kind") not in {"tickets", "stories", "sprint", "explicit"}:
-            raise CampaignError("source.kind must be tickets, stories, sprint or explicit")
+        if source.get("kind") not in {"tickets", "stories", "sprint", "sprint-status"}:
+            raise CampaignError("source.kind must be tickets, stories or sprint-status")
         params = dict(source)
+        if params["kind"] == "sprint":
+            params["kind"] = "sprint-status"
         for key in ("epics", "units"):
             params[key] = _strings(params.get(key, []), f"source.{key}")
-        for key in ("initiative", "path", "id"):
+        for key in ("initiative", "path", "id", "store_remote", "store_branch", "scheduler_config"):
             if key in params and not isinstance(params[key], str):
                 raise CampaignError(f"source.{key} must be a string")
+        if params.get("scheduler_config") and params["kind"] != "tickets":
+            raise CampaignError("source.scheduler_config applies only to tickets")
         if "independent" in params and type(params["independent"]) is not bool:
             raise CampaignError("source.independent must be boolean")
+        store_remote, store_branch = params.get("store_remote", ""), params.get("store_branch", "")
+        if bool(store_remote) != bool(store_branch):
+            raise CampaignError(
+                "versioned source publication requires both store_remote and store_branch"
+            )
+        if any(
+            value.startswith("-") or any(ord(ch) <= 32 or ord(ch) == 127 for ch in value)
+            for value in (store_remote, store_branch)
+            if value
+        ):
+            raise CampaignError(
+                "source publication remote/branch must be explicit names, not options or whitespace"
+            )
         params.setdefault("id", f"{params['kind']}-{i + 1}")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", params["id"]):
+            raise CampaignError("source.id must be a stable identifier")
         sources.append(SourceSelector(**params))
     if len({s.id for s in sources}) != len(sources):
         raise CampaignError("duplicate source IDs")
@@ -592,13 +644,31 @@ def spec_from_dict(value: Mapping[str, Any]) -> CampaignSpec:
     if any(not command for command in raw["verify_commands"]):
         raise CampaignError("verification command cannot be empty")
     raw["archive_roots"] = _strings(raw.get("archive_roots", []), "archive_roots")
+    ownership = raw.get("ownership", {})
+    if not isinstance(ownership, dict):
+        ownership = dict(ownership)
+    resolved_ownership = []
+    for unit_id, scopes in ownership.items():
+        if not isinstance(unit_id, str) or not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._:/-]*", unit_id
+        ):
+            raise CampaignError("ownership keys must be qualified unit IDs")
+        parsed_scopes = _strings(scopes, f"ownership.{unit_id}")
+        if not parsed_scopes:
+            raise CampaignError("ownership overrides must name at least one scope")
+        resolved_ownership.append(
+            (unit_id, tuple(normalize_scope(scope) for scope in parsed_scopes))
+        )
+    raw["ownership"] = tuple(resolved_ownership)
     spec = CampaignSpec(**raw)
     if not spec.sources and not spec.units and not spec.planning.enabled:
         raise CampaignError("campaign requires sources, explicit units or planning")
     if spec.github.merge_mode not in {"direct-strict", "queue", "project-command"}:
         raise CampaignError("github.merge_mode must be direct-strict, queue or project-command")
-    if spec.github.merge_method not in {"merge", "squash", "rebase"}:
-        raise CampaignError("github.merge_method must be merge, squash or rebase")
+    if spec.github.merge_method != "merge":
+        raise CampaignError(
+            "github.merge_method must be merge: campaigns preserve all checkpoint commits and agent history; squash and rebase are prohibited"
+        )
     if spec.paradev.group_by not in {"story", "epic"}:
         raise CampaignError("paradev.group_by must be story or epic")
     if spec.communication.mode not in {"off", "observe"}:
@@ -609,11 +679,20 @@ def spec_from_dict(value: Mapping[str, Any]) -> CampaignSpec:
         raise CampaignError("decisions.mode must be off or evidence-first")
     if spec.resolution.mode not in {"off", "diagnose", "bounded-auto"}:
         raise CampaignError("resolution.mode must be off, diagnose or bounded-auto")
+    for scope in spec.intake.allowed_scopes:
+        normalize_scope(scope)
+    if spec.intake.allow_new_units and not spec.intake.allowed_scopes:
+        raise CampaignError("automatic new intake units require explicit allowed_scopes")
     if spec.intake.issues not in {"off", "selected", "all-open-and-new"}:
         raise CampaignError("intake.issues must be off, selected or all-open-and-new")
     if spec.max_in_flight_units < spec.max_workers:
         raise CampaignError("max_in_flight_units must cover max_workers")
-    validate_graph(list(spec.units))
+    validate_graph(
+        list(spec.units),
+        external_prefixes=tuple(
+            f"{source.id}:{source.initiative or 'project'}:" for source in spec.sources
+        ),
+    )
     return spec
 
 
@@ -633,6 +712,7 @@ def spec_to_dict(spec: CampaignSpec) -> dict[str, Any]:
     }
     raw["roles"] = {name: asdict(role) for name, role in spec.roles}
     raw["planning"]["skills"] = dict(spec.planning.skills)
+    raw["ownership"] = dict(spec.ownership)
     return raw
 
 
@@ -644,7 +724,7 @@ def snapshot_to_dict(snapshot: CampaignSnapshot) -> dict[str, Any]:
 
 def snapshot_from_dict(value: Mapping[str, Any]) -> CampaignSnapshot:
     raw = dict(value)
-    if raw.get("schema_version") != SCHEMA_VERSION:
+    if raw.get("schema_version") != SCHEMA_VERSION or type(raw.get("schema_version")) is not int:
         raise CampaignError("unsupported campaign snapshot schema")
     _fields(raw, set(CampaignSnapshot.__dataclass_fields__), "snapshot")
     raw["spec"] = spec_from_dict(_table(raw["spec"], "snapshot.spec"))
