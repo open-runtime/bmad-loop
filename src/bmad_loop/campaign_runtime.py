@@ -56,7 +56,6 @@ from .campaign_supervisor import Observation, Proposal
 from .campaign_tracking import HierarchyCoordinator
 from .campaign_workers import (
     allocate_worktree,
-    assert_workspace,
     common_directory,
     git,
     observe,
@@ -707,7 +706,7 @@ class CampaignRuntime:
                 if reserve("execution"):
                     proposals.append(Proposal("launch", key, {"kind": "integrate"}))
             elif unit.state == UnitState.SYNCING and unit.evidence.get("integrated"):
-                if not unit.evidence.get("pushed"):
+                if unit.evidence.get("pushed") != unit.evidence["integrated"]["head"]:
                     proposals.append(
                         Proposal("push", key, {"head": unit.evidence["integrated"]["head"]})
                     )
@@ -1524,13 +1523,14 @@ class CampaignRuntime:
                 intent, json.dumps({"unit": unit.id, "branch": branch, "action": action.id})
             )
         observation_ref = f"refs/bmad-campaign/{snapshot.id}/allocation/{action.id}"
-        git(
-            self.project,
-            "fetch",
-            "--no-tags",
-            snapshot.spec.remote,
-            f"refs/heads/{snapshot.spec.target}:{observation_ref}",
-        )
+        if not verify.ref_exists_checked(self.project, observation_ref):
+            git(
+                self.project,
+                "fetch",
+                "--no-tags",
+                snapshot.spec.remote,
+                f"refs/heads/{snapshot.spec.target}:{observation_ref}",
+            )
         base = verify.rev_parse_revision(self.project, observation_ref)
         if snapshot.spec.paradev.reflect:
             from .campaign_paradev import ParadevWorkspaceProvider
@@ -1557,12 +1557,14 @@ class CampaignRuntime:
             native = dataclasses.asdict(binding)
         else:
             workspace = root / safe_segment(unit.id + "-" + action.id[:8])
-            if workspace.exists():
-                assert_workspace(workspace, Path(snapshot.common_dir), branch)
-            else:
-                workspace = allocate_worktree(
-                    self.project, root, branch=branch, unit_id=workspace.name, base=base
-                )
+            workspace = allocate_worktree(
+                self.project,
+                root,
+                branch=branch,
+                unit_id=workspace.name,
+                base=base,
+                allocation_dir=state_dir,
+            )
             native = {}
         self._seed_checkout(workspace)
         source = self.source(snapshot, unit)
@@ -3652,6 +3654,10 @@ class CampaignRuntime:
                 )
         elif outcome == "integrated":
             unit.evidence["integrated"] = receipt
+            for key in ("verification", "review"):
+                unit.evidence.pop(key, None)
+            if unit.evidence.get("pushed") != receipt["head"]:
+                unit.evidence.pop("pushed", None)
         elif outcome == "verified":
             if receipt.get("stage") == "resolution_verify":
                 receipt["resolution_id"] = unit.evidence["accepted_resolution"]["id"]

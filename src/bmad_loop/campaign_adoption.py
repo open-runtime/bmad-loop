@@ -947,33 +947,36 @@ def prepare(runtime, snapshot, action) -> dict[str, Any]:
         verify.create_ref(runtime.project, preserved_ref, manifest.head)
     if verify.ref_revision(runtime.project, preserved_ref) != manifest.head:
         raise AdoptionError("adoption preservation ref changed")
-    if not workspace.exists():
-        if snapshot.spec.paradev.reflect:
-            raise AdoptionError(
-                "native reflection requires the explicitly registered owner-qualified workspace UUID/path"
+    from .campaign_workers import worktree_metadata_lock
+
+    with worktree_metadata_lock(runtime.project):
+        if not workspace.exists():
+            if snapshot.spec.paradev.reflect:
+                raise AdoptionError(
+                    "native reflection requires the explicitly registered owner-qualified workspace UUID/path"
+                )
+            worktrees = _git(runtime.project, "worktree", "list", "--porcelain")
+            if "branch refs/heads/" + manifest.branch in worktrees.splitlines():
+                raise AdoptionError("adopted branch is checked out in an unselected workspace")
+            root.mkdir(parents=True, exist_ok=True)
+            local = (
+                verify.rev_parse_revision(runtime.project, "refs/heads/" + manifest.branch)
+                if verify.ref_exists_checked(runtime.project, "refs/heads/" + manifest.branch)
+                else None
             )
-        worktrees = _git(runtime.project, "worktree", "list", "--porcelain")
-        if "branch refs/heads/" + manifest.branch in worktrees.splitlines():
-            raise AdoptionError("adopted branch is checked out in an unselected workspace")
-        root.mkdir(parents=True, exist_ok=True)
-        local = (
-            verify.rev_parse_revision(runtime.project, "refs/heads/" + manifest.branch)
-            if verify.ref_exists_checked(runtime.project, "refs/heads/" + manifest.branch)
-            else None
-        )
-        if local is not None and local != manifest.head:
-            raise AdoptionError(
-                "local adopted branch has unpublished history; explicit preservation required"
-            )
-        if local is None:
-            _git(runtime.project, "branch", manifest.branch, manifest.head)
-        _git(runtime.project, "worktree", "add", str(workspace), manifest.branch)
-    if (
-        common(workspace) != Path(snapshot.common_dir).resolve()
-        or _git(workspace, "symbolic-ref", "--short", "HEAD") != manifest.branch
-        or not verify.worktree_clean(workspace)
-    ):
-        raise AdoptionError("selected adopted workspace identity or clean preservation changed")
+            if local is not None and local != manifest.head:
+                raise AdoptionError(
+                    "local adopted branch has unpublished history; explicit preservation required"
+                )
+            if local is None:
+                _git(runtime.project, "branch", manifest.branch, manifest.head)
+            _git(runtime.project, "worktree", "add", str(workspace), manifest.branch)
+        if (
+            common(workspace) != Path(snapshot.common_dir).resolve()
+            or _git(workspace, "symbolic-ref", "--short", "HEAD") != manifest.branch
+            or not verify.worktree_clean(workspace)
+        ):
+            raise AdoptionError("selected adopted workspace identity or clean preservation changed")
     native = {}
     if snapshot.spec.paradev.reflect:
         from .campaign_paradev import ParadevWorkspaceProvider

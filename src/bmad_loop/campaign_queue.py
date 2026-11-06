@@ -243,7 +243,10 @@ def allocate_checkout(
         "workspace": str(workspace),
         "common_dir": str(common),
     }
-    if workspace.exists():
+
+    def existing() -> Path | None:
+        if not workspace.exists():
+            return None
         if is_link_like(intent) or not intent.is_file():
             raise GithubError("existing queue verification checkout has no owned intent")
         old = json.loads(intent.read_text(encoding="utf-8"))
@@ -255,12 +258,21 @@ def allocate_checkout(
             raise GithubError("queue checkout allocation authority changed")
         assert_checkout(workspace, common, group)
         return workspace
-    state_dir.mkdir(parents=True, exist_ok=True)
-    atomic_write_text(intent, json.dumps(value, sort_keys=True), follow_symlinks=False)
+
+    from .campaign_workers import worktree_metadata_lock
+
+    with worktree_metadata_lock(project):
+        if (owned := existing()) is not None:
+            return owned
+        state_dir.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(intent, json.dumps(value, sort_keys=True), follow_symlinks=False)
     _git(project, "fetch", "--no-tags", remote, group.head)
     root.mkdir(parents=True, exist_ok=True)
-    _git(project, "worktree", "add", "--detach", str(workspace), group.head)
-    assert_checkout(workspace, common, group)
+    with worktree_metadata_lock(project):
+        if (owned := existing()) is not None:
+            return owned
+        _git(project, "worktree", "add", "--detach", str(workspace), group.head)
+        assert_checkout(workspace, common, group)
     if not verify.is_ancestor(workspace, group.pr_head, group.head) or not verify.is_ancestor(
         workspace, group.base, group.head
     ):

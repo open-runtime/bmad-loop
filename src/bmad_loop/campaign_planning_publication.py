@@ -14,10 +14,11 @@ import os
 from pathlib import Path
 from typing import Any
 
-from . import stories, verify
+from . import sprintstatus, stories, ticketlayout, verify
 from .campaign_model import CampaignError, SourceSelector
 from .campaign_sources import source_paths
 from .platform_util import atomic_write_text, is_link_like, safe_segment
+from .tickettree import TicketsError, TicketTree
 
 SUFFIXES = {".md", ".toml", ".yaml", ".yml", ".json"}
 
@@ -263,6 +264,48 @@ def validate_stage_products(
         ):
             raise CampaignError("planning artifact escaped its product-document ownership")
         allowed.update((artifact["path"], artifact.get("review_path", artifact["path"])))
+    authored = {
+        (workspace / artifact["path"]).resolve() for artifact in receipt["validated"]["artifacts"]
+    }
+    for source in sources:
+        if source.kind == "stories":
+            folder = stories.resolve_spec_folder(workspace, source.path)
+            if (folder / stories.STORIES_FILENAME).resolve() not in authored:
+                continue
+            try:
+                stories.load_stories(folder)
+            except stories.StoriesError as exc:
+                raise CampaignError(
+                    "planning authored an invalid native stories manifest: " + str(exc)
+                ) from exc
+        elif source.kind == "sprint-status":
+            board = source_paths(workspace, source).sprint_status
+            if board.resolve() not in authored:
+                continue
+            try:
+                sprintstatus.planning_rows_in_bytes(board.read_bytes())
+                sprintstatus.load(board)
+            except sprintstatus.SprintStatusError as exc:
+                raise CampaignError(
+                    "planning authored an invalid native sprint board: " + str(exc)
+                ) from exc
+        elif source.kind == "tickets":
+            folder = source_paths(workspace, source).initiative_folder
+            if folder is None or not any(
+                path.name == ticketlayout.BREAKDOWN and path.is_relative_to(folder.resolve())
+                for path in authored
+            ):
+                continue
+            try:
+                board = TicketTree(workspace, folder=folder).status()
+            except TicketsError as exc:
+                raise CampaignError(
+                    "planning authored an invalid native ticket tree: " + str(exc)
+                ) from exc
+            if board.problems:
+                raise CampaignError(
+                    "planning authored an invalid native ticket tree: " + "; ".join(board.problems)
+                )
     observed = verify.git_bytes(
         workspace, "diff", "--name-only", "-z", receipt["base"], receipt["head"]
     )

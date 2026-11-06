@@ -326,6 +326,68 @@ def test_explicit_prepare_converts_draft_preserves_history_and_pushes_same_branc
     assert adoption.prepare(runtime, snapshot, action) == result
 
 
+def test_authenticated_remote_adoption_creates_worktree_under_shared_metadata_lock(
+    case, tmp_path, monkeypatch
+):
+    from contextlib import contextmanager
+
+    from bmad_loop import campaign_workers
+    from bmad_loop.campaign_runtime import CampaignRuntime
+    from bmad_loop.campaign_store import CampaignStore, add_action
+
+    # This sandbox actor has relinquished its registered tree; its original
+    # branch and every preserved commit remain intact for the authenticated PR.
+    git(case.repo, "worktree", "remove", str(case.workspace))
+    case.manifest = dataclasses.replace(case.manifest, workspace="")
+    actor = case.service.items[0]
+    actor = dataclasses.replace(actor, details={**actor.details, "workspace": ""})
+    case.service = dataclasses.replace(case.service, items=(actor,), observed_at=time.time())
+    store = CampaignStore(tmp_path / "state")
+    snapshot = store.create(case.snapshot)
+    runtime = CampaignRuntime(
+        case.repo, store, gateway=case.gateway, adoption_resolver=case.resolver
+    )
+    path = tmp_path / "remote-adopt.json"
+    path.write_text(json.dumps(dataclasses.asdict(case.manifest)), encoding="utf-8")
+    payload = adoption.prepare_request(
+        case.repo,
+        snapshot,
+        case.unit.id,
+        path,
+        "handoff",
+        gateway=case.gateway,
+        resolver=case.resolver,
+    )
+    adoption.begin(snapshot, case.unit.id, payload, command_id="owner-adopt")
+    case.pr["draft"] = True
+    snapshot.units[case.unit.id].bindings["adoption"]["state"] = "draft_confirmed"
+    action = add_action(snapshot, "prepare-unit", case.unit.id, {"adoption": True})
+    original_lock = campaign_workers.worktree_metadata_lock
+    original_git = adoption._git
+    state, calls = {"held": False}, []
+
+    @contextmanager
+    def observed_lock(repo):
+        with original_lock(repo) as common:
+            state["held"] = True
+            try:
+                yield common
+            finally:
+                state["held"] = False
+
+    def observed_git(repo, *args):
+        if args[:2] == ("worktree", "add") or (args and args[0] == "fetch"):
+            calls.append((args[0], state["held"]))
+        return original_git(repo, *args)
+
+    monkeypatch.setattr(campaign_workers, "worktree_metadata_lock", observed_lock)
+    monkeypatch.setattr(adoption, "_git", observed_git)
+    result = adoption.prepare(runtime, snapshot, action)
+    assert ("worktree", True) in calls and ("fetch", False) in calls
+    assert not any(held for kind, held in calls if kind == "fetch")
+    assert git(case.repo, "merge-base", case.manifest.head, result["head"]) == case.manifest.head
+
+
 def test_selected_installed_observer_identity_pins_distribution_version_and_module_hash(
     case, monkeypatch
 ):

@@ -512,6 +512,56 @@ def test_poll_apply_rechecks_ack_arrived_after_frozen_poll_snapshot(snapshot):
     assert closure.version_id in snapshot.bindings["intake"]["seen_versions"]
 
 
+@pytest.mark.parametrize("pushed", [None, "previous-candidate", "current-candidate"])
+def test_replanned_candidate_requires_its_exact_push_before_verification(project, tmp_path, pushed):
+    from test_campaign_takeover import configured
+
+    runtime, snapshot, unit = configured(project, tmp_path)
+    unit.state = UnitState.SYNCING
+    unit.evidence["integrated"] = {"head": "current-candidate"}
+    if pushed is not None:
+        unit.evidence["pushed"] = pushed
+    proposals = [row for row in runtime.proposals(snapshot) if row.unit == unit.id]
+    assert len(proposals) == 1
+    if pushed == "current-candidate":
+        assert proposals[0].kind == "launch" and proposals[0].payload["kind"] == "verify"
+    else:
+        assert proposals[0].kind == "push"
+        assert proposals[0].payload["head"] == "current-candidate"
+
+
+def test_reintegration_retires_prior_candidate_acceptance_and_push(project, tmp_path):
+    from test_campaign_takeover import configured
+
+    from bmad_loop.campaign_model import WorkerClaim
+
+    runtime, snapshot, unit = configured(project, tmp_path)
+    unit.state = UnitState.SYNCING
+    unit.claim = WorkerClaim(unit.id, 1, snapshot.generation, "integration")
+    unit.evidence.update(
+        integrated={"head": "previous-candidate"},
+        pushed="previous-candidate",
+        verification={"head": "previous-candidate"},
+        review={"head": "previous-candidate", "validated": {"verdict": "approved"}},
+    )
+    action = OutboxAction(
+        "observed", "observe-worker", unit.id, {"launch_id": "integration"}, snapshot.generation
+    )
+    runtime._apply_worker(
+        snapshot,
+        unit,
+        action,
+        {
+            "state": "finished",
+            "receipt": {"outcome": "integrated", "head": "current-candidate"},
+        },
+    )
+    assert unit.evidence["integrated"]["head"] == "current-candidate"
+    assert not {"pushed", "verification", "review"}.intersection(unit.evidence)
+    proposal = next(row for row in runtime.proposals(snapshot) if row.unit == unit.id)
+    assert proposal.kind == "push" and proposal.payload["head"] == "current-candidate"
+
+
 @pytest.mark.parametrize("production_case", [{"intake": True}], indirect=True)
 def test_github_issue_triage_planning_review_delivery_and_reused_issue_binding(production_case):
     case = production_case
@@ -562,7 +612,8 @@ def test_github_issue_triage_planning_review_delivery_and_reused_issue_binding(p
             spec=workspace/"specs"/"epic"/"stories"/"incoming-story.md"
             spec.write_text("---\\nstatus: ready-for-dev\\n---\\n# Incoming\\n\\nAccept incoming.\\n")
             manifest=workspace/"specs"/"epic"/"stories.yaml"
-            manifest.write_text(manifest.read_text()+"- id: incoming\\n  title: Incoming\\n  description: Accept incoming\\n")
+            if "- id: incoming\\n" not in manifest.read_text():
+                manifest.write_text(manifest.read_text()+"- id: incoming\\n  title: Incoming\\n  description: Accept incoming\\n")
             artifact["artifacts"] += [str(spec.relative_to(workspace)),str(manifest.relative_to(workspace))]
             artifact.update(units=units,source_bindings={added["id"]:{"kind":"stories","path":str(spec.relative_to(workspace))}})
 """
@@ -581,6 +632,16 @@ def test_github_issue_triage_planning_review_delivery_and_reused_issue_binding(p
     assert len(controls) == 1
     assert intake.control(controls[0])["state"] == "completed"
     assert controls[0].evidence["planning_flow"]["state"] == "activated"
+    published_heads = set()
+    for action in result.outbox:
+        if action.unit != controls[0].id or action.state != "confirmed":
+            continue
+        if action.kind == "push":
+            published_heads.add(action.receipt["head"])
+        elif action.kind == "observe-worker":
+            receipt = action.receipt.get("receipt", {})
+            if receipt.get("outcome") == "verified":
+                assert receipt["head"] in published_heads
     assert len(case.service.pulls) == 5
     assert any(
         method == "POST" and "/issues/1/comments" in path for method, path, _ in case.service.calls

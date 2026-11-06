@@ -3,12 +3,25 @@
 import hashlib
 
 import pytest
-from conftest import git
+from conftest import (
+    DEFAULT_TREE,
+    git,
+    install_bmad_config,
+    write_plan,
+    write_sprint,
+    write_ticket_tree,
+)
 from test_stories_engine import SPEC_FOLDER, setup_stories
 
-from bmad_loop import verify
+from bmad_loop import ticketlayout, verify
 from bmad_loop.campaign_model import CampaignError, SourceSelector
-from bmad_loop.campaign_planning_publication import bind_mirrors, capture, changes, mirror_artifacts
+from bmad_loop.campaign_planning_publication import (
+    bind_mirrors,
+    capture,
+    changes,
+    mirror_artifacts,
+    validate_stage_products,
+)
 
 
 def test_ignored_artifact_has_committed_mirror_and_exact_preimage(project, tmp_path):
@@ -90,3 +103,102 @@ def test_committed_mirror_cannot_name_different_bytes(project):
     }
     with pytest.raises(CampaignError, match="exact committed"):
         bind_mirrors(repo, receipt)
+
+
+@pytest.mark.parametrize("duplicate", [False, True])
+def test_planning_native_story_manifest_is_validated_before_publication(project, duplicate):
+    setup_stories(project, [{"id": "one", "title": "One", "description": "One"}])
+    repo = project.project
+    baseline = verify.rev_parse_head(repo)
+    source = SourceSelector("stories", id="source", path=SPEC_FOLDER)
+    manifest = repo / SPEC_FOLDER / "stories.yaml"
+    manifest.write_text(
+        manifest.read_text(encoding="utf-8")
+        + "- id: "
+        + ("one" if duplicate else "two")
+        + "\n  title: New story\n  description: Accepted story\n",
+        encoding="utf-8",
+    )
+    git(repo, "add", "-A")
+    git(repo, "commit", "-m", "planned source output")
+    receipt = {
+        "base": baseline,
+        "head": verify.rev_parse_head(repo),
+        "validated": {"artifacts": [{"path": manifest.relative_to(repo).as_posix()}]},
+    }
+    if duplicate:
+        with pytest.raises(CampaignError, match="invalid native stories manifest.*duplicate id"):
+            validate_stage_products(repo, receipt, (source,))
+    else:
+        validate_stage_products(repo, receipt, (source,))
+
+
+@pytest.mark.parametrize("mutation", ["valid", "duplicate", "syntax", "problem"])
+def test_planning_native_ticket_manifest_is_validated_before_publication(project_v7, mutation):
+    layout = project_v7
+    write_ticket_tree(layout, DEFAULT_TREE)
+    repo = layout.project
+    git(repo, "add", "-A")
+    git(repo, "commit", "--allow-empty", "-m", "native ticket baseline")
+    baseline = verify.rev_parse_head(repo)
+    source = SourceSelector(
+        "tickets", id="tickets", initiative=layout.initiative, epics=("epic-cart",)
+    )
+    manifest = (
+        ticketlayout.breakdown_dir(ticketlayout.epic_folder(layout.initiative_folder, "epic-cart"))
+        / ticketlayout.BREAKDOWN
+    )
+    additions = {
+        "valid": '\n[[entry]]\nid = 3\ntype = "story"\ntitle = "Next story"\n',
+        "duplicate": '\n[[entry]]\nid = 1\ntype = "story"\ntitle = "Duplicate"\n',
+        "syntax": "\n[[entry]\n",
+        "problem": "\n# inspect the authored native plan\n",
+    }
+    manifest.write_text(
+        manifest.read_text(encoding="utf-8") + additions[mutation], encoding="utf-8"
+    )
+    artifacts = [{"path": manifest.relative_to(repo).as_posix()}]
+    if mutation == "problem":
+        orphan = write_plan(layout, "epic-cart", "orphan-plan", 999, "ready-for-dev")
+        artifacts.append({"path": orphan.relative_to(repo).as_posix()})
+    git(repo, "add", "-A")
+    git(repo, "commit", "-m", "planned native tickets")
+    receipt = {
+        "base": baseline,
+        "head": verify.rev_parse_head(repo),
+        "validated": {"artifacts": artifacts},
+    }
+    if mutation == "valid":
+        validate_stage_products(repo, receipt, (source,))
+    else:
+        with pytest.raises(CampaignError, match="invalid native ticket tree"):
+            validate_stage_products(repo, receipt, (source,))
+
+
+@pytest.mark.parametrize("mutation", ["valid", "duplicate", "syntax"])
+def test_planning_native_sprint_board_is_validated_before_publication(project, mutation):
+    install_bmad_config(project)
+    write_sprint(project, {"1-1-one": "ready-for-dev"})
+    repo = project.project
+    git(repo, "add", "-A")
+    git(repo, "commit", "--allow-empty", "-m", "native sprint baseline")
+    baseline = verify.rev_parse_head(repo)
+    board = project.sprint_status
+    additions = {
+        "valid": "\n  1-2-next: backlog\n",
+        "duplicate": "\n  1-1-one: done\n",
+        "syntax": "\n[",
+    }
+    board.write_text(board.read_text(encoding="utf-8") + additions[mutation], encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-m", "planned native sprint board")
+    receipt = {
+        "base": baseline,
+        "head": verify.rev_parse_head(repo),
+        "validated": {"artifacts": [{"path": board.relative_to(repo).as_posix()}]},
+    }
+    if mutation == "valid":
+        validate_stage_products(repo, receipt, (SourceSelector("sprint-status", id="sprint"),))
+    else:
+        with pytest.raises(CampaignError, match="invalid native sprint board"):
+            validate_stage_products(repo, receipt, (SourceSelector("sprint-status", id="sprint"),))

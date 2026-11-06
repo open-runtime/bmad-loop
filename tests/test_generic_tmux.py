@@ -7419,6 +7419,26 @@ def test_tmux_timeout_with_flushed_spec_rescued_post_kill(tmp_path, private_tmux
         },
         timeout_s=6.0,
     )
+    real_start_session = adapter.start_session
+
+    def start_flushed_session(session_spec):
+        handle = real_start_session(session_spec)
+        # Establish this test's scenario before its deliberately short timeout:
+        # the scripted CLI really flushed successful work and rendered into the
+        # attached sink. Shell startup and scheduling are outside this assertion;
+        # the unchanged six-second wait still has to time out, kill the live
+        # window and rescue via the real post-kill read-back. A missing launch
+        # fails at the shared hang ceiling rather than pretending to test rescue.
+        deadline = time.monotonic() + REAL_MUX_HANG_CEILING_S
+        while time.monotonic() < deadline:
+            if (impl / "spec-3-1-foo.md").is_file() and (
+                adapter.logs_dir / "t-rescue.log"
+            ).stat().st_size > generic.PROOF_OF_WORK_MIN_LOG_BYTES:
+                return handle
+            time.sleep(0.01)
+        pytest.fail("scripted CLI never flushed its terminal spec and pane output")
+
+    adapter.start_session = start_flushed_session
     try:
         result = adapter.run(spec)
     finally:

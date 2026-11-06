@@ -15,8 +15,9 @@ import os
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from . import bmadconfig, childrun, runs, runsetup, verify
 from .adapters.base import SessionSpec
@@ -24,7 +25,14 @@ from .campaign_execution import CampaignExecution, CampaignExecutionError, worke
 from .campaign_model import CampaignError, SourceSelector, UnitSpec
 from .engine import Engine
 from .journal import TASK_CYCLE_ARTIFACTS, load_state
-from .platform_util import atomic_write_text, detach_kwargs, safe_segment, session_task_id
+from .platform_util import (
+    atomic_write_text,
+    detach_kwargs,
+    file_lock,
+    is_link_like,
+    safe_segment,
+    session_task_id,
+)
 from .stories_engine import StoriesEngine
 
 
@@ -49,18 +57,101 @@ def assert_workspace(workspace: Path, common: Path, branch: str) -> None:
         raise CampaignError("worker branch binding changed")
 
 
-def allocate_worktree(repo: Path, root: Path, *, branch: str, unit_id: str, base: str) -> Path:
-    """Allocate only beneath the explicitly configured project worktree root."""
+@contextmanager
+def worktree_metadata_lock(repo: Path) -> Iterator[Path]:
+    """Protect short shared Git-admin mutations; never sessions or network I/O."""
+    common = common_directory(repo)
+    with file_lock(common / "bmad-campaign-worktree-allocation.lock"):
+        yield common
+
+
+def allocate_worktree(
+    repo: Path,
+    root: Path,
+    *,
+    branch: str,
+    unit_id: str,
+    base: str,
+    allocation_dir: Path | None = None,
+) -> Path:
+    """Serialize short Git metadata writes and reconcile only this exact intent.
+
+    Git can create a branch before worktree registration fails. The saved
+    absence/base/path proof permits using that same untouched branch on retry;
+    it never permits deleting, resetting or adopting an existing foreign branch.
+    Model sessions and normal worker execution never hold this metadata lock.
+    """
     root = root.expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
     name = safe_segment(unit_id)
     workspace = root / name
-    if workspace.exists():
-        raise CampaignError("workspace allocation uncertain: reconcile its prior action")
-    git(repo, "check-ref-format", "--branch", branch)
-    git(repo, "worktree", "add", "-b", branch, str(workspace), base)
-    assert_workspace(workspace, common_directory(repo), branch)
-    return workspace
+    with worktree_metadata_lock(repo) as common:
+        git(repo, "check-ref-format", "--branch", branch)
+        resolved = verify.rev_parse_revision(repo, base)
+        expected = {
+            "schema_version": 1,
+            "common_dir": str(common),
+            "branch": branch,
+            "workspace": str(workspace),
+            "base": resolved,
+            "branch_absent": True,
+        }
+        path = (
+            allocation_dir / "worktree-allocation-intent.json"
+            if allocation_dir is not None
+            else None
+        )
+        record = None
+        if path is not None and path.exists():
+            if is_link_like(path) or not path.is_file() or path.stat().st_size > 16384:
+                raise CampaignError("worktree allocation intent is redirected or unavailable")
+            record = json.loads(path.read_text(encoding="utf-8"))
+            if record != expected:
+                raise CampaignError("worktree allocation intent coordinates changed")
+        reference = "refs/heads/" + branch
+        check = verify.git_bytes(repo, "show-ref", "--verify", "--quiet", reference)
+        if check.returncode not in (0, 1):
+            raise CampaignError("worktree branch preimage is unavailable")
+        exists = check.returncode == 0
+        if record is None:
+            if workspace.exists() or exists:
+                raise CampaignError(
+                    "unrecorded existing branch/worktree cannot be adopted by allocation"
+                )
+            if path is not None:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                atomic_write_text(path, json.dumps(expected, sort_keys=True), follow_symlinks=False)
+        registered = git(repo, "worktree", "list", "--porcelain", "-z")
+        bound = []
+        for block in registered.split("\0\0"):
+            fields: dict[str, str] = {}
+            for value in block.split("\0"):
+                if value:
+                    field, _, content = value.partition(" ")
+                    fields[field] = content
+            if fields.get("branch") == reference:
+                bound.append(Path(fields["worktree"]).resolve())
+        if workspace.exists():
+            if record is None or bound != [workspace] or is_link_like(workspace):
+                raise CampaignError("existing allocation workspace has no exact owned registration")
+            assert_workspace(workspace, common, branch)
+            if not verify.is_ancestor(repo, resolved, verify.rev_parse_head(workspace)):
+                raise CampaignError("allocation workspace no longer preserves its original base")
+            return workspace
+        if bound:
+            raise CampaignError("allocation branch is already registered to another worktree")
+        if exists:
+            if record is None or verify.rev_parse_revision(repo, reference) != resolved:
+                raise CampaignError(
+                    "allocation orphan branch changed or lacks its original absence proof"
+                )
+            git(repo, "worktree", "add", str(workspace), branch)
+        else:
+            git(repo, "worktree", "add", "-b", branch, str(workspace), resolved)
+        assert_workspace(workspace, common, branch)
+        if verify.rev_parse_head(workspace) != resolved:
+            raise CampaignError("new allocation branch moved before baseline confirmation")
+        return workspace
 
 
 def prepare_launch(execution: CampaignExecution, request: dict[str, Any]) -> Path:

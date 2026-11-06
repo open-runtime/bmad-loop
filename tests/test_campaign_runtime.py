@@ -40,6 +40,7 @@ from bmad_loop.campaign_model import (
 from bmad_loop.campaign_scheduler import CapacityObservation
 from bmad_loop.campaign_store import CampaignStore
 from bmad_loop.campaign_supervisor import CampaignSupervisor
+from bmad_loop.platform_util import atomic_write_text
 
 
 class ScriptedGithub:
@@ -62,7 +63,8 @@ class ScriptedGithub:
         self._save()
 
     def _save(self):
-        self.state_file.write_text(
+        atomic_write_text(
+            self.state_file,
             json.dumps(
                 {
                     "pulls": list(self.pulls.values()),
@@ -70,7 +72,6 @@ class ScriptedGithub:
                     "planning_required": self.planning_required,
                 }
             ),
-            encoding="utf-8",
         )
 
     def _base(self):
@@ -827,7 +828,10 @@ def test_tracking_debt_blocks_only_affected_dependent_until_reconciled(
     original_proposals = case.runtime.proposals
 
     def observer(snapshot):
-        if snapshot.units["source:project:second"].state == UnitState.DELIVERED:
+        if (
+            snapshot.units["source:project:second"].state == UnitState.DELIVERED
+            and snapshot.units["source:project:first"].state == UnitState.MERGED_PENDING_SYNC
+        ):
             case.store.enqueue(snapshot.id, "stop", request_id="observed-independent-delivery")
         return original_proposals(snapshot)
 
