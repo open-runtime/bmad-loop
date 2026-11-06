@@ -11634,7 +11634,8 @@ def main(argv: list[str] | None = None) -> int:
         "--probe",
         action="store_true",
         help="opt-in LIVE capture: launch one trivial content-free turn in a temp "
-        "workspace and capture real hook payloads (default: zero-launch scan)",
+        "workspace (codex: a stable per-user probe workspace you trust once) and "
+        "capture real hook payloads (default: zero-launch scan)",
     )
     probe_p.add_argument(
         "--transcript", help="exact transcript file to inspect (overrides discovery)"
