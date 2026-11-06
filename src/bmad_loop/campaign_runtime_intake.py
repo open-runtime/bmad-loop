@@ -198,7 +198,7 @@ def collect(
         mapped_numbers=tuple(sorted(mapped)),
         max_batch=snapshot.spec.intake.batch_size,
     )
-    keep, suppressed = [], []
+    keep, suppressed, owned_observations = [], [], []
     for observation in batch.observations:
         if _owned_projection(snapshot, observation.to_dict()) or any(
             prior.repository == snapshot.repository
@@ -207,12 +207,14 @@ def collect(
             for prior in prior_projections
         ):
             suppressed.append(observation.version_id)
+            owned_observations.append(observation.to_dict())
         else:
             keep.append(observation)
     return {
         "batch": dataclasses.asdict(dataclasses.replace(batch, observations=tuple(keep))),
         "observed_at": now,
         "suppressed_versions": suppressed,
+        "owned_projection_observations": owned_observations,
     }
 
 

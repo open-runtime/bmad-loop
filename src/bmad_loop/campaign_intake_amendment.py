@@ -392,6 +392,54 @@ def perform(runtime, snapshot, action) -> dict[str, Any]:
     return receipt
 
 
+_SUPERSEDED_FAILURES = frozenset(
+    {
+        "paused",
+        "failed",
+        "technical_failure",
+        "verification_failed",
+        "invalid_stage_result",
+        "interrupted",
+    }
+)
+
+
+def _retire_drained_failures(target) -> dict[str, Any]:
+    """New reviewed input supersedes only technical faults of the drained actor.
+
+    Execution acceptance must run again on the fresh source generation. Retain
+    unrelated owner/review/publisher/ownership gates and every accounting counter;
+    the archived old receipts remain evidence rather than future retry authority.
+    """
+    claim = target.claim
+    if claim is None or not claim.quiescent:
+        raise CampaignError("source amendment failure retirement requires a drained actor")
+
+    def obsolete(raw):
+        return (
+            raw.get("id") == claim.launch_id
+            and raw.get("kind", raw.get("code")) in _SUPERSEDED_FAILURES
+        )
+
+    retired = {}
+    pending = target.evidence.get("pending_failure_hold")
+    if pending and obsolete(pending):
+        retired["pending_failure_hold"] = target.evidence.pop("pending_failure_hold")
+    queue = target.evidence.get("pending_failure_holds", [])
+    removed = [raw for raw in queue if obsolete(raw)]
+    if removed:
+        retired["pending_failure_holds"] = removed
+        remaining = [raw for raw in queue if not obsolete(raw)]
+        if remaining:
+            target.evidence["pending_failure_holds"] = remaining
+        else:
+            target.evidence.pop("pending_failure_holds", None)
+    failure = target.evidence.get("failure")
+    if failure and obsolete(failure):
+        retired["failure"] = target.evidence.pop("failure")
+    return retired
+
+
 def apply(snapshot, target, data) -> None:
     plan, value, proposal = _current(
         snapshot, target, data["planning_unit"], data["proposal_id"], action_id=data["action_id"]
@@ -424,6 +472,8 @@ def apply(snapshot, target, data) -> None:
     ):
         if key in target.evidence:
             invalidated[key] = target.evidence.pop(key)
+    if target.claim is not None:
+        invalidated.update(_retire_drained_failures(target))
     target.evidence.setdefault("amendment_history", []).append(
         {"receipt": data, "invalidated": invalidated}
     )

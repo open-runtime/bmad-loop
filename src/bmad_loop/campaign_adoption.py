@@ -1051,11 +1051,16 @@ def prepare(runtime, snapshot, action) -> dict[str, Any]:
             "private_paths": [str(item) for item in prepared.private_paths],
         }
         atomic_write_text(path, json.dumps(state, sort_keys=True), follow_symlinks=False)
+    from .campaign_product_input import collect as selected_product_input
+
     specification = execution_spec(
         unit.spec,
         campaign_id=snapshot.id,
         graph_revision=snapshot.graph_revision,
         source=snapshot.bindings.get("source_observations", {}).get(unit.id, {}),
+        native_input=selected_product_input(
+            workspace, SourceSelector(**state["source"]["effective_source"]), unit.spec
+        ),
     )
     specification += (
         "\n\nExplicit adopted PR: "

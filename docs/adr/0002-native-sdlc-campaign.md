@@ -1,6 +1,6 @@
 # ADR 0002: A deterministic SDLC campaign with GitHub delivery
 
-- **Status:** Architecture reviewed; implementation and activation qualification pending
+- **Status:** Implemented in the development PR; final review and activation qualification pending
 - **Date:** 2026-11-05
 - **Scope:** An opt-in campaign supervisor, isolated workers, planning, GitHub synchronization and native Paradev reflection
 
@@ -21,9 +21,10 @@ queued merge, local commit or successful worker exit is insufficient.
 
 The detailed [implementation contract](0002-campaign-implementation.md) resolves
 the command surface, persistence, worker/source isolation, publication, terminal
-retention and activation decisions below. Both documents form the plan for one
-implementation PR. Capability and repository-policy prerequisites remain
-explicit; a reviewed design is not evidence of a deployed feature.
+retention and activation decisions below. Both documents define the contract for
+one implementation PR; current usage is in the [campaign guide](../campaign-guide.md).
+Capability and repository-policy prerequisites remain explicit; implementation
+tests do not establish that a target project has been activated.
 
 Add a deterministic Python campaign supervisor above the existing serial story
 engine. Planning, implementation, conflict repair and review run in coding-CLI

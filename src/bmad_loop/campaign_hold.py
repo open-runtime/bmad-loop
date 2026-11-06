@@ -34,6 +34,8 @@ PROTECTED_HOLDS = frozenset(
         "checkpoint",
         "github_review",
         "required_review",
+        "intake_plan_change",
+        "intake_plan_changed",
     }
 )
 

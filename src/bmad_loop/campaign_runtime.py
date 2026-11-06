@@ -1329,7 +1329,10 @@ class CampaignRuntime:
             )
         )
         since = (
-            (datetime.fromtimestamp(self.clock(), timezone.utc) - timedelta(days=7))
+            (
+                datetime.fromtimestamp(self.clock(), timezone.utc)
+                - timedelta(days=snapshot.spec.github.recent_days)
+            )
             .isoformat()
             .replace("+00:00", "Z")
         )
@@ -1620,12 +1623,25 @@ class CampaignRuntime:
         # ignored. Use a repository-owned docs path instead of force-adding logs.
         spec_path = workspace / "docs" / "bmad-campaign" / f"{safe_segment(unit.id)}.md"
         spec_path.parent.mkdir(parents=True, exist_ok=True)
-        specification = execution_spec(
-            unit.spec,
-            campaign_id=snapshot.id,
-            graph_revision=snapshot.graph_revision,
-            source=snapshot.bindings.get("source_observations", {}).get(unit.id, {}),
-        )
+        from .campaign_product_input import collect as selected_product_input
+
+        try:
+            native_input = selected_product_input(
+                workspace,
+                SourceSelector(
+                    **source_binding.get("effective_source", dataclasses.asdict(source))
+                ),
+                unit.spec,
+            )
+            specification = execution_spec(
+                unit.spec,
+                campaign_id=snapshot.id,
+                graph_revision=snapshot.graph_revision,
+                source=snapshot.bindings.get("source_observations", {}).get(unit.id, {}),
+                native_input=native_input,
+            )
+        except CampaignError as exc:
+            return Observation("rejected", reason=str(exc))
         if unit.spec.kind == "planning" and snapshot.spec.planning.brief:
             brief = Path(snapshot.spec.planning.brief)
             if not brief.is_absolute():

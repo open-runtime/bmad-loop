@@ -10,7 +10,7 @@ import pytest
 from bmad_loop.campaign_decision_sources import configured_locations, github_provider
 from bmad_loop.campaign_decisions import collect_evidence
 from bmad_loop.campaign_github import ApiResponse, GithubGateway
-from bmad_loop.campaign_model import CampaignError, DecisionSpec, OutboxAction
+from bmad_loop.campaign_model import CampaignError, DecisionSpec, OutboxAction, SourceSelector
 from bmad_loop.campaign_planning import StageCoordinates
 from bmad_loop.campaign_resolution_flow import apply_context
 from bmad_loop.campaign_runtime import CampaignRuntime
@@ -219,14 +219,28 @@ def test_production_context_and_receipt_refresh_use_authenticated_default_provid
     snapshot = state(project, hold="product_choice")
     unit = snapshot.units["s:project:u"]
     snapshot.spec = dataclasses.replace(
-        snapshot.spec, decisions=DecisionSpec(sources=("gh:issue:7",))
+        snapshot.spec,
+        decisions=DecisionSpec(sources=("gh:issue:7",)),
+        sources=(SourceSelector("stories", id="s"),),
+        units=(unit.spec,),
     )
+    action = OutboxAction(
+        "context",
+        "resolution-context",
+        unit.id,
+        {"mode": "decision", "hold_id": unit.hold.id, "head": unit.bindings["head"]},
+        0,
+    )
+    snapshot.outbox.append(action)
+    store = CampaignStore(tmp_path / "state")
+    snapshot = store.create(snapshot)
+    unit = snapshot.units[unit.id]
+    action = snapshot.outbox[0]
     runtime = CampaignRuntime(
         project.project,
-        CampaignStore(tmp_path / "state"),
+        store,
         gateway=GithubGateway(service, "org/repo"),
     )
-    action = OutboxAction("context", "resolution-context", unit.id, {"mode": "decision"}, 0)
     result = runtime._perform_resolution_context(snapshot, action)
     assert result.state == "confirmed"
     apply_context(snapshot, unit.id, result.data)

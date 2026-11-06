@@ -221,7 +221,9 @@ class CampaignSupervisor:
         return self._save(snapshot) if changed else snapshot
 
     def _reconciled(self, campaign_id: str, executor: ThreadPoolExecutor) -> CampaignSnapshot:
-        snapshot = self.store.load(campaign_id)
+        # Queued holds/stops must reach the authority before an uncertain
+        # effect can authorize any retry during startup reconciliation.
+        snapshot = self._commands(self.store.load(campaign_id))
         for action in tuple(snapshot.outbox):
             if action.state == "sent_unknown":
                 snapshot = self._submit(snapshot, action, executor, reconcile=True)
@@ -297,6 +299,21 @@ class CampaignSupervisor:
                     while snapshot.phase not in {"delivered", "stopped"}:
                         snapshot = self._commands(snapshot)
                         snapshot = self._harvest(snapshot)
+                        if (
+                            snapshot.phase == "draining"
+                            and not self._active
+                            and not any(
+                                unit.claim and not unit.claim.quiescent
+                                for unit in snapshot.units.values()
+                            )
+                        ):
+                            # Leave durable API debt for resume. Retrying it
+                            # before checking drain completion can keep an
+                            # otherwise quiescent campaign running forever.
+                            snapshot.phase = "stopped"
+                            add_event(snapshot, "campaign-drained")
+                            snapshot = self._save(snapshot)
+                            break
                         if self.clock() - progress_at >= 10:
                             counts: dict[str, int] = {}
                             for unit in snapshot.units.values():

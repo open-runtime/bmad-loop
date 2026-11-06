@@ -454,7 +454,8 @@ def execution(request, session):
     (MARKERS/suffix).write_text("started")
     if suffix in {"first","second"}:
         deadline=time.monotonic()+10
-        while not all((MARKERS/name).exists() for name in ("first","second")):
+        independent=("first","second","planned") if remote.get("planning_required") else ("first","second")
+        while sum((MARKERS/name).exists() for name in independent)<2:
             if time.monotonic()>deadline: raise RuntimeError("independent units were serialized")
             threading.Event().wait(.01)
     workspace=Path(request["workspace"])
@@ -731,9 +732,9 @@ def diagnose(snapshot):
 
 
 def run_case(case, *, ticks=1500):
-    return CampaignSupervisor(case.store, case.runtime, progress=lambda _: None).run(
-        case.snapshot.id, max_ticks=ticks
-    )
+    return CampaignSupervisor(
+        case.store, case.runtime, clock=case.runtime.clock, progress=lambda _: None
+    ).run(case.snapshot.id, max_ticks=ticks)
 
 
 def test_production_delivery_parallel_drafts_review_merge_and_tracking(production_case):
@@ -818,10 +819,24 @@ def test_lost_child_launch_ack_adopts_existing_process_without_relaunch(
     assert len(case.service.pulls) == 3
 
 
-def test_tracking_debt_blocks_only_affected_dependent_until_reconciled(production_case):
+def test_tracking_debt_blocks_only_affected_dependent_until_reconciled(
+    production_case, monkeypatch
+):
     case = production_case
     case.service.delay_tracking_for = "source:project:first"
-    pending = run_case(case, ticks=1500)
+    original_proposals = case.runtime.proposals
+
+    def observer(snapshot):
+        if snapshot.units["source:project:second"].state == UnitState.DELIVERED:
+            case.store.enqueue(snapshot.id, "stop", request_id="observed-independent-delivery")
+        return original_proposals(snapshot)
+
+    # An operator pauses once unrelated delivery is observed. Waiting thousands
+    # of extra ticks adds no overlap evidence and only repeats the held API read.
+    with monkeypatch.context() as patch:
+        patch.setattr(case.runtime, "proposals", observer)
+        pending = run_case(case, ticks=1500)
+    assert pending.phase == "stopped", diagnose(pending)
     assert pending.units["source:project:first"].state == UnitState.MERGED_PENDING_SYNC, diagnose(
         pending
     )

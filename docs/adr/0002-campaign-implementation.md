@@ -1,13 +1,14 @@
 # ADR 0002 implementation contract
 
-- **Status:** Reviewed implementation design; runtime qualification required
+- **Status:** Implemented in the development PR; final review and project activation pending
 - **Date:** 2026-11-05
 - **Parent:** [Native SDLC campaign](0002-native-sdlc-campaign.md)
 - **Delivery:** One bmad-loop PR, including code, tests, documentation and local deployment tooling
 
-This contract resolves implementation choices in ADR 0002. It describes proposed
-behavior, not commands available in the current release. Preserve existing run
-formats and serial execution; the campaign is a new supervisor above them.
+This contract resolves implementation choices in ADR 0002. The experimental
+campaign implements these boundaries above the existing serial engines. The
+[campaign guide](../campaign-guide.md) describes its current commands. Repository
+policy, migration and installation qualification remain activation prerequisites.
 
 ## Command and configuration contract
 
@@ -25,6 +26,11 @@ bmad-loop campaign hold ID --unit UNIT --reason TEXT --json
 bmad-loop campaign release ID --unit UNIT --json
 bmad-loop campaign attach ID --unit UNIT [--role ROLE]
 bmad-loop campaign reconcile ID --json
+bmad-loop campaign migration-inventory SPEC --json
+bmad-loop campaign migration-qualify SPEC MANIFEST --json
+bmad-loop campaign adoption-proposal ID --unit UNIT --pr NUMBER [--observer NAME] --json
+bmad-loop campaign adopt ID --unit UNIT --manifest FILE [--observer NAME] --json
+bmad-loop campaign provenance [--expected-commit SHA] --json
 ```
 
 Run/resume supervise in the foreground. JSON mode emits one terminal result;

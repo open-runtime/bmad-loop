@@ -150,6 +150,30 @@ def test_workers_in_one_epic_start_concurrently_with_durable_claims(campaign_sto
     assert not driver.reconciled
 
 
+def test_stop_preserves_uncertain_api_debt_without_starting_another_retry(campaign_store):
+    store, campaign_id = campaign_store
+    snapshot = store.load(campaign_id)
+    action = add_action(snapshot, "metadata", "s:e:first", {})
+    action.state = "sent_unknown"
+    snapshot = store.save(snapshot, snapshot.revision)
+    store.enqueue(campaign_id, "stop")
+
+    class WaitingDriver(PipelineDriver):
+        def reconcile_action(self, snapshot, action):
+            assert snapshot.phase == "draining"
+            self.reconciled.append(action.id)
+            return Observation("unknown", reason="API unavailable", retry_at=99)
+
+    driver = WaitingDriver(store)
+    result = CampaignSupervisor(store, driver, clock=lambda: 100, progress=lambda _: None).run(
+        campaign_id, max_ticks=5
+    )
+    assert result.phase == "stopped"
+    assert driver.reconciled == [action.id]
+    assert result.outbox[0].state == "sent_unknown"
+    assert all(unit.claim is None for unit in result.units.values())
+
+
 def test_hold_from_durable_inbox_blocks_one_unit_while_other_delivers(campaign_store):
     store, campaign_id = campaign_store
     store.enqueue(campaign_id, "hold", unit="s:e:first", reason="Owner deciding")

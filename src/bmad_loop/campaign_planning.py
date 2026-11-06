@@ -9,6 +9,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -154,9 +155,22 @@ def validate_result(
 
 
 def execution_spec(
-    unit: UnitSpec, *, campaign_id: str, graph_revision: int, source: dict[str, Any]
+    unit: UnitSpec,
+    *,
+    campaign_id: str,
+    graph_revision: int,
+    source: dict[str, Any],
+    native_input: tuple[dict[str, str], ...] = (),
 ) -> str:
     """A substantive first commit allows the draft PR to precede all coding."""
+    if (
+        not any(value.strip() for value in unit.acceptance)
+        and not native_input
+        and unit.kind not in {"planning", "tracking"}
+    ):
+        raise CampaignError(
+            "execution draft requires concrete acceptance criteria or genuine selected native product input"
+        )
     lines = [
         f"# {unit.title}",
         "",
@@ -168,9 +182,22 @@ def execution_spec(
         "",
     ]
     lines.extend(f"- {criterion}" for criterion in unit.acceptance)
-    if not unit.acceptance:
-        lines.append(
-            "- Satisfy the selected BMAD source specification and its deterministic verification gates."
+    for product in native_input:
+        text = product["text"]
+        fence = "~" * max(4, max((len(value) for value in re.findall(r"~+", text)), default=0) + 1)
+        lines.extend(
+            [
+                "",
+                "Selected native product input",
+                "",
+                "Source: " + product["path"],
+                "SHA256: " + product["sha256"],
+                "",
+                fence + "markdown",
+                text,
+                fence,
+                "",
+            ]
         )
     lines.extend(["", "Dependencies", "", *(f"- {key}" for key in unit.after), "", "Ownership", ""])
     lines.extend(f"- {scope}" for scope in unit.scopes)

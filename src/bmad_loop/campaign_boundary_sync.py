@@ -84,6 +84,59 @@ def _own(snapshot, kind, row):
     )
 
 
+_METADATA = frozenset(
+    {"close_issue", "close_issue_not_planned", "reopen_issue", "milestone_assignment"}
+)
+
+
+def metadata_owned(snapshot, row):
+    """Exact native ID/content projection; comment-only timestamps are incidental."""
+    if not row.get("updated_at") or not _own(snapshot, "issue", row):
+        return False
+    return any(
+        action.state == "confirmed"
+        and intent.get("state") == "confirmed"
+        and intent.get("kind") in _METADATA | {"issue"}
+        and bool(intent.get("payload"))
+        and (receipt := intent.get("receipt") or {}).get("id") == row.get("id")
+        and all(
+            receipt.get(name) == row.get(name)
+            for name in ("state", "title", "body", "labels", "assignees")
+        )
+        and (receipt.get("milestone") or {}).get("id") == (row.get("milestone") or {}).get("id")
+        for action in snapshot.outbox
+        for intent in [action.receipt.get("intent") or action.payload.get("intent") or {}]
+    )
+
+
+def metadata_preimage(snapshot, row, value):
+    """Recognize an immutable older read only through a later known own write."""
+    confirmed = {
+        event.get("action"): event.get("revision", -1)
+        for event in snapshot.events
+        if event.get("kind") == "effect-confirmed"
+    }
+    for action in snapshot.outbox:
+        intent = action.receipt.get("intent") or action.payload.get("intent") or {}
+        coordinates, receipt = intent.get("coordinates") or {}, intent.get("receipt") or {}
+        if (
+            action.state != "confirmed"
+            or intent.get("kind") not in _METADATA
+            or confirmed.get(action.id, -1) <= value.get("authority_revision", -1)
+            or action.id in value.get("pending_metadata", ())
+            or coordinates.get("id") != row.get("id")
+            or not coordinates.get("updated_at")
+            or coordinates["updated_at"] != row.get("updated_at")
+        ):
+            continue
+        if all(
+            name in receipt and receipt[name] == row.get(name)
+            for name in ("title", "body", "labels", "assignees")
+        ):
+            return True
+    return False
+
+
 def semantic(snapshot, unit, value, *, allowed_heads=()):
     """Content/native identity, excluding only proved operational projections."""
     result = {"issues": {}, "pulls": {}}
@@ -91,8 +144,22 @@ def semantic(snapshot, unit, value, *, allowed_heads=()):
         issue = item["issue"]
         fields = ("id", "number", "title", "body", "state", "labels", "assignees")
         result["issues"][name] = {field: issue.get(field) for field in fields}
-        if not _own(snapshot, "issue", issue):
+        owned = value.get("metadata_owned", {}).get(name, False) or metadata_preimage(
+            snapshot, issue, value
+        )
+        if owned:
+            result["issues"][name]["state"] = "acknowledged-owned-metadata"
+        else:
             result["issues"][name]["milestone"] = issue.get("milestone")
+            result["issues"][name]["state_reason"] = issue.get("state_reason")
+            if any(
+                action.state == "confirmed"
+                and intent.get("kind") in {"close_issue", "close_issue_not_planned", "reopen_issue"}
+                and (intent.get("coordinates") or {}).get("id") == issue.get("id")
+                for action in snapshot.outbox
+                for intent in [action.receipt.get("intent") or action.payload.get("intent") or {}]
+            ):
+                result["issues"][name]["state_revision"] = issue.get("updated_at")
         result["issues"][name]["comments"] = [
             row for row in item["comments"] if not _own(snapshot, "comment", row)
         ]
@@ -138,7 +205,11 @@ def semantic(snapshot, unit, value, *, allowed_heads=()):
         result["repository_inputs"] = {
             key: row
             for key, row in value["repository_inputs"].items()
-            if not _own(snapshot, "issue", row["payload"])
+            if not (
+                value.get("repository_metadata_owned", {}).get(key, False)
+                or metadata_owned(snapshot, row["payload"])
+                or metadata_preimage(snapshot, row["payload"], value)
+            )
         }
         result["external_pulls"] = value["external_pulls"]
         result["external_branches"] = value.get("external_branches", {}).get("branches", [])
@@ -159,7 +230,7 @@ def collect(runtime, snapshot, unit, *, action_id):
         for name, version in state.get("latest", {}).items()
         if version in records
     }
-    for row in intake["batch"]["observations"]:
+    for row in [*intake["batch"]["observations"], *intake.get("owned_projection_observations", [])]:
         latest[row["kind"] + ":" + row["object_id"]] = row
     # Frontier content is stable across incremental cursor/seen changes.
     repository_inputs = {
@@ -197,6 +268,20 @@ def collect(runtime, snapshot, unit, *, action_id):
         "observed_at": runtime.clock(),
         "observed_wall": runtime.boundary_clock(),
         "complete": intake["batch"]["complete"],
+        "authority_revision": snapshot.revision,
+        "metadata_owned": {
+            name: metadata_owned(snapshot, item["issue"]) for name, item in github["issues"].items()
+        },
+        "repository_metadata_owned": {
+            name: metadata_owned(snapshot, item["payload"])
+            for name, item in repository_inputs.items()
+        },
+        "pending_metadata": [
+            action.id
+            for action in snapshot.outbox
+            if action.state in {"prepared", "sent_unknown"}
+            and (action.payload.get("intent") or {}).get("kind") in _METADATA
+        ],
     }
     if unit.spec.kind == "planning":
         from .campaign_branch_frontier import collect as collect_branches

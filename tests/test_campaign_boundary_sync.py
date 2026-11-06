@@ -343,6 +343,106 @@ def test_changed_closure_inputs_return_quiescent_unit_to_ready_without_canonical
     assert unit.evidence["actual_usage"]["tokens"] == 99
 
 
+@pytest.mark.parametrize("initial_owned", [False, True])
+def test_owned_issue_close_is_metadata_but_owner_reopen_remains_new_intent(
+    project, tmp_path, initial_owned
+):
+    runtime, snapshot, unit = setup(project, tmp_path)
+    snapshot.revision = 10
+    gateway = runtime._gateway
+    if initial_owned:
+        created = MutationIntent(
+            "create",
+            "issue",
+            "POST",
+            "/issues",
+            {"title": gateway.item["title"], "body": gateway.item["body"]},
+            state="confirmed",
+            receipt=copy.deepcopy(gateway.item),
+        )
+        snapshot.outbox.append(
+            OutboxAction(
+                "create",
+                "github",
+                unit.id,
+                {"intent": created.to_dict()},
+                snapshot.generation,
+                state="confirmed",
+                receipt={"intent": created.to_dict()},
+            )
+        )
+    _, before = prepared(runtime, snapshot, unit)
+    if initial_owned:
+        own_comment = {
+            "id": 101,
+            "body": "owned progress",
+            "updated_at": "2026-11-06T00:01:00Z",
+            "user": {"id": 20},
+        }
+        intent = MutationIntent(
+            "progress",
+            "comment",
+            "POST",
+            "/issues/1/comments",
+            {"body": own_comment["body"]},
+            state="confirmed",
+            receipt=copy.deepcopy(own_comment),
+        )
+        snapshot.outbox.append(
+            OutboxAction(
+                "progress",
+                "github",
+                unit.id,
+                {"intent": intent.to_dict()},
+                snapshot.generation,
+                state="confirmed",
+                receipt={"intent": intent.to_dict()},
+            )
+        )
+        gateway.notes.append(own_comment)
+        gateway.item["updated_at"] = own_comment["updated_at"]
+        projected = boundary.collect(runtime, snapshot, unit, action_id="own-comment")
+        allowed = {unit.bindings["head"]}
+        assert boundary.semantic(
+            snapshot, unit, before, allowed_heads=allowed
+        ) == boundary.semantic(snapshot, unit, projected, allowed_heads=allowed)
+    prior = gateway.item["updated_at"]
+    gateway.item.update(state="closed", state_reason="completed", updated_at="2026-11-06T00:02:00Z")
+    closed = MutationIntent(
+        "close",
+        "close_issue",
+        "PATCH",
+        "/issues/1",
+        {"state": "closed", "state_reason": "completed"},
+        state="confirmed",
+        receipt=copy.deepcopy(gateway.item),
+        coordinates={"id": 1, "updated_at": prior},
+    )
+    snapshot.outbox.append(
+        OutboxAction(
+            "close",
+            "github",
+            unit.id,
+            {"intent": closed.to_dict()},
+            snapshot.generation,
+            state="confirmed",
+            receipt={"intent": closed.to_dict()},
+        )
+    )
+    snapshot.events.append({"kind": "effect-confirmed", "action": "close", "revision": 20})
+    snapshot.revision = 20
+    after = boundary.collect(runtime, snapshot, unit, action_id="closed")
+    allowed = {unit.bindings["head"]}
+    assert boundary.semantic(snapshot, unit, before, allowed_heads=allowed) == boundary.semantic(
+        snapshot, unit, after, allowed_heads=allowed
+    )
+    gateway.item.update(state="open", state_reason="reopened", updated_at="2026-11-06T00:03:00Z")
+    reopened = boundary.collect(runtime, snapshot, unit, action_id="reopened")
+    assert boundary.semantic(snapshot, unit, before, allowed_heads=allowed) != boundary.semantic(
+        snapshot, unit, reopened, allowed_heads=allowed
+    )
+
+
 def test_settled_campaign_does_not_requeue_periodic_observations_forever(project, tmp_path):
     runtime, snapshot, unit = configured(project, tmp_path)
     unit.state = UnitState.DELIVERED

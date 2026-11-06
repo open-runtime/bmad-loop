@@ -6,12 +6,22 @@ import hashlib
 import pytest
 from conftest import git
 
+from bmad_loop.campaign_hold import promote_pending
 from bmad_loop.campaign_intake_amendment import (
     _new_files,
+    _retire_drained_failures,
     _validate_generation,
     validate_initial_source,
 )
-from bmad_loop.campaign_model import CampaignError, SourceSelector, UnitSpec
+from bmad_loop.campaign_model import (
+    CampaignError,
+    CampaignUnit,
+    Hold,
+    SourceSelector,
+    UnitSpec,
+    WorkerClaim,
+)
+from bmad_loop.campaign_runtime import CampaignRuntime
 
 
 def initial_request(project, tmp_path):
@@ -88,3 +98,65 @@ def test_unknown_refresh_receipt_cannot_adopt_an_edited_private_generation(tmp_p
     path.write_bytes(b"new owner changes")
     with pytest.raises(CampaignError, match="changed before acknowledgement"):
         _validate_generation(record, generation)
+
+
+def draining_unit():
+    unit = CampaignUnit(
+        UnitSpec("source:project:u", "source", "epic", "U", selector="u"),
+        hold=Hold("intake_plan_change", "reviewed source amendment pending", id="amendment"),
+    )
+    unit.claim = WorkerClaim(unit.id, 1, 1, "old-actor")
+    unit.evidence.update(dev_attempts_spent=2, publication_faults=1)
+    return unit
+
+
+def test_amendment_barrier_survives_old_actor_pause_until_reviewed_source_activation():
+    unit = draining_unit()
+    CampaignRuntime._set_hold(unit, Hold("paused", "old source actor paused", id="old-actor"))
+    assert unit.hold.kind == "intake_plan_change" and unit.hold.id == "amendment"
+    assert unit.evidence["pending_failure_hold"]["kind"] == "paused"
+    unit.claim.quiescent = True
+    retired = _retire_drained_failures(unit)
+    assert retired["pending_failure_hold"]["id"] == "old-actor"
+    unit.hold = None  # the verified amendment apply removes only its own barrier
+    assert not promote_pending(unit) and unit.hold is None
+    assert unit.evidence["dev_attempts_spent"] == 2 and unit.evidence["publication_faults"] == 1
+
+
+def test_amendment_preserves_unrelated_and_protected_failures_instead_of_waiving_them():
+    unit = draining_unit()
+    unit.claim.quiescent = True
+    unit.evidence["pending_failure_hold"] = dataclasses.asdict(
+        Hold("paused", "old source pause", id="old-actor")
+    )
+    unit.evidence["pending_failure_holds"] = [
+        dataclasses.asdict(Hold("required_review", "approval required", id="old-actor")),
+        dataclasses.asdict(Hold("failed", "different actor", id="other-actor")),
+        dataclasses.asdict(Hold("ownership_uncertain", "writer not released", id="old-actor")),
+        dataclasses.asdict(Hold("verification_failed", "old source verification", id="old-actor")),
+    ]
+    unit.evidence["failure"] = {
+        "id": "old-actor",
+        "code": "verification_failed",
+        "detail": "old source",
+    }
+    retired = _retire_drained_failures(unit)
+    assert retired["failure"]["id"] == "old-actor"
+    assert [item["kind"] for item in retired["pending_failure_holds"]] == ["verification_failed"]
+    unit.hold = None
+    assert promote_pending(unit) and unit.hold.kind == "required_review"
+    assert [item["kind"] for item in unit.evidence["pending_failure_holds"]] == [
+        "failed",
+        "ownership_uncertain",
+    ]
+
+
+def test_amendment_cannot_retire_faults_of_an_actor_still_writing():
+    unit = draining_unit()
+    unit.evidence["pending_failure_hold"] = dataclasses.asdict(
+        Hold("paused", "old source pause", id="old-actor")
+    )
+    before = dict(unit.evidence)
+    with pytest.raises(CampaignError, match="requires a drained actor"):
+        _retire_drained_failures(unit)
+    assert unit.evidence == before

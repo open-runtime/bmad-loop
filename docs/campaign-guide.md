@@ -204,6 +204,14 @@ checkpoints are excluded from change detection; a branch-name prefix grants no
 ownership. These immutable ref IDs guide overlap inspection, without checking
 out or running branch code. Canonical target heads are reported separately and
 still pass the ordinary fresh-main integration and publication gates.
+
+Execution drafts include concrete acceptance criteria and, when available, the
+exact selected native plan or story text with its source hash. An unplanned
+ticket includes only its native product entry; an unplanned sprint story can use
+its exact story section from the native epics document. Source documents are
+confined to the private checkout and bounded to 256 KiB. A status row or dispatch
+placeholder cannot replace missing product intent.
+
 The coordinator rereads mapped issues, PRs, comments, reviews and threads after
 the actor stops. Changed inputs invalidate affected acceptance and preserve the
 prior artifacts. Administrative repeats retain token accounting without charging
