@@ -84,6 +84,7 @@ if sys.platform == "win32" and not sys.flags.utf8_mode:
 # `tests/test_conftest.py` holds this list to the module-level binders in src.
 _MUX_BINDING_MODULES = (
     "bmad_loop.adapters.generic",
+    "bmad_loop.campaign_headless",
     "bmad_loop.probe",
     "bmad_loop.runs",
     "bmad_loop.stopped_native",

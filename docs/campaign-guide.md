@@ -124,6 +124,10 @@ hold. An epic's `ready_on = "tickets"` releases advisory closure dependencies
 only when its tickets pin the prerequisite work and no epic-file gate requires
 closure. Explicit `lease_scope = "declared"` and ticket `touches` declarations
 provide normalized ownership scopes; incomplete declarations stay conservative.
+Closure prerequisites are refreshed from canonical source state before allocating
+the closure workspace or claiming a writer. An unfinished external child creates
+a visible, automatically retried prerequisite wait. When that child completes,
+the same campaign resumes closure, review and publication without a manual release.
 For separately versioned ticket stores, configure both `store_remote` and
 `store_branch` on the source so source publication has its own remote contract.
 
@@ -593,9 +597,13 @@ no-tools arguments, input transport and conservative context bounds. Run
 to submit a fixed nonce/marker canary through the ordinary owned terminal runner.
 Use `--input-bytes`, `--output-tokens` and `--timeout` to select bounded canary
 coverage. Normal campaign admission never launches an unqualified route. Successful
-qualification records the observed input/output envelope, native model identity
-and process quiescence; it does not establish a provider's advertised maximum or
-semantic summary fidelity. Larger inputs need a larger successful qualification.
+qualification records observed input coverage, the configured output ceiling,
+actual output usage, native model identity and process quiescence. Output above
+the configured ceiling rejects the receipt; wall time and wire bytes have external
+hard limits. Unless a native generation limit is explicitly qualified, the ceiling
+is a result acceptance limit rather than a promise that generation cannot exceed
+it. This does not establish a provider's advertised maximum or semantic summary
+fidelity. Larger inputs need a larger successful qualification.
 Native selected aliases and served model names remain separate in receipts.
 
 For Grok, large prompt files require its native `--verbatim` option to avoid

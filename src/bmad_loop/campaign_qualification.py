@@ -120,7 +120,7 @@ def build_probe(directory, selection, capability, *, input_bytes, output_tokens,
     _no_tools(capability)
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     nonce = secrets.token_hex(16)
-    count = min(1024, max(8, output_tokens // 32), max(8, input_bytes // 256))
+    count = min(256, max(8, output_tokens // 32), max(8, input_bytes // 256))
     values = [secrets.token_hex(16) for _ in range(count)]
     text = canary_source(nonce, values, input_bytes)
     source = directory / "canary.txt"

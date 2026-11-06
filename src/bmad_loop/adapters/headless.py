@@ -14,7 +14,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from ..campaign_headless import HeadlessRunner, provider_family
+from ..campaign_headless import HeadlessRunner, file_digest, provider_family
 from ..campaign_jobs import JobLimits, JobRequest
 from ..campaign_model import CampaignError, RoleCandidate
 from ..childrun import hard_stop_pending
@@ -192,6 +192,8 @@ class HeadlessAdapter(CodingCLIAdapter):
                 "observed_models": receipt.get("observed_models", []),
                 "reasoning_receipt": str(path.parent / "receipt.json"),
                 "headless_request": str(path),
+                "headless_request_sha256": file_digest(path),
+                "headless_receipt_sha256": file_digest(path.parent / "receipt.json"),
                 "outcome": outcome,
                 "quiescent": True,
                 "input_delivery": receipt.get("input_delivery", {}),
@@ -203,8 +205,13 @@ class HeadlessAdapter(CodingCLIAdapter):
             self.runner.terminate(self.requests[handle.task_id])
 
     def read_usage(self, result: SessionResult) -> TokenUsage | None:
+        request_path = (result.native_binding or {}).get("headless_request")
         receipt = next(
-            (row for row in self.receipts.values() if row.get("session_id") == result.session_id),
+            (
+                self.receipts.get(task_id)
+                for task_id, path in self.requests.items()
+                if str(path) == request_path
+            ),
             None,
         )
         if receipt is None or not receipt.get("usage_known"):

@@ -28,7 +28,7 @@ family:
   into a ``SystemExit``.
 
 Bundled kinds register from :func:`_load_builtin_adapters` (:data:`GENERIC`,
-:data:`OPENCODE_HTTP`); out-of-tree kinds arrive at import time, triggered by the
+:data:`OPENCODE_HTTP`, :data:`BOUNDED_HEADLESS`); out-of-tree kinds arrive at import time, triggered by the
 ``bmad_loop.adapters`` entry-point scan in :func:`_load_external_adapters` — so a
 pip/uv co-installed adapter package is selectable with no config step. Builtins
 are seeded by :func:`register_adapter` itself, so an external can never shadow a
@@ -61,13 +61,14 @@ from dataclasses import dataclass
 
 from .entrypoints import record_load_error
 
-# The two bundled kind names, as constants rather than literals scattered across
+# The bundled kind names, as constants rather than literals scattered across
 # modules. `validate`'s httpx check keys on OPENCODE_HTTP because httpx is *that
 # family's* optional extra — a fact about one bundled family, which is a different
 # thing from the set of VALID kinds (that set is only ever `known_adapter_kinds()`,
 # never a literal). GENERIC is the `profile.adapter` default.
 GENERIC = "generic"
 OPENCODE_HTTP = "opencode-http"
+BOUNDED_HEADLESS = "bounded-headless"
 
 
 class AdapterError(Exception):
@@ -144,11 +145,12 @@ def _opencode_http_builder() -> AdapterBuilder:
 # The bundled kinds, as (name, needs_mux, load-thunk). A module constant, not
 # mutable registry state, so detect_adapters can label a row builtin-vs-external
 # without the fixtures having to snapshot it. `generic` drives tmux + hooks and
-# needs the multiplexer; `opencode-http` is hookless HTTP/SSE and does not.
+# needs the multiplexer; headless owns a bounded native window; `opencode-http`
+# is hookless HTTP/SSE and does not need a multiplexer.
 _BUILTIN_ADAPTERS: tuple[tuple[str, bool, Callable[[], AdapterBuilder]], ...] = (
     (GENERIC, True, _generic_builder),
     (OPENCODE_HTTP, False, _opencode_http_builder),
-    ("bounded-headless", True, _headless_builder),
+    (BOUNDED_HEADLESS, True, _headless_builder),
 )
 _BUILTIN_NAMES = frozenset(name for name, _, _ in _BUILTIN_ADAPTERS)
 

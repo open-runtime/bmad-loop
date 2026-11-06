@@ -10,6 +10,7 @@ common directory so alternate checkouts/state roots cannot create two owners.
 from __future__ import annotations
 
 import copy
+import dataclasses
 import json
 import os
 import re
@@ -54,6 +55,29 @@ def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n"
 
 
+def _state_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
+    """Detach JSON authority without recursively copying every scalar twice.
+
+    JSON's encoder handles the nested ordinary containers in C. Dataclass nodes
+    expose fields only; no arbitrary object's attributes enter persisted state.
+    The lazy event journal is a separate append-only transaction component.
+    """
+
+    def fields(value):
+        if not dataclasses.is_dataclass(value) or isinstance(value, type):
+            raise TypeError(f"Unsupported campaign value: {type(value).__name__}")
+        return {field.name: getattr(value, field.name) for field in dataclasses.fields(value)}
+
+    raw = fields(snapshot)
+    raw["events"] = []
+    from .campaign_model import spec_to_dict
+
+    raw["spec"] = spec_to_dict(snapshot.spec)
+    return json.loads(
+        json.dumps(raw, default=fields, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    )
+
+
 class CampaignStore:
     """Persist snapshots beneath an external repository-associated root.
 
@@ -73,9 +97,7 @@ class CampaignStore:
 
     @staticmethod
     def _normalize(snapshot: CampaignSnapshot) -> CampaignSnapshot:
-        result = snapshot_from_dict(
-            json.loads(_json(snapshot_to_dict(snapshot, include_events=False)))
-        )
+        result = snapshot_from_dict(_state_document(snapshot))
         result.events = copy.deepcopy(snapshot.events)
         return result
 
@@ -97,7 +119,7 @@ class CampaignStore:
             if directory.exists():
                 raise CampaignError(f"campaign already exists: {snapshot.id}")
             self._validate(snapshot)
-            candidate = snapshot.clone()
+            candidate = snapshot  # _normalize already detached this entire document.
             candidate.created_at = candidate.created_at or self.clock()
             candidate.updated_at = candidate.created_at
             for event in candidate.events:
@@ -105,9 +127,7 @@ class CampaignStore:
             if self.storage == "sqlite":
                 directory.mkdir(parents=True, mode=0o700)
                 database = CampaignDatabase(directory)
-                database.initialize(
-                    snapshot_to_dict(candidate, include_events=False), list(candidate.events)
-                )
+                database.initialize(_state_document(candidate), list(candidate.events))
                 self._write(directory / "snapshot.json", MARKER)
                 candidate.events = EventJournal(database, len(candidate.events))
             else:
@@ -257,7 +277,7 @@ class CampaignStore:
                 snapshot.events.validate_prefix(database, len(previous.events))
             elif snapshot.events[: len(previous.events)] != previous.events:
                 raise CampaignError("campaign events are append-only")
-            candidate = snapshot.clone()
+            candidate = snapshot  # _normalize already detached this entire document.
             candidate.revision = expected_revision + 1
             candidate.updated_at = self.clock()
             for event in candidate.events[len(previous.events) :]:
@@ -265,7 +285,7 @@ class CampaignStore:
             self._validate(candidate)
             if database is not None:
                 archived = database.commit(
-                    snapshot_to_dict(candidate, include_events=False),
+                    _state_document(candidate),
                     revision=expected_revision,
                     event_count=len(previous.events),
                     events=list(candidate.events[len(previous.events) :]),

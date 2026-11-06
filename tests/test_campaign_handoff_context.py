@@ -452,3 +452,37 @@ def test_codex_fork_retains_ancestor_metadata_without_granting_parent_agent_owne
     )
     with pytest.raises(CampaignError, match="ancestor binding"):
         snapshot_history(child_path, "codex", "child", tmp_path / "sealed")
+
+
+def test_summary_normalizes_only_verified_fragment_aliases(tmp_path):
+    snapshot = capture(tmp_path, [native_row("codex")])
+    events = load_events(snapshot)
+    job = plan_maps(events, budget(), tmp_path / "chunks")[0]
+    value = result(job, events)
+    original = [events[0].id, job.primary_ids[0]]
+    value["facts"][0]["citations"] = original
+    normalized = validate_summary(job, value, events)["facts"][0]
+    assert normalized["citations"] == [events[0].id]
+    assert normalized["original_citations"] == original
+    assert normalized["fragment_provenance"] == [
+        {
+            "id": job.primary_ids[0],
+            "event_id": events[0].id,
+            "start": 0,
+            "end": len(events[0].record.text),
+        }
+    ]
+    value["facts"][0]["citations"] = [events[0].id, "unknown-fragment"]
+    with pytest.raises(CampaignError, match="source citations"):
+        validate_summary(job, value, events)
+
+
+def test_summary_cannot_cite_fragment_from_another_chunk(tmp_path):
+    snapshot = capture(tmp_path, [native_row("codex", text="owner detail " * 1000)])
+    events = load_events(snapshot)
+    jobs = plan_maps(events, budget(), tmp_path / "chunks", overlap_tokens=0)
+    assert len(jobs) > 1
+    value = result(jobs[0], events)
+    value["facts"][0]["citations"] = [jobs[-1].primary_ids[0]]
+    with pytest.raises(CampaignError, match="source citations"):
+        validate_summary(jobs[0], value, events)

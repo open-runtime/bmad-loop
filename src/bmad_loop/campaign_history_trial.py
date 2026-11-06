@@ -15,10 +15,12 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+from .adapters.multiplexer import MultiplexerError
 from .campaign_headless import (
     HeadlessRunner,
     file_digest,
     read_json,
+    render_input,
     validate_capability,
     write_json,
 )
@@ -166,21 +168,44 @@ def run_trial(
         working_tokens=0,
         qualified=True,
     )
-    binding = {
-        "schema_version": 1,
-        "snapshots_sha256": file_digest(snapshot_path),
-        "capability_sha256": file_digest(capability_path),
-        "budget": asdict(budget),
-        "timeout_s": timeout_s,
-    }
     path = directory / "binding.json"
     with file_lock(directory / "trial.lock"):
+        while True:
+            jobs = plan_maps(events, budget, directory / "inputs", overlap_tokens=payload // 8)
+            try:
+                for job in jobs:
+                    render_input(trial_request(job, capability, snapshots, timeout_s), capability)
+                break
+            except CampaignError as exc:
+                if "exceeds its input token bound" not in str(
+                    exc
+                ) and "insufficient output/thinking context" not in str(exc):
+                    raise
+                payload = payload * 3 // 4
+                if payload < 2048:
+                    raise CampaignError(
+                        "Native route cannot fit rendered summary metadata"
+                    ) from exc
+                budget = ContextBudget(
+                    selection.profile + ":" + selection.model,
+                    payload + output,
+                    output,
+                    prompt_tokens=0,
+                    working_tokens=0,
+                    qualified=True,
+                )
+        binding = {
+            "schema_version": 1,
+            "snapshots_sha256": file_digest(snapshot_path),
+            "capability_sha256": file_digest(capability_path),
+            "budget": asdict(budget),
+            "timeout_s": timeout_s,
+        }
         if path.exists() and read_json(path) != binding:
             raise CampaignError(
                 "Trial directory belongs to different frozen sources, route or limits"
             )
         write_json(path, binding)
-        jobs = plan_maps(events, budget, directory / "inputs", overlap_tokens=payload // 8)
         write_json(
             directory / "map-plan.json",
             {"schema_version": 1, "jobs": [asdict(job) for job in jobs]},
@@ -223,7 +248,14 @@ def run_trial(
                     try:
                         current.append(future.result())
                         report["completed_jobs"] += 1
-                    except (CampaignError, OSError, ValueError, KeyError, TypeError) as exc:
+                    except (
+                        CampaignError,
+                        OSError,
+                        ValueError,
+                        KeyError,
+                        TypeError,
+                        MultiplexerError,
+                    ) as exc:
                         problems.append({"job_id": job.id, "problem": str(exc)})
                     write_json(
                         directory / "report.json",

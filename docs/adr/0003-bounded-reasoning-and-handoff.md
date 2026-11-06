@@ -431,6 +431,32 @@ a fresh run with an exact predecessor permit, preserving the remaining review an
 development counters without replaying completed development. Accepted-review and
 stopped-native reservations remain fenced; they are not ordinary-review permits.
 
+A native quota receipt invalidates older positive capacity observations for its
+actual development or review route. Before replacing a writer, the coordinator
+can choose another currently eligible, qualified member of the frozen role pool.
+An explicit operator-selected route remains explicit. Rerouting reuses an audited
+packet when its bytes fit the new destination; a smaller destination returns to
+assembly and bounded reduction before any successor acquires the write claim.
+
+Current constraints that exceed the working packet budget use additional bounded
+reduction jobs. Each reduction retains a source-linked tree and receives an
+independent audit of its complete immediate input. Exact original quotations and
+canonical acceptance stay in immutable indexes. Output bounds include source-ID
+coverage overhead; every semantic failure retains its attempt accounting across
+retries. The constraint-compression schemas require their own earned semantic
+qualification binding. Completing the history-only corpus does not qualify this
+additional contract automatically.
+
+Missing native history first triggers a read-only evidence-recovery job over
+canonical acceptance, explicitly adopted committed policy, configured documents
+and provenance-checked mapped GitHub discussions. An independent audit must find
+that authenticated current authority establishes the complete working contract.
+Canonical acceptance or contextual discussion alone cannot replace unknown owner
+instructions. Insufficient evidence preserves a precise hold after the attempt.
+Successful recovery retains every missing-history marker, confers no approval or
+scope waiver, and rechecks source revisions before releasing the successor.
+Recovery has a separate schema-bound semantic qualification gate.
+
 Headless write-capable execution requires a qualified native route and an OS
 confinement wrapper. The shipped macOS wrapper enforces frozen product/private-source,
 owned Git branch and explicitly granted harness-runtime paths for descendants.
@@ -480,8 +506,11 @@ supported controls; capability discovery must not start a coding session.
 The operator qualification path uses a fixed canary and the same owned terminal
 runner as normal jobs. Its narrowly scoped bootstrap cannot accept an arbitrary
 prompt, source grammar, tool grant or changed result schema. Successful receipts
-bound qualified coverage to observed input and output and retain selected versus
-served model identities. The normal launch path continues to require earned
+bound qualified input coverage to observed input and retain selected versus
+served model identities. Output ceilings are configured acceptance limits; actual
+canary output usage remains separate. External time and wire-byte containment and
+native receipt rejection are explicit, without implying an unqualified hard
+provider-generation limit. The normal launch path continues to require earned
 qualification. Grok prompt-file recipes must preserve full input with its native
 verbatim option; Muse recipes pin the native binary and suppress launcher updates.
 Native protocol decoders preserve structured quota failures and provider usage.

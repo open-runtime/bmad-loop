@@ -1,5 +1,6 @@
 """Production supervision, real child PIDs, scripted zero-token model responses."""
 
+import copy
 import dataclasses
 import json
 import time
@@ -99,22 +100,35 @@ def test_real_worker_quota_continues_same_pr_through_normal_supervisor(
     fixture_roles = dict(configured.spec.roles)
     roles = dict(snapshot.spec.roles)
     roles.update(fixture_roles)
+    first, last = configured.spec.candidates("execution")
+    unavailable = dataclasses.replace(first, model="gpt-capacity-unavailable")
+    routes = copy.deepcopy(configured.config_snapshot["reasoning_capabilities"])
+    routes["codex:" + unavailable.model] = {
+        "execution": {**routes["codex:" + first.model]["execution"], "model": unavailable.model}
+    }
     capabilities = tmp_path / "capabilities.json"
-    capabilities.write_text(
-        json.dumps(
-            {"schema_version": 1, "routes": configured.config_snapshot["reasoning_capabilities"]}
-        )
-    )
+    capabilities.write_text(json.dumps({"schema_version": 1, "routes": routes}))
     spec = dataclasses.replace(
         snapshot.spec,
         units=(),
         roles=tuple(roles.items()),
-        role_pools=(*snapshot.spec.role_pools, *configured.spec.role_pools),
+        role_pools=(
+            *snapshot.spec.role_pools,
+            *(
+                (name, (first, unavailable, last) if name == "writers" else pool)
+                for name, pool in configured.spec.role_pools
+            ),
+        ),
         reasoning=dataclasses.replace(configured.spec.reasoning, capabilities=str(capabilities)),
     )
     from bmad_loop.campaign_runtime import create
 
     _, snapshot = create(case.repo, spec)
+    from bmad_loop.campaign_scheduler import CapacityObservation
+
+    case.runtime.capacity_observer = lambda candidate, project: CapacityObservation(
+        candidate.model != unavailable.model, slots=8, model_access=True
+    )
     case.runtime.reasoning_runner = ScriptedReasoning()
     script = tmp_path / "scripted-coding-cli.py"
     body = script.read_text()
@@ -182,6 +196,7 @@ def test_real_worker_quota_continues_same_pr_through_normal_supervisor(
     )
     assert first.evidence["developer_families"] == ["anthropic", "openai"]
     assert first.evidence["handoff"]["phase"] == "continuing"
+    assert first.evidence["handoff"]["candidate"]["model"] == "claude-test"
     assert first.evidence["session_lineage"][0]["native_session_imported"] is False
     assert (
         len(

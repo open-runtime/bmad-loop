@@ -20,6 +20,7 @@ from .campaign_model import CampaignError
 from .platform_util import atomic_write_bytes, is_link_like
 
 READER_VERSIONS = {"codex": 3, "claude": 1, "grok": 1, "antigravity": 1, "muse": 1}
+READER_VERSIONS["managed-headless"] = 1
 
 
 def encoded(value: Any) -> bytes:
@@ -77,7 +78,17 @@ def read_record(harness: str, row: dict[str, Any], session_id: str) -> Normalize
     if harness not in READER_VERSIONS or not isinstance(row, dict):
         raise CampaignError("unsupported native history reader or record")
     role, kind, content, native, parent, tool, owner = "system", "unknown", row, "", "", "", False
-    if harness == "codex":
+    if harness == "managed-headless":
+        if row.get("schema_version") != 1 or row.get("session_id") != session_id:
+            raise CampaignError("Managed history belongs to another launch or schema")
+        role = row.get("role", "system")
+        if role not in {"system", "assistant", "tool"}:
+            raise CampaignError("Managed input cannot assert native owner authority")
+        kind = str(row.get("kind", "managed-unknown"))
+        content = row.get("content", row)
+        native, parent = str(row.get("native_id") or ""), str(row.get("parent_id") or "")
+        tool = str(row.get("tool_id") or "")
+    elif harness == "codex":
         payload = row.get("payload", {})
         if not isinstance(payload, dict):
             raise CampaignError("invalid Codex record payload")

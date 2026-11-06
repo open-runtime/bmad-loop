@@ -82,3 +82,14 @@ def test_capture_explicit_prefix_ignores_later_complete_records(tmp_path):
         snapshot_history(
             path, "codex", "s1", tmp_path / "archive", prefix_bytes=path.stat().st_size + 1
         )
+
+
+def test_trial_planning_accounts_for_rendered_json_escaping(tmp_path, prepared):
+    runner, capability, snapshots = fixture_route(prepared, tmp_path)
+    snapshot = capture(tmp_path, [native_row("codex", text="\\" * 60000)])
+    snapshots.write_text(json.dumps({"schema_version": 1, "snapshots": [asdict(snapshot)]}))
+    directory = tmp_path / "escaped-trial"
+    report = run_trial(snapshots, capability, directory, runner=runner, execute=False)
+    assert report["map_jobs"] > 1
+    bounds = read_json(directory / "binding.json")["budget"]
+    assert bounds["context_tokens"] - bounds["output_tokens"] < 100000 * 3 // 4 - 8192

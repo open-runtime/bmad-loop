@@ -198,3 +198,44 @@ def test_bounded_history_uses_sequence_cursor_across_filters(tmp_path):
     first = store.history(current.id, kind="even", limit=2)
     assert [row["sequence"] for row in first] == [1, 3]
     assert [row["sequence"] for row in store.history(current.id, kind="even", after=3)] == [5]
+
+
+def test_fast_authority_document_preserves_schema_and_nested_isolation(tmp_path):
+    from bmad_loop.campaign_store import _state_document
+
+    original = state()
+    original.bindings["nested"] = {"rows": [1, {"unicode": "résumé"}]}
+    add_action(
+        original, "push", "source:epic:story", {"paths": ("a", "b"), "nested": {"head": "old"}}
+    )
+    expected = json.loads(json.dumps(snapshot_to_dict(original, include_events=False)))
+    assert _state_document(original) == expected
+    store = CampaignStore(tmp_path)
+    created = store.create(original)
+    original.bindings["nested"]["rows"][1]["unicode"] = "caller changed"
+    assert created.bindings["nested"]["rows"][1]["unicode"] == "résumé"
+    saved = store.save(created, created.revision)
+    created.outbox[0].payload["nested"]["head"] = "caller changed"
+    assert saved.outbox[0].payload["nested"]["head"] == "old"
+    assert store.load(saved.id).outbox[0].payload["nested"]["head"] == "old"
+
+
+def test_fast_normalization_canonicalizes_role_and_pool_order(tmp_path):
+    from dataclasses import replace
+
+    from bmad_loop.campaign_model import RoleCandidate, RoleSpec
+
+    original = state()
+    original.spec = replace(
+        original.spec,
+        roles=(("triage", RoleSpec(pool="z-pool")), ("planning", RoleSpec(pool="a-pool"))),
+        role_pools=(
+            ("z-pool", (RoleCandidate("codex", "z"),)),
+            ("a-pool", (RoleCandidate("claude", "a"),)),
+        ),
+    )
+    store = CampaignStore(tmp_path)
+    created = store.create(original)
+    assert created.spec == store.load(created.id).spec
+    saved = store.save(created, created.revision)
+    assert saved.spec == created.spec and saved.config_revision == created.config_revision

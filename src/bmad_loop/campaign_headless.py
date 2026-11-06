@@ -14,7 +14,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from .adapters.multiplexer import get_multiplexer
+from .adapters.multiplexer import MultiplexerError, get_multiplexer
 from .adapters.tmux_base import native_window_command
 from .campaign_jobs import JobRequest, digest
 from .campaign_model import CampaignError, RoleCandidate
@@ -411,6 +411,9 @@ class HeadlessRunner:
         }
         if probe is not None:
             envelope.update(probe=probe, probe_digest=digest(probe))
+        # Dataclass tuple fields (notably capacity_command) deserialize as JSON
+        # lists. Compare the persisted wire form when reconciling a prepared job.
+        envelope = json.loads(json.dumps(envelope))
         path = directory / "request.json"
         with file_lock(directory / "prepare.lock"):
             if path.exists():
@@ -440,14 +443,35 @@ class HeadlessRunner:
             )
         with file_lock(directory / "launch.lock"):
             intent = directory / "launch-intent.json"
-            if intent.exists():
+            if intent.exists() and read_json(intent).get("phase") != "before-window":
                 return self.observe(request_path)
             write_json(
-                intent, {"launch_id": envelope["launch_id"], "generation": envelope["generation"]}
+                intent,
+                {
+                    "launch_id": envelope["launch_id"],
+                    "generation": envelope["generation"],
+                    "phase": "before-window",
+                },
             )
-            if not self.mux.has_session(envelope["session"]):
-                self.mux.new_session(envelope["session"], directory)
+            try:
+                # Jobs share a session, but execute in independent windows. Only
+                # the check/create mutation needs a repository-local mutex.
+                with file_lock(directory.parent / "mux-session.lock"):
+                    if not self.mux.has_session(envelope["session"]):
+                        self.mux.new_session(envelope["session"], directory)
+            except (OSError, MultiplexerError) as exc:
+                write_json(
+                    intent,
+                    {
+                        **read_json(intent),
+                        "pre_window_error": {"type": type(exc).__name__, "message": str(exc)},
+                    },
+                )
+                raise
             argv = [sys.executable, "-m", "bmad_loop.campaign_headless_worker", str(request_path)]
+            # From this point, a lost acknowledgement is uncertain and must be
+            # reconciled by window/startup identity rather than blindly replayed.
+            write_json(intent, {**read_json(intent), "phase": "window-pending"})
             native_id = self.mux.new_window(
                 envelope["session"],
                 envelope["window_name"],

@@ -18,6 +18,17 @@ from .campaign_scheduler import CapacityObservation
 from .childrun import run_argv
 
 
+def record_unavailable(snapshot, profile: str, model: str, *, now: float, reason: str) -> None:
+    """Invalidate an older positive observation after an owned native quota failure."""
+    if not profile or not model:
+        return
+    snapshot.bindings.setdefault("capacity_faults", {})[profile + "\0" + model] = {
+        "observed_at": now,
+        "reason": reason,
+    }
+    snapshot.bindings.setdefault("capacity", {})["observed_at"] = 0
+
+
 def from_teamrouter(
     raw: dict[str, Any], candidate: RoleCandidate, *, now: float, max_age_s: float = 120
 ) -> CapacityObservation:

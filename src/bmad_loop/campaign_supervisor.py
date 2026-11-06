@@ -64,6 +64,7 @@ class CampaignSupervisor:
         self.progress = progress or (lambda message: print(message, file=sys.stderr, flush=True))
         self.io_workers = io_workers
         self._active: dict[str, Future[Observation]] = {}
+        self._control_active: set[str] = set()
         self._wake = threading.Event()
         self._control_executor: ThreadPoolExecutor | None = None
 
@@ -81,14 +82,6 @@ class CampaignSupervisor:
 
     def _save(self, snapshot: CampaignSnapshot) -> CampaignSnapshot:
         return self.store.save(snapshot, snapshot.revision, expected_generation=snapshot.generation)
-
-    def _has_slot(self, snapshot: CampaignSnapshot, action: OutboxAction) -> bool:
-        """Count the independent executor budgets at normal-loop admission too."""
-        controls = {row.id for row in snapshot.outbox if row.kind in self._CONTROL_EFFECTS}
-        control_active = sum(key in controls for key in self._active)
-        if action.kind in self._CONTROL_EFFECTS:
-            return control_active < 2
-        return len(self._active) - control_active < self.io_workers
 
     def _commands(self, snapshot: CampaignSnapshot) -> CampaignSnapshot:
         commands = self.store.commands(snapshot.id, after=snapshot.processed_commands)
@@ -147,6 +140,8 @@ class CampaignSupervisor:
         if self._control_executor is not None and action.kind in self._CONTROL_EFFECTS:
             executor = self._control_executor
         self._active[action.id] = executor.submit(operation, frozen, owned_action)
+        if executor is self._control_executor:
+            self._control_active.add(action.id)
         return snapshot
 
     def _harvest(self, snapshot: CampaignSnapshot) -> CampaignSnapshot:
@@ -155,6 +150,7 @@ class CampaignSupervisor:
             if not future.done():
                 continue
             del self._active[action_id]
+            self._control_active.discard(action_id)
             action = next(row for row in snapshot.outbox if row.id == action_id)
             try:
                 observation = future.result()
@@ -222,6 +218,50 @@ class CampaignSupervisor:
             )
             changed = True
         return self._save(snapshot) if changed else snapshot
+
+    def _dispatch_ready(
+        self, snapshot: CampaignSnapshot, executor: ThreadPoolExecutor
+    ) -> CampaignSnapshot:
+        """Persist a bounded submission batch before starting any of its effects.
+
+        A crash between commit and submission leaves every selected effect
+        uncertain, exactly as an interrupted individual submission does. Each
+        executor still receives its own independent mutable snapshot.
+        """
+        controls = len(self._control_active)
+        regular = len(self._active) - controls
+        selected: list[tuple[str, bool]] = []
+        for action in snapshot.outbox:
+            if action.state not in {"prepared", "sent_unknown"} or action.id in self._active:
+                continue
+            if action.next_retry_at and action.next_retry_at > self.clock():
+                continue
+            if action.kind in self._CONTROL_EFFECTS:
+                if controls >= 2:
+                    continue
+                controls += 1
+            else:
+                if regular >= self.io_workers:
+                    continue
+                regular += 1
+            selected.append((action.id, action.state == "sent_unknown"))
+        fresh = {key for key, reconcile in selected if not reconcile}
+        if fresh:
+            for action in snapshot.outbox:
+                if action.id in fresh:
+                    action.state = "sent_unknown"
+                    add_event(
+                        snapshot,
+                        "effect-submitted",
+                        unit=action.unit,
+                        action=action.id,
+                        effect=action.kind,
+                    )
+            snapshot = self._save(snapshot)
+        actions = {action.id: action for action in snapshot.outbox}
+        for key, reconcile in selected:
+            snapshot = self._submit(snapshot, actions[key], executor, reconcile=reconcile)
+        return snapshot
 
     def _queue(
         self, snapshot: CampaignSnapshot, proposals: tuple[Proposal, ...]
@@ -389,19 +429,7 @@ class CampaignSupervisor:
                         if observe_admission(snapshot, now=self.clock()):
                             snapshot = self._save(snapshot)
                         snapshot = self._queue(snapshot, proposals)
-                        for action in tuple(snapshot.outbox):
-                            if not self._has_slot(snapshot, action):
-                                continue
-                            if (
-                                action.state in {"confirmed", "rejected"}
-                                or action.id in self._active
-                            ):
-                                continue
-                            if action.next_retry_at and action.next_retry_at > self.clock():
-                                continue
-                            snapshot = self._submit(
-                                snapshot, action, executor, reconcile=action.state == "sent_unknown"
-                            )
+                        snapshot = self._dispatch_ready(snapshot, executor)
                         live = any(
                             unit.claim and not unit.claim.quiescent
                             for unit in snapshot.units.values()

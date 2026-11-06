@@ -61,6 +61,11 @@ def campaign(prepared, project, tmp_path):
                 "critical_ids": ["scripted-fixture"],
             }
         ]
+        from bmad_loop.campaign_handoff_constraints import AUDIT_SCHEMA as CONSTRAINT_AUDIT_SCHEMA
+        from bmad_loop.campaign_handoff_constraints import REDUCTION_SCHEMA
+        from bmad_loop.campaign_handoff_recovery import AUDIT_SCHEMA as RECOVERY_AUDIT_SCHEMA
+        from bmad_loop.campaign_handoff_recovery import SCHEMA as RECOVERY_SCHEMA
+
         native_path = tmp_path / (candidate.profile + str(execution) + "-native-fidelity.json")
         write_json(
             native_path,
@@ -74,6 +79,10 @@ def campaign(prepared, project, tmp_path):
                 ),
                 "result": {
                     "verdict": "passed",
+                    "contract_schema_digests": {
+                        "constraints-v1": digest([REDUCTION_SCHEMA, CONSTRAINT_AUDIT_SCHEMA]),
+                        "recovery-v1": digest([RECOVERY_SCHEMA, RECOVERY_AUDIT_SCHEMA]),
+                    },
                     "corpus_digest": digest(corpus),
                     "missing_critical_ids": [],
                     "invented_authority": [],
@@ -89,6 +98,8 @@ def campaign(prepared, project, tmp_path):
             "reader_versions": READER_VERSIONS,
             "summary_schema_digest": digest(summary_schema()),
             "audit_schema_digest": digest(flow.AUDIT_SCHEMA),
+            "constraint_schemas_digest": digest([REDUCTION_SCHEMA, CONSTRAINT_AUDIT_SCHEMA]),
+            "recovery_schemas_digest": digest([RECOVERY_SCHEMA, RECOVERY_AUDIT_SCHEMA]),
             "prompt_versions": ["history-extract-v1", "history-reduce-v1"],
             "structural_pass": True,
             "corpus": corpus,

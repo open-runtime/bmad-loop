@@ -78,7 +78,7 @@ def test_native_closure_authors_real_epic_and_retrospective_then_reviews_merges_
     layout = ticket_campaign(case, private_store=private_store)
     before = ticketlayout.epic_file(layout.initiative_folder, "epic-cart").read_bytes()
     assert b"status: in-progress" in before
-    result = run_case(case, ticks=2200)
+    result = run_case(case)
     assert result.phase == "delivered", diagnose(result)
     closure = next(unit for unit in result.units.values() if unit.spec.kind == "closure")
     assert closure.state == UnitState.DELIVERED
@@ -107,9 +107,27 @@ def test_native_closure_authors_real_epic_and_retrospective_then_reviews_merges_
 def test_unselected_unfinished_native_child_keeps_epic_open_without_closure_writer(production_case):
     case = production_case
     layout = ticket_campaign(case, second_done=False)
-    result = run_case(case, ticks=650)
+    original = case.runtime.proposals
+    observed = []
+
+    def proposals(snapshot):
+        closure = next(unit for unit in snapshot.units.values() if unit.spec.kind == "closure")
+        if closure.hold and all(
+            unit.state == UnitState.DELIVERED
+            for unit in snapshot.units.values()
+            if unit.spec.kind != "closure"
+        ):
+            observed.append(closure.hold.reason)
+            case.store.enqueue(snapshot.id, "stop", request_id="closure-observed")
+        return original(snapshot)
+
+    case.runtime.proposals = proposals
+    result = run_case(case)
+    assert observed and "unfinished" in observed[-1].lower()
     closure = next(unit for unit in result.units.values() if unit.spec.kind == "closure")
     assert closure.state != UnitState.DELIVERED
+    assert not closure.bindings.get("workspace")
+    assert not closure.claim
     assert b"status: in-progress" in verify.file_bytes_at_revision(
         case.repo,
         git(case.remote, "rev-parse", "main"),
@@ -117,5 +135,22 @@ def test_unselected_unfinished_native_child_keeps_epic_open_without_closure_writ
         .relative_to(case.repo)
         .as_posix(),
     )
-    rows = [json.loads(line) for line in case.events.read_text().splitlines()]
+    rows = (
+        [json.loads(line) for line in case.events.read_text().splitlines()]
+        if case.events.exists()
+        else []
+    )
     assert not any(row["event"] == "planning-closure" for row in rows)
+
+    # The external child finishes later. Its canonical update must resume the
+    # same campaign automatically without an operator releasing a generic hold.
+    git(case.repo, "fetch", "origin", "main")
+    git(case.repo, "merge", "--no-edit", "origin/main")
+    write_plan(layout, "epic-cart", "story-cart-rules-plan", 2, "done")
+    git(case.repo, "add", "_bmad-output")
+    git(case.repo, "commit", "-qm", "complete external closure prerequisite")
+    git(case.repo, "push", "origin", "main")
+    case.runtime.proposals = original
+    delivered = run_case(case)
+    assert delivered.phase == "delivered", diagnose(delivered)
+    assert delivered.units[closure.id].state == UnitState.DELIVERED

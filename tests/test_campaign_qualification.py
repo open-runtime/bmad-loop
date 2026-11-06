@@ -209,3 +209,104 @@ def test_muse_msp_receipt_uses_native_model_usage_and_bound_session():
     frames[-1]["payload"]["run_stream"]["id"] = "other-run"
     with pytest.raises(CampaignError, match="another run"):
         parse_output(json.dumps(frames), protocol="muse-json", selected_model="muse-spark-1.3")
+
+
+def test_muse_wire_echo_budget_is_distinct_from_native_output_tokens(tmp_path, prepared):
+    from dataclasses import replace
+
+    from test_campaign_headless import finish
+
+    from bmad_loop.campaign_jobs import JobLimits
+
+    runner, _, request, candidate, cap = prepared
+    script = tmp_path / "msp-wire-fixture.py"
+    script.write_text("""import json,sys,time
+sys.stdin.read()
+print(json.dumps({"type":"system","model":"gpt-test","session_id":"native","input_echo":"x"*70000}),flush=True)
+time.sleep(.5)
+print(json.dumps({"type":"result","structured_output":{"ok":True},"usage":{"input_tokens":1000,"output_tokens":32}}),flush=True)
+""")
+    cap = {
+        **cap,
+        "protocol": "muse-json",
+        "argv": [cap["binary"], str(script)],
+        "dependencies": [{"path": str(script), "sha256": file_digest(script)}],
+    }
+    request = replace(request, limits=JobLimits(100000, 64, timeout_s=20))
+    path = runner.prepare(
+        tmp_path / "wire", request, candidate, cap, launch_id="wire", generation=1
+    )
+    runner.launch(path)
+    receipt = finish(runner, path)
+    assert receipt["outcome"] == "completed", receipt
+    assert receipt["usage"]["output_tokens"] == 32
+    assert receipt["wire_output_limit_bytes"] > 70000
+
+
+def test_prepared_headless_request_reconciles_json_normalized_candidate(prepared):
+    runner, path, request, candidate, cap = prepared
+    assert (
+        runner.prepare(path.parent, request, candidate, cap, launch_id="launch-1", generation=1)
+        == path
+    )
+
+
+def test_parallel_native_jobs_create_shared_mux_session_once(tmp_path, prepared):
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+    from dataclasses import replace
+
+    from test_campaign_headless import ChildMux, finish
+
+    from bmad_loop.adapters.multiplexer import MultiplexerError
+    from bmad_loop.campaign_headless import HeadlessRunner
+
+    class RacingMux(ChildMux):
+        def __init__(self):
+            super().__init__()
+            self.created = False
+            self.creations = 0
+            self.window_lock = threading.Lock()
+
+        def has_session(self, session):
+            if not self.created:
+                time.sleep(0.05)
+                return False
+            return True
+
+        def new_session(self, session, cwd):
+            if self.created:
+                raise MultiplexerError("duplicate session")
+            self.created = True
+            self.creations += 1
+
+        def new_window(self, *args):
+            with self.window_lock:
+                return super().new_window(*args)
+
+    _, _, request, candidate, cap = prepared
+    mux = RacingMux()
+    runner = HeadlessRunner(mux)
+    paths = [
+        runner.prepare(
+            tmp_path / "parallel" / str(i),
+            replace(request, id=f"job-{i}"),
+            candidate,
+            cap,
+            launch_id=f"launch-{i}",
+            generation=1,
+        )
+        for i in range(4)
+    ]
+    try:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(runner.launch, paths))
+        assert all(row["state"] == "running" for row in results)
+        assert mux.creations == 1
+        assert all(finish(runner, path)["outcome"] == "completed" for path in paths)
+    finally:
+        for process in mux.processes.values():
+            if process.poll() is None:
+                process.terminate()
+            process.wait(timeout=10)

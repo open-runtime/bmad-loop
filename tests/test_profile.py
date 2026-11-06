@@ -127,7 +127,11 @@ def test_builtin_profiles_load():
     assert opencode.usage_parser == "none"
     assert opencode.binary == "opencode"
     # every hook-driven built-in stays non-hookless
-    for name in sorted(set(profiles) - {"opencode-http"}):
+    for name in ("grok", "muse"):
+        assert profiles[name].hookless is True
+        assert profiles[name].hooks.dialect == "none"
+        assert profiles[name].hooks.events == {}
+    for name in sorted(set(profiles) - {"opencode-http", "grok", "muse"}):
         assert profiles[name].hookless is False
 
 
@@ -841,8 +845,12 @@ def test_adapter_field_defaults_to_generic_and_parses():
     would dispatch to the tmux adapter, which cannot host it."""
     profiles = load_profiles()
     assert profiles["opencode-http"].adapter == "opencode-http"
+    assert {name for name, p in profiles.items() if p.adapter == "bounded-headless"} == {
+        "grok",
+        "muse",
+    }
     assert {name for name, p in profiles.items() if p.adapter == "generic"} == (
-        set(profiles) - {"opencode-http"}
+        set(profiles) - {"opencode-http", "grok", "muse"}
     )
 
 

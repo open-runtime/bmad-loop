@@ -23,6 +23,8 @@ breaking changes may land in a minor release.
 - Resume temporary GitHub waits and reconsider owner decisions when their evidence changes.
 - Preserve contributor attribution and admit independent work fairly using fresh provider capacity.
 - Reflect native task status and observe bounded hcom context through normal campaign operation.
+- Resume closure after external prerequisites complete without reserving an idle writer.
+- Preserve native quota telemetry and refresh fallback routing before continuing interrupted work.
 
 ## [0.14.0] — 2026-11-05
 

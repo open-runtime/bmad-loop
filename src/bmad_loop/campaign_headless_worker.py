@@ -57,6 +57,7 @@ def child_main(path: Path) -> int:
     process = None
     known = {}
     reason = ""
+    limit_kind = ""
     started = time.monotonic()
 
     def stopped():
@@ -137,6 +138,12 @@ def child_main(path: Path) -> int:
             # The launcher can otherwise replace the pinned native executable
             # after qualification and before exec. Account routing is unchanged.
             environment["MUSE_NO_AUTO_UPDATE"] = "1"
+        # MSP emits input echoes and a separate native envelope for every output
+        # delta. Bound those wire bytes separately from model output tokens.
+        wire_limit = request.limits.output_tokens * 16 + 65536
+        if capability["protocol"] == "muse-json":
+            wire_limit = envelope["input"]["bytes"] * 3 + request.limits.output_tokens * 128 + 65536
+        receipt["wire_output_limit_bytes"] = wire_limit
         with (
             (directory / "input.txt").open("rb") as source,
             (directory / "stdout.jsonl").open("wb") as stdout,
@@ -163,12 +170,13 @@ def child_main(path: Path) -> int:
                     reason = "canceled"
                 elif time.monotonic() - started > request.limits.timeout_s:
                     reason = "limit"
-                elif (
-                    directory / "stdout.jsonl"
-                ).stat().st_size > request.limits.output_tokens * 16 + 65536 or (
-                    directory / "stderr.log"
-                ).stat().st_size > 1048576:
+                    limit_kind = "wall-time"
+                elif (directory / "stdout.jsonl").stat().st_size > wire_limit:
                     reason = "limit"
+                    limit_kind = "stdout-wire-bytes"
+                elif (directory / "stderr.log").stat().st_size > 1048576:
+                    reason = "limit"
+                    limit_kind = "stderr-bytes"
                 if reason:
                     kill_tree(process, known=known)
                     break
@@ -178,13 +186,36 @@ def child_main(path: Path) -> int:
             kill_tree(process, known=known)
             record_tree()
         if reason:
+            try:
+                partial = parse_output(
+                    (directory / "stdout.jsonl").read_text(encoding="utf-8"),
+                    protocol=capability["protocol"],
+                    selected_model=candidate.model,
+                    served_model_aliases=tuple(capability.get("served_model_aliases", ())),
+                    partial=True,
+                )
+                for key in (
+                    "usage",
+                    "usage_known",
+                    "session_id",
+                    "selected_model",
+                    "observed_model",
+                    "observed_models",
+                    "provider_family",
+                    "turns",
+                ):
+                    if key in partial:
+                        receipt[key] = partial[key]
+            except (OSError, ValueError, TypeError, CampaignError) as exc:
+                receipt["telemetry_error"] = f"{type(exc).__name__}: {exc}"
             receipt.update(
                 outcome=reason,
                 reason=(
                     "Native job canceled"
                     if reason == "canceled"
-                    else "Native job exceeded a whole-job bound"
+                    else "Native job exceeded whole-job " + limit_kind + " bound"
                 ),
+                limit_kind=limit_kind,
             )
         else:
             native = parse_output(

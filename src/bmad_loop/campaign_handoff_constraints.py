@@ -45,13 +45,15 @@ AUDIT_SCHEMA = {
 }
 
 
-def partition(rows, bound):
+def partition(rows, bound, *, max_nodes=None):
     """Never split a quoted obligation or silently omit a source node."""
     groups, current = [], []
     for row in rows:
         if len(encoded([row])) > bound:
             raise CampaignError("A current constraint needs a larger qualified reduction route")
-        if current and len(encoded([*current, row])) > bound:
+        if current and (
+            len(encoded([*current, row])) > bound or (max_nodes and len(current) >= max_nodes)
+        ):
             groups.append(current)
             current = []
         current.append(row)

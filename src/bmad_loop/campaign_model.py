@@ -355,7 +355,9 @@ class CampaignSnapshot:
     updated_at: float = 0
 
     def clone(self) -> CampaignSnapshot:
-        return copy.deepcopy(self)
+        from .campaign_clone import clone
+
+        return clone(self)
 
 
 def _table(value: Any, name: str) -> dict[str, Any]:

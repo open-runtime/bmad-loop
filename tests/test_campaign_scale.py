@@ -13,8 +13,10 @@ from pathlib import Path
 
 from conftest import git
 from test_campaign_headless import prepared as prepared
+from test_campaign_merge_adapter import source as combined_verifier_source
 from test_campaign_runtime import production_case as production_case
 from test_campaign_runtime import run_case
+from test_campaign_runtime_queue import QueuedServer
 
 from bmad_loop import campaign_runtime
 from bmad_loop.campaign_headless import file_digest
@@ -75,12 +77,30 @@ print(json.dumps({'type':'result','structured_output':result,'usage':{'input_tok
     return runner, candidate, path
 
 
+def recorded_job_count(store, campaign_id):
+    count, after = 0, ""
+    while rows := store.jobs(campaign_id, after=after, limit=1000):
+        count += len(rows)
+        after = rows[-1]["id"]
+    return count
+
+
 def test_48_stories_24_epics_verify8_and_reasoning_drain_resume(
-    production_case, prepared, tmp_path
+    production_case, prepared, tmp_path, monkeypatch
 ):
     case = production_case
     sources, ownership = scaled_sources(case)
     runner, candidate, capabilities = reporting_route(tmp_path, prepared)
+    server = QueuedServer(case.service)
+    monkeypatch.setattr(case.service, "request", server.request)
+    verifier = tmp_path / "qualified-combined-verifier.py"
+    verifier.write_text(combined_verifier_source())
+    producer = tmp_path / "authenticated-check-producer.py"
+    producer.write_text(
+        "import json,time\nprint(json.dumps({'schema_version':1,'repository':'a/b',"
+        "'context':'CI','app_id':7,'mode':'native','authenticated':True,"
+        "'producer':'scripted-github-app','checks_write':True,'observed_at':time.monotonic()}))\n"
+    )
     roles = tuple((name, replace(role, max_sessions=24)) for name, role in case.snapshot.spec.roles)
     roles += (("reporting", RoleSpec(pool="scale-reporting", max_sessions=4)),)
     spec = replace(
@@ -99,7 +119,15 @@ def test_48_stories_24_epics_verify8_and_reasoning_drain_resume(
         reasoning=ReasoningSpec(
             enabled=True, capabilities=str(capabilities), max_sessions=4, purposes=("report",)
         ),
-        github=replace(case.snapshot.spec.github, max_base_refreshes=128),
+        github=replace(
+            case.snapshot.spec.github,
+            merge_mode="queue",
+            max_base_refreshes=128,
+            candidate_command=(sys.executable, str(verifier)),
+            candidate_check_context="CI",
+            candidate_check_app_id=7,
+            candidate_producer_probe=(sys.executable, str(producer)),
+        ),
     )
     _, case.snapshot = campaign_runtime.create(case.repo, spec)
     case.runtime.clock = time.monotonic
@@ -113,6 +141,7 @@ def test_48_stories_24_epics_verify8_and_reasoning_drain_resume(
         "stories": 48,
         "epics": 24,
         "verify_slots": 8,
+        "publication": "queue",
         "max_live": 0,
         "max_execution": 0,
         "max_verify": 0,
@@ -152,7 +181,9 @@ def test_48_stories_24_epics_verify8_and_reasoning_drain_resume(
             metrics["stop_requested_at"] = time.monotonic()
             case.store.enqueue(snapshot.id, "stop", reason="scale drain/restart qualification")
         if snapshot.phase == "draining" and metrics["control_ack_seconds"] is None:
-            metrics["control_ack_seconds"] = time.monotonic() - metrics["stop_requested_at"]
+            requested = metrics["stop_requested_at"]
+            assert requested is not None
+            metrics["control_ack_seconds"] = time.monotonic() - requested
         if time.monotonic() - sampled_at >= 5:
             sampled_at = time.monotonic()
             (tmp_path / "scale-metrics-live.json").write_text(
@@ -198,7 +229,7 @@ def test_48_stories_24_epics_verify8_and_reasoning_drain_resume(
         events=len(result.events),
         outbox_hot=len(result.outbox),
         jobs_hot=len(result.jobs),
-        jobs_total=len(case.store.jobs(result.id, limit=10000)),
+        jobs_total=recorded_job_count(case.store, result.id),
     )
     (tmp_path / "scale-metrics.json").write_text(json.dumps(metrics, indent=2))
     assert result.phase == "delivered" and metrics["delivered"] == 48
@@ -208,3 +239,5 @@ def test_48_stories_24_epics_verify8_and_reasoning_drain_resume(
     assert metrics["control_ack_seconds"] is not None and metrics["control_ack_seconds"] < 30
     assert len(set(metrics["first_launch_epics"])) == 24
     assert len(case.service.closed_units) >= 48
+    assert len(server.group_numbers) == 48
+    assert all(unit.evidence.get("queue", {}).get("verification") for unit in result.units.values())

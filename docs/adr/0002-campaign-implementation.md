@@ -381,6 +381,13 @@ only after its children and any required closure/retrospective unit are delivere
 Represent closure work explicitly so several children cannot each run the same
 epic retrospective or shared completion writer.
 
+Observe external closure prerequisites before allocating a broad workspace or
+claiming its writer. Preserve an unfinished child as a typed, retried prerequisite
+wait and refresh canonical source state until it clears. Recheck immediately
+before launch; a newly discovered prerequisite produces a confirmed no-launch
+receipt and releases the unused claim. An external completion must resume the
+same campaign through review, merge and tracking without an operator release.
+
 Select ownership-compatible ready work before reserving scarce workspaces, and
 persist the fairness cursor with admission. An overlapping sibling cannot occupy
 the final slot while disjoint work waits. Preserve source hierarchy and GitHub

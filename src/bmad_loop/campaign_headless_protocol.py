@@ -27,7 +27,7 @@ _ERRORS = {
 }
 
 
-def _muse_envelopes(frames):
+def _muse_envelopes(frames, *, partial=False):
     """Decode MSP v1 native telemetry, never model-authored output deltas."""
     session = run = ""
     usage = terminal = None
@@ -58,8 +58,12 @@ def _muse_envelopes(frames):
                 usage = payload
             else:
                 terminal = payload
-    if not session or not usage or not terminal:
+    if partial and (not session or not usage):
+        return [{"type": "system", "session_id": session}]
+    if not partial and (not session or not usage or not terminal):
         raise CampaignError("Muse native session/usage/terminal receipt is incomplete")
+    terminal = terminal or {}
+    usage = usage or {}
     models = usage.get("models", [])
     if (
         not isinstance(models, list)
@@ -96,21 +100,32 @@ def _muse_envelopes(frames):
 
 
 def parse_output(
-    text: str, *, protocol: str, selected_model: str, served_model_aliases: tuple[str, ...] = ()
+    text: str,
+    *,
+    protocol: str,
+    selected_model: str,
+    served_model_aliases: tuple[str, ...] = (),
+    partial: bool = False,
 ) -> dict[str, Any]:
     """Decode native stream frames; never classify prose as provider failure."""
     try:
         whole = json.loads(text)
         frames = whole if isinstance(whole, list) else [whole]
     except ValueError:
-        try:
-            frames = [json.loads(line) for line in text.splitlines() if line.strip()]
-        except ValueError as exc:
-            raise CampaignError("Native headless output is not framed JSON") from exc
-    if not frames or any(not isinstance(row, dict) for row in frames):
+        frames = []
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            try:
+                frames.append(json.loads(line))
+            except ValueError as exc:
+                if partial:
+                    break  # An interrupted tail cannot erase preceding native telemetry.
+                raise CampaignError("Native headless output is not framed JSON") from exc
+    if (not frames and not partial) or any(not isinstance(row, dict) for row in frames):
         raise CampaignError("Native headless output has no object frames")
     if protocol == "muse-json" and any("payload_type" in row for row in frames):
-        frames = _muse_envelopes(frames)
+        frames = _muse_envelopes(frames, partial=partial)
     result = None
     models: list[str] = []
     session_id = ""
@@ -173,6 +188,8 @@ def parse_output(
                 frame.get("session_id") or frame.get("thread_id") or frame.get("conversation_id")
             )
             if isinstance(identifier, str):
+                if session_id and identifier and session_id != identifier:
+                    raise CampaignError("Native output mixes different session identities")
                 session_id = identifier
         # Only native failure envelopes count. An assistant's result containing
         # an 'error' property is application content, never quota telemetry.
@@ -243,16 +260,18 @@ def parse_output(
                     usage[key] = native_usage[key]
             turns = max(turns, 1)
     observed = models[0] if models else ""
-    if outcome == "completed" and (
-        not observed or observed not in {selected_model, *served_model_aliases}
+    if (
+        not partial
+        and outcome == "completed"
+        and (not observed or observed not in {selected_model, *served_model_aliases})
     ):
         raise CampaignError("Native primary model is missing or differs from selected route")
-    if outcome == "completed" and (not session_id or result is None):
+    if not partial and outcome == "completed" and (not session_id or result is None):
         raise CampaignError("Native session identity or structured result is missing")
     return {
-        "outcome": outcome,
-        "reason": reason,
-        "result": result,
+        "outcome": "failed" if partial else outcome,
+        "reason": "Partial native telemetry; no completion evidence" if partial else reason,
+        "result": None if partial else result,
         "usage": usage,
         "usage_known": bool(usage),
         "session_id": session_id,
@@ -261,5 +280,5 @@ def parse_output(
         "observed_models": models,
         "provider_family": provider_family(observed),
         "turns": turns,
-        "truncated": truncated,
+        "truncated": partial or truncated,
     }

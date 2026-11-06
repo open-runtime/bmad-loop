@@ -289,7 +289,16 @@ def apply(runtime, snapshot, action, observation) -> None:
             row["retry_at"] = runtime.clock() + 15
         elif row["state"] == "capacity_wait":
             row["retry_at"] = runtime.clock() + 30
-            snapshot.bindings.setdefault("capacity", {})["observed_at"] = 0
+            from .campaign_capacity import record_unavailable
+
+            selected = row.get("selection", {})
+            record_unavailable(
+                snapshot,
+                selected.get("profile", ""),
+                selected.get("model", ""),
+                now=runtime.clock(),
+                reason="native quota exhausted; waiting for newer provider capacity",
+            )
     else:
         row["state"] = "running"
         row["claim"]["status"] = "running"

@@ -333,6 +333,9 @@ class CampaignRuntime:
                 ),
             )
             reason = route_unavailable(stamped, now=self.clock())
+            fault = snapshot.bindings.get("capacity_faults", {}).get("\0".join(identity), {})
+            if fault and (stamped.observed_at or 0) <= fault["observed_at"]:
+                reason = fault["reason"]
             capacities[identity] = (
                 dataclasses.replace(stamped, available=False, reason=reason) if reason else stamped
             )
@@ -745,6 +748,15 @@ class CampaignRuntime:
                 continue
             if (
                 unit.hold
+                and unit.hold.kind == "closure_prerequisite"
+                and (unit.retry_at is None or now >= unit.retry_at)
+                and not self._pending(snapshot, key)
+                and (not unit.claim or unit.claim.quiescent)
+            ):
+                proposals.append(Proposal("closure-prerequisite", key))
+                continue
+            if (
+                unit.hold
                 or self._pending(snapshot, key)
                 or (unit.claim and not unit.claim.quiescent)
             ):
@@ -796,6 +808,11 @@ class CampaignRuntime:
                     proposals.append(Proposal("planning-complete", key))
                 continue
             if unit.state == UnitState.PENDING:
+                if unit.spec.kind == "closure" and not unit.evidence.get(
+                    "closure_readiness", {}
+                ).get("ready"):
+                    proposals.append(Proposal("closure-prerequisite", key))
+                    continue
                 from .campaign_existing import terminal_status
 
                 if terminal_status(
@@ -1960,6 +1977,11 @@ class CampaignRuntime:
             "confirmed", {"observations": imported.observations, "observed_at": self.clock()}
         )
 
+    def _perform_closure_prerequisite(self, snapshot, action) -> Observation:
+        from .campaign_closure_flow import observe
+
+        return observe(self, snapshot, action)
+
     def _perform_reconcile_existing(self, snapshot, action) -> Observation:
         from .campaign_existing import ExistingDeliveryHeld, prior_delivery
 
@@ -3120,14 +3142,21 @@ class CampaignRuntime:
             if stage == "closure":
                 from .campaign_closure import context as closure_context
                 from .campaign_closure import prepare as prepare_closure
-                from .campaign_source_publication import SourceBinding
+                from .campaign_source_publication import SourceBinding, SourcePublicationHold
 
                 binding = SourceBinding.from_dict(unit.bindings["canonical_source"])
                 publisher = self._source_publisher(snapshot, project=Path(binding.project))
                 canonical_head, _ = publisher._canonical(
                     action.id + ":closure", unit.bindings["base"]
                 )
-                publisher._closure_ready(binding, canonical_head)
+                try:
+                    publisher._closure_ready(binding, canonical_head)
+                except SourcePublicationHold as exc:
+                    # This check precedes prepare_launch and any subprocess.
+                    # Its refusal is positive proof that no writer was spawned.
+                    return Observation(
+                        "confirmed", {"not_launched": True, "closure_wait": str(exc)}
+                    )
                 request["closure_manifest"] = prepare_closure(
                     workspace,
                     SourceSelector(**request["source"]),
@@ -4466,12 +4495,26 @@ class CampaignRuntime:
                     from .campaign_runtime_intake import complete_delivery
 
                     complete_delivery(snapshot, unit.id)
+        elif kind == "closure-prerequisite":
+            from .campaign_closure_flow import apply
+
+            apply(self, snapshot, unit, action, data)
         elif kind == "launch":
             if not unit.claim or unit.claim.launch_id != action.id:
                 raise CampaignError("launch result no longer owns claim")
             if data.get("not_launched") and not data.get("remote_feedback_changed"):
                 unit.claim.quiescent = True
                 unit.claim.status = "not_launched"
+                if data.get("closure_wait"):
+                    from .campaign_closure_flow import apply
+
+                    apply(
+                        self,
+                        snapshot,
+                        unit,
+                        action,
+                        {"ready": False, "reason": data["closure_wait"]},
+                    )
                 if data.get("adoption_refused"):
                     self._set_hold(
                         unit, Hold("adoption_fence", data["adoption_refused"], id=action.id)

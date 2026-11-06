@@ -281,7 +281,7 @@ def validate_summary(
     count: TokenCounter = byte_token_bound,
 ) -> dict[str, Any]:
     """Validate structural fidelity; this cannot certify semantic completeness."""
-    load_input(job)
+    input_payload = load_input(job)
     if count(encoded(result).decode()) > job.output_tokens:
         raise CampaignError("summary exceeds its qualified output budget")
     if (
@@ -302,6 +302,26 @@ def validate_summary(
     ):
         raise CampaignError("summary must expose structured facts and coverage gaps")
     source = {event.id: event for event in events}
+    aliases = {}
+    for fragment in [*input_payload.get("primary", []), *input_payload.get("halo", [])]:
+        if not isinstance(fragment, dict):
+            raise CampaignError("summary input fragment is not an object")
+        event_id, start, end = fragment.get("event_id"), fragment.get("start"), fragment.get("end")
+        event = source.get(event_id) if isinstance(event_id, str) else None
+        if (
+            event is None
+            or event_id not in job.event_ids
+            or type(start) is not int
+            or type(end) is not int
+            or not 0 <= start <= end <= len(event.record.text)
+            or fragment.get("text") != event.record.text[start:end]
+            or fragment.get("id") != digest([event_id, start, end])
+            or fragment["id"] in source
+        ):
+            raise CampaignError("summary input fragment has invalid native source provenance")
+        if fragment["id"] in aliases and aliases[fragment["id"]] != fragment:
+            raise CampaignError("summary input fragment identity is ambiguous")
+        aliases[fragment["id"]] = fragment
     normalized = []
     for fact in facts:
         if (
@@ -312,11 +332,21 @@ def validate_summary(
             or not isinstance(fact.get("citations"), list)
             or not fact["citations"]
             or not all(
-                isinstance(ref, str) and ref in job.event_ids and ref in source
+                isinstance(ref, str)
+                and ((ref in job.event_ids and ref in source) or ref in aliases)
                 for ref in fact["citations"]
             )
         ):
             raise CampaignError("summary fact has invalid kind/text/source citations")
+        original = list(fact["citations"])
+        citations = list(
+            dict.fromkeys(aliases[ref]["event_id"] if ref in aliases else ref for ref in original)
+        )
+        fragment_provenance = [
+            {key: aliases[ref][key] for key in ("id", "event_id", "start", "end")}
+            for ref in dict.fromkeys(original)
+            if ref in aliases
+        ]
         if fact.get("authority", "context") != "context":
             raise CampaignError("summary cannot grant approval or completion authority")
         if fact["kind"] == "owner_request":
@@ -326,17 +356,25 @@ def validate_summary(
                 or not quote
                 or not any(
                     source[ref].record.owner_input and quote in source[ref].record.text
-                    for ref in fact["citations"]
+                    for ref in citations
                 )
             ):
                 raise CampaignError("owner request requires an exact native-owner quote")
         normalized.append(
             {
-                **fact,
+                **{
+                    key: value
+                    for key, value in fact.items()
+                    if key not in {"original_citations", "fragment_provenance", "id"}
+                },
                 "authority": "context",
-                "id": digest(
-                    [fact["kind"], fact["citations"], fact.get("source_quote"), fact["text"]]
+                "citations": citations,
+                **(
+                    {"original_citations": original, "fragment_provenance": fragment_provenance}
+                    if fragment_provenance
+                    else {}
                 ),
+                "id": digest([fact["kind"], citations, fact.get("source_quote"), fact["text"]]),
             }
         )
     return {

@@ -102,3 +102,21 @@ def test_never_submitted_merge_wait_reenters_fresh_gate(project, tmp_path, monke
     )
     result = runtime.reconcile_action(snapshot, action)
     assert result.state == "waiting" and observed == ["merge-action"]
+
+
+def test_native_quota_invalidates_fresh_positive_until_newer_observation(project, tmp_path):
+    from bmad_loop.campaign_capacity import record_unavailable
+
+    runtime, snapshot, astra, fable = configured(project, tmp_path)
+    for row in snapshot.bindings["capacity"]["observations"]:
+        row["capacity"].update(observed_at=99, expires_at=220)
+    assert runtime._role(snapshot, "planning") == astra
+    record_unavailable(snapshot, astra.profile, astra.model, now=100, reason="native quota")
+    assert runtime._role(snapshot, "planning") == fable
+    snapshot.bindings["capacity"]["observed_at"] = 101
+    assert (
+        runtime._role(snapshot, "planning") == fable
+    )  # delayed old route observation stays invalid
+    runtime.clock = lambda: 102
+    snapshot.bindings["capacity"]["observations"][0]["capacity"]["observed_at"] = 101
+    assert runtime._role(snapshot, "planning") == astra
