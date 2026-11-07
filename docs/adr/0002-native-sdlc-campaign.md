@@ -1,6 +1,6 @@
 # ADR 0002: A deterministic SDLC campaign with GitHub delivery
 
-- **Status:** Implementation under qualification; full-suite failures block review readiness and activation remains separate
+- **Status:** Implemented and review-ready; project activation remains gated
 - **Date:** 2026-11-05
 - **Scope:** An opt-in campaign supervisor, isolated workers, planning, GitHub synchronization and native Paradev reflection
 
@@ -32,7 +32,7 @@ It preserves this record's delivery contract and does not replace outstanding re
 
 ### Implementation and delivery milestones
 
-The next milestone is a review-ready PR containing the audited repairs and the
+This milestone is a review-ready PR containing the audited repairs and the
 reasoning/handoff extension. The implementation contract's
 [G0–G8 traceability matrix](0002-campaign-implementation.md#implementation-goals-and-traceability)
 is the shared acceptance map. A helper test is not evidence that the normal
@@ -45,13 +45,18 @@ Merge, exact-commit installation, canonical-base update and qualified REM delive
 remain later gates of the original objective. A green suite, disabled automations
 or a locally completed story cannot substitute for those gates.
 
-The scripted 48-story load and stop/resume qualification passed, as did the
-sealed-history fidelity assessment and native read-only successor retrieval.
-These establish the bounded capabilities recorded in
-[ADR 0003](0003-bounded-reasoning-and-handoff.md#qualification-achieved-and-remaining-gates),
-not universal harness support or writable continuation of the historical packet.
-Full-suite failures still block review readiness despite two independent scoped
-reviews finding no outstanding issue in their reviewed candidate.
+The frozen implementation passed its integrated regression suite, packaging and
+static checks, and two independent reviews found no open findings. Normal-runtime
+coverage also demonstrates live history warmup, quota handoff, exact prefix reuse,
+fresh owner-constraint audits and fenced successor delivery. The fresh scripted
+48-story load and stop/resume qualification passed against the same frozen
+candidate, including completed parent tracking.
+
+The sealed-history fidelity assessment and native read-only successor retrieval
+establish the bounded capabilities recorded in
+[ADR 0003](0003-bounded-reasoning-and-handoff.md#qualification-achieved-and-remaining-gates).
+They do not establish universal harness support, writable continuation of the
+historical packet or target-project activation.
 
 Optimize useful parallel work through dependencies, ownership and token/session
 capacity. Preserve initiatives and sprints as existing source structure and GitHub

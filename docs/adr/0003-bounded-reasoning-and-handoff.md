@@ -1,6 +1,6 @@
 # ADR 0003: Bounded reasoning jobs and portable session handoff
 
-- **Status:** Implemented in the development PR; bounded native qualifications passed, full-suite failures block review readiness
+- **Status:** Implemented and review-ready; project activation remains gated
 - **Date:** 2026-11-06
 - **Extends:** [ADR 0002](0002-native-sdlc-campaign.md) and its [implementation contract](0002-campaign-implementation.md)
 - **Delivery:** The same campaign implementation PR, before autonomous project activation
@@ -647,22 +647,46 @@ Scripted runtime coverage of quota replacement through delivery and finite nativ
 writer canaries provide separate evidence. Failed qualification attempts remain
 retained alongside successful results.
 
-The scripted load qualification delivered 48 stories across 24 active epics,
-reached eight verification slots, eight review slots and four reasoning jobs, and
-completed parent tracking after stop, drain and resume. Stop acknowledgement was
-0.291 seconds in that run. This demonstrates tested concurrency and responsiveness,
-not maximum throughput or a REM/provider benchmark.
+The normal supervisor path now demonstrates optional history extraction while a
+real scripted predecessor remains live, followed by appended owner instructions,
+quota interruption, reuse of completed prefix maps, a fresh full-history owner
+audit and same-PR successor delivery. The successor starts only after predecessor
+quiescence. Native handle observation supplies the exact hook binding with Paradev
+reflection disabled; no completed jobs are manually seeded into this scenario.
+Both Claude- and Codex-format predecessor histories exercise this zero-token path.
+
+Focused regressions cover immutable-prefix and fragment validation, source rewrite,
+corrupt optional artifacts, stale extraction contracts, unavailable bindings and
+route changes. Exhausted maps advance optional pages without becoming semantic
+coverage; mandatory final extraction still includes their failed source ranges.
+Background jobs remain optional, resource-bound and lower priority than required
+reasoning work. Only trusted hook-bound native prefixes qualify for live warmup;
+active managed-headless streams retain their quiescent-export boundary. No
+native-store import writer or universal live-history capability is claimed.
+
+The fresh scripted load qualification on `276daa62` delivered 48 stories across
+24 active epics, reached eight verification slots, eight review slots and four
+reasoning jobs, and completed parent tracking after stop, drain and resume. Stop
+acknowledgement was 0.617 seconds; the measured scenario took 994.09 seconds. This
+demonstrates tested concurrency and responsiveness, not maximum throughput or a
+REM/provider benchmark.
 
 Only exact earned Grok and Muse routes have the applicable native qualification;
 the five shipped harness contracts are not a claim that every model, effort,
 permission mode or continuation path is qualified. Claude/Codex/AGY deployment
 routes and approved Astra/Fable reasoning roles need their matching evidence.
-Two independent scoped reviews found no outstanding issue against `9f806480`, but
-its full suite reported 58 failures, 20,260 passes and 261 skips. Those failures
-block review readiness; repairs require affected regression checks and refreshed
-reviews. Hosted Actions remain disabled, and unrun platform gates remain explicit.
-Merge, exact-commit installation, canonical-base update and REM activation remain
-later gates, unchanged by these qualifications.
+The frozen code candidate `276daa62` passed the integrated regression suite with
+20,391 passes and 261 skips in 664.86 seconds; the dedicated scale case is run
+separately. Pyright, Trunk, package build, isolated wheel installation and release
+checks passed. Two independent reviews against that same candidate closed without
+open findings. The earlier full-suite failures have been repaired and no longer
+block this milestone.
+
+The final-candidate regression, load and independent-review gates are complete;
+the implementation is ready for the next review. Hosted Actions remain disabled,
+and unrun platform gates remain explicit. Merge, exact-commit installation,
+canonical-base update and REM activation remain later gates, unchanged by these
+qualifications.
 
 ## Capability evidence and limits
 
