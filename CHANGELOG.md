@@ -21,6 +21,8 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Lead managed Paradev labels with observed hcom names, epics, issues and PRs, refreshing discovered bindings.
+- Preserve the configured hcom room across headless launches without inheriting another agent's identity.
 - Resume temporary GitHub waits and reconsider owner decisions when their evidence changes.
 - Preserve contributor attribution and admit independent work fairly using fresh provider capacity.
 - Reflect native task status and observe bounded hcom context through normal campaign operation.

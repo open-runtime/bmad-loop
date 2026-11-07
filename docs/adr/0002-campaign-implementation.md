@@ -1095,9 +1095,19 @@ root; neither provider silently allocates beneath a run folder or temporary path
 One actual worker PTY is attached once. Persist workspace/terminal/pane/tab and
 native provider session mappings independently; hook read-back, not a terminal
 title, proves native agent attribution. Pending/unknown attribution is visible.
-Titles name unit, phase, attempt and agent; use a separate display-title method
-so renaming cannot break window identity. Preserve focus and user-customized
-layout. Reflection tasks remain optional; the campaign owns all identities.
+Managed workspace, task and terminal titles put observed hcom names, epic, issue
+and PR first, followed by description, phase or job identity. Unknown bindings
+remain explicit; a provider or model name is never an hcom identity. Bound each
+navigation field before shortening descriptive text. Group labels aggregate their
+actual members and retain a stable identity suffix; group identity itself remains
+independent of labels. Refresh labels after actor reassignment and GitHub discovery,
+including quiescent sibling workspaces. Use a separate display-title method so
+renaming cannot break window identity, and persist title-write intent before
+native mutation so lost acknowledgements cannot become operator suffixes.
+Keep genuine operator terminal text after the navigation prefix. Preserve focus
+and user-customized layout; manually named tabs can still override their terminal's
+automatic tab label. Reflection tasks remain optional, preserve operator descriptions
+and labels, and update their native linked-PR field when its binding is available.
 
 Headless jobs freeze the terminal's registered worktree separately from external
 job files and native tool permissions. Unit jobs use their own workspace;
@@ -1105,6 +1115,9 @@ portfolio reasoning waits visibly for an allocated campaign workspace. After
 account isolation, restore only the terminal context whose host row, launch record
 and process ancestry match this worker. Native harness hooks then register the
 actual session; no model output or display title manufactures that identity.
+Headless titles show their own hcom binding as pending until observed; they never
+borrow a parent coding worker's name. Their ephemeral display links can refresh
+without changing frozen job input, workspace binding or permissions.
 Managed tags use the host's lowercase representation while retaining full group
 identity in the campaign record.
 
@@ -1252,6 +1265,18 @@ completion/authority/publication; the other covers runtime wiring, harness/hando
 and throughput. Substantive later changes invalidate affected evidence. Report
 disabled hosted Actions and unrun platform gates accurately; do not enable
 repository settings or claim CI success implicitly.
+
+The operator follow-up must distinguish route availability from messageability.
+TeamRouter capacity observations do not establish execution through its wrapper;
+optional hcom observation does not establish enrollment or a receive loop. Before
+claiming every worker and reasoning job can receive outside-agent check-ins,
+qualify each selected route's enrollment, exact job/session identity, delivery,
+reply and closing/drain behavior. This universal messaging contract is not yet
+implemented by the headless job path. Carry the configured room into immutable
+headless launch requests without inheriting a parent actor's identity, and show
+unbound identities explicitly. Include an actual delegated check-in in the
+controlled target pilot alongside draft PR creation, main synchronization,
+review/fix/merge, tracking reconciliation and interruption recovery.
 
 ## Required qualification matrix
 

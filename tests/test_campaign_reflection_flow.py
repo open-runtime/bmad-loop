@@ -173,7 +173,7 @@ def test_reflection_projects_enabled_tasks_through_normal_flow(flow):
     )
     result = reflect(snapshot, unit, claim, provider=provider, mux=mux, run_directories=(run_dir,))
     assert result["task"] == {"state": "confirmed", "task_id": "task-id"}
-    assert calls[0]["title"] == unit.spec.title
+    assert calls[0]["title"] == "hcom:pending · E:epic · I:pending · PR:pending · Story"
     assert calls[0]["state"] == unit.state.value
 
 
@@ -270,6 +270,75 @@ def test_runtime_reflects_completed_tasks_and_persists_history(flow, tmp_path, m
         status_document(saved)["units"][0]["operator"]["reflection"]["task"]["task_id"]
         == "native-task"
     )
+
+
+def test_runtime_group_refreshes_quiescent_siblings_after_actor_and_pr_discovery(
+    flow, tmp_path, monkeypatch
+):
+    from bmad_loop import campaign_paradev, campaign_reflection_flow
+    from bmad_loop.campaign_runtime import CampaignRuntime
+    from bmad_loop.campaign_store import CampaignStore
+    from bmad_loop.campaign_supervisor import Observation
+
+    snapshot, unit, claim, binding, _, mux = flow
+    unit.claim = dataclasses.replace(claim, quiescent=True)
+    peer = CampaignUnit(
+        dataclasses.replace(unit.spec, id="peer", title="Other story"),
+        claim=dataclasses.replace(claim, unit="peer", launch_id="peer-launch", quiescent=True),
+        bindings={
+            "workspace": binding.path,
+            "branch": binding.branch,
+            "native": dataclasses.asdict(
+                dataclasses.replace(binding, unit_id="peer", workspace_id="peer-workspace")
+            ),
+        },
+    )
+    snapshot.units[peer.id] = peer
+    snapshot.spec = dataclasses.replace(
+        snapshot.spec, paradev=dataclasses.replace(snapshot.spec.paradev, group_by="epic")
+    )
+    runtime = CampaignRuntime(
+        Path(claim.workspace), CampaignStore(tmp_path / "refresh-store"), clock=lambda: 100
+    )
+    for work in snapshot.units.values():
+        work.bindings["reflection"] = {
+            "fingerprint": runtime._reflection_fingerprint(work, snapshot),
+            "observed_at": 100,
+        }
+    assert not [row for row in runtime.observe_workers(snapshot) if row.kind == "reflection"]
+    unit.bindings["issue"] = {"number": 42}
+    unit.bindings["pr"] = {"number": 18}
+    unit.bindings["reflection"]["stage"] = {
+        "launch_id": claim.launch_id,
+        "windows": [{"state": "gone", "hook": {"hcom_name": "tina"}}],
+    }
+    proposed = [row for row in runtime.observe_workers(snapshot) if row.kind == "reflection"]
+    assert {row.unit for row in proposed} == {unit.id, peer.id}
+    captured = []
+    provider = SimpleNamespace(reflect=lambda *args, **kwargs: captured.append(kwargs) or kwargs)
+    monkeypatch.setattr(campaign_paradev, "ParadevWorkspaceProvider", lambda **kwargs: provider)
+    monkeypatch.setattr(runtime, "_native_mux", lambda _: mux)
+    monkeypatch.setattr(
+        runtime,
+        "_lifecycle_bridge",
+        lambda *args, **kwargs: SimpleNamespace(observe=lambda *a, **k: {}),
+    )
+    monkeypatch.setattr(
+        campaign_reflection_flow,
+        "stage_binding",
+        lambda *args, **kwargs: {
+            "state": "observed",
+            "launch_id": peer.claim.launch_id,
+            "windows": [],
+        },
+    )
+    from bmad_loop.campaign_store import add_action
+
+    action = add_action(snapshot, "reflection", peer.id, {})
+    result = runtime.perform(snapshot, action)
+    assert isinstance(result, Observation) and result.state == "confirmed"
+    assert captured[0]["group_title"].startswith("@tina · E:epic · I:#42 · PR:#18")
+    assert captured[0]["title"].startswith("hcom:pending · E:epic · I:pending · PR:pending")
 
 
 def test_runtime_persists_hcom_cursor_with_reflection_disabled(flow, tmp_path, monkeypatch):

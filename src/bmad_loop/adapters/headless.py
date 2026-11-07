@@ -126,6 +126,7 @@ class HeadlessAdapter(CodingCLIAdapter):
             environment={
                 key: value for key, value in spec.env.items() if key.startswith("BMAD_LOOP_")
             },
+            communication_room=spec.env.get("HCOM_DIR", ""),
             presentation=(
                 {
                     "workspace": str(spec.cwd.resolve()),

@@ -24,7 +24,9 @@ def test_registered_terminal_runs_owned_child_with_external_no_tools_state(prepa
 
     runner.mux.new_window = new_window
     titles = []
-    runner.mux.set_display_title = lambda terminal, title: titles.append((terminal, title))
+    runner.mux.set_display_title = lambda terminal, title, **kwargs: titles.append(
+        (terminal, title)
+    )
     path = runner.prepare(
         tmp_path / "external-state",
         request,
@@ -47,7 +49,9 @@ def test_registered_terminal_runs_owned_child_with_external_no_tools_state(prepa
     assert envelope["presentation"] == view
     assert envelope["workspace"] == str(path.parent)
     assert envelope["permissions"] == "no-tools" and envelope["grants"] == {}
-    assert titles == [("1", "campaign · summary · gpt-test")]
+    assert titles == [
+        ("1", f"hcom:pending · E:unbound · I:none · PR:none · {request.id} · summary · gpt-test")
+    ]
     assert result["receipt"]["presentation_status"]["state"] == "confirmed"
 
 
@@ -85,10 +89,60 @@ def test_reasoning_waits_for_workspace_then_freezes_its_native_binding(tmp_path,
     proposal = proposals[0]
     action = add_action(snapshot, proposal.kind, proposal.unit, proposal.payload)
     runtime.control(snapshot, {"kind": "prepare-effect", "action": asdict(action)})
-    expected = {"workspace": str(workspace), "workspace_id": "owned-workspace"}
+    expected = {
+        "workspace": str(workspace),
+        "workspace_id": "owned-workspace",
+        "navigation_prefix": f"hcom:pending · E:{unit.spec.epic} · I:pending · PR:pending",
+    }
     assert job["claim"]["presentation"] == expected
     unit.bindings["native"]["workspace_id"] = "later-workspace"
     assert job["claim"]["presentation"] == expected
+
+
+def test_reasoning_navigation_uses_own_unknown_actor_and_updates_parent_pr(tmp_path, prepared):
+    from bmad_loop.campaign_jobs import request_from_dict
+    from bmad_loop.campaign_reasoning_flow import presentation
+
+    snapshot, _, _, _ = case(tmp_path, prepared, count=1)
+    snapshot.spec = replace(snapshot.spec, paradev=replace(snapshot.spec.paradev, reflect=True))
+    request = request_from_dict(snapshot.jobs["job-0"]["request"])
+    unit = snapshot.units[request.unit]
+    unit.bindings.update(workspace=str(tmp_path), branch="branch")
+    unit.bindings["native"] = asdict(
+        WorkspaceBinding(
+            unit.id,
+            "allocate",
+            "owned-workspace",
+            "project",
+            str(tmp_path),
+            "branch",
+            "common",
+            "git",
+            "epic",
+        )
+    )
+    unit.bindings["hcom"] = {"name": "tina"}
+    unit.bindings["issue"] = {"number": 42}
+    unit.bindings["pr"] = {"number": 18}
+    view = presentation(snapshot, request)
+    assert view["navigation_prefix"] == f"hcom:pending · E:{unit.spec.epic} · I:#42 · PR:#18"
+    runner, _, standalone, candidate, capability = prepared
+    runner.mux.set_display_title = lambda terminal, title, **kwargs: title
+    path = runner.prepare(
+        tmp_path / "title-state",
+        standalone,
+        candidate,
+        capability,
+        launch_id="title-refresh",
+        generation=1,
+        presentation=view,
+    )
+    runner.launch(path)
+    before = path.read_bytes()
+    prefix = view["navigation_prefix"].replace("PR:#18", "PR:#19")
+    status = runner.refresh_presentation(path, prefix)
+    assert status["title"].startswith(prefix + " · ")
+    assert path.read_bytes() == before
 
 
 def test_headless_restores_only_verified_own_native_hook_context(monkeypatch):

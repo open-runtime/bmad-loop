@@ -1143,7 +1143,7 @@ class CampaignRuntime:
                 and unit.bindings.get("native")
                 and not self._pending(snapshot, key, "reflection")
                 and (
-                    reflected.get("fingerprint") != self._reflection_fingerprint(unit)
+                    reflected.get("fingerprint") != self._reflection_fingerprint(unit, snapshot)
                     or (
                         claim
                         and not claim.quiescent
@@ -1815,7 +1815,9 @@ class CampaignRuntime:
         return ParadevMultiplexer(state_dir=self.store.directory(snapshot.id) / "native-transport")
 
     @staticmethod
-    def _reflection_fingerprint(unit) -> str:
+    def _reflection_fingerprint(unit, snapshot=None) -> str:
+        from .campaign_titles import group_navigation, unit_navigation
+
         return hashlib.sha256(
             json.dumps(
                 {
@@ -1823,6 +1825,9 @@ class CampaignRuntime:
                     "hold": dataclasses.asdict(unit.hold) if unit.hold else None,
                     "claim": dataclasses.asdict(unit.claim) if unit.claim else None,
                     "pr": unit.bindings.get("pr"),
+                    "navigation": unit_navigation(unit),
+                    "group_navigation": group_navigation(snapshot, unit) if snapshot else None,
+                    "title": unit.spec.title,
                 },
                 sort_keys=True,
             ).encode()
@@ -1862,7 +1867,7 @@ class CampaignRuntime:
                 "detail": "Lifecycle observation unavailable: " + type(exc).__name__,
             }
         result["observed_at"] = self.clock()
-        result["fingerprint"] = self._reflection_fingerprint(unit)
+        result["fingerprint"] = self._reflection_fingerprint(unit, snapshot)
         payload = json.dumps(result, sort_keys=True)
         history = self.store.directory(snapshot.id) / "reflection-history" / safe_segment(unit.id)
         history.mkdir(parents=True, exist_ok=True)
@@ -2186,6 +2191,7 @@ class CampaignRuntime:
         if snapshot.spec.paradev.reflect:
             from .campaign_paradev import ParadevWorkspaceProvider
             from .campaign_reflection_flow import group_identity
+            from .campaign_titles import navigation_title
 
             provider = ParadevWorkspaceProvider(
                 project_id=snapshot.spec.paradev.project_id,
@@ -2198,6 +2204,7 @@ class CampaignRuntime:
                 branch,
                 unit.spec.title,
                 action_id=action.id,
+                display_name=navigation_title(epics=(unit.spec.epic,), description=unit.spec.title),
                 target=snapshot.spec.target,
                 group=group_identity(unit.spec, snapshot.spec.paradev.group_by),
             )

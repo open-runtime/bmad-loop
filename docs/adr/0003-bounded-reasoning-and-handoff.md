@@ -311,6 +311,14 @@ delivery rather than inferring it from an advertised model window.
 
 ## Incremental handoff and worker replacement
 
+Reasoning and replacement sessions share the campaign navigation-title contract:
+their own observed hcom name, epic, issue and PR precede purpose, role, model and
+descriptive text. Unbound portfolio work is explicit. A headless job never adopts
+its parent worker's hcom identity; absent qualified enrollment remains pending.
+Presentation can refresh GitHub links while frozen job inputs, permissions and
+workspace identity remain unchanged. Campaign-created tabs inherit terminal
+labels; manual tab titles and operator folder precedence remain visible limits.
+
 Build summaries incrementally while work proceeds. Hash sealed source ranges,
 prompt/schema versions, route identities and extraction settings for cache keys.
 New input recomputes the tail and affected ancestors. New authoritative decisions

@@ -396,6 +396,7 @@ class HeadlessRunner:
         permissions="no-tools",
         grants=None,
         environment=None,
+        communication_room="",
         presentation=None,
     ) -> Path:
         return self._prepare(
@@ -408,6 +409,7 @@ class HeadlessRunner:
             permissions=permissions,
             grants=grants,
             environment=environment,
+            communication_room=communication_room,
             presentation=presentation,
         )
 
@@ -457,10 +459,18 @@ class HeadlessRunner:
         permissions: str = "no-tools",
         grants: dict[str, Any] | None = None,
         environment: dict[str, str] | None = None,
+        communication_room: str = "",
         probe: dict[str, Any] | None = None,
         presentation: dict[str, str] | None = None,
     ) -> Path:
         request.validate()
+        if not isinstance(communication_room, str) or (
+            communication_room
+            and (not Path(communication_room).is_absolute() or "\0" in communication_room)
+        ):
+            raise CampaignError("Headless communication room must be an absolute path")
+        if communication_room:
+            communication_room = str(Path(communication_room).resolve())
         if environment and any(
             not key.startswith("BMAD_LOOP_") or not isinstance(value, str)
             for key, value in environment.items()
@@ -476,6 +486,7 @@ class HeadlessRunner:
             writer_probe = probe.get("kind") == "workspace-tools-v1"
             if (
                 environment
+                or communication_room
                 or (
                     writer_probe
                     and (permissions != "workspace-tools" or grants != probe.get("grants"))
@@ -505,7 +516,8 @@ class HeadlessRunner:
         directory = directory.absolute()
         if presentation:
             if (
-                set(presentation) != {"workspace", "workspace_id"}
+                not {"workspace", "workspace_id"}.issubset(presentation)
+                or set(presentation) - {"workspace", "workspace_id", "navigation_prefix"}
                 or not all(isinstance(value, str) and value for value in presentation.values())
                 or not Path(presentation["workspace"]).is_absolute()
                 or is_link_like(Path(presentation["workspace"]))
@@ -549,6 +561,11 @@ class HeadlessRunner:
             + hashlib.sha256(str(directory.parent).encode()).hexdigest()[:16],
             "window_name": "job-" + hashlib.sha256(launch_id.encode()).hexdigest()[:24],
         }
+        if communication_room:
+            # Optional for compatibility with already prepared envelopes. The
+            # selected room is configuration, never inherited actor identity.
+            envelope["communication_room"] = communication_room
+            envelope["communication_room_digest"] = digest(communication_room)
         if probe is not None:
             envelope.update(probe=probe, probe_digest=digest(probe))
         if presentation:
@@ -638,27 +655,49 @@ class HeadlessRunner:
                 {"launch_id": envelope["launch_id"], "generation": envelope["generation"]},
             )
         if presentation:
-            request = envelope["request"]
-            title = " · ".join(
-                " ".join(str(value).split())
-                for value in (
-                    request.get("unit") or "campaign",
-                    request["role"],
-                    candidate.model,
-                )
-            )[:200]
-            status = {"state": "confirmed", "title": title, "terminal_id": native_id}
-            try:
-                getattr(self.mux, "set_display_title")(native_id, title)
-            except (AttributeError, OSError, MultiplexerError) as exc:
-                status.update(state="unavailable", reason=str(exc))
-            write_json(directory / "presentation.json", status)
+            self.refresh_presentation(request_path, presentation.get("navigation_prefix", ""))
         return {
             "state": "running",
             "run_dir": str(directory),
             "native_id": native_id,
             "presentation_status": self._presentation_status(directory),
         }
+
+    def refresh_presentation(self, request_path: Path, navigation_prefix: str = "") -> dict | None:
+        """Refresh display-only links without changing frozen input or borrowing actor names."""
+        from .campaign_titles import navigation_title
+
+        envelope = read_json(request_path)
+        if not envelope.get("presentation"):
+            return None
+        directory = request_path.parent
+        window = read_json(directory / "window.json")
+        if window.get("launch_id") != envelope["launch_id"]:
+            raise CampaignError("Headless title target differs from owned launch")
+        prefix = navigation_prefix or navigation_title(
+            epics=("unbound",), issues=("none",), prs=("none",)
+        )
+        request = envelope["request"]
+        detail = " · ".join(
+            str(value) for value in (request["id"], request["role"], envelope["selection"]["model"])
+        )
+        title = prefix + " · " + " ".join(detail.split())[: max(0, 177 - len(prefix))]
+        status = {
+            "state": "confirmed",
+            "title": title,
+            "requested_title": title,
+            "terminal_id": window["native_id"],
+        }
+        try:
+            displayed = getattr(self.mux, "set_display_title")(
+                window["native_id"], title, navigation_prefix=prefix
+            )
+            if isinstance(displayed, str):
+                status["title"] = displayed
+        except (AttributeError, OSError, MultiplexerError) as exc:
+            status.update(state="unavailable", reason=str(exc))
+        write_json(directory / "presentation.json", status)
+        return status
 
     @staticmethod
     def _presentation_status(directory):

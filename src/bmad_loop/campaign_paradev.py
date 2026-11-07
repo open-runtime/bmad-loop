@@ -264,6 +264,7 @@ class ParadevWorkspaceProvider:
         *,
         group: str = "",
         target: str = "main",
+        display_name: str = "",
     ) -> WorkspaceBinding:
         self.preflight()
         path = self._path(action_id)
@@ -302,6 +303,7 @@ class ParadevWorkspaceProvider:
                     "unit_id": unit_id,
                     "branch": branch,
                     "name": name,
+                    "display_name": display_name or name,
                     "action_id": action_id,
                     "project_id": self.project_id,
                     "tag": tag,
@@ -322,7 +324,7 @@ class ParadevWorkspaceProvider:
                     "--checkout",
                     "worktree",
                     "--name",
-                    name,
+                    intent["display_name"],
                     "--branch",
                     branch,
                     "--base-branch",
@@ -392,6 +394,8 @@ class ParadevWorkspaceProvider:
         attempt: int,
         pr_url: str = "",
         held: bool = False,
+        title: str = "",
+        group_title: str = "",
     ) -> dict:
         """Reconcile one sortable managed folder while retaining operator tags.
 
@@ -420,18 +424,31 @@ class ParadevWorkspaceProvider:
         # Stock Paradev normalizes tag casing on write. Compare the same wire
         # value on readback, while preserving the full display identity below.
         prefix = f"bmad-{campaign_id}-".lower()
-        folder = (prefix + binding.group.replace(",", "-")).lower()
-        tags = [t for t in _tags(row) if not t.startswith(prefix)]
+        campaign_marker = " · bmad-" + hashlib.sha256(campaign_id.encode()).hexdigest()[:8] + "-"
+        suffix = campaign_marker + hashlib.sha256(binding.group.encode()).hexdigest()[:12]
+        folder = (
+            group_title.replace(",", "/") + suffix
+            if group_title
+            else prefix + binding.group.replace(",", "-")
+        ).lower()
+        tags = [
+            t
+            for t in _tags(row)
+            if not t.startswith(prefix)
+            and not re.search(re.escape(campaign_marker) + r"[0-9a-f]{12}$", t)
+        ]
         tags.append(folder)
-        if set(tags) != set(_tags(row)):
+        if set(tags) != set(_tags(row)) or (title and row.get("name") != title):
             # Replacement-only host API: read back and refuse concurrent human
             # changes instead of repeatedly erasing them.
             fresh = next(
                 r for r in self._rows("workspace.list") if r.get("id") == binding.workspace_id
             )
-            if _tags(fresh) != _tags(row):
-                raise ReflectionError("Workspace tags changed during reflection")
+            if _tags(fresh) != _tags(row) or fresh.get("name") != row.get("name"):
+                raise ReflectionError("Workspace name or tags changed during reflection")
             args = ["workspaces", "update", binding.workspace_id, "--local"]
+            if title:
+                args += ["--name", title]
             for tag in tags:
                 args += ["--tag", tag]
             self.host.cli(args)
@@ -440,6 +457,8 @@ class ParadevWorkspaceProvider:
             )
             if set(_tags(observed)) != set(tags):
                 raise ReflectionError("Workspace tag update unconfirmed")
+            if title and observed.get("name") != title:
+                raise ReflectionError("Workspace title update unconfirmed")
         metadata = {
             "schema_version": 1,
             **asdict(binding),
@@ -450,6 +469,7 @@ class ParadevWorkspaceProvider:
             "pr_url": pr_url,
             "held": held,
             "folder": folder,
+            "title": title or row.get("name", ""),
             "competing_tags": [
                 t for t in tags if t != folder and not t.startswith("zz-bmad-action-")
             ],
@@ -467,13 +487,23 @@ class ParadevWorkspaceProvider:
         phase: str,
         attempt: int,
         agent: str,
+        title: str = "",
+        navigation_prefix: str = "",
     ) -> dict:
         row = mux._address(terminal_id)
         if row["workspace"] != binding.workspace_id or Path(row["cwd"]).resolve() != Path(
             binding.path
         ):
             raise ReflectionError("Worker terminal belongs to another workspace")
-        mux.set_display_title(terminal_id, f"{binding.unit_id} · {phase} · {attempt} · {agent}")
+        display_title = title or f"{binding.unit_id} · {phase} · {attempt} · {agent}"
+        if navigation_prefix:
+            updated_title = mux.set_display_title(
+                terminal_id, display_title, navigation_prefix=navigation_prefix
+            )
+            if isinstance(updated_title, str):
+                display_title = updated_title
+        else:
+            mux.set_display_title(terminal_id, display_title)
         pane = mux._ensure_pane(terminal_id, binding.workspace_id)
         native = mux.native_identity(terminal_id)
         record_path = self.root / "terminals" / f"{terminal_id}.json"
@@ -492,6 +522,7 @@ class ParadevWorkspaceProvider:
             "pane_id": pane,
             "phase": phase,
             "attempt": attempt,
+            "title": display_title,
             "native": native,
             "first_observed_at": first,
             "attribution": attribution,
@@ -616,7 +647,7 @@ class ParadevWorkspaceProvider:
     ) -> str:
         """Optional flat task projection with durable create uncertainty.
 
-        Only status and PR link are subsequently managed; operator text and labels
+        Navigation titles and status are managed; operator descriptions and labels
         are never overwritten. Prefer a native held/blocked status by name; when
         unavailable these remain started and workspace hold tags carry the reason.
         """
@@ -735,9 +766,27 @@ class ParadevWorkspaceProvider:
             if not any(row.get("id") == status_id for row in statuses):
                 raise ReflectionError("Configured native task status is absent")
             task_id = intent["task_id"]
-            self.host.cli(
-                ["tasks", "update", task_id, "--tracker", "superset", "--status-id", status_id]
-            )
+            pr_links = [
+                link
+                for link in links
+                if re.fullmatch(r"https://[^/\s]+/[^/\s]+/[^/\s]+/pull/[1-9][0-9]*", link)
+            ]
+            if len(set(pr_links)) > 1:
+                raise ReflectionError("Task has multiple PR targets; automatic linking refused")
+            args = [
+                "tasks",
+                "update",
+                task_id,
+                "--tracker",
+                "superset",
+                "--status-id",
+                status_id,
+                "--title",
+                title,
+            ]
+            if pr_links:
+                args += ["--pr-url", pr_links[0]]
+            self.host.cli(args)
             readback = self.host.cli(
                 [
                     "tasks",
@@ -768,6 +817,10 @@ class ParadevWorkspaceProvider:
                 observed_status = confirmed[0]["status"].get("id")
             if observed_status != status_id:
                 raise ReflectionError("Task status update remains pending or unsupported")
+            if confirmed[0].get("title") != title:
+                raise ReflectionError("Task title update remains pending or unsupported")
+            if pr_links and confirmed[0].get("prUrl", confirmed[0].get("pr_url")) != pr_links[0]:
+                raise ReflectionError("Task PR link update remains pending or unsupported")
             current = next(
                 (
                     row

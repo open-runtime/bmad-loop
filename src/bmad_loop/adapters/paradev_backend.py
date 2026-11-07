@@ -33,6 +33,7 @@ import os
 import subprocess
 import sys
 import time
+import unicodedata
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -818,10 +819,18 @@ class ParadevMultiplexer(TerminalMultiplexer):
             self._write("windows", row)
             self._journal("window-renamed", id=row["id"], session=row["session"], name=name)
 
-    def set_display_title(self, window_id, title):
+    def set_display_title(self, window_id, title, *, navigation_prefix=""):
         """Set a terminal's display title separately from its registry window identity."""
         if not isinstance(title, str) or any(char in title for char in ("\x00", "\r", "\n")):
             raise ParadevTransportError("Paradev display title must be a single line of text")
+        if (
+            not isinstance(navigation_prefix, str)
+            or len(navigation_prefix) > 160
+            or any(unicodedata.category(char).startswith("C") for char in navigation_prefix)
+        ):
+            raise ParadevTransportError(
+                "Paradev navigation prefix must be bounded single-line text"
+            )
         row = self._address(window_id)
         listing = self._rpc("terminal.list", {"workspaceId": row["workspace"]})
         terminals = listing.get("sessions") if isinstance(listing, dict) else None
@@ -840,10 +849,52 @@ class ParadevMultiplexer(TerminalMultiplexer):
             )
         current = matches[0].get("customTitle")
         previous = row.get("managedTitle")
-        if current and current not in (previous, title):
+        pending = row.get("pendingDisplayTitle") or {}
+        operator_suffix = row.get("operatorTitleSuffix", "")
+        if current == pending.get("title"):
+            operator_suffix = pending.get("operator_suffix", "")
+        if navigation_prefix:
+            if current and current not in (previous, title, pending.get("title")):
+                prefixes = (
+                    pending.get("navigation_prefix", ""),
+                    row.get("managedNavigationPrefix", ""),
+                )
+                old_prefix = next(
+                    (
+                        prefix
+                        for prefix in prefixes
+                        if prefix and current.startswith(prefix + " · ")
+                    ),
+                    "",
+                )
+                operator_suffix = (
+                    current.removeprefix(old_prefix + " · ") if old_prefix else current
+                )
+            if operator_suffix:
+                operator_suffix = " ".join(
+                    "".join(
+                        char if not unicodedata.category(char).startswith("C") else " "
+                        for char in operator_suffix
+                    ).split()
+                )
+                room = 180 - len(navigation_prefix) - 3
+                if len(operator_suffix) > room:
+                    operator_suffix = operator_suffix[: room - 1] + "…"
+                title = navigation_prefix + " · " + operator_suffix
+        elif current and current not in (previous, title, pending.get("title")):
             self._journal("title-operator-owned", id=row["id"])
             return  # Preserve the operator's title; stable window identity is unchanged.
         if current != title:
+            with self._lock():
+                record = self._read("windows", row["id"])
+                if record is None:
+                    raise ParadevTransportError("Title target registry disappeared")
+                record["pendingDisplayTitle"] = {
+                    "title": title,
+                    "navigation_prefix": navigation_prefix,
+                    "operator_suffix": operator_suffix,
+                }
+                self._write("windows", record)
             self._rpc(
                 "terminal.rename",
                 {"terminalId": row["id"], "workspaceId": row["workspace"], "title": title},
@@ -860,7 +911,12 @@ class ParadevMultiplexer(TerminalMultiplexer):
             if record is None:
                 raise ParadevTransportError("Title target registry disappeared")
             record["managedTitle"] = title
+            record.pop("pendingDisplayTitle", None)
+            if navigation_prefix:
+                record["managedNavigationPrefix"] = navigation_prefix
+                record["operatorTitleSuffix"] = operator_suffix
             self._write("windows", record)
+        return title
 
     def set_window_option(self, target, option, value):
         try:

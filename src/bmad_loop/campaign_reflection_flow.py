@@ -29,6 +29,7 @@ from .campaign_model import (
     scopes_overlap,
 )
 from .campaign_paradev import ParadevWorkspaceProvider, ReflectionError, WorkspaceBinding
+from .campaign_titles import group_navigation, navigation_title, unit_navigation
 from .platform_util import atomic_write_text, is_link_like, safe_segment
 from .policy import Policy
 from .signals import SessionAttribution, _parse_event, is_session_event
@@ -513,6 +514,13 @@ def reflect(
     binding = dataclasses.replace(
         binding, group=group_identity(unit.spec, snapshot.spec.paradev.group_by)
     )
+    projection = (
+        stage_binding(snapshot, unit, claim, mux=mux, run_directories=run_directories)
+        if claim
+        else {"state": "pending", "windows": []}
+    )
+    navigation = unit_navigation(unit, projection)
+    title = navigation_title(**navigation, description=unit.spec.title)
     metadata = provider.reflect(
         binding,
         campaign_id=snapshot.id,
@@ -521,30 +529,35 @@ def reflect(
         attempt=unit.attempt,
         pr_url=_pr_url(unit),
         held=unit.hold is not None,
+        title=title,
+        group_title=navigation_title(**group_navigation(snapshot, unit, projection=projection)),
     )
     task = {"state": "off"}
     if snapshot.spec.paradev.tasks:
         try:
             links = tuple(
-                value for value in (_pr_url(unit), unit.bindings.get("issue_url", "")) if value
+                value
+                for value in (
+                    _pr_url(unit),
+                    (unit.bindings.get("issue") or {}).get("url", "")
+                    or unit.bindings.get("issue_url", ""),
+                )
+                if value
             )
             task_id = provider.reflect_task(
                 binding,
                 campaign_id=snapshot.id,
-                title=unit.spec.title,
+                title=title,
                 state="held" if unit.hold else unit.state.value,
                 links=links,
             )
             task = {"state": "confirmed", "task_id": task_id}
         except ReflectionError as exc:
             task = {"state": "pending", "detail": str(exc)}
-    projection = (
-        stage_binding(snapshot, unit, claim, mux=mux, run_directories=run_directories)
-        if claim
-        else {"state": "pending", "windows": []}
-    )
     for window in projection["windows"]:
         if window["state"] in ("active", "launching"):
+            terminal_navigation = unit_navigation(unit, {**projection, "windows": [window]})
+            prefix = navigation_title(**terminal_navigation)
             observed = provider.bind_terminal(
                 binding,
                 mux,
@@ -552,6 +565,11 @@ def reflect(
                 phase=window.get("phase", "unknown"),
                 attempt=claim.attempt if claim else unit.attempt,
                 agent=(window.get("native") or {}).get("definitionId") or "pending",
+                title=navigation_title(
+                    **terminal_navigation,
+                    description=f"{unit.spec.title} · {window.get('phase', 'unknown')} · attempt {claim.attempt if claim else unit.attempt}",
+                ),
+                navigation_prefix=prefix,
             )
             window.update(observed)
         elif show_history and claim and claim.quiescent and Path(window["log_path"]).is_file():

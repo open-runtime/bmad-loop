@@ -331,3 +331,54 @@ def test_operator_title_retained_without_renaming_stable_window(setup):
     mux.set_display_title(tid, "unit · review")
     assert host.terminals[tid]["customTitle"] == "owner focus"
     assert mux._address(tid)["name"] == "dev"
+
+
+def test_campaign_navigation_refreshes_with_operator_suffix_on_same_terminal(setup):
+    mux, host, root, _ = setup
+    tid = mux.new_window("run", "dev", root, {}, "fake-worker")
+    mux.set_display_title(tid, "unit · dev")
+    first = "@tina · E:epic · I:#42 · PR:pending"
+    mux.set_display_title(tid, first + " · Story", navigation_prefix=first)
+    assert host.terminals[tid]["customTitle"] == first + " · Story"
+    host.terminals[tid]["customTitle"] = first + " · Owner focus"
+    second = "@nava · E:epic · I:#42 · PR:#18"
+    mux.set_display_title(tid, second + " · Story", navigation_prefix=second)
+    assert host.terminals[tid]["customTitle"] == second + " · Owner focus"
+    third = "@luna · E:epic · I:#42 · PR:#18"
+    mux.set_display_title(tid, third + " · Story", navigation_prefix=third)
+    assert host.terminals[tid]["customTitle"] == third + " · Owner focus"
+    assert mux._address(tid)["name"] == "dev"
+    assert len(host.launches()) == 1
+
+
+def test_campaign_title_lost_ack_cannot_become_an_obsolete_operator_suffix(setup):
+    mux, host, root, _ = setup
+    tid = mux.new_window("run", "dev", root, {}, "fake-worker")
+    original = host.rpc
+
+    def lose_ack(name, data=None, mutate=False):
+        result = original(name, data, mutate)
+        if name == "terminal.rename":
+            host.rpc = original
+            raise OSError("lost rename acknowledgement")
+        return result
+
+    host.rpc = lose_ack
+    first = "@tina · E:epic · I:#42 · PR:pending"
+    with pytest.raises(ParadevTransportError):
+        mux.set_display_title(tid, first + " · Story", navigation_prefix=first)
+    second = "@nava · E:epic · I:#42 · PR:#18"
+    mux.set_display_title(tid, second + " · Story", navigation_prefix=second)
+    assert host.terminals[tid]["customTitle"] == second + " · Story"
+    assert mux._address(tid).get("pendingDisplayTitle") is None
+
+
+def test_campaign_operator_suffix_is_bounded_and_single_line(setup):
+    mux, host, root, _ = setup
+    tid = mux.new_window("run", "dev", root, {}, "fake-worker")
+    host.terminals[tid]["customTitle"] = "Operator\n\x1bnotes " * 100
+    prefix = "@tina · E:epic · I:#42 · PR:#18"
+    mux.set_display_title(tid, prefix + " · Story", navigation_prefix=prefix)
+    assert host.terminals[tid]["customTitle"].startswith(prefix + " · Operator notes")
+    assert len(host.terminals[tid]["customTitle"]) == 180
+    assert "\n" not in host.terminals[tid]["customTitle"]

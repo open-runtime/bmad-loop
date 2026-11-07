@@ -93,6 +93,15 @@ def child_main(path: Path) -> int:
             raise CampaignError("Headless execution grants changed")
         if digest(envelope.get("environment", {})) != envelope["environment_digest"]:
             raise CampaignError("Headless environment changed")
+        communication_room = envelope.get("communication_room", "")
+        if ("communication_room" in envelope or "communication_room_digest" in envelope) and (
+            not isinstance(communication_room, str)
+            or not communication_room
+            or not Path(communication_room).is_absolute()
+            or "\0" in communication_room
+            or digest(communication_room) != envelope.get("communication_room_digest")
+        ):
+            raise CampaignError("Headless communication room changed or is invalid")
         payload = (directory / "input.txt").read_bytes()
         if hashlib.sha256(payload).hexdigest() != envelope["input"]["sha256"]:
             raise CampaignError("Headless input bytes changed")
@@ -131,7 +140,7 @@ def child_main(path: Path) -> int:
                 for key, value in os.environ.items()
                 if not key.startswith(("GH_", "GITHUB_"))
             },
-            communication=CommunicationSpec(),
+            communication=CommunicationSpec(room=communication_room),
         )
         environment.update(envelope.get("environment", {}))
         from .campaign_headless_context import restore

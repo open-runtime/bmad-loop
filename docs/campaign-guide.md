@@ -419,10 +419,27 @@ panes, unavailable host observations and pending native registration do not
 permit a replacement launch. Managed presentation preserves operator layout and
 user-owned workspace content.
 
+Managed workspace, task and terminal titles start with the observed hcom name,
+epic, issue and PR: `@tina · E:epic · I:#42 · PR:#18 · description`. Missing
+bindings display `pending`; no name is inferred from a model or another worker.
+Groups aggregate their members' actors/issues/PRs, with counts when the bounded
+label omits additional members. Stable workspace and group identities survive
+renaming. Actor changes and discovered GitHub links refresh the labels, including
+quiescent group members; native tasks also receive the linked PR URL.
+
+Campaign-created tabs inherit terminal titles. Existing manually titled tabs
+retain their operator label and can mask a terminal's automatic tab title.
+Operator terminal text follows the managed navigation prefix. Native tags are
+lowercased; earlier-sorting operator tags can still determine the sidebar folder,
+which reflection reports as `operator-tag-precedence`.
+
 Headless reasoning jobs use an owned campaign workspace for their terminal while
 keeping their input/output state outside the editing tree. Portfolio jobs wait
 visibly until a workspace is available. Job status includes the terminal and
-workspace IDs; managed titles identify the role and model. Native agent identity
+workspace IDs; navigation fields precede the job identity, role and model. A
+portfolio job has explicit unbound/none work fields. Headless hcom identity stays
+pending until its own registration is observed; a parent's name is never borrowed.
+Native agent identity
 still requires the harness's actual lifecycle hook registration.
 
 `communication.mode = "observe"` enables bounded hcom observations and structured
@@ -430,6 +447,25 @@ sibling context where the installed launch chain supports them. Campaign message
 are advisory and cannot assign work, transfer ownership or establish completion.
 Automatic inbound peer wakeups remain unavailable until their Stop-event closing
 behavior is qualified; preexisting hcom hooks can still deliver messages.
+
+TeamRouter capacity observation does not prove that a process was launched through
+TeamRouter. Execution follows the resolved profile or qualified capability's
+executable and arguments. Select and qualify the installed wrapper when that route
+requires TeamRouter; a direct native binary retains its own authentication path.
+
+Hcom observation defaults to off. Enabling it does not enroll agents or make every
+headless job messageable. A configured room is carried into fresh headless
+requests after inherited actor identities are removed; the selected harness must
+still provide its own enrollment and receive loop. Grok and Muse's bounded
+headless profiles do not claim native hcom hooks. Reasoning jobs do not yet expose
+the same hcom peer binding as hook-backed unit sessions.
+
+An outside agent can inspect or message a registered, listening actor using its
+own identity in the same project room. Verify the current name and session before
+sending a check-in. Queued mail is not proof of delivery to a running model, and a
+one-shot process with no receive loop cannot answer it. Peer messages remain
+advisory; use campaign controls for holds, releases and other controller state
+changes. A delegated agent's message does not itself establish owner approval.
 
 ## Operator controls
 

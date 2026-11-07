@@ -54,6 +54,7 @@ class Host:
                         "worktreePath": str(checkout),
                         "branch": branch if not self.rewrite_branch else "rewritten",
                         "tags": args[args.index("--tag") + 1],
+                        "name": args[args.index("--name") + 1],
                     }
                 )
             if self.lose_reply or self.no_create:
@@ -66,6 +67,8 @@ class Host:
                 row["tags"] = ",".join(tags)
             if "--task-id" in args:
                 row["taskId"] = args[args.index("--task-id") + 1]
+            if "--name" in args:
+                row["name"] = args[args.index("--name") + 1]
             return row
         if args[:2] == ["tasks", "create"]:
             row = {
@@ -84,6 +87,10 @@ class Host:
         if args[:2] == ["tasks", "update"]:
             row = next(item for item in self.tasks if item["id"] == args[2])
             row["statusId"] = args[args.index("--status-id") + 1]
+            if "--title" in args:
+                row["title"] = args[args.index("--title") + 1]
+            if "--pr-url" in args:
+                row["prUrl"] = args[args.index("--pr-url") + 1]
             return {"id": args[2]}
         if args[:3] == ["panes", "open", "file"]:
             return {"opened": True}
@@ -240,6 +247,74 @@ def test_native_tag_normalization_keeps_mixed_case_group_identity(provider):
         == data["folder"]
     )
     assert len(host.calls) == before
+
+
+def test_navigation_titles_refresh_without_changing_allocation_or_operator_tags(provider):
+    p, host = provider
+    first = "hcom:pending · E:epic · I:pending · PR:pending · Story"
+    binding = p.allocate(
+        "unit", "campaign-unit", "Story", "action", group="epic-stable", display_name=first
+    )
+    assert host.workspaces[0]["name"] == first
+    host.workspaces[0]["tags"] += ",factory-desk-side-tasks"
+    initial = p.reflect(
+        binding,
+        campaign_id="Campaign",
+        epic="epic",
+        phase="running",
+        attempt=1,
+        title=first,
+        group_title=first,
+    )
+    title = "@tina · E:epic · I:#42 · PR:#18 · Story"
+    updated = p.reflect(
+        binding,
+        campaign_id="Campaign",
+        epic="epic",
+        phase="reviewing",
+        attempt=1,
+        title=title,
+        group_title=title,
+    )
+    assert host.workspaces[0]["name"] == title
+    assert updated["folder"].startswith("@tina · e:epic · i:#42 · pr:#18")
+    assert initial["folder"] not in host.workspaces[0]["tags"]
+    assert "factory-desk-side-tasks" in host.workspaces[0]["tags"]
+    assert (
+        p.allocate(
+            "unit", "campaign-unit", "Story", "action", group="epic-stable", display_name=title
+        )
+        == binding
+    )
+    assert p.reconcile("action") == binding
+    assert sum(call[:2] == ["workspaces", "create"] for call in host.calls) == 1
+
+
+def test_task_navigation_refresh_retains_description_and_exact_task(provider):
+    p, host = provider
+    binding = p.allocate("unit", "campaign-unit", "Story", "action")
+    task = p.reflect_task(
+        binding,
+        campaign_id="campaign",
+        title="hcom:pending · E:epic · I:pending · PR:pending",
+        state="running",
+    )
+    host.tasks[0]["description"] += "\nOwner's steering note"
+    title = "@nava · E:epic · I:#42 · PR:#18"
+    assert (
+        p.reflect_task(
+            binding,
+            campaign_id="campaign",
+            title=title,
+            state="running",
+            links=("https://github.com/owner/repo/pull/18",),
+        )
+        == task
+    )
+    assert host.tasks[0]["title"] == title
+    assert host.tasks[0]["prUrl"] == "https://github.com/owner/repo/pull/18"
+    assert host.tasks[0]["description"].endswith("Owner's steering note")
+    assert len(host.tasks) == 1
 
 
 def test_optional_task_explicit_tracker_preserves_human_text(provider):

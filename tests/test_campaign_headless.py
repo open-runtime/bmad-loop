@@ -229,6 +229,112 @@ def test_complete_input_arrives_on_stdin_and_completion_requires_quiescence(prep
     assert len(runner.mux.processes) == 1
 
 
+@pytest.mark.parametrize("configured", [False, True])
+def test_headless_room_is_explicit_and_inherited_actor_identity_is_removed(
+    prepared, tmp_path, monkeypatch, configured
+):
+    runner, _, request, candidate, cap = prepared
+    script = tmp_path / "native-environment.py"
+    script.write_text("""import hashlib,json,os,sys
+payload=sys.stdin.buffer.read()
+keys=('HCOM_DIR','HCOM_INSTANCE_NAME','HCOM_PROCESS_ID','HCOM_NAME','HCOM_LAUNCHED','SUPERSET_TERMINAL_ID','BMAD_LOOP_TASK_ID')
+print(json.dumps({'type':'system','model':'gpt-test','session_id':'room-native'}))
+print(json.dumps({'type':'result','structured_output':{'digest':hashlib.sha256(payload).hexdigest(),'bytes':len(payload),'environment':{key:os.environ[key] for key in keys if key in os.environ}},'usage':{'input_tokens':12,'output_tokens':8}}))
+""")
+    cap = fixture_capability(
+        tmp_path,
+        {
+            **cap,
+            "argv": [cap["binary"], str(script)],
+            "dependencies": [{"path": str(script), "sha256": file_digest(script)}],
+        },
+    )
+    room = str(tmp_path / "campaign-room") if configured else ""
+    for key in ("HCOM_DIR", "HCOM_INSTANCE_NAME", "HCOM_PROCESS_ID", "HCOM_NAME", "HCOM_LAUNCHED"):
+        monkeypatch.setenv(key, "inherited-parent")
+    monkeypatch.setenv("SUPERSET_TERMINAL_ID", "parent-terminal")
+    path = runner.prepare(
+        tmp_path / "room-job",
+        request,
+        candidate,
+        cap,
+        launch_id="room-launch",
+        generation=1,
+        communication_room=room,
+        environment={"BMAD_LOOP_TASK_ID": "owned-task"},
+    )
+    runner.launch(path)
+    receipt = finish(runner, path)
+    assert receipt["outcome"] == "completed", receipt
+    assert receipt["result"]["environment"] == {
+        "BMAD_LOOP_TASK_ID": "owned-task",
+        **({"HCOM_DIR": str(Path(room).resolve())} if configured else {}),
+    }
+    # Empty rooms retain the preexisting wire shape and do not infer a parent room.
+    assert ("communication_room" in read_json(path)) is configured
+
+
+@pytest.mark.parametrize("tamper", ["replace", "remove"])
+def test_headless_room_is_frozen_and_validated_before_native_launch(prepared, tmp_path, tamper):
+    from bmad_loop.campaign_headless_worker import child_main
+
+    runner, _, request, candidate, cap = prepared
+    directory = tmp_path / "room-job"
+    room = str(tmp_path / "room")
+    with pytest.raises(CampaignError, match="absolute path"):
+        runner.prepare(
+            directory,
+            request,
+            candidate,
+            cap,
+            launch_id="room",
+            generation=1,
+            communication_room="relative-room",
+        )
+    path = runner.prepare(
+        directory,
+        request,
+        candidate,
+        cap,
+        launch_id="room",
+        generation=1,
+        communication_room=room,
+    )
+    assert (
+        runner.prepare(
+            directory,
+            request,
+            candidate,
+            cap,
+            launch_id="room",
+            generation=1,
+            communication_room=room,
+        )
+        == path
+    )
+    with pytest.raises(CampaignError, match="immutable"):
+        runner.prepare(
+            directory,
+            request,
+            candidate,
+            cap,
+            launch_id="room",
+            generation=1,
+            communication_room=str(tmp_path / "other-room"),
+        )
+    raw = read_json(path)
+    if tamper == "replace":
+        raw["communication_room"] = str(tmp_path / "tampered-room")
+    else:
+        raw.pop("communication_room")
+    write_json(path, raw)
+    write_json(directory / "go.json", {"launch_id": "room", "generation": 1})
+    assert child_main(path) == 1
+    receipt = read_json(directory / "receipt.json")
+    assert "communication room changed" in receipt["reason"]
+    assert receipt["processes_quiescent"] and not receipt["input_complete"]
+
+
 def test_lost_launch_ack_adopts_the_same_window(prepared):
     runner, path, *_ = prepared
     runner.mux.drop_ack = True
@@ -492,6 +598,7 @@ nonce=match[1]""",
         model=candidate.model,
         effort=candidate.effort,
         timeout_s=15,
+        env={"HCOM_DIR": str(tmp_path / "execution-room"), "HCOM_INSTANCE_NAME": "parent"},
     )
     result = adapter.run(spec)
     assert result.status == "completed"
@@ -501,6 +608,9 @@ nonce=match[1]""",
     assert adapter.read_usage(result).models == (candidate.model,)
     path = adapter.requests[spec.task_id]
     assert read_json(path.parent / "grants.json") == grants
+    envelope = read_json(path)
+    assert envelope["communication_room"] == str((tmp_path / "execution-room").resolve())
+    assert "HCOM_INSTANCE_NAME" not in envelope["environment"]
 
 
 def test_execution_capability_must_consume_scope_grants(prepared):

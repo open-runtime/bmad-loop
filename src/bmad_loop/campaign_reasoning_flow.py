@@ -23,6 +23,7 @@ def presentation(snapshot, request):
     if not snapshot.spec.paradev.reflect:
         return None
     from .campaign_reflection_flow import workspace_binding
+    from .campaign_titles import navigation_title, unit_navigation
 
     units = (
         [snapshot.units[request.unit]]
@@ -34,7 +35,21 @@ def presentation(snapshot, request):
     for unit in units:
         if unit.bindings.get("native"):
             binding = workspace_binding(unit)
-            return {"workspace": binding.path, "workspace_id": binding.workspace_id}
+            navigation = (
+                {**unit_navigation(unit), "names": ()}
+                if request.unit in snapshot.units
+                else {"epics": ("unbound",), "issues": ("none",), "prs": ("none",)}
+            )
+            return {
+                "workspace": binding.path,
+                "workspace_id": binding.workspace_id,
+                "navigation_prefix": navigation_title(
+                    names=navigation.get("names", ()),
+                    epics=navigation.get("epics", ()),
+                    issues=navigation.get("issues", ()),
+                    prs=navigation.get("prs", ()),
+                ),
+            }
     return None
 
 
@@ -299,6 +314,7 @@ def perform(runtime, snapshot, action, *, reconcile: bool = False) -> Observatio
                     capability,
                     launch_id=claim["launch_id"],
                     generation=claim["generation"],
+                    communication_room=snapshot.spec.communication.room,
                     presentation=claim.get("presentation"),
                 )
             except (CampaignError, OSError, ValueError) as exc:
@@ -328,6 +344,12 @@ def perform(runtime, snapshot, action, *, reconcile: bool = False) -> Observatio
         observed = runner.observe(path)
     else:
         raise CampaignError("unsupported reasoning effect")
+    if observed["state"] == "running" and claim.get("presentation"):
+        view = presentation(snapshot, request)
+        if view is not None:
+            observed["presentation_status"] = runner.refresh_presentation(
+                path, view["navigation_prefix"]
+            )
     if observed["state"] == "unknown":
         return Observation(
             "unknown",

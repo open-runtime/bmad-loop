@@ -5,6 +5,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 from test_campaign_core import make_snapshot
@@ -134,6 +135,31 @@ def test_terminal_jobs_leave_hot_authority_but_remain_queryable(tmp_path, prepar
     restored.jobs["job-0"]["state"] = "proposed"
     with pytest.raises(CampaignError, match="reactivate"):
         driver.store.save(restored, restored.revision)
+
+
+def test_reasoning_launch_preserves_configured_room_without_forwarding_actor_identity(
+    tmp_path, prepared
+):
+    from bmad_loop.campaign_headless import read_json
+    from bmad_loop.campaign_reasoning_flow import perform
+
+    room = str(tmp_path / "reasoning-room")
+
+    def configure(snapshot):
+        snapshot.spec = replace(
+            snapshot.spec,
+            communication=replace(snapshot.spec.communication, mode="observe", room=room),
+        )
+
+    snapshot, driver, supervisor, _ = case(tmp_path, prepared, count=1, configure=configure)
+    snapshot = supervisor._queue(snapshot, driver.observe_workers(snapshot))
+    action = next(action for action in snapshot.outbox if action.kind == "reasoning-launch")
+    observed = perform(driver, snapshot, action)
+    assert observed.state == "confirmed"
+    path = Path(snapshot.jobs["job-0"]["claim"]["run_dir"]) / "request.json"
+    envelope = read_json(path)
+    assert envelope["communication_room"] == room
+    assert envelope["environment"] == {}
 
 
 def test_restart_adopts_prepared_binding_and_launches_real_child(tmp_path, prepared, monkeypatch):
