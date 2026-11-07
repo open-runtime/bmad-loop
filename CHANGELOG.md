@@ -10,6 +10,7 @@ breaking changes may land in a minor release.
 ### Added
 
 - Add durable reasoning jobs, qualified headless adapters and portable transcript handoff contracts.
+- Prepare reusable native-history summaries during active work with bounded background jobs.
 - Bind required acceptance evidence to exact candidates and recruit configured GitHub reviewers.
 - Expose campaign job history, retained terminal history and scoped operator evidence.
 

@@ -210,6 +210,10 @@ def current(
     coordinates = request.coordinates
     if coordinates["config_revision"] != snapshot.config_revision:
         return False
+    if coordinates.get("history_warmup"):
+        from .campaign_history_warmup import current as prefix_current
+
+        return prefix_current(snapshot, request)
     if request.purpose in {"handoff_map", "handoff_reduce"} and coordinates.get("handoff_id"):
         unit = snapshot.units.get(request.unit)
         handoff = unit.evidence.get("handoff", {}) if unit else {}

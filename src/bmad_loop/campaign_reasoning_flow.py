@@ -67,7 +67,12 @@ def proposals(runtime, snapshot) -> tuple[Proposal, ...]:
     )
     selected: list[tuple[str, RoleCandidate]] = []
     for job_id, row in sorted(
-        snapshot.jobs.items(), key=lambda item: (item[1]["request"]["created_at"], item[0])
+        snapshot.jobs.items(),
+        key=lambda item: (
+            not item[1]["request"]["required"],
+            item[1]["request"]["created_at"],
+            item[0],
+        ),
     ):
         request = request_from_dict(row["request"])
         if live(row):
@@ -116,6 +121,11 @@ def proposals(runtime, snapshot) -> tuple[Proposal, ...]:
             from .campaign_handoff_flow import job_launch_allowed
 
             if not job_launch_allowed(snapshot, row):
+                continue
+        if request.coordinates.get("history_warmup"):
+            from .campaign_history_warmup import launch_allowed
+
+            if not launch_allowed(snapshot, request):
                 continue
         dependencies = []
         for dependency in request.dependencies:

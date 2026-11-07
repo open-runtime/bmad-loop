@@ -853,6 +853,16 @@ def _maps(runtime, snapshot, unit, value):
         and _job(runtime, snapshot, key)["request"]["coordinates"]["config_revision"]
         == snapshot.config_revision
     )
+    from .campaign_history_warmup import reusable
+
+    warmed, invalidated = reusable(
+        runtime,
+        snapshot,
+        unit,
+        value["capture"]["sources"],
+    )
+    known = {job.id for job, _ in completed}
+    completed = (*completed, *((job, result) for job, result in warmed if job.id not in known))
     planned = plan_remaining_maps(
         events, completed, _budget(candidate, cap), _root(runtime, snapshot, value) / "maps"
     )
@@ -898,7 +908,11 @@ def _maps(runtime, snapshot, unit, value):
                 )
             )
         )
-    return {"requests": jobs, "reuse_jobs": [job.id for job, _ in completed]}
+    return {
+        "requests": jobs,
+        "reuse_jobs": [job.id for job, _ in completed],
+        "invalidated_warmup_jobs": invalidated,
+    }
 
 
 def _reduce(runtime, snapshot, unit, value):
@@ -2025,6 +2039,13 @@ def apply(runtime, snapshot, action, observation):
         "handoff-replan",
         "handoff-audit-replan",
     }:
+        if data.get("invalidated_warmup_jobs"):
+            add_event(
+                snapshot,
+                "handoff-warmup-invalidated",
+                unit=unit.id,
+                jobs=data["invalidated_warmup_jobs"],
+            )
         ids = list(data.get("reuse_jobs", []))
         if action.kind in {"handoff-replan", "handoff-audit-replan"}:
             value["plan_epoch"] = data["plan_epoch"]

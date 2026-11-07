@@ -317,6 +317,26 @@ New input recomputes the tail and affected ancestors. New authoritative decision
 invalidate affected interpretations even when old raw chunks remain reusable.
 An interrupted reduction resumes completed jobs instead of replaying the pipeline.
 
+The runtime prepares optional extraction jobs from exact hook-bound native
+transcript prefixes while the owned worker remains active. Observation starts
+after a debounce interval, runs outside the coordinator tick, and seals only
+immutable prefixes. Unchanged or small-growth histories reuse the private index;
+map preparation is paged and admitted behind required reasoning work under the
+same resource limits. The hot unit retains a bounded pending-job list and a
+hash-bound index reference. Missing bindings, unavailable qualified routes and
+coverage bounds appear in operator diagnostics without holding the coding unit.
+
+This live precomputation applies to trusted native hook bindings, independently
+of Paradev reflection. Active managed-headless streams do not yet have a qualified
+live export; their receipt-bound history remains available after quiescence.
+Native-store import is optional enrichment, and no native-store writer is claimed.
+Final capture verifies each reused raw prefix and every input fragment against
+current source records, including after transcript truncation or rewrite. It also
+checks the original approved route and extraction contract, so provider capacity
+loss does not discard valid completed maps. Invalid optional cache entries are
+reported and re-extracted. Fresh owner-constraint audits and writer fencing remain
+mandatory before continuation; summaries never settle acceptance or delivery.
+
 Handoff correctness does not depend on the source provider answering one final
 prompt. Provide a mechanical packet of current state, exact obligations, available
 summaries and unsummarized tail when deeper reduction is unavailable. Expose that
@@ -363,8 +383,8 @@ contract is reviewed:
    capability tests; reuse campaign supervisor/worker seams without unit-claim abuse.
 2. Transcript readers, immutable source/obligation indexes, chunk planning, map/reduce
    schemas, cache/retrieval and destination-packet assembly.
-3. Execution route pools, typed quota receipts, fenced replacement, native import
-   adapters, attribution and hcom/Paradev lineage.
+3. Execution route pools, typed quota receipts, fenced replacement, portable handoff
+   adapters with optional native-import enrichment, attribution and hcom/Paradev lineage.
 4. Integrate semantic routing, mass triage, graph/priority proposals and reports;
    retain existing graph publication and canonical-source write APIs.
 

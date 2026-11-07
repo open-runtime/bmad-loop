@@ -101,6 +101,23 @@ def diagnostics(unit) -> dict:
                     if field in nested
                 }
         output[name] = projected
+    warmup = unit.evidence.get("history_warmup", {})
+    output["history_warmup"] = {
+        key: scrub_text(value) if isinstance(value, str) else value
+        for key, value in warmup.items()
+        if key
+        in {
+            "state",
+            "detail",
+            "checked_at",
+            "source_count",
+            "event_count",
+            "reusable_jobs",
+            "invalidated_jobs",
+            "deferred_large_events",
+            "backlog",
+        }
+    }
     return output
 
 

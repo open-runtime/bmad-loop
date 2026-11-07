@@ -450,6 +450,21 @@ bmad-loop campaign resume CAMPAIGN_ID --json
 bmad-loop campaign attach CAMPAIGN_ID --unit QUALIFIED_UNIT --role execution
 ```
 
+When reasoning and `handoff_map` are enabled with a qualified summarization route,
+live sessions with exact hook-backed transcripts prepare optional prefix summaries.
+Warmup starts after 60 seconds, revisits growth of at least 64 KiB, and prepares at
+most four maps per observation. Required reasoning jobs have admission priority.
+`status --json` exposes `units[].operator.history_warmup` with availability, coverage and
+failure details; `jobs` retains the map receipts. Missing bindings or routes do not
+hold coding work. Active managed-headless streams wait for their quiescent export.
+
+These summaries grant no writer lease. Handoff rechecks cached raw prefixes,
+source fragments and their original qualified extraction contract against final
+capture, then audits the current owner constraints before replacing a worker.
+Changed or corrupt optional cache entries are re-extracted. Complete native-store
+migration is not provided; portable context and source retrieval preserve the
+handoff contract.
+
 Controls append durable requests; the coordinator is the single state writer.
 Stop closes admissions and drains current bounded stages by default. Explicit
 termination uses owned process controls and retains unresolved claims. Release

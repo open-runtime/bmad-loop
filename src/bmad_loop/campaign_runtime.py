@@ -1117,6 +1117,7 @@ class CampaignRuntime:
     @capability_admission
     def observe_workers(self, snapshot: CampaignSnapshot) -> tuple[Proposal, ...]:
         from .campaign_handoff_flow import proposals as handoff_proposals
+        from .campaign_history_warmup import proposals as warmup_proposals
         from .campaign_reasoning_flow import proposals as reasoning_proposals
         from .campaign_reasoning_plan import proposals as semantic_proposals
 
@@ -1124,6 +1125,7 @@ class CampaignRuntime:
             list(reasoning_proposals(self, snapshot))
             + list(semantic_proposals(self, snapshot))
             + list(handoff_proposals(self, snapshot))
+            + list(warmup_proposals(self, snapshot))
         )
         if (
             snapshot.spec.communication.mode == "observe"
@@ -1446,6 +1448,10 @@ class CampaignRuntime:
     def perform(self, snapshot: CampaignSnapshot, action) -> Observation:
         if action.generation != snapshot.generation:
             return Observation("rejected", reason="stale effect generation")
+        if action.kind == "history-warmup":
+            from .campaign_history_warmup import perform
+
+            return perform(self, snapshot, action)
         if action.kind.startswith("handoff-"):
             from .campaign_handoff_flow import perform
 
@@ -1492,6 +1498,10 @@ class CampaignRuntime:
         return handler(snapshot, action)
 
     def reconcile_action(self, snapshot: CampaignSnapshot, action) -> Observation:
+        if action.kind == "history-warmup":
+            from .campaign_history_warmup import perform
+
+            return perform(self, snapshot, action)
         if action.kind.startswith("handoff-"):
             from .campaign_handoff_flow import perform
 
@@ -4097,6 +4107,11 @@ class CampaignRuntime:
                 )
 
     def _apply_effect(self, snapshot, action, observation: Observation) -> None:
+        if action.kind == "history-warmup":
+            from .campaign_history_warmup import apply
+
+            apply(self, snapshot, action, observation)
+            return
         if action.kind.startswith("handoff-"):
             from .campaign_handoff_flow import apply
 
