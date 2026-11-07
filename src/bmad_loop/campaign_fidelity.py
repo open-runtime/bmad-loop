@@ -10,6 +10,8 @@ from pathlib import Path
 from .campaign_jobs import digest
 from .campaign_model import CampaignError
 
+HISTORY_AUDIT_PROMPT_VERSION = "history-audit-v3"
+
 PURPOSES = {
     "handoff_map",
     "handoff_reduce",
@@ -40,10 +42,46 @@ def route_binding(cap, purpose, candidate=None):
     }
 
 
-def validate(cap, audit_schema, *, candidate=None, purpose="handoff_audit", contract=""):
-    from .campaign_headless import file_digest, provider_family, read_json
+def semantic_contract(purpose, audit_schema, contract=""):
+    """Return only the schemas, readers and prompts this operation actually uses.
+
+    Generic qualification must bind this digest in the independent native result,
+    not merely in the editable outer manifest. Finite contracts retain their
+    separately earned schema digest protocol; unused history headers do not apply.
+    """
     from .campaign_summary import EXTRACT_PROMPT_VERSION, REDUCE_PROMPT_VERSION, summary_schema
     from .campaign_transcripts import READER_VERSIONS
+
+    result = {"schema_version": 1, "purpose": purpose}
+    if contract == "constraints-v1" and purpose in {"constraint_reduce", "constraint_audit"}:
+        from .campaign_handoff_constraints import AUDIT_SCHEMA, REDUCTION_SCHEMA
+
+        return {
+            **result,
+            "contract": contract,
+            "schemas_digest": digest([REDUCTION_SCHEMA, AUDIT_SCHEMA]),
+        }
+    if contract == "recovery-v1" and purpose in {"recovery_extract", "recovery_audit"}:
+        from .campaign_handoff_recovery import AUDIT_SCHEMA, SCHEMA
+
+        return {**result, "contract": contract, "schemas_digest": digest([SCHEMA, AUDIT_SCHEMA])}
+    if contract or purpose not in {"handoff_map", "handoff_reduce", "handoff_audit"}:
+        raise CampaignError("Unknown semantic fidelity purpose/contract combination")
+    result.update(
+        reader_versions=dict(READER_VERSIONS), summary_schema_digest=digest(summary_schema())
+    )
+    result["prompt_version"] = {
+        "handoff_map": EXTRACT_PROMPT_VERSION,
+        "handoff_reduce": REDUCE_PROMPT_VERSION,
+        "handoff_audit": HISTORY_AUDIT_PROMPT_VERSION,
+    }[purpose]
+    if purpose == "handoff_audit":
+        result["audit_schema_digest"] = digest(audit_schema)
+    return result
+
+
+def validate(cap, audit_schema, *, candidate=None, purpose="handoff_audit", contract=""):
+    from .campaign_headless import file_digest, provider_family, read_json
 
     binding = cap.get("semantic_qualification") or {}
     if not binding:
@@ -58,29 +96,42 @@ def validate(cap, audit_schema, *, candidate=None, purpose="handoff_audit", cont
     if not isinstance(proofs, list) or not 1 <= len(proofs) <= 32:
         raise CampaignError("Semantic handoff fidelity proof list is invalid")
     target = route_binding(cap, purpose, candidate)
+    actual_contract = semantic_contract(purpose, audit_schema, contract)
     expected = {
         "schema_version": 2,
-        "reader_versions": READER_VERSIONS,
-        "summary_schema_digest": digest(summary_schema()),
-        "audit_schema_digest": digest(audit_schema),
-        "prompt_versions": [EXTRACT_PROMPT_VERSION, REDUCE_PROMPT_VERSION],
         "structural_pass": True,  # nosec B105: validation outcome, not a credential.
     }
-    if contract == "constraints-v1":
-        from .campaign_handoff_constraints import AUDIT_SCHEMA, REDUCTION_SCHEMA
-
-        expected["constraint_schemas_digest"] = digest([REDUCTION_SCHEMA, AUDIT_SCHEMA])
-    elif contract == "recovery-v1":
-        from .campaign_handoff_recovery import AUDIT_SCHEMA, SCHEMA
-
-        expected["recovery_schemas_digest"] = digest([SCHEMA, AUDIT_SCHEMA])
-    elif contract:
-        raise CampaignError("Unknown semantic fidelity contract")
+    if contract:
+        field = (
+            "constraint_schemas_digest"
+            if contract == "constraints-v1"
+            else "recovery_schemas_digest"
+        )
+        expected[field] = actual_contract["schemas_digest"]
+    else:
+        expected.update(
+            {key: actual_contract[key] for key in ("reader_versions", "summary_schema_digest")}
+        )
+        if purpose == "handoff_audit":
+            expected.update(
+                audit_schema_digest=actual_contract["audit_schema_digest"],
+                audit_prompt_version=HISTORY_AUDIT_PROMPT_VERSION,
+            )
 
     failures = []
     for proof in proofs:
         try:
-            _proof(proof, cap, target, expected, contract, file_digest, read_json, provider_family)
+            _proof(
+                proof,
+                cap,
+                target,
+                expected,
+                contract,
+                actual_contract,
+                file_digest,
+                read_json,
+                provider_family,
+            )
             return binding
         except (CampaignError, OSError, ValueError, TypeError, KeyError) as exc:
             failures.append(str(exc))
@@ -89,7 +140,9 @@ def validate(cap, audit_schema, *, candidate=None, purpose="handoff_audit", cont
     )
 
 
-def _proof(proof, cap, target, expected, contract, file_digest, read_json, provider_family):
+def _proof(
+    proof, cap, target, expected, contract, actual_contract, file_digest, read_json, provider_family
+):
     if not isinstance(proof, dict) or not proof.get("path"):
         raise CampaignError("Semantic handoff fidelity qualification is missing")
     path = Path(proof["path"])
@@ -121,6 +174,11 @@ def _proof(proof, cap, target, expected, contract, file_digest, read_json, provi
     receipt = read_json(Path(independent["native_receipt_path"]))
     observed = provider_family(receipt.get("observed_model", ""))
     result = receipt.get("result") or {}
+    if (
+        "audit_prompt_version" in expected
+        and result.get("audit_prompt_version") != expected["audit_prompt_version"]
+    ):
+        raise CampaignError("Independent native fidelity receipt did not review this audit prompt")
     if contract:
         field = (
             "constraint_schemas_digest"
@@ -132,6 +190,12 @@ def _proof(proof, cap, target, expected, contract, file_digest, read_json, provi
     if result.get("route_bindings_digest") != digest(bindings):
         raise CampaignError(
             "Independent native fidelity receipt did not review these purposes and efforts"
+        )
+    if not contract and result.get("semantic_contract_digests", {}).get(
+        target["purpose"]
+    ) != digest(actual_contract):
+        raise CampaignError(
+            "Independent native fidelity receipt did not review this semantic contract"
         )
     if (
         receipt.get("outcome") != "completed"

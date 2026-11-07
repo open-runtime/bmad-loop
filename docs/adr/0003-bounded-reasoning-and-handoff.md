@@ -278,6 +278,10 @@ available independently of every lossy summary or native import.
 5. Reduce by workstream and chronology. Each reducer receives relevant source
    references and ledger entries as well as child summaries. Retain a summary tree
    for targeted retrieval; do not discard intermediate artifacts after reduction.
+   Packet indexes retain every validated summary node, its immutable input and
+   semantic child identities. Retry dependencies remain separate provenance.
+   Final summaries omitted while fitting initial or audited context stay retrievable;
+   bounded omission indexes distinguish omitted finals from intermediate nodes.
 6. Assemble a concise working brief, the exact active obligations and latest owner
    direction, current repository/PR state and a bounded detailed-history packet.
    Size it to the destination's effective context after instructions, tools,
@@ -409,6 +413,19 @@ histories. Measure input/output work, latency, failure recovery, delivered
 throughput and working-context size before advertising scale. Original merge,
 exact-install and selected REM-delivery gates still apply.
 
+Parent tracking closes independent epics concurrently, with at most sixteen
+pending parent scopes and the shared I/O bound. Each scope keeps its own durable
+mutation intent and identity fence; initiatives wait for epic confirmations and
+an aggregate pass still precedes campaign completion. Fresh graph, intake and
+native-child checks apply before writes and retries. A temporary intake wait
+retains its intent, while a changed graph invalidates the old scope authority.
+
+Capability validation is memoized only within one synchronous admission pass,
+using the complete capability, candidate, permission mode and validation mode.
+Repeated routes share successful or failed observations in that pass. Preparation
+and launch always revalidate executable and evidence bytes, and no cached result
+survives the pass or substitutes filesystem timestamps for content hashes.
+
 ## Implemented semantic and operator boundaries
 
 The campaign runtime now schedules `semantic-plan` effects from changed canonical
@@ -485,6 +502,30 @@ An explicit operator-selected route remains explicit. Rerouting reuses an audite
 packet when its bytes fit the new destination; a smaller destination returns to
 assembly and bounded reduction before any successor acquires the write claim.
 
+History audit covers complete native-owner source spans, not just message IDs or
+model-selected quotations. The controller partitions each message into contiguous
+spans of at most 512 characters, binds offsets and UTF-8 hashes, and reconstructs
+every exact quotation locally. Audit batches reserve input and mandatory output
+coverage capacity. Each span occurs exactly once in its result; packet assembly
+also checks coverage against the complete captured native-owner history. Compound
+requests and requirements adopted from quoted plans therefore remain available
+even when an interpretation summarizes only part of a message.
+
+Both current and contextual spans remain in the successor's constraint view and
+its independently audited compression tree. A status question need not create an
+approval hold, but classifying it as context cannot erase its text. Historical
+exclusion requires a separate authenticated, scope-specific supersession or
+canonical completion proof for the affected spans. No current evidence producer
+establishes that binding, so the shipped audit schema offers no historical
+exclusion and requires an empty exclusion-evidence reference. Raw later messages,
+assistant completion claims and model-selected quotations cannot manufacture this
+proof. Semantic qualification includes compound/adopted requirements and omission
+or unsupported-exclusion mutations. The audit prompt version is history-audit-v3.
+The frozen continuation context binds this prompt version and schema digest.
+Persisted captures or ready packets from an older contract cannot resume a writer;
+the normal refresh path rebuilds their audit while retaining original artifacts.
+Launch preparation and claim adoption independently enforce that freshness.
+
 Current constraints that exceed the working packet budget use additional bounded
 reduction jobs. Each reduction retains a source-linked tree and receives an
 independent audit of its complete immediate input. Exact original quotations and
@@ -523,9 +564,25 @@ earned transport-evidence hash. A capability may reference several independent
 proofs for history extraction, reduction, audit and the separate constraint or
 recovery operations. The native independent result must bind the complete
 route-purpose list digest as well as the corpus and any additional contract
-schemas. Editing a manifest cannot extend an existing receipt to another effort
+schemas. Finite constraint/recovery proofs bind their own used schemas; a change
+to the unrelated history-audit schema does not relabel or invalidate those native
+receipts. Editing a manifest cannot extend an existing receipt to another effort
 or purpose. Older generic semantic proofs require requalification; verified
 version-1 native transport canaries retain their separate supported read path.
+The independent native result also carries `semantic_contract_digests`, keyed by
+operation. Each digest binds the actual readers, summary schema and that
+operation's prompt; history audit additionally binds its audit schema. Extraction
+and reduction do not depend on the unused audit schema or each other's prompt.
+Editing only a manifest and its outer hash cannot requalify a native result for
+changed code contracts. Older generic receipts without this attestation require
+renewed independent qualification. Existing finite constraint/recovery receipts
+retain their separately attested `contract_schema_digests` protocol and do not
+inherit unused generic reader, summary or prompt requirements.
+
+Generic history-auditor evidence also binds the audit prompt version in both the
+proof and independent native result. Clear unfinished work, resolved historical
+questions and rejected untrusted claims are not unresolved owner decisions;
+missing current authority or conflicting current constraints still block continuation.
 Automatic map/reduce admission applies these semantic gates before launching,
 and completed result reuse retains its original source and route provenance.
 
@@ -640,6 +697,21 @@ the controller extracts the original text instead of trusting reconstructed quot
 strings. A model-result rejection permits two immutable corrective attempts and
 retains the rejected receipts. Source corruption or uncertain native lifecycle is
 not a semantic retry.
+
+Reducer presentation exposes native citations and exact owner-quote references,
+with child identities retained for coverage. Internal fact IDs remain in the
+hash-bound original artifact rather than competing with eligible citations in
+the model input. Existing frozen trial requests remain immutable. The operator
+trial can reconcile an exhausted legacy reducer through one recorded presentation
+revision, retaining all three prior attempts and allowing one additional native
+attempt. This does not reset campaign lifetime retry counters or reinterpret an
+old result against a new schema. Native schema rejections retain their session
+identity and usage while remaining failed results.
+An isolated native output-token excess with a complete structured result and
+quiescent lifecycle can consume the remaining model-result correction budget.
+The original receipt remains a limit failure; concurrent wall, wire, turn,
+provider or incomplete-result failures are ineligible. Final stream sizes and
+the whole-job deadline are checked again after owned descendants drain.
 
 Explicit trial reuse follows only retained bindings and revalidates each source,
 native receipt and earned route qualification. Map and reducer routes may use

@@ -25,7 +25,6 @@ from bmad_loop.campaign_model import (
     WorkerClaim,
 )
 from bmad_loop.campaign_store import CampaignStore
-from bmad_loop.campaign_transcripts import HistorySnapshot, load_events
 
 
 @pytest.fixture
@@ -47,7 +46,12 @@ def campaign(prepared, project, tmp_path):
             value = fixture_writer_capability(tmp_path, value, candidate, input_bytes=100000)
         else:
             value = fixture_capability(tmp_path, value, candidate)
-        from bmad_loop.campaign_fidelity import PURPOSES, route_binding
+        from bmad_loop.campaign_fidelity import (
+            HISTORY_AUDIT_PROMPT_VERSION,
+            PURPOSES,
+            route_binding,
+            semantic_contract,
+        )
         from bmad_loop.campaign_headless import file_digest, write_json
         from bmad_loop.campaign_summary import (
             EXTRACT_PROMPT_VERSION,
@@ -86,7 +90,12 @@ def campaign(prepared, project, tmp_path):
                 ),
                 "result": {
                     "verdict": "passed",
+                    "audit_prompt_version": HISTORY_AUDIT_PROMPT_VERSION,
                     "route_bindings_digest": digest(route_bindings),
+                    "semantic_contract_digests": {
+                        purpose: digest(semantic_contract(purpose, flow.AUDIT_SCHEMA))
+                        for purpose in ("handoff_map", "handoff_reduce", "handoff_audit")
+                    },
                     "contract_schema_digests": {
                         "constraints-v1": digest([REDUCTION_SCHEMA, CONSTRAINT_AUDIT_SCHEMA]),
                         "recovery-v1": digest([RECOVERY_SCHEMA, RECOVERY_AUDIT_SCHEMA]),
@@ -107,6 +116,7 @@ def campaign(prepared, project, tmp_path):
             "constraint_schemas_digest": digest([REDUCTION_SCHEMA, CONSTRAINT_AUDIT_SCHEMA]),
             "recovery_schemas_digest": digest([RECOVERY_SCHEMA, RECOVERY_AUDIT_SCHEMA]),
             "prompt_versions": [EXTRACT_PROMPT_VERSION, REDUCE_PROMPT_VERSION],
+            "audit_prompt_version": HISTORY_AUDIT_PROMPT_VERSION,
             "structural_pass": True,
             "corpus": corpus,
             "independent_review": {
@@ -287,11 +297,6 @@ def complete_maps(runtime, snapshot, unit):
 
 def complete_audits(runtime, snapshot, unit):
     value = unit.evidence["handoff"]
-    events = {
-        event.id: event
-        for item in value["capture"]["sources"]
-        for event in load_events(HistorySnapshot(**item))
-    }
     for key in value["audits"]:
         row = snapshot.jobs[key]
         coord = row["request"]["coordinates"]
@@ -299,16 +304,17 @@ def complete_audits(runtime, snapshot, unit):
             "handoff_id": value["id"],
             "capture_digest": coord["capture_digest"],
             "covered_owner_ids": coord["owner_ids"],
+            "covered_span_ids": [span["span_id"] for span in coord["owner_spans"]],
             "obligation_ids": coord["obligation_ids"],
             "ambiguities": [],
             "constraints": [
                 {
-                    "source_id": key,
-                    "source_quote": events[key].record.text,
+                    "span_id": span["span_id"],
                     "interpretation": "Preserve this requirement",
                     "relevance": "current",
+                    "exclusion_evidence_id": "",
                 }
-                for key in coord["owner_ids"]
+                for span in coord["owner_spans"]
             ],
         }
         row.update(
@@ -346,6 +352,81 @@ def test_quota_handoff_preserves_work_and_continues_same_stage(campaign):
     assert unit.evidence["developer_families"] == ["openai"]
     unit.claim = dataclasses.replace(unit.claim, launch_id="replacement", quiescent=True)
     assert not flow.intercept_terminal(runtime, snapshot, unit, {"outcome": "locally_complete"})
+
+
+def test_post_audit_context_fit_retains_omitted_summary_retrieval(campaign, monkeypatch):
+    import copy
+
+    from bmad_loop import campaign_handoff_context as context
+    from bmad_loop.campaign_headless import read_json
+    from bmad_loop.campaign_reasoning_results import apply_result
+    from bmad_loop.campaign_summary import SummaryJobSpec, plan_reduction
+
+    runtime, snapshot, unit, receipt = campaign
+    assert flow.intercept_terminal(runtime, snapshot, unit, receipt)
+    step(runtime, snapshot, unit, "handoff-capture")
+    step(runtime, snapshot, unit, "handoff-plan")
+    complete_maps(runtime, snapshot, unit)
+    value = unit.evidence["handoff"]
+    row = snapshot.jobs[value["jobs"][0]]
+    row["result"]["facts"][0]["text"] = "Keep all accepted functionality. " * 35
+    apply_result(runtime, snapshot, row)
+    child = row
+    child_spec = SummaryJobSpec(**child["request"]["coordinates"]["summary_spec"])
+    candidate = flow._candidate(value["candidate"])
+    reducer = plan_reduction(
+        ((child_spec, flow._applied(child)),),
+        flow._budget(candidate, flow._cap(snapshot, candidate)),
+        runtime.store.root / "test-reduction",
+    )[0]
+    row = copy.deepcopy(child)
+    row["id"] = reducer.id
+    row["request"].update(id=reducer.id, purpose="handoff_reduce")
+    row["request"]["coordinates"]["summary_spec"] = dataclasses.asdict(reducer)
+    row["result"].update(
+        job_id=reducer.id, input_sha256=reducer.input_sha256, covered_ids=list(reducer.primary_ids)
+    )
+    row["receipt"].update(job_id=reducer.id, result=row["result"])
+    snapshot.jobs[row["id"]] = row
+    apply_result(runtime, snapshot, row)
+    value["all_jobs"] = [child["id"], row["id"]]
+    value["jobs"] = [row["id"]]
+    step(runtime, snapshot, unit, "handoff-audit-plan")
+    complete_audits(runtime, snapshot, unit)
+    original = context.assemble_packet
+    initial = []
+
+    def observe_initial(*args, **kwargs):
+        packet = original(*args, **kwargs)
+        initial.append(read_json(Path(packet.path))["summaries"])
+        return packet
+
+    monkeypatch.setattr(context, "assemble_packet", observe_initial)
+    baseline = flow._assemble(runtime, snapshot, unit, value)
+    baseline_size = baseline["packet"]["tokens"]
+    for ceiling in range(baseline_size - 64, 2000, -128):
+        snapshot.spec = dataclasses.replace(
+            snapshot.spec,
+            reasoning=dataclasses.replace(snapshot.spec.reasoning, packet_token_limit=ceiling),
+        )
+        try:
+            result = flow._assemble(runtime, snapshot, unit, value)
+        except CampaignError:
+            continue
+        payload = read_json(Path(result["packet"]["path"]))
+        if initial[-1] and not payload["summaries"]:
+            assert result["packet"]["tokens"] <= ceiling
+            assert context.retrieve_summary(payload, row["id"]) == flow._applied(row)
+            parent = context.retrieve_summary(payload, row["id"])
+            assert parent["covered_ids"] == [child["id"]]
+            assert context.retrieve_summary(payload, parent["covered_ids"][0]) == flow._applied(
+                child
+            )
+            omitted = read_json(Path(payload["omitted_summary_index"]["path"]))
+            assert omitted["final_summary_ids"] == [row["id"]]
+            break
+    else:
+        pytest.fail("Fixture never exercised post-audit removal of an initially included summary")
 
 
 def test_live_predecessor_and_uncertain_push_fence_capture(campaign):
@@ -581,3 +662,89 @@ def test_semantic_failure_retries_same_job_without_resetting_failure_budget(camp
     # The shared reasoning admission applies this unchanged terminal attempt
     # budget. No replacement identity can erase failed semantic attempts.
     assert len(snapshot.jobs) == 1
+
+
+def test_context_spans_survive_successor_and_missing_exact_span_blocks_packet(campaign):
+    import hashlib
+
+    from bmad_loop.campaign_transcripts import blob, encoded
+
+    runtime, snapshot, unit, receipt = campaign
+    flow.intercept_terminal(runtime, snapshot, unit, receipt)
+    step(runtime, snapshot, unit, "handoff-capture")
+    step(runtime, snapshot, unit, "handoff-plan")
+    complete_maps(runtime, snapshot, unit)
+    step(runtime, snapshot, unit, "handoff-audit-plan")
+    complete_audits(runtime, snapshot, unit)
+    value = unit.evidence["handoff"]
+    row = snapshot.jobs[value["audits"][0]]
+    row["result"]["constraints"][0]["relevance"] = "context"
+    flow.apply_audit(runtime, snapshot, row)
+    result = flow._assemble(runtime, snapshot, unit, value)
+    packet = json.loads(Path(result["packet"]["path"]).read_text())
+    assert packet["resolved_constraints"][0]["relevance"] == "context"
+    assert (
+        packet["resolved_constraints"][0]["source_quote"]
+        == "Keep history and all acceptance criteria."
+    )
+    applied = flow._applied(row)
+    applied["constraints"] = []
+    data = encoded(applied)
+    path = blob(flow._root(runtime, snapshot, value) / "legacy-omission-fixture", data)
+    row["applied_result"] = {
+        "artifact_path": str(path),
+        "artifact_sha256": hashlib.sha256(data).hexdigest(),
+    }
+    with pytest.raises(CampaignError, match="complete native-owner span coverage"):
+        flow._assemble(runtime, snapshot, unit, value)
+
+
+@pytest.mark.parametrize("persisted_phase", ["audit", "ready"])
+def test_persisted_legacy_audit_contract_refreshes_before_any_writer_admission(
+    campaign, persisted_phase
+):
+    runtime, snapshot, unit, receipt = campaign
+    flow.intercept_terminal(runtime, snapshot, unit, receipt)
+    step(runtime, snapshot, unit, "handoff-capture")
+    step(runtime, snapshot, unit, "handoff-plan")
+    complete_maps(runtime, snapshot, unit)
+    step(runtime, snapshot, unit, "handoff-audit-plan")
+    complete_audits(runtime, snapshot, unit)
+    if persisted_phase == "ready":
+        step(runtime, snapshot, unit, "handoff-assemble")
+        step(runtime, snapshot, unit, "handoff-release")
+        assert flow.resume_proposal(snapshot, unit)
+    value = unit.evidence["handoff"]
+    old_audits = [flow._job(runtime, snapshot, key)["applied_result"] for key in value["audits"]]
+    old_bytes = [Path(row["artifact_path"]).read_bytes() for row in old_audits]
+    old_packet = value.get("packet")
+    old_packet_bytes = Path(old_packet["path"]).read_bytes() if old_packet else None
+    # Schema-2 captures used event-level audits and never bound their contract.
+    value["capture"]["audit_context"].pop("history_audit_contract", None)
+    snapshot = runtime.store.save(snapshot, snapshot.revision)
+    snapshot = runtime.store.load(snapshot.id)
+    unit = snapshot.units[unit.id]
+    value = unit.evidence["handoff"]
+    assert flow.resume_proposal(snapshot, unit) is None
+    assert not flow.job_launch_allowed(snapshot, flow._job(runtime, snapshot, value["audits"][0]))
+    if persisted_phase == "ready":
+        request = {
+            "handoff_id": value["id"],
+            "role": value["role"],
+            "candidate": value["candidate"],
+        }
+        with pytest.raises(CampaignError, match="constraints changed before launch"):
+            flow.decorate_launch(snapshot, unit, request)
+        replacement = dataclasses.replace(unit.claim, launch_id="successor-v3", quiescent=False)
+        with pytest.raises(CampaignError, match="constraints changed before claim adoption"):
+            flow.adopt_launch(snapshot, unit, request, replacement)
+    assert [row.kind for row in flow.proposals(runtime, snapshot)] == ["handoff-refresh"]
+    step(runtime, snapshot, unit, "handoff-refresh")
+    assert value["phase"] == "capture" and unit.hold.kind == "handoff"
+    assert (
+        value["capture"]["audit_context"]["history_audit_contract"]
+        == flow._audit_context(snapshot, unit)["history_audit_contract"]
+    )
+    assert old_bytes == [Path(row["artifact_path"]).read_bytes() for row in old_audits]
+    if old_packet:
+        assert Path(old_packet["path"]).read_bytes() == old_packet_bytes

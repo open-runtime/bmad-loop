@@ -117,7 +117,7 @@ def original_nodes(audits):
             digest(row): {"id": digest(row), "text": row["interpretation"], "original": row}
             for audit in audits
             for row in audit["constraints"]
-            if row["relevance"] == "current"
+            if row["relevance"] in {"current", "context"}
         }.values()
     )
 

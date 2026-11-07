@@ -24,6 +24,7 @@ from .campaign_headless import (
     validate_capability,
     write_json,
 )
+from .campaign_headless_protocol import parse_output
 from .campaign_jobs import JobLimits, JobRequest
 from .campaign_model import CampaignError, RoleCandidate
 from .campaign_summary import (
@@ -36,6 +37,7 @@ from .campaign_summary import (
     measured_output_tokens,
     plan_reduction,
     plan_remaining_maps,
+    project_reduction_input,
     split_map_input,
     split_reduction_input,
     summary_prompt,
@@ -119,7 +121,108 @@ def _observed_receipt(request_path, runner, observation=None):
         or receipt.get("launch_id") != envelope["launch_id"]
     ):
         raise CampaignError("Observed lifecycle belongs to another immutable request")
+    # Older workers discarded native telemetry when Grok rejected an output
+    # schema. Reclassify only this evidenced failure; never turn it into success
+    # or mutate the historical receipt. The sidecar binds the complete native
+    # output and delivery bytes to the already-quiescent attempt.
+    if (
+        receipt.get("reason")
+        == ("CampaignError: Native session identity or structured result is missing")
+        and envelope["capability"]["protocol"] == "grok-json"
+    ):
+        output_path = directory / "stdout.jsonl"
+        cap = envelope["capability"]
+        native = parse_output(
+            output_path.read_text(encoding="utf-8"),
+            protocol=cap["protocol"],
+            selected_model=envelope["selection"]["model"],
+            served_model_aliases=tuple(cap.get("served_model_aliases", ())),
+        )
+        if (
+            native.get("failure_kind") != "schema"
+            or native.get("native_terminal_completed") is not True
+            or receipt.get("quiescent") is not True
+            or receipt.get("processes_quiescent") is not True
+            or file_digest(directory / "input.txt") != envelope["input"]["sha256"]
+        ):
+            raise CampaignError("Historical failure has no complete native schema-rejection proof")
+        receipt = {
+            **receipt,
+            **native,
+            "native_outcome": native["outcome"],
+            "input_complete": True,
+            "input_delivery": envelope["input"],
+        }
+        limits = envelope["request"]["limits"]
+        if (
+            native["turns"] > limits["max_turns"]
+            or native["usage"].get("output_tokens", 0) > limits["output_tokens"]
+        ):
+            receipt.update(
+                outcome="limit",
+                reason="Native turn/output receipt exceeds the job bound",
+                limit_kind=(
+                    "native-turns"
+                    if native["turns"] > limits["max_turns"]
+                    else "native-output-tokens"
+                ),
+            )
+        reparse = {
+            "schema_version": 2,
+            "native_receipt_sha256": file_digest(raw_path),
+            "stdout_sha256": file_digest(output_path),
+            "request_sha256": file_digest(request_path),
+            "receipt": receipt,
+        }
+        reparse_path = directory / "schema-rejection-reparse-v2.json"
+        if reparse_path.exists() and read_json(reparse_path) != reparse:
+            raise CampaignError("Historical schema-rejection evidence changed")
+        write_json(reparse_path, reparse)
     return receipt
+
+
+def _schema_rejected(receipt, request):
+    return (
+        receipt.get("failure_kind") == "schema"
+        and receipt.get("native_terminal_completed") is True
+        and receipt.get("outcome") in {"failed", "limit"}
+        and receipt.get("limit_kind", "") in {"", "native-output-tokens"}
+        and receipt.get("native_outcome", "failed") == "failed"
+        and type(receipt.get("turns")) is int
+        and 1 <= receipt["turns"] <= request.limits.max_turns
+        and receipt.get("input_complete") is True
+        and receipt.get("quiescent") is True
+        and receipt.get("processes_quiescent") is True
+        and receipt.get("truncated") is False
+    )
+
+
+def _output_rejected(receipt, request):
+    """A complete native output limit can use the remaining validation budget.
+
+    Older receipts lack typed limit/native-outcome fields, but input_complete
+    was emitted only after completed native parsing. Every positive lifecycle,
+    measured-output and other-limit check remains mandatory.
+    """
+    tokens = (receipt.get("usage") or {}).get("output_tokens")
+    turns = receipt.get("turns")
+    return (
+        receipt.get("outcome") == "limit"
+        and receipt.get("limit_kind", "") in {"", "native-output-tokens"}
+        and receipt.get("native_outcome", "completed") == "completed"
+        and receipt.get("failure_kind", "") == ""
+        and not receipt.get("telemetry_error")
+        and receipt.get("input_complete") is True
+        and receipt.get("quiescent") is True
+        and receipt.get("processes_quiescent") is True
+        and receipt.get("truncated") is False
+        and isinstance(receipt.get("result"), dict)
+        and receipt.get("usage_known") is True
+        and type(tokens) is int
+        and tokens > request.limits.output_tokens
+        and type(turns) is int
+        and 1 <= turns <= request.limits.max_turns
+    )
 
 
 def _single_attempt(job, snapshots, events, capability, directory, timeout_s, runner):
@@ -163,6 +266,18 @@ def _single_attempt(job, snapshots, events, capability, directory, timeout_s, ru
                 )
             time.sleep(0.2)
         receipt = _observed_receipt(request_path, runner, observation)
+        if _schema_rejected(receipt, request):
+            raise SummaryResultRejected(
+                str(receipt["reason"])
+                + ". Reducer citations must copy the child fact's citations array, never its id. "
+                "Use concise facts and preserve the configured output bound."
+            )
+        if _output_rejected(receipt, request):
+            raise SummaryResultRejected(
+                f"Native output {receipt['usage']['output_tokens']} tokens exceeds {request.limits.output_tokens}. "
+                f"Keep the complete result JSON below {max(1024, job.output_tokens // 3)} UTF-8 bytes, leaving room for native reasoning. "
+                "Consolidate repeated contextual facts without losing owner constraints or child coverage."
+            )
         if (
             receipt.get("outcome") != "completed"
             or receipt.get("input_complete") is not True
@@ -191,6 +306,11 @@ def _single_attempt(job, snapshots, events, capability, directory, timeout_s, ru
 
 
 def _one(job, snapshots, events, capability, directory, timeout_s, runner):
+    if (
+        job.purpose == "handoff-reduce"
+        and not (directory / "jobs" / job.id / "request.json").exists()
+    ):
+        job = project_reduction_input(job, directory / "inputs")
     original = job
     for attempt in range(3):
         try:
@@ -198,11 +318,13 @@ def _one(job, snapshots, events, capability, directory, timeout_s, runner):
         except SummaryResultRejected as exc:
             destination = directory / "jobs" / job.id
             receipt_path = destination / "receipt.json"
-            receipt = read_json(receipt_path)
+            receipt = _observed_receipt(destination / "request.json", runner)
+            request = trial_request(job, capability, snapshots, timeout_s)
             if (
                 receipt.get("outcome") != "completed"
-                or receipt.get("processes_quiescent") is not True
-            ):
+                and not _schema_rejected(receipt, request)
+                and not _output_rejected(receipt, request)
+            ) or receipt.get("processes_quiescent") is not True:
                 raise CampaignError(
                     "Correction requires a completed, quiescent native attempt"
                 ) from exc
@@ -216,6 +338,31 @@ def _one(job, snapshots, events, capability, directory, timeout_s, runner):
             }
             write_json(destination / "rejected.json", rejected)
             if attempt == 2:
+                if original.purpose == "handoff-reduce":
+                    revised = project_reduction_input(original, directory / "inputs")
+                    if revised.id != original.id:
+                        # One explicit presentation revision for a frozen legacy
+                        # input; no reset of its three exhausted native attempts.
+                        write_json(
+                            directory / "jobs" / original.id / "presentation-revision.json",
+                            {
+                                "schema_version": 1,
+                                "original_job_id": original.id,
+                                "revised_job_id": revised.id,
+                                "prior_attempts": 3,
+                                "additional_attempt_limit": 1,
+                                "last_rejection": rejected,
+                            },
+                        )
+                        try:
+                            return _single_attempt(
+                                revised, snapshots, events, capability, directory, timeout_s, runner
+                            )
+                        except SummaryResultRejected as revision_error:
+                            raise SummaryResultRejected(
+                                "Reducer presentation revision exhausted its single native attempt: "
+                                + str(revision_error)
+                            ) from revision_error
                 raise SummaryResultRejected(
                     "Summary validation budget exhausted after two corrective jobs: " + str(exc)
                 ) from exc
@@ -621,9 +768,15 @@ def run_trial(
         }
         report["usage_unknown_jobs"] = 0
         for receipt_path in receipt_paths:
-            if not read_json(receipt_path).get("usage_known"):
+            receipt = read_json(receipt_path)
+            if any(
+                (receipt_path.parent / name).exists()
+                for name in ("schema-rejection-reparse.json", "schema-rejection-reparse-v2.json")
+            ):
+                receipt = _observed_receipt(receipt_path.parent / "request.json", runner)
+            if not receipt.get("usage_known"):
                 report["usage_unknown_jobs"] += 1
-            for key, value in read_json(receipt_path).get("usage", {}).items():
+            for key, value in receipt.get("usage", {}).items():
                 if type(value) in (int, float):
                     report["usage"][key] = report["usage"].get(key, 0) + value
         write_json(directory / "report.json", report)

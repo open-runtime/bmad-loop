@@ -333,6 +333,93 @@ def test_native_model_mismatch_and_truncation_are_not_successful():
     assert result["outcome"] == "limit" and result["truncated"]
 
 
+def test_native_grok_schema_rejection_preserves_telemetry_without_success():
+    frame = {
+        "sessionId": "native-schema-rejection",
+        "stopReason": "end_turn",
+        "modelUsage": {"grok-test": {"modelCalls": 1}},
+        "num_turns": 1,
+        "usage": {"input_tokens": 1234, "output_tokens": 789},
+        "structuredOutput": None,
+        "structuredOutputError": "citation is not in the enum " + "x" * 10000,
+        "text": '{"citations":["invented"]}',
+    }
+    result = parse_output(json.dumps(frame), protocol="grok-json", selected_model="grok-test")
+    assert result["outcome"] == "failed" and result["failure_kind"] == "schema"
+    assert result["result"] is None and result["native_terminal_completed"]
+    assert result["session_id"] == frame["sessionId"]
+    assert result["usage"] == frame["usage"] and len(result["reason"]) < 600
+    with pytest.raises(CampaignError, match="differs"):
+        parse_output(json.dumps(frame), protocol="grok-json", selected_model="other")
+
+
+@pytest.mark.parametrize("bound", ["stdout-wire-bytes", "stderr-bytes", "wall-time"])
+def test_finished_native_child_cannot_bypass_final_whole_job_bounds(
+    prepared, tmp_path, monkeypatch, bound
+):
+    from types import SimpleNamespace
+
+    from bmad_loop import campaign_headless_worker as worker
+
+    runner, _, request, candidate, cap = prepared
+    script = tmp_path / "fast-native.py"
+    script.write_text(
+        """import hashlib,json,sys,time
+payload=sys.stdin.buffer.read()
+time.sleep(.35)
+print(json.dumps({'type':'system','model':'gpt-test','session_id':'fast-native'}))
+print(json.dumps({'type':'result','structured_output':{'digest':hashlib.sha256(payload).hexdigest(),'bytes':len(payload)},'usage':{'input_tokens':12,'output_tokens':8},'padding':'x'*STDOUT_BYTES}))
+sys.stderr.write('x'*STDERR_BYTES)
+""".replace("STDOUT_BYTES", "500000" if bound == "stdout-wire-bytes" else "0").replace(
+            "STDERR_BYTES", "1100000" if bound == "stderr-bytes" else "0"
+        )
+    )
+    cap = fixture_capability(
+        tmp_path,
+        {
+            **cap,
+            "argv": [cap["binary"], str(script)],
+            "dependencies": [{"path": str(script), "sha256": file_digest(script)}],
+        },
+    )
+    path = runner.prepare(
+        tmp_path / "fast-job", request, candidate, cap, launch_id="fast", generation=1
+    )
+    write_json(path.parent / "go.json", {"launch_id": "fast", "generation": 1})
+    original = subprocess.Popen
+
+    def launched(*args, **kwargs):
+        process = original(*args, **kwargs)
+        if args and args[0] == cap["argv"]:
+            poll = process.poll
+            first = True
+
+            def after_exit():
+                nonlocal first
+                if first:
+                    first = False
+                    process.wait(timeout=5)
+                return poll()
+
+            process.poll = after_exit
+        return process
+
+    monkeypatch.setattr(worker.subprocess, "Popen", launched)
+    if bound == "wall-time":
+        clock = iter((0, request.limits.timeout_s + 1))
+        monkeypatch.setattr(
+            worker,
+            "time",
+            SimpleNamespace(monotonic=lambda: next(clock), sleep=time.sleep, time=time.time),
+        )
+    assert worker.child_main(path) == 1
+    receipt = read_json(path.parent / "receipt.json")
+    assert receipt["outcome"] == "limit" and receipt["limit_kind"] == bound
+    assert receipt["usage"] == {"input_tokens": 12, "output_tokens": 8}
+    assert receipt["session_id"] == "fast-native" and receipt["processes_quiescent"]
+    assert not receipt["input_complete"] and receipt.get("result") is None
+
+
 def test_live_descendant_prevents_completion_even_after_window_death(prepared, monkeypatch):
     runner, path, *_ = prepared
     runner.launch(path)

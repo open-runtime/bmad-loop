@@ -38,6 +38,33 @@ def audit_identity(inputs):
     return {"handoff_id": inputs["handoff_id"], "capture_digest": inputs["capture_digest"]}
 
 
+@pytest.mark.parametrize("measurement", ["native", "unknown", "over-limit", "not-quiescent"])
+def test_handoff_audit_counts_trusted_native_tokens_with_byte_fallback(campaign, measurement):
+    runtime, snapshot, unit, receipt = campaign
+    flow.intercept_terminal(runtime, snapshot, unit, receipt)
+    step(runtime, snapshot, unit, "handoff-capture")
+    step(runtime, snapshot, unit, "handoff-plan")
+    complete_maps(runtime, snapshot, unit)
+    step(runtime, snapshot, unit, "handoff-audit-plan")
+    complete_audits(runtime, snapshot, unit)
+    row = snapshot.jobs[unit.evidence["handoff"]["audits"][0]]
+    row["result"]["constraints"][0]["interpretation"] = "Preserve exact requirements. " * 100
+    row["request"]["limits"]["output_tokens"] = 100
+    row["receipt"].update(
+        outcome="completed",
+        input_complete=True,
+        quiescent=measurement != "not-quiescent",
+        usage_known=measurement != "unknown",
+        usage={"output_tokens": 101 if measurement == "over-limit" else 50},
+    )
+    if measurement == "native":
+        flow.apply_audit(runtime, snapshot, row)
+        assert row["applied_result"]["artifact_sha256"]
+    else:
+        with pytest.raises(CampaignError, match="output bound|lifecycle"):
+            flow.apply_audit(runtime, snapshot, row)
+
+
 def complete_history(runtime, snapshot, unit):
     from bmad_loop.campaign_summary import SummaryJobSpec, load_input
 
@@ -139,6 +166,12 @@ def test_oversized_current_constraints_reduce_and_are_independently_audited(camp
     assert unit.evidence["handoff"]["phase"] == "ready", unit.hold
     packet = json.loads(Path(unit.evidence["handoff"]["packet"]["path"]).read_text())
     assert packet["read_only"] is False
+    audit_index = packet["current_constraint_audits_index"]
+    import hashlib
+
+    audit_bytes = Path(audit_index["path"]).read_bytes()
+    assert hashlib.sha256(audit_bytes).hexdigest() == audit_index["sha256"]
+    assert len(json.loads(audit_bytes)) == len(value["audits"]) == audit_index["count"]
     exact = json.loads(Path(packet["exact_current_constraint_index"]["path"]).read_text())
     assert len(exact) == 91
     assert len(packet["resolved_constraints"]) < len(exact)

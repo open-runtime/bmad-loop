@@ -190,6 +190,18 @@ def child_main(path: Path) -> int:
             # processes behind. The qualified no-tools route has no owned daemon.
             kill_tree(process, known=known)
             record_tree()
+        # Exit may occur between polls, after emitting a complete oversized
+        # frame. Recheck immutable final streams and the whole-job deadline
+        # after descendants drain; a fast exit cannot bypass these bounds.
+        if not reason:
+            if stopped():
+                reason = "canceled"
+            elif time.monotonic() - started > request.limits.timeout_s:
+                reason, limit_kind = "limit", "wall-time"
+            elif (directory / "stdout.jsonl").stat().st_size > wire_limit:
+                reason, limit_kind = "limit", "stdout-wire-bytes"
+            elif (directory / "stderr.log").stat().st_size > 1048576:
+                reason, limit_kind = "limit", "stderr-bytes"
         if reason:
             try:
                 partial = parse_output(
@@ -230,6 +242,7 @@ def child_main(path: Path) -> int:
                 served_model_aliases=tuple(capability.get("served_model_aliases", ())),
             )
             receipt.update(native)
+            receipt["native_outcome"] = native["outcome"]
             if process.returncode and receipt["outcome"] == "completed":
                 receipt.update(outcome="failed", reason="Native CLI exited unsuccessfully")
             if (
@@ -237,9 +250,17 @@ def child_main(path: Path) -> int:
                 or native["usage"].get("output_tokens", 0) > request.limits.output_tokens
             ):
                 receipt.update(
-                    outcome="limit", reason="Native turn/output receipt exceeds the job bound"
+                    outcome="limit",
+                    reason="Native turn/output receipt exceeds the job bound",
+                    limit_kind=(
+                        "native-turns"
+                        if native["turns"] > request.limits.max_turns
+                        else "native-output-tokens"
+                    ),
                 )
-            receipt["input_complete"] = native["outcome"] == "completed" and not native["truncated"]
+            receipt["input_complete"] = (
+                native["outcome"] == "completed" or native.get("native_terminal_completed") is True
+            ) and not native["truncated"]
             receipt["input_delivery"] = envelope["input"]
     except (OSError, ValueError, KeyError, TypeError, CampaignError) as exc:
         receipt.update(outcome="failed", reason=f"{type(exc).__name__}: {exc}")

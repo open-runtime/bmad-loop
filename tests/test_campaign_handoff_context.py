@@ -6,7 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from bmad_loop.campaign_handoff_context import assemble_packet, check_fidelity
+from bmad_loop.campaign_handoff_context import (
+    assemble_packet,
+    check_fidelity,
+    load_summary_index,
+    retrieve_summary,
+)
 from bmad_loop.campaign_model import CampaignError
 from bmad_loop.campaign_summary import (
     ContextBudget,
@@ -15,6 +20,7 @@ from bmad_loop.campaign_summary import (
     plan_maps,
     plan_reduction,
     plan_remaining_maps,
+    project_reduction_input,
     validate_summary,
     window_count,
 )
@@ -342,6 +348,34 @@ def test_reducers_retain_child_dependencies_and_citations(tmp_path):
         assert job.input_tokens <= budget().payload_tokens
 
 
+def test_reducer_presentation_keeps_native_sources_without_competing_fact_ids(tmp_path):
+    snapshot = capture(tmp_path, [native_row("codex")])
+    events = load_events(snapshot)
+    job = plan_maps(events, budget(), tmp_path / "maps")[0]
+    child = validate_summary(job, result(job, events), events)
+    original = plan_reduction(((job, child),), budget(), tmp_path / "reducers")[0]
+    original_bytes = Path(original.input_path).read_bytes()
+    projected = project_reduction_input(original, tmp_path / "projected")
+    payload = load_input(projected)
+    fact = payload["children"][0]["summary"]["facts"][0]
+    assert projected.id != original.id and projected.primary_ids == original.primary_ids
+    assert projected.event_ids == original.event_ids
+    assert projected.dependencies == original.dependencies and job.id in projected.dependencies
+    assert payload["source_input"]["job_id"] == original.id
+    assert payload["source_input"]["sha256"] == original.input_sha256
+    assert Path(original.input_path).read_bytes() == original_bytes
+    assert fact["text"] == child["facts"][0]["text"]
+    assert fact["citations"] == child["facts"][0]["citations"]
+    assert fact["source_quote_ref"] == child["facts"][0]["source_quote_ref"]
+    assert "id" not in fact and "original_citations" not in fact
+    assert project_reduction_input(projected, tmp_path / "again") == projected
+    value = result(projected, events)
+    validate_summary(projected, value, events)
+    value["facts"][0]["citations"] = [child["facts"][0]["id"]]
+    with pytest.raises(CampaignError, match="citation"):
+        validate_summary(projected, value, events)
+
+
 def test_packet_prioritizes_obligations_and_keeps_complete_indexes_when_overflowing(tmp_path):
     snapshot = capture(tmp_path, [native_row("codex", "keep " + "x" * 12000)])
     obligations = (
@@ -372,6 +406,113 @@ def test_complete_small_packet_and_structural_fidelity_still_distinguish_semanti
     )
     assert fidelity["structural_pass"]
     assert fidelity["semantic_fidelity"] == "requires-independent-review"
+
+
+@pytest.mark.parametrize(
+    "fault", ["none", "index-change", "index-missing", "artifact-change", "artifact-missing"]
+)
+def test_omitted_summary_is_retrievable_only_through_unchanged_index_and_artifact(tmp_path, fault):
+    snapshot = capture(tmp_path, [native_row("codex")])
+    events = load_events(snapshot)
+    job = replace(plan_maps(events, budget(), tmp_path / "maps")[0], output_tokens=20000)
+    value = result(job, events)
+    value["facts"][0]["text"] = "Retained detailed work context. " * 250
+    summary = validate_summary(job, value, events)
+    packet = assemble_packet(
+        (snapshot,),
+        (),
+        {"head": "H"},
+        (summary,),
+        budget(),
+        tmp_path / "packet",
+        packet_ceiling=4000,
+    )
+    payload = json.loads(Path(packet.path).read_text())
+    assert payload["summaries"] == [] and packet.tokens <= 4000
+    assert packet.omitted_summary_ids == (job.id,)
+    omission = json.loads(Path(payload["omitted_summary_index"]["path"]).read_text())
+    assert omission["summary_ids"] == [job.id]
+    rows = load_summary_index(payload)
+    assert retrieve_summary(payload, job.id) == summary
+    if fault == "none":
+        return
+    target = Path(
+        payload["summary_index"]["path"] if fault.startswith("index") else rows[0]["path"]
+    )
+    if fault.endswith("missing"):
+        target.unlink()
+    elif fault == "artifact-change":
+        # Same byte length prevents the size guard from masking a broken hash check.
+        target.write_bytes(target.read_bytes().replace(b"Retained", b"Changed!", 1))
+    else:
+        target.write_bytes(target.read_bytes() + b" ")
+    with pytest.raises(CampaignError):
+        retrieve_summary(payload, job.id)
+
+
+def test_packet_retains_complete_summary_tree_but_inlines_only_final_nodes(tmp_path):
+    snapshot = capture(tmp_path, [native_row("codex")])
+    events = load_events(snapshot)
+    child = plan_maps(events, budget(), tmp_path / "maps")[0]
+    detail = validate_summary(child, result(child, events), events)
+    reducer = plan_reduction(((child, detail),), budget(), tmp_path / "reduce")[0]
+    final_result = result(reducer, events)
+    final_summary = validate_summary(reducer, final_result, events)
+    packet = assemble_packet(
+        (snapshot,),
+        (),
+        {},
+        (final_summary,),
+        budget(),
+        tmp_path / "packet",
+        summary_tree=((child, detail), (reducer, final_summary)),
+    )
+    payload = json.loads(Path(packet.path).read_text())
+    assert [node["job_id"] for node in payload["summaries"]] == [reducer.id]
+    rows = {row["id"]: row for row in load_summary_index(payload)}
+    assert rows[reducer.id]["dependencies"] == [child.id]
+    assert retrieve_summary(payload, reducer.id)["covered_ids"] == [child.id]
+    assert retrieve_summary(payload, child.id) == detail
+    assert rows[child.id]["input"]["sha256"] == child.input_sha256
+    omitted = json.loads(Path(payload["omitted_summary_index"]["path"]).read_text())
+    assert omitted["summary_ids"] == [child.id]
+    assert omitted["final_summary_ids"] == []
+    with pytest.raises(CampaignError, match="missing a retained child"):
+        assemble_packet(
+            (snapshot,),
+            (),
+            {},
+            (final_summary,),
+            budget(),
+            tmp_path / "bad",
+            summary_tree=((reducer, final_summary),),
+        )
+
+
+def test_summary_tree_distinguishes_corrective_predecessor_from_validated_children(tmp_path):
+    from bmad_loop.campaign_summary import corrective_spec
+
+    snapshot = capture(tmp_path, [native_row("codex")])
+    events = load_events(snapshot)
+    original = plan_maps(events, budget(), tmp_path / "maps")[0]
+    corrected = corrective_spec(
+        original, attempt=1, receipt_sha256="a" * 64, reason="invalid citation"
+    )
+    validated = validate_summary(corrected, result(corrected, events), events)
+    packet = assemble_packet(
+        (snapshot,),
+        (),
+        {},
+        (validated,),
+        budget(),
+        tmp_path / "packet",
+        summary_tree=((corrected, validated),),
+    )
+    payload = json.loads(Path(packet.path).read_text())
+    row = load_summary_index(payload)[0]
+    assert row["dependencies"] == []
+    assert original.id in row["execution_dependencies"]
+    assert retrieve_summary(payload, corrected.id) == validated
 
 
 def test_generic_job_schema_and_result_bind_native_source_manifest(tmp_path):

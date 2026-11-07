@@ -690,6 +690,57 @@ def corrective_spec(
     )
 
 
+def project_reduction_input(job: SummaryJobSpec, artifact_root: Path) -> SummaryJobSpec:
+    """Separate native citations from internal fact identities without losing sources.
+
+    A reducer needs child coverage identities, semantic facts and native source
+    citations. Internal fact/fragment hashes are provenance, not eligible model
+    citations; their complete original payload remains hash-bound and retained.
+    """
+    payload = load_input(job)
+    if job.purpose != "handoff-reduce":
+        raise CampaignError("Citation presentation applies only to reducer inputs")
+    if payload.get("citation_presentation") == "native-events-v1":
+        return job
+    fields = {
+        "kind",
+        "text",
+        "citations",
+        "source_quote",
+        "source_quote_ref",
+        "source_quote_id",
+        "authority",
+    }
+    value = {
+        "schema_version": 1,
+        "citation_presentation": "native-events-v1",
+        "source_input": {"path": job.input_path, "sha256": job.input_sha256, "job_id": job.id},
+        "children": [
+            {
+                "job_id": child["job_id"],
+                "summary": {
+                    "facts": [
+                        {key: val for key, val in fact.items() if key in fields}
+                        for fact in child["summary"]["facts"]
+                    ],
+                    "gaps": child["summary"].get("gaps", []),
+                },
+            }
+            for child in payload["children"]
+        ],
+    }
+    content = encoded(value)
+    path = blob(artifact_root, content)
+    return replace(
+        job,
+        id=digest([job.id, value, "native-citation-presentation-v1"]),
+        input_path=str(path),
+        input_sha256=hashlib.sha256(content).hexdigest(),
+        input_tokens=len(content),
+        dependencies=job.dependencies,
+    )
+
+
 def split_map_input(job: SummaryJobSpec, artifact_root: Path) -> tuple[SummaryJobSpec, ...]:
     """Split only an oversized map, preserving exact native source ranges.
 

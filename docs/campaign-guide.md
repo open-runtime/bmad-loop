@@ -604,6 +604,10 @@ Configure `routing`, `reasoning`, `graph_review`, `reporting`, `summarization` a
 roles. Each job also respects total campaign, role and current provider capacity.
 The packet limit is an initial context ceiling, not an aggregate history limit;
 retained exact sources and obligation indexes remain available for retrieval.
+The hash-bound summary catalog also retains intermediate summaries and their
+inputs. Omitted final summaries remain retrievable after audited context fitting;
+their child references lead to the detailed summary tree. Retrieval verifies the
+catalog, summary bytes and original input, and refuses missing or changed data.
 
 When reasoning is enabled, changed campaign facts trigger qualified jobs for model
 routing, bulk triage, priority, graph review, GitHub/source reconciliation and
@@ -685,6 +689,14 @@ validated children and the citations actually represented by those children.
 Native owner quotations use immutable span IDs, and the controller retrieves the
 exact bytes. Each rejected completed result permits at most two separately
 recorded corrective jobs; source corruption and unknown actor state do not retry.
+A complete structured result rejected only for measured native output tokens can
+use that same remaining correction budget. Its receipt remains a limit failure;
+wall, wire, turn, quota and incomplete-result failures cannot use this path.
+
+Reducer input separates eligible native citations from internal fact IDs; complete
+original artifacts remain hash-bound. An exhausted frozen legacy trial reducer
+can receive one recorded presentation revision with one additional attempt,
+preserving all earlier failures and usage. This does not renew campaign retries.
 Output token limits use verified native telemetry when available, including the
 provider's reported reasoning contribution. Unknown usage retains a conservative
 UTF-8 byte bound. Model-supplied usage fields do not establish that measurement.
@@ -707,8 +719,24 @@ Semantic qualification uses a version 2 proof list attached to a native capabili
 Each proof binds the exact model, effort, transport qualification, current readers,
 schemas and prompts to the operation it qualifies: history extraction, reduction,
 audit, constraint reduction/audit or recovery extraction/audit. The independent
-native reviewer must attest to those same bindings and the source corpus. A
+native reviewer must attest to those same bindings and the source corpus. Generic
+history receipts include `semantic_contract_digests` for each qualified operation,
+binding its used readers, schemas and prompt. Updating the manifest cannot extend
+an earlier native result to a changed contract. Finite constraint/recovery proofs
+retain their own schema attestations; unrelated history-schema changes do not
+invalidate them.
+
+A generic history-auditor proof also binds its current audit prompt version. A
 successful history summary does not qualify an auditor or a different thinking
 level. Retain all referenced proof and source files; changed or missing evidence
 leaves the operation waiting for qualification. Earlier generic semantic proofs
 require renewed assessment; native transport proof compatibility is separate.
+
+History audits retain every character of native owner messages through stable
+source spans and exact controller-reconstructed quotations. Current and contextual
+spans both remain available to the successor, including requirements adopted from
+quoted plans. A contextual status question does not create an approval hold.
+Historical text cannot be excluded based on a model's completion claim: no current
+producer supplies the authenticated span-specific resolution proof needed for that
+exclusion. Large constraint views pass through separately qualified compression
+and independent audit while their exact source index remains retrievable.

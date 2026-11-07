@@ -13,7 +13,6 @@ from test_campaign_runtime import production_case as production_case
 from bmad_loop.campaign_headless import HeadlessRunner, read_json
 from bmad_loop.campaign_summary import SummaryJobSpec, load_input, quote_catalog
 from bmad_loop.campaign_supervisor import CampaignSupervisor
-from bmad_loop.campaign_transcripts import HistorySnapshot, load_events
 
 
 class ScriptedReasoning:
@@ -52,25 +51,21 @@ class ScriptedReasoning:
             }
         else:
             assert request["purpose"] == "handoff_audit"
-            events = {
-                event.id: event
-                for item in coordinate["history_snapshots"]
-                for event in load_events(HistorySnapshot(**item))
-            }
             result = {
                 "handoff_id": coordinate["handoff_id"],
                 "capture_digest": coordinate["capture_digest"],
                 "covered_owner_ids": coordinate["owner_ids"],
+                "covered_span_ids": [span["span_id"] for span in coordinate["owner_spans"]],
                 "obligation_ids": coordinate["obligation_ids"],
                 "ambiguities": [],
                 "constraints": [
                     {
-                        "source_id": key,
-                        "source_quote": events[key].record.text,
-                        "interpretation": events[key].record.text,
+                        "span_id": span["span_id"],
+                        "interpretation": span["text"],
                         "relevance": "current",
+                        "exclusion_evidence_id": "",
                     }
-                    for key in coordinate["owner_ids"]
+                    for span in coordinate["owner_spans"]
                 ],
             }
         return {
@@ -102,6 +97,9 @@ def test_real_worker_quota_continues_same_pr_through_normal_supervisor(
     case = production_case
     snapshot = case.store.load(case.snapshot.id)
     fixture_roles = dict(configured.spec.roles)
+    # This scenario requires an independent worker alongside the interrupted
+    # unit. The single-unit handoff fixture deliberately defaults to one slot.
+    fixture_roles["execution"] = dataclasses.replace(fixture_roles["execution"], max_sessions=2)
     roles = dict(snapshot.spec.roles)
     roles.update(fixture_roles)
     first, last = configured.spec.candidates("execution")
@@ -153,14 +151,16 @@ def test_real_worker_quota_continues_same_pr_through_normal_supervisor(
             partial.parent.mkdir(exist_ok=True)
             partial.write_text("preserved partial work")
             history=Path(request["execution"]).parent/"history.jsonl"
-            history.write_text(json.dumps({"type":"session_meta","payload":{"id":"quota-native"}})+"\\n"+json.dumps({"type":"event_msg","payload":{"type":"user_message","message":"Preserve partial work and all acceptance."}})+"\\n")
+            messages=([{"type":"session_meta","payload":{"id":"quota-native"}},{"type":"event_msg","payload":{"type":"user_message","message":"Preserve partial work and all acceptance."}}] if request["candidate"]["profile"]=="codex" else [{"type":"user","sessionId":"quota-native","message":{"role":"user","content":"Preserve partial work and all acceptance."}}])
+            history.write_text("\\n".join(json.dumps(row) for row in messages)+"\\n")
             event("quota",request)
-            return SessionResult(status="crashed",session_id="quota-native",transcript_path=str(history),env_fault=True,env_fault_evidence="scripted quota",native_binding={"outcome":"quota","observed_model":"gpt-test","provider_family":"openai"})
+            return SessionResult(status="crashed",session_id="quota-native",transcript_path=str(history),env_fault=True,env_fault_evidence="scripted quota",native_binding={"outcome":"quota","observed_model":request["candidate"]["model"],"provider_family":request["candidate"]["provider_family"]})
         packet=Path(request["handoff_packet"]["path"])
         assert hashlib.sha256(packet.read_bytes()).hexdigest()==request["handoff_packet"]["sha256"]
         assert json.loads(packet.read_text())["resolved_constraints"]
         assert partial.read_text()=="preserved partial work"
-        assert request["candidate"]["profile"]=="claude"
+        predecessor=json.loads((Path(request["native_predecessor"]["run_dir"])/"request.json").read_text())
+        assert request["candidate"]["profile"]!=predecessor["candidate"]["profile"]
         assert request["native_predecessor"]["launch_id"]!=request["launch_id"]
         event("successor-context-delivered",request)
 """
@@ -218,7 +218,9 @@ def test_real_worker_quota_continues_same_pr_through_normal_supervisor(
     )
     assert first.evidence["developer_families"] == ["anthropic", "openai"]
     assert first.evidence["handoff"]["phase"] == "continuing"
-    assert first.evidence["handoff"]["candidate"]["model"] == "claude-test"
+    continuation = first.evidence["handoff"]["candidate"]
+    assert continuation["model"] in {"gpt-test", "claude-test"}
+    assert continuation["profile"] != first.evidence["handoff"]["previous_route"][0]
     assert first.evidence["session_lineage"][0]["native_session_imported"] is False
     assert (
         len(

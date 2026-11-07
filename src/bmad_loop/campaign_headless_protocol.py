@@ -131,6 +131,8 @@ def parse_output(
     session_id = ""
     usage: dict[str, int | float] = {}
     outcome, reason, truncated = "completed", "", False
+    failure_kind = ""
+    native_terminal_completed = False
     turns = 0
     for frame in frames:
         if protocol == "grok-json" and "sessionId" in frame:
@@ -159,6 +161,13 @@ def parse_output(
             if type(frame.get("num_turns")) is not int or frame["num_turns"] < 1:
                 raise CampaignError("Grok native turn count is missing")
             turns += frame["num_turns"] - 1
+            if frame.get("structuredOutputError"):
+                outcome, failure_kind = "failed", "schema"
+                reason = (
+                    "Native structured result rejected: "
+                    + str(frame["structuredOutputError"])[:512]
+                )
+                native_terminal_completed = frame.get("stopReason") == "end_turn"
         if protocol == "muse-json" and frame.get("type") == "result":
             turns += max(0, frame.get("num_turns", 1) - 1)
         cost = frame.get("total_cost_usd")
@@ -262,12 +271,14 @@ def parse_output(
     observed = models[0] if models else ""
     if (
         not partial
-        and outcome == "completed"
+        and (outcome == "completed" or failure_kind == "schema")
         and (not observed or observed not in {selected_model, *served_model_aliases})
     ):
         raise CampaignError("Native primary model is missing or differs from selected route")
     if not partial and outcome == "completed" and (not session_id or result is None):
         raise CampaignError("Native session identity or structured result is missing")
+    if not partial and failure_kind == "schema" and not session_id:
+        raise CampaignError("Native schema rejection lacks session identity")
     return {
         "outcome": "failed" if partial else outcome,
         "reason": "Partial native telemetry; no completion evidence" if partial else reason,
@@ -281,4 +292,6 @@ def parse_output(
         "provider_family": provider_family(observed),
         "turns": turns,
         "truncated": partial or truncated,
+        "failure_kind": failure_kind,
+        "native_terminal_completed": not partial and native_terminal_completed,
     }

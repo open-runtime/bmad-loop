@@ -31,6 +31,8 @@ breaking changes may land in a minor release.
 - Share session admission across reasoning and coding workers without spending deferred attempts.
 - Reuse capability checks within admission passes while revalidating every native launch.
 - Reconcile independent parent closures concurrently and resume them after temporary intake waits.
+- Preserve complete owner-source spans through handoff audits and invalidate obsolete audit contracts.
+- Enforce native stream limits after process exit and retain telemetry for rejected structured results.
 
 ## [0.14.0] — 2026-11-05
 
