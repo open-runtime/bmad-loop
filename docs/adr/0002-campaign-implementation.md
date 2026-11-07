@@ -348,6 +348,17 @@ before resuming or replacing it. Unknown launch ownership blocks that unit and
 keeps its resources reserved. Multiple CLI controls append idempotent requests
 to the coordinator inbox under a short lock; they do not edit its state directly.
 
+Keep the exact child-process handles in a process-local registry across coordinator
+instances. Reserve each launch before process creation; independent launches do
+not wait on another unit's process constructor. Observe and reap only the handle
+created by this interpreter for the matching launch claim, before OS liveness
+checks, so an exited unreaped child cannot appear permanently active. A forked or
+restarted coordinator must use the OS identity path for inherited or adopted
+workers; persisted PIDs never authorize reaping. Release terminal handles while
+retaining a lightweight uncertain-launch reservation when no startup or receipt
+exists. A process exit alone never substitutes for the existing receipt, workspace
+and Git checks, and an unacknowledged launch never authorizes a duplicate spawn.
+
 Worker receipts are versioned and name campaign/unit/attempt/generation, run ID,
 legacy outcome, base/head commits, source-change paths and native binding.
 Planning results name stage, graph revision, input target and artifact paths.

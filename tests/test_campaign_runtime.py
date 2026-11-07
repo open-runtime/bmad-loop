@@ -8,6 +8,7 @@ are production code. The child script never imports or invokes a coding CLI.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
 import subprocess
@@ -25,6 +26,7 @@ from bmad_loop import campaign_runtime, campaign_workers, verify
 from bmad_loop.adapters import multiplexer
 from bmad_loop.campaign_github import ApiResponse, GithubError, GithubGateway, UncertainMutation
 from bmad_loop.campaign_model import (
+    CampaignError,
     CampaignSpec,
     CheckpointSpec,
     GitHubSpec,
@@ -716,23 +718,24 @@ def production_case(project, tmp_path, monkeypatch, request):
     )
     processes = {}
 
-    def spawn(request_path, *, env=None):
+    def scripted_process(argv, **options):
+        request_path = Path(argv[-1])
         process = subprocess.Popen(
             [sys.executable, str(script), str(request_path)],
-            stdout=(request_path.parent / "script.log").open("wb"),
-            stderr=subprocess.STDOUT,
-            env=env,
+            **options,
         )
         processes[request_path.parent] = process
         return process
 
-    def observe(directory, *, expected):
-        if directory in processes:
-            processes[directory].poll()  # Reap the exact child whose handle this fixture owns.
-        return campaign_workers.observe(directory, expected=expected)
-
-    monkeypatch.setattr(campaign_runtime, "spawn", spawn)
-    monkeypatch.setattr(campaign_runtime, "observe", observe)
+    # Exercise production spawn and observation, including owned child reaping.
+    # Change only the child entrypoint, never subprocess's global Popen function.
+    monkeypatch.setattr(
+        campaign_workers,
+        "subprocess",
+        types.SimpleNamespace(
+            Popen=scripted_process, DEVNULL=subprocess.DEVNULL, STDOUT=subprocess.STDOUT
+        ),
+    )
     monkeypatch.setattr(multiplexer, "configure_multiplexer", lambda *a, **k: None)
     monkeypatch.setattr(
         multiplexer, "get_multiplexer", lambda: types.SimpleNamespace(list_window_ids=lambda _: [])
@@ -751,6 +754,11 @@ def production_case(project, tmp_path, monkeypatch, request):
         if process.poll() is None:
             process.terminate()
         process.wait(timeout=10)
+    for directory in processes:
+        with contextlib.suppress(CampaignError):
+            campaign_workers.observe(
+                directory, expected=json.loads((directory / "request.json").read_text())
+            )
 
 
 def diagnose(snapshot):

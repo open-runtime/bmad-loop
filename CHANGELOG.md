@@ -34,6 +34,7 @@ breaking changes may land in a minor release.
 - Preserve complete owner-source spans through handoff audits and invalidate obsolete audit contracts.
 - Enforce native stream limits after process exit and retain telemetry for rejected structured results.
 - Preserve macOS worker identity across clock corrections and refuse uncertain legacy process ownership.
+- Reap owned campaign workers before checking process liveness and refuse duplicate uncertain launches.
 
 ## [0.14.0] — 2026-11-05
 

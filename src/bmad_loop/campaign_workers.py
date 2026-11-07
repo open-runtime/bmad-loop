@@ -14,6 +14,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -34,6 +35,53 @@ from .platform_util import (
     session_task_id,
 )
 from .stories_engine import StoriesEngine
+
+_LAUNCH_KEYS = ("campaign_id", "unit_id", "attempt", "generation", "launch_id")
+
+
+@dataclasses.dataclass
+class _OwnedLaunch:
+    binding: tuple[Any, ...]
+    owner_pid: int
+    process: subprocess.Popen[Any] | None = None
+    spawning: bool = True
+
+
+# Survive coordinator-object replacement within this interpreter. Never infer
+# parenthood from a persisted PID: only the Popen returned by our own spawn may
+# be polled. Unacknowledged exits retain a small tombstone, not a process handle.
+_OWNED_LAUNCHES: dict[Path, _OwnedLaunch] = {}
+_OWNED_LAUNCHES_LOCK = threading.Lock()
+
+
+def _after_fork() -> None:
+    global _OWNED_LAUNCHES_LOCK
+    _OWNED_LAUNCHES_LOCK = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_after_fork)
+
+
+def _reap_owned(directory: Path, expected: dict[str, Any], *, has_binding: bool) -> str | None:
+    with _OWNED_LAUNCHES_LOCK:
+        key = directory.resolve()
+        owned = _OWNED_LAUNCHES.get(key)
+        if owned is None or owned.owner_pid != os.getpid():
+            return None
+        if owned.binding != tuple(expected.get(k) for k in _LAUNCH_KEYS):
+            raise CampaignError("owned launch binding does not match its durable claim")
+        if owned.spawning:
+            return "unknown"
+        if owned.process is not None:
+            # poll is nonblocking and reaps only this exact direct child. An
+            # unreaped POSIX zombie otherwise still looks alive to PID probes.
+            if owned.process.poll() is None:
+                return "running"
+            owned.process = None
+        if has_binding:
+            del _OWNED_LAUNCHES[key]
+        return None
 
 
 def git(repo: Path, *args: str) -> str:
@@ -176,24 +224,40 @@ def prepare_launch(execution: CampaignExecution, request: dict[str, Any]) -> Pat
 
 
 def spawn(request_path: Path, *, env: dict[str, str] | None = None) -> subprocess.Popen[Any]:
-    directory = request_path.parent
+    directory = request_path.parent.resolve()
     # An existing startup/receipt, including a dead child, is reconciled by the
     # coordinator.  This API never guesses whether retrying the spawn is safe.
-    if (directory / "startup.json").exists() or (directory / "receipt.json").exists():
-        raise CampaignError("launch already has a startup binding or receipt")
-    log = (directory / "child.log").open("ab")
+    with _OWNED_LAUNCHES_LOCK:
+        if directory in _OWNED_LAUNCHES:
+            raise CampaignError("launch already has an owned process or uncertain spawn")
+        if (directory / "startup.json").exists() or (directory / "receipt.json").exists():
+            raise CampaignError("launch already has a startup binding or receipt")
+        request = json.loads(request_path.read_text(encoding="utf-8"))
+        owned = _OwnedLaunch(tuple(request[k] for k in _LAUNCH_KEYS), os.getpid())
+        _OWNED_LAUNCHES[directory] = owned
+    # Reserve before launching, without serializing slow OS executable checks
+    # across independent units. Observers see an uncertain in-progress launch.
     process_options: dict[str, Any] = detach_kwargs()
     try:
-        return subprocess.Popen(
-            [sys.executable, "-m", "bmad_loop.campaign_workers", str(request_path)],
-            stdin=subprocess.DEVNULL,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            env=env,
-            **process_options,
-        )
-    finally:
-        log.close()
+        with (directory / "child.log").open("ab") as log:
+            process = subprocess.Popen(
+                [sys.executable, "-m", "bmad_loop.campaign_workers", str(request_path)],
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                env=env,
+                **process_options,
+            )
+            with _OWNED_LAUNCHES_LOCK:
+                owned.process = process
+                owned.spawning = False
+    except BaseException:
+        with _OWNED_LAUNCHES_LOCK:
+            # An exception during process creation is not an acknowledgement
+            # that no child exists. Retain the reservation for reconciliation.
+            owned.spawning = False
+        raise
+    return process
 
 
 def observe(directory: Path, *, expected: dict[str, Any]) -> dict[str, Any]:
@@ -201,11 +265,19 @@ def observe(directory: Path, *, expected: dict[str, Any]) -> dict[str, Any]:
     startup = (
         json.loads(startup_path.read_text(encoding="utf-8")) if startup_path.exists() else None
     )
+    if startup is not None:
+        for key in _LAUNCH_KEYS:
+            if startup.get(key) != expected.get(key):
+                raise CampaignError(f"startup {key} does not match its durable claim")
+    owned_state = _reap_owned(
+        directory, expected, has_binding=startup is not None or receipt_path.exists()
+    )
     if startup is None:
         return {"state": "unknown", "reason": "startup binding not observed"}
-    for key in ("campaign_id", "unit_id", "attempt", "generation", "launch_id"):
-        if startup.get(key) != expected.get(key):
-            raise CampaignError(f"startup {key} does not match its durable claim")
+    if owned_state is not None:
+        # A known-live handle outranks contradictory/stale persisted PID
+        # evidence. A constructor still in progress is uncertain, never done.
+        return {"state": owned_state, "startup": startup}
     pid, identity = runs.read_named_pid_identity(directory / "engine.pid")
     if pid is None or identity is None:
         return {"state": "unknown", "reason": "worker process identity is unavailable"}

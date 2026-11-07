@@ -5,9 +5,14 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import select
 import shutil
+import signal
 import sys
 import tempfile
+import threading
+import time
+import types
 from pathlib import Path
 
 import pytest
@@ -262,9 +267,23 @@ def test_module_child_verification_receipt_has_real_process_and_git_binding(proj
     context = envelope(project.project, tmp_path / "execution")
     path = workers.prepare_launch(context, worker_request(project.project, context))
     process = workers.spawn(path)
-    assert process.wait(timeout=20) == 0
-    observed = workers.observe(context.directory, expected=json.loads(path.read_text()))
-    assert observed["state"] == "finished"
+    try:
+        # No caller wait/poll and no unrelated Popen between launch and the
+        # decisive observation: production must reap its own exited child.
+        deadline = time.monotonic() + 20
+        while True:
+            observed = workers.observe(context.directory, expected=json.loads(path.read_text()))
+            if observed["state"] == "finished" or time.monotonic() >= deadline:
+                break
+            time.sleep(0.01)
+        assert observed["state"] == "finished"
+        assert process.returncode == 0
+        assert context.directory.resolve() not in workers._OWNED_LAUNCHES
+    finally:
+        if process.poll() is None:
+            process.terminate()
+        process.wait(timeout=20)
+        workers._OWNED_LAUNCHES.pop(context.directory.resolve(), None)
     assert observed["receipt"]["outcome"] == "verified"
     assert observed["receipt"]["commands"][0]["returncode"] == 0
     assert "zero-token verification" in observed["receipt"]["commands"][0]["stdout"]
@@ -272,6 +291,220 @@ def test_module_child_verification_receipt_has_real_process_and_git_binding(proj
     pid, identity = runs.read_named_pid_identity(context.directory / "engine.pid")
     assert pid == process.pid
     assert identity is not None
+
+
+@pytest.fixture
+def owned_launch(monkeypatch, tmp_path):
+    class Process:
+        def __init__(self):
+            self.returncode = None
+            self.polls = 0
+
+        def poll(self):
+            self.polls += 1
+            return self.returncode
+
+    processes = []
+
+    def popen(*args, **kwargs):
+        process = Process()
+        processes.append(process)
+        return process
+
+    module = types.SimpleNamespace(Popen=popen, DEVNULL=-3, STDOUT=-2)
+    monkeypatch.setattr(workers, "subprocess", module)
+    paths = []
+
+    def prepare(name="launch"):
+        directory = tmp_path / name
+        directory.mkdir()
+        request = {
+            "campaign_id": "c",
+            "unit_id": name,
+            "attempt": 1,
+            "generation": 1,
+            "launch_id": name,
+        }
+        path = directory / "request.json"
+        path.write_text(json.dumps(request))
+        paths.append(directory.resolve())
+        return path, request
+
+    yield types.SimpleNamespace(prepare=prepare, module=module, processes=processes)
+    for directory in paths:
+        workers._OWNED_LAUNCHES.pop(directory, None)
+
+
+@pytest.mark.parametrize("os_liveness", ["alive", "dead", "unknown"])
+def test_owned_running_child_with_early_receipt_still_requires_process_death(
+    owned_launch, monkeypatch, os_liveness, project
+):
+    path, _ = owned_launch.prepare()
+    request, receipt = observed_files(path.parent, project)
+    path.write_text(json.dumps(request))
+    (path.parent / "startup.json").unlink()
+    (path.parent / "receipt.json").unlink()
+    process = workers.spawn(path)
+    (path.parent / "startup.json").write_text(json.dumps(request))
+    (path.parent / "receipt.json").write_text(json.dumps(receipt))
+    monkeypatch.setattr(runs, "read_named_pid_identity", lambda path: (123, 456))
+    monkeypatch.setattr(runs, "probe_liveness", lambda *args: os_liveness)
+    assert workers.observe(path.parent, expected=request)["state"] == "running"
+    assert process.polls == 1
+    assert workers._OWNED_LAUNCHES[path.parent].process is process
+
+
+@pytest.mark.parametrize("startup", [False, True])
+def test_wrong_claim_never_polls_owned_handle(owned_launch, startup):
+    path, request = owned_launch.prepare()
+    process = workers.spawn(path)
+    if startup:
+        (path.parent / "startup.json").write_text(json.dumps(request))
+    with pytest.raises(CampaignError, match="does not match its durable claim"):
+        workers.observe(path.parent, expected={**request, "generation": 2})
+    assert process.polls == 0
+
+
+def test_early_exit_releases_handle_but_refuses_duplicate_unacknowledged_launch(owned_launch):
+    path, request = owned_launch.prepare()
+    process = workers.spawn(path)
+    process.returncode = 7
+    assert workers.observe(path.parent, expected=request)["state"] == "unknown"
+    assert process.polls == 1
+    assert workers._OWNED_LAUNCHES[path.parent].process is None
+    with pytest.raises(CampaignError, match="owned process or uncertain spawn"):
+        workers.spawn(path)
+    assert len(owned_launch.processes) == 1
+    # Subsequent observation uses the lightweight tombstone, never a saved PID.
+    assert workers.observe(path.parent, expected=request)["state"] == "unknown"
+    assert process.polls == 1
+
+
+def test_concurrent_spawn_reserves_same_launch_without_serializing_other_units(owned_launch):
+    path, request = owned_launch.prepare("blocked")
+    other_path, _ = owned_launch.prepare("independent")
+    entered, release = threading.Event(), threading.Event()
+    original = owned_launch.module.Popen
+    result, errors = [], []
+
+    def blocked_popen(argv, **options):
+        if argv[-1] == str(path):
+            entered.set()
+            assert release.wait(10), "test did not release process construction"
+        return original(argv, **options)
+
+    def launch():
+        try:
+            result.append(workers.spawn(path))
+        except BaseException as error:
+            errors.append(error)
+
+    owned_launch.module.Popen = blocked_popen
+    thread = threading.Thread(target=launch)
+    thread.start()
+    try:
+        assert entered.wait(10)
+        assert workers.observe(path.parent, expected=request)["state"] == "unknown"
+        (path.parent / "startup.json").write_text(json.dumps(request))
+        (path.parent / "receipt.json").write_text(json.dumps(request))
+        assert workers.observe(path.parent, expected=request)["state"] == "unknown"
+        with pytest.raises(CampaignError, match="owned process or uncertain spawn"):
+            workers.spawn(path)
+        other = workers.spawn(other_path)
+        assert other is owned_launch.processes[0]
+    finally:
+        release.set()
+        thread.join(timeout=10)
+    assert not thread.is_alive()
+    assert errors == []
+    assert len(result) == 1
+    assert len(owned_launch.processes) == 2
+
+
+def test_uncertain_spawn_exception_cannot_authorize_a_second_spawn(owned_launch):
+    path, request = owned_launch.prepare()
+
+    def interrupted(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    owned_launch.module.Popen = interrupted
+    with pytest.raises(KeyboardInterrupt):
+        workers.spawn(path)
+    assert workers.observe(path.parent, expected=request)["state"] == "unknown"
+    with pytest.raises(CampaignError, match="owned process or uncertain spawn"):
+        workers.spawn(path)
+
+
+@pytest.mark.parametrize("inherited", [False, True])
+def test_adopted_or_fork_inherited_process_is_never_reaped(owned_launch, monkeypatch, inherited):
+    owned_path, request = owned_launch.prepare("owned")
+    process = workers.spawn(owned_path)
+    if inherited:
+        path = owned_path
+        workers._OWNED_LAUNCHES[path.parent].owner_pid = os.getpid() + 1
+    else:
+        path, request = owned_launch.prepare("adopted")
+    (path.parent / "startup.json").write_text(json.dumps(request))
+    monkeypatch.setattr(runs, "read_named_pid_identity", lambda path: (123, 456))
+    monkeypatch.setattr(runs, "probe_liveness", lambda *args: "alive")
+    assert workers.observe(path.parent, expected=request)["state"] == "running"
+    assert process.polls == 0
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="POSIX fork ownership")
+def test_native_fork_resets_registry_lock_without_reaping_inherited_handles(owned_launch):
+    path, request = owned_launch.prepare()
+    process = workers.spawn(path)
+    read_fd, write_fd = os.pipe()
+    with workers._OWNED_LAUNCHES_LOCK:
+        child = os.fork()
+        if child == 0:
+            os.close(read_fd)
+            try:
+                acquired = workers._OWNED_LAUNCHES_LOCK.acquire(blocking=False)
+                assert acquired, "fork inherited the parent's held lock"
+                workers._OWNED_LAUNCHES_LOCK.release()
+                result = workers.observe(path.parent, expected=request)
+                os.write(write_fd, json.dumps([result["state"], process.polls]).encode())
+            except BaseException as error:
+                os.write(write_fd, repr(error).encode())
+            finally:
+                os.close(write_fd)
+                os._exit(0)
+    os.close(write_fd)
+    try:
+        ready, _, _ = select.select([read_fd], [], [], 10)
+        assert ready, "forked registry observation did not finish"
+        assert json.loads(os.read(read_fd, 4096)) == ["unknown", 0]
+    finally:
+        os.close(read_fd)
+        # Only this test-created fork; never any campaign or adopted PID.
+        waited, _ = os.waitpid(child, os.WNOHANG)
+        if not waited:
+            os.kill(child, signal.SIGKILL)
+            os.waitpid(child, 0)
+
+
+def test_reaped_owned_process_still_requires_unchanged_workspace(
+    owned_launch, tmp_path, project, monkeypatch
+):
+    path, _ = owned_launch.prepare("owned")
+    startup, receipt = observed_files(path.parent, project)
+    path.write_text(json.dumps(startup))
+    (path.parent / "startup.json").unlink()
+    (path.parent / "receipt.json").unlink()
+    process = workers.spawn(path)
+    process.returncode = 0
+    (path.parent / "startup.json").write_text(json.dumps(startup))
+    (path.parent / "receipt.json").write_text(json.dumps({**receipt, "head": "wrong"}))
+    monkeypatch.setattr(runs, "read_named_pid_identity", lambda path: (123, 456))
+    monkeypatch.setattr(runs, "probe_liveness", lambda *args: "dead")
+    with pytest.raises(CampaignError, match="head changed"):
+        workers.observe(path.parent, expected=startup)
+    assert process.polls == 1
+    assert path.parent not in workers._OWNED_LAUNCHES
+    with pytest.raises(CampaignError, match="startup binding or receipt"):
+        workers.spawn(path)
 
 
 def test_child_failed_verification_is_not_an_acceptance_receipt(project, tmp_path):
