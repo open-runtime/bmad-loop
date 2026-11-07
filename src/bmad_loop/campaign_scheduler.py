@@ -240,20 +240,24 @@ def allocation_order(snapshot: CampaignSnapshot) -> tuple[str, ...]:
     return tuple(result)
 
 
+def active_sessions(snapshot: CampaignSnapshot) -> int:
+    """One global count for unit workers, reasoning jobs and uncertain actors."""
+    return sum(
+        bool(unit.claim and not unit.claim.quiescent and unit.claim.resource != "verify")
+        or (unit.state in {UnitState.CLAIMED, UnitState.RUNNING} and not unit.claim)
+        for unit in snapshot.units.values()
+    ) + sum(
+        bool(row.get("claim") and not row["claim"]["quiescent"]) for row in snapshot.jobs.values()
+    )
+
+
 def resource_available(snapshot: CampaignSnapshot, resource: str) -> bool:
     """Separate phase limits; CI/merge/tracking waits use no session slot."""
     claims = [
         unit.claim for unit in snapshot.units.values() if unit.claim and not unit.claim.quiescent
     ]
     if resource in {"execution", "review", "resolution", "planning"}:
-        if (
-            sum(claim.resource != "verify" for claim in claims)
-            + sum(
-                bool(job.get("claim") and not job["claim"]["quiescent"])
-                for job in snapshot.jobs.values()
-            )
-            >= snapshot.spec.resources.max_sessions
-        ):
+        if active_sessions(snapshot) >= snapshot.spec.resources.max_sessions:
             return False
     used = sum(claim.resource == resource for claim in claims)
     limit = {

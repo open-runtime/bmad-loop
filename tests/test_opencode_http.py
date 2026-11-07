@@ -156,9 +156,7 @@ PINNED_EPOCH_MS = 1_784_218_739_410
 # connect), pid (the server's own pid).
 
 FAKE_OPENCODE = r"""
-import itertools, json, os, re, sys, threading, time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlsplit
+import os, sys
 
 VERSION = os.environ.get("FAKE_OPENCODE_VERSION", "1.18.2")
 
@@ -168,6 +166,12 @@ if sys.argv[1:] == ["--version"]:
     # before anything below reads FAKE_OPENCODE_DIR.
     print(VERSION, flush=True)
     sys.exit(0)
+
+# The version probe needs neither the server nor its imports. Keep its startup
+# independent of the HTTP fixture's cost when many subprocess E2Es run at once.
+import itertools, json, re, threading, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
 
 _VERSION_MATCH = re.search(r"(\d+)\.(\d+)\.(\d+)", VERSION)
 V2 = bool(_VERSION_MATCH) and _VERSION_MATCH.group(1) == "2"

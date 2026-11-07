@@ -354,7 +354,11 @@ class HierarchyCoordinator:
         )
 
     def close_parents(
-        self, snapshot: CampaignSnapshot, *, receipts: Mapping[str, MutationIntent] | None = None
+        self,
+        snapshot: CampaignSnapshot,
+        *,
+        receipts: Mapping[str, MutationIntent] | None = None,
+        only_key: str = "",
     ) -> TrackingStep:
         """Close drained parent issues and milestones after child delivery.
 
@@ -369,6 +373,8 @@ class HierarchyCoordinator:
             if binding.get("kind") == "issue"
         }
         for key, binding in bindings.items():
+            if only_key and key != only_key:
+                continue
             if not key.startswith("epic:") or binding.get("closed_confirmed"):
                 continue
             members = [
@@ -413,6 +419,8 @@ class HierarchyCoordinator:
             )
             return TrackingStep(action_key, intent, bindings, {})
         for key, binding in bindings.items():
+            if only_key and key != only_key:
+                continue
             if not key.startswith("initiative:") or binding.get("closed_confirmed"):
                 continue
             namespace = key.removeprefix("initiative:")
@@ -427,6 +435,10 @@ class HierarchyCoordinator:
                 k.startswith("epic:" + namespace + ":") and not b.get("closed_confirmed")
                 for k, b in bindings.items()
             ):
+                if only_key:
+                    return TrackingStep(
+                        "", None, bindings, {}, reason="Milestone retains open epic scope"
+                    )
                 continue
             action_key = self._action(snapshot, key, "close")
             existing = saved.get(action_key)

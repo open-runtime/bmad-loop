@@ -28,6 +28,9 @@ breaking changes may land in a minor release.
 - Recheck publication holds before releasing merge groups and resume suppressed queue effects.
 - Bind native and semantic qualifications to their earned model, thinking level, permissions and purpose.
 - Preserve reasoning-job identity through late acknowledgements and coordinator restart.
+- Share session admission across reasoning and coding workers without spending deferred attempts.
+- Reuse capability checks within admission passes while revalidating every native launch.
+- Reconcile independent parent closures concurrently and resume them after temporary intake waits.
 
 ## [0.14.0] — 2026-11-05
 

@@ -10,7 +10,10 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +28,31 @@ PROTOCOLS = frozenset(
     {"claude-stream", "codex-jsonl", "agy-json", "grok-json", "muse-json", "bmad-test-v1"}
 )
 MAX_RECORD_BYTES = 16 * 1024 * 1024
+_ADMISSION_VALIDATIONS: ContextVar[dict[str, Exception | None] | None] = ContextVar(
+    "campaign_admission_validations", default=None
+)
+
+
+@contextmanager
+def admission_validation_pass():
+    """Share exact route checks only within this synchronous proposal pass."""
+    if _ADMISSION_VALIDATIONS.get() is not None:
+        yield
+        return
+    token = _ADMISSION_VALIDATIONS.set({})
+    try:
+        yield
+    finally:
+        _ADMISSION_VALIDATIONS.reset(token)
+
+
+def capability_admission(function):
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        with admission_validation_pass():
+            return function(*args, **kwargs)
+
+    return wrapped
 
 
 def read_json(path: Path, *, limit: int = MAX_RECORD_BYTES) -> dict[str, Any]:
@@ -173,7 +201,21 @@ def _validate_capability(
 
 def validate_capability(raw, candidate, *, verify_files=True, permissions="no-tools") -> None:
     """Normal campaign launches always require earned native qualification."""
-    _validate_capability(raw, candidate, verify_files=verify_files, permissions=permissions)
+    memo = _ADMISSION_VALIDATIONS.get()
+    key = digest([raw, asdict(candidate), verify_files, permissions]) if memo is not None else ""
+    if memo is not None and key in memo:
+        failure = memo[key]
+        if failure is not None:
+            raise failure
+        return
+    try:
+        _validate_capability(raw, candidate, verify_files=verify_files, permissions=permissions)
+    except (CampaignError, OSError) as exc:
+        if memo is not None:
+            memo[key] = exc
+        raise
+    if memo is not None:
+        memo[key] = None
 
 
 def validate_probe_capability(raw, candidate) -> None:
@@ -427,7 +469,7 @@ class HeadlessRunner:
         if selection not in request.candidates:
             raise CampaignError("Selected headless route is not authorized by the request")
         if probe is None:
-            validate_capability(capability, selection, permissions=permissions)
+            _validate_capability(capability, selection, permissions=permissions)
         else:
             from .campaign_qualification import validate_probe_request
 
@@ -540,7 +582,7 @@ class HeadlessRunner:
             validate_probe_envelope(envelope)
             validate_probe_capability(envelope["capability"], candidate)
         else:
-            validate_capability(
+            _validate_capability(
                 envelope["capability"], candidate, permissions=envelope["permissions"]
             )
         with file_lock(directory / "launch.lock"):

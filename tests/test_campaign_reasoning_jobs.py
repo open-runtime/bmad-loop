@@ -18,7 +18,9 @@ from bmad_loop.campaign_store import CampaignStore, add_event
 from bmad_loop.campaign_supervisor import CampaignSupervisor
 
 
-def case(tmp_path, prepared, count=2):
+def case(
+    tmp_path, prepared, count=2, *, max_sessions=None, extra_roles=(), configure=None, job_unit=None
+):
     runner, _, request, candidate, cap = prepared
     snapshot = make_snapshot()
     common = tmp_path / "git-common"
@@ -27,6 +29,10 @@ def case(tmp_path, prepared, count=2):
     snapshot.generation = 1
     snapshot.spec = replace(
         snapshot.spec,
+        resources=replace(
+            snapshot.spec.resources,
+            max_sessions=max_sessions or snapshot.spec.resources.max_sessions,
+        ),
         reasoning=ReasoningSpec(enabled=True, purposes=(request.purpose,)),
         roles=(
             (
@@ -36,6 +42,7 @@ def case(tmp_path, prepared, count=2):
                     max_sessions=4,
                 ),
             ),
+            *extra_roles,
         ),
         role_pools=(("summary-pool", (candidate,)),),
     )
@@ -59,9 +66,11 @@ def case(tmp_path, prepared, count=2):
             }
         ],
     }
-    unit = next(iter(snapshot.units))
+    unit = next(iter(snapshot.units)) if job_unit is None else job_unit
     for index in range(count):
         prepare(snapshot, replace(request, id=f"job-{index}", role="summarization", unit=unit))
+    if configure:
+        configure(snapshot)
     store = CampaignStore(tmp_path / "campaigns")
     snapshot = store.create(snapshot)
     clock = [100]

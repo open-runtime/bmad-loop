@@ -272,6 +272,7 @@ class CampaignSupervisor:
                 row.unit == proposal.unit
                 and row.kind == proposal.kind
                 and row.payload.get("job_id") == proposal.payload.get("job_id")
+                and row.payload.get("parent_key") == proposal.payload.get("parent_key")
                 and row.state in {"prepared", "sent_unknown"}
                 for row in snapshot.outbox
             ):
@@ -421,9 +422,12 @@ class CampaignSupervisor:
                                 )
                             )
                             progress_at = self.clock()
-                        proposals = self.driver.observe_workers(snapshot)
+                        # Observation can admit reasoning jobs. Persist their
+                        # claims before planning unit work against capacity.
+                        snapshot = self._queue(snapshot, self.driver.observe_workers(snapshot))
+                        proposals = ()
                         if snapshot.phase == "active":
-                            proposals += self.driver.proposals(snapshot)
+                            proposals = self.driver.proposals(snapshot)
                         from .campaign_metrics import observe_admission
 
                         if observe_admission(snapshot, now=self.clock()):

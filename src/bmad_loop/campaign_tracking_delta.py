@@ -23,7 +23,7 @@ def _changes(before, after):
     }
 
 
-def observation(snapshot, result, unit_id=""):
+def observation(snapshot, result, unit_id="", *, read_keys=None):
     value = asdict(result)
     before = snapshot.bindings.get("github_hierarchy", {})
     value["binding_changes"] = _changes(before, value.pop("bindings"))
@@ -41,6 +41,8 @@ def observation(snapshot, result, unit_id=""):
         while unit:
             keys.add("story:" + unit.id)
             unit = snapshot.units.get(unit.spec.parent)
+    elif read_keys is not None:
+        keys.update(read_keys)
     else:
         keys.update(result.bindings)
     value["read_fence"] = {

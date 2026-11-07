@@ -30,7 +30,6 @@ from conftest import (
     refuse_to_resolve,
     render_probe_stub_skill_md,
     windows_relay_builder,
-    write_script_launcher,
 )
 
 import bmad_loop.install as install_mod
@@ -1737,12 +1736,19 @@ def test_cli_version_runs_the_binary_under_the_profile_env(tmp_path, monkeypatch
 
     ABLATION: drop `env=` from the `run_argv` call and the first read is None."""
     monkeypatch.setattr(install_mod, "_cli_versions", {})
-    launcher = write_script_launcher(
-        tmp_path,
-        "envcli",
-        "import os\nv = os.environ.get('BMAD_LOOP_TEST_CLI_VERSION')\n"
-        "print(v if v else 'no version')\n",
-    )
+    # This row tests process environment propagation, not interpreter startup.
+    # Use the host shell's builtin output to avoid an unnecessary interpreter
+    # start inside this bounded probe when subprocess-heavy E2Es run concurrently.
+    if os.name == "nt":
+        launcher = tmp_path / "envcli.cmd"
+        launcher.write_text("@echo %BMAD_LOOP_TEST_CLI_VERSION%\n", encoding="utf-8")
+    else:
+        launcher = tmp_path / "envcli"
+        launcher.write_text(
+            "#!/bin/sh\nprintf '%s\\n' \"${BMAD_LOOP_TEST_CLI_VERSION:-no version}\"\n",
+            encoding="utf-8",
+        )
+        launcher.chmod(0o755)
     monkeypatch.delenv("BMAD_LOOP_TEST_CLI_VERSION", raising=False)
     claude = get_profile("claude")
     old = dataclasses.replace(

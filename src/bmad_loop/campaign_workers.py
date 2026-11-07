@@ -696,7 +696,14 @@ def _stage(request: dict[str, Any], envelope: CampaignExecution) -> dict[str, An
         or actual.get("status") != "done"
     ):
         raise CampaignError(f"{role} session did not produce a completed structured result")
-    if candidate.get("model") and observed != candidate["model"]:
+    from .adapters.headless import HeadlessAdapter
+
+    model_matches = (
+        adapter.matches_selected_model(spec, observed)
+        if isinstance(adapter, HeadlessAdapter)
+        else observed == candidate.get("model")
+    )
+    if candidate.get("model") and not model_matches:
         raise CampaignError(
             f"{role} observed model is missing or differs from selection: {observed!r}"
         )

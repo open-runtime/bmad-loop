@@ -678,13 +678,14 @@ def test_live_story_acceptance_amendment_drains_retains_same_pr_and_reexecutes_r
     text = text.replace(
         '    workspace=Path(request["workspace"])\n    product=',
         """    if suffix=="first" and "amended" not in request["unit"]["acceptance"][0]:
-        # Keep the actor live at the intake barrier even when this zero-token
-        # scenario shares the full suite's subprocess and Git workload.
-        deadline=time.monotonic()+90
+        # The parent's completion guard owns the deadline. A second, shorter
+        # deadline would turn slow accepted triage into a failed live actor.
+        # Observe its stop probe so fixture cleanup also releases this barrier.
+        from bmad_loop.childrun import hard_stop_pending
         while not Path("""
         + repr(str(released))
         + """).exists():
-            if time.monotonic()>deadline: raise RuntimeError("live amendment rendezvous timed out after 90s waiting for accepted triage; original actor remains unreleased")
+            if hard_stop_pending(): raise RuntimeError("live amendment fixture stopped before accepted triage")
             threading.Event().wait(.01)
     workspace=Path(request["workspace"])
     product=""",

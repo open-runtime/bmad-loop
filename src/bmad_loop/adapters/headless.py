@@ -224,6 +224,22 @@ class HeadlessAdapter(CodingCLIAdapter):
         if handle.task_id in self.requests and handle.task_id not in self.receipts:
             self.runner.terminate(self.requests[handle.task_id])
 
+    def matches_selected_model(self, spec: SessionSpec, observed: str) -> bool:
+        """Accept an earned served alias only for this completed native task."""
+        cap = self.capability or {}
+        receipt = self.receipts.get(spec.task_id, {})
+        return (
+            cap.get("profile") == self.profile.name
+            and cap.get("model") == spec.model
+            and spec.effort in cap.get("efforts", [])
+            and receipt.get("selected_model") == spec.model
+            and receipt.get("observed_model") == observed
+            and receipt.get("outcome") == "completed"
+            and receipt.get("quiescent") is True
+            and receipt.get("input_complete") is True
+            and observed in {spec.model, *cap.get("served_model_aliases", [])}
+        )
+
     def read_usage(self, result: SessionResult) -> TokenUsage | None:
         request_path = (result.native_binding or {}).get("headless_request")
         receipt = next(

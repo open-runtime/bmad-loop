@@ -418,6 +418,13 @@ quota waits are resumable resource conditions, not product failures. Unknown
 usage stays unknown. Bound repair/review/rebase attempts and surface exhaustion;
 do not restart counters by creating another worker or PR.
 
+Reasoning jobs consume the same global session budget as unit workers. Persist
+their claims before computing ordinary-worker proposals and recheck capacity
+when preparing every never-sent launch. A last-slot race defers the action
+without a claim, attempt or operator hold. Verification keeps its separate limit.
+Reuse exact capability-validation results only within one synchronous admission
+pass; every actual native launch revalidates its executable and evidence files.
+
 Create a worker entry point internal to the package. It calls compose_run with
 the exact source selectors and max_stories=1, isolation=none, an explicit run ID,
 resolved profiles and frozen plugin grants. Tickets use the ticket epic slug and

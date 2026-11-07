@@ -32,6 +32,7 @@ from .campaign_discovery import (
 )
 from .campaign_execution import CampaignExecution
 from .campaign_github import GhTransport, GithubGateway, MutationIntent
+from .campaign_headless import capability_admission
 from .campaign_model import (
     CampaignError,
     CampaignSnapshot,
@@ -525,6 +526,7 @@ class CampaignRuntime:
                     changed = True
         return changed
 
+    @capability_admission
     def proposals(self, snapshot: CampaignSnapshot) -> tuple[Proposal, ...]:
         if self._units_settled(snapshot) and self.completion_ready(snapshot):
             # Let already-issued observations/metadata drain. Re-admitting a
@@ -591,6 +593,14 @@ class CampaignRuntime:
             claim.resource
             for row in snapshot.units.values()
             if (claim := row.claim) is not None and not claim.quiescent
+        )
+        reserved["reasoning"] = sum(
+            bool(row.get("claim") and not row["claim"]["quiescent"])
+            for row in snapshot.jobs.values()
+        )
+        reserved["uncertain"] = sum(
+            row.state in {UnitState.CLAIMED, UnitState.RUNNING} and not row.claim
+            for row in snapshot.units.values()
         )
         limits = {
             "execution": snapshot.spec.max_workers,
@@ -990,12 +1000,10 @@ class CampaignRuntime:
             and not self.completion_ready(snapshot)
             and not self._pending(snapshot, "", "intake")
             and intake.get("observed_at", 0) >= snapshot.bindings.get("last_delivery_at", 0)
-            and not any(
-                action.kind == "hierarchy-close" and action.state in {"prepared", "sent_unknown"}
-                for action in snapshot.outbox
-            )
         ):
-            proposals.append(Proposal("hierarchy-close", next(reversed(snapshot.units))))
+            from .campaign_parent_closure import proposals as parent_proposals
+
+            proposals.extend(parent_proposals(snapshot))
         admitted = []
         role_reservations = []
         writer_reservations = []
@@ -1106,6 +1114,7 @@ class CampaignRuntime:
 
         return tuple(before_proposal(self, snapshot, proposal) for proposal in admitted)
 
+    @capability_admission
     def observe_workers(self, snapshot: CampaignSnapshot) -> tuple[Proposal, ...]:
         from .campaign_handoff_flow import proposals as handoff_proposals
         from .campaign_reasoning_flow import proposals as reasoning_proposals
@@ -1214,6 +1223,24 @@ class CampaignRuntime:
             return
         if kind == "prepare-effect":
             action = command["action"]
+            if action["kind"] in {"launch", "reasoning-launch"}:
+                from .campaign_scheduler import active_sessions
+
+                is_session = action["kind"] == "reasoning-launch" or action["payload"].get(
+                    "kind"
+                ) not in {"verify", "queue_verify"}
+                if is_session and active_sessions(snapshot) >= snapshot.spec.resources.max_sessions:
+                    owned = next(row for row in snapshot.outbox if row.id == action["id"])
+                    owned.state = "confirmed"
+                    owned.receipt = {"admission_deferred": "global session capacity is reserved"}
+                    add_event(
+                        snapshot,
+                        "admission-deferred",
+                        unit=owned.unit,
+                        action=owned.id,
+                        reason=owned.receipt["admission_deferred"],
+                    )
+                    return
             if action["kind"].startswith("reasoning-"):
                 from .campaign_reasoning_flow import prepare_effect
 
@@ -1530,6 +1557,25 @@ class CampaignRuntime:
                         independent_families=current.spec.github.require_independent_review,
                         queue_evidence_context=current.spec.github.candidate_check_context,
                     )
+                return Observation(
+                    "confirmed" if result.state == "confirmed" else "unknown",
+                    {"intent": result.to_dict()},
+                    result.error,
+                )
+            if action.payload.get("purpose") == "parent-tracking":
+                from .campaign_parent_closure import guard
+
+                observed = gateway.reconcile_update(intent, allow_retry=False)
+                if observed.state == "confirmed":
+                    return Observation("confirmed", {"intent": observed.to_dict()})
+                blocked = guard(self, snapshot, action, intent)
+                if blocked is not None:
+                    return blocked
+                result = gateway.reconcile_update(
+                    dataclasses.replace(intent, generation=snapshot.generation),
+                    allow_retry=True,
+                    generation=snapshot.generation,
+                )
                 return Observation(
                     "confirmed" if result.state == "confirmed" else "unknown",
                     {"intent": result.to_dict()},
@@ -2330,6 +2376,10 @@ class CampaignRuntime:
     def _perform_hierarchy_close(self, snapshot, action) -> Observation:
         if not self._units_settled(snapshot):
             return Observation("confirmed", {"stale_scope": True})
+        if action.payload.get("parent_key"):
+            from .campaign_parent_closure import perform
+
+            return perform(self, snapshot, action)
         from .campaign_action_history import TrackingReceipts
 
         receipts = TrackingReceipts(snapshot)
@@ -2601,13 +2651,11 @@ class CampaignRuntime:
                 )
             intent = dataclasses.replace(refreshed, action_id=intent.action_id)
         if action.payload.get("purpose") == "parent-tracking":
-            current = self.store.load(snapshot.id)
-            if action.payload.get(
-                "scope_revision"
-            ) != current.graph_revision or not self._units_settled(current):
-                return Observation(
-                    "confirmed", {"intent": intent.to_dict(), "canceled_before_write": True}
-                )
+            from .campaign_parent_closure import guard
+
+            blocked = guard(self, snapshot, action, intent)
+            if blocked is not None:
+                return blocked
         if intent.state == "confirmed":
             return Observation("confirmed", {"intent": intent.to_dict()})
         if intent.kind in {"merge", "project_merge", "review_request"}:
@@ -4023,6 +4071,7 @@ class CampaignRuntime:
                 "purpose": data.get("purpose", "hierarchy"),
                 "tracking_key": tracking_key,
                 "scope_revision": snapshot.graph_revision,
+                **({"parent_key": data["parent_key"]} if data.get("parent_key") else {}),
             },
             action_id=intent["action_id"],
         )
@@ -4316,6 +4365,11 @@ class CampaignRuntime:
                 )
         elif kind == "hierarchy-close":
             if data.get("stale_scope") or data.get("graph_revision") != snapshot.graph_revision:
+                return
+            if data.get("parent_key"):
+                from .campaign_parent_closure import apply
+
+                apply(self, snapshot, unit, action, data)
                 return
             if data.get("intent"):
                 self._queue_intent(
