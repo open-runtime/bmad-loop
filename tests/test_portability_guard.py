@@ -359,6 +359,9 @@ REFUSAL_HELPER_DEFS = {
     # test_engine_block_with_a_name_is_refused, test_engine_name_of_wrong_type_is_refused
     ("policy.py", "_refuse_removed_engine"),
     ("resolve.py", "_reject_json_constant"),
+    # Live/legacy engine ownership, including force; test_runs.py
+    # test_cleanup_protects_legacy_macos_engine_until_pid_exits
+    ("runs.py", "_refuse_live_engine_cleanup"),
     ("runs.py", "_refuse_live_session"),
     ("runs.py", "_refuse_uncontained_run_dir"),
     ("sweep.py", "_refuse_advanced_migration_head"),  # DW-427/428, test_sweep.py
