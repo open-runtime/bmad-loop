@@ -354,6 +354,8 @@ def test_write_pid(tmp_path):
     # told from our engine; Linux always provides one (via /proc starttime).
     if sys.platform.startswith("linux"):
         assert len(tokens) == 2 and float(tokens[1]) > 0
+    elif sys.platform == "darwin" and len(tokens) > 1:
+        assert float(tokens[1]) < -2  # stable macOS stamp, outside pid-file sentinels
     elif len(tokens) > 1:
         assert float(tokens[1]) > 0
 
@@ -3388,6 +3390,116 @@ def test_delete_run_refuses_a_live_engine_inside_the_lifecycle_hold(tmp_path, mo
 
     assert run_dir.is_dir()
     assert state_dir.is_dir()
+
+
+def _legacy_macos_engine(monkeypatch):
+    """Use the real Darwin decision table with an explicitly simulated PID."""
+    from types import SimpleNamespace
+
+    from bmad_loop import process_host
+
+    monkeypatch.setattr(process_host, "sys", SimpleNamespace(platform="darwin"))
+    host = process_host.PosixProcessHost()
+    alive = [True]
+    monkeypatch.setattr(host, "is_alive", lambda pid: pid == 4242 and alive[0])
+    monkeypatch.setattr(host, "identity", lambda pid: -1700000000.0 if alive[0] else None)
+    monkeypatch.setattr(host, "terminate", lambda _pid: pytest.fail("unexpected process signal"))
+    monkeypatch.setattr(host, "force_kill", lambda _pid: pytest.fail("unexpected process kill"))
+    monkeypatch.setattr(runs, "get_process_host", lambda: host)
+    return host, alive
+
+
+@pytest.mark.parametrize("action", ["delete", "archive"])
+@pytest.mark.parametrize("force", [False, True])
+def test_cleanup_protects_legacy_macos_engine_until_pid_exits(tmp_path, monkeypatch, action, force):
+    """A stamp migration cannot authorize removal of a still-running engine.
+
+    Ablation: remove the legacy guard and the real delete/archive succeeds while
+    the simulated PID still exists. After it exits the same operation must work.
+    """
+    run_dir = _make_state_run(tmp_path, "legacy-mac")
+    state_dir = _seed_state_dir(tmp_path, run_dir.name)
+    (run_dir / "engine.pid").write_text("4242 1700000000.0")
+    host, alive = _legacy_macos_engine(monkeypatch)
+    monkeypatch.setattr(runs, "_refuse_live_session", lambda *_args, **_kwargs: None)
+    operation = runs.delete_run if action == "delete" else runs.archive_run
+    assert runs.engine_liveness(run_dir) == "unknown"
+
+    with pytest.raises(runs.LiveEngineError, match="legacy macOS identity"):
+        operation(tmp_path, run_dir, force=force)
+    assert run_dir.is_dir() and state_dir.is_dir()
+    assert not (tmp_path / ".bmad-loop" / "archive").exists()
+
+    alive[0] = False
+    assert host.liveness_of(4242, 1700000000.0) == "dead"
+    result = operation(tmp_path, run_dir, force=force)
+    assert not run_dir.exists()
+    if action == "archive":
+        assert result.is_file()
+
+
+@pytest.mark.parametrize("terminal", ["finished", "stopped"])
+def test_reclaim_predicates_protect_legacy_macos_engine(tmp_path, monkeypatch, terminal):
+    run_dir = _make_state_run(tmp_path, "legacy-mac", **{terminal: True})
+    (run_dir / "engine.pid").write_text("4242 1700000000.0")
+    _, alive = _legacy_macos_engine(monkeypatch)
+    assert not runs.is_finished(run_dir)
+    assert not runs.reclaimable(run_dir)
+    alive[0] = False
+    assert runs.is_finished(run_dir) is (terminal == "finished")
+    assert runs.reclaimable(run_dir)
+
+
+def test_legacy_macos_stop_keeps_cooperative_request_and_nonterminal_state(tmp_path, monkeypatch):
+    run_dir = _make_state_run(tmp_path, "legacy-mac")
+    (run_dir / "engine.pid").write_text("4242 1700000000.0")
+    host, _ = _legacy_macos_engine(monkeypatch)
+
+    def forbidden(*_args):
+        pytest.fail("a live actor with ambiguous identity must not be signalled")
+
+    monkeypatch.setattr(host, "terminate", forbidden)
+    monkeypatch.setattr(host, "force_kill", forbidden)
+    monkeypatch.setattr(runs, "kill_session", forbidden)
+    assert runs.request_graceful_stop(run_dir) == "requested-unverifiable"
+    with pytest.raises(runs.StopRunError, match="hard stop request is pending"):
+        runs.stop_run(run_dir)
+    assert runs.read_stop_request_mode(run_dir) == "hard"
+    assert not load_state(run_dir).stopped
+
+
+def test_legacy_macos_stop_reports_when_request_cannot_be_lodged(tmp_path, monkeypatch):
+    run_dir = _make_state_run(tmp_path, "legacy-mac")
+    (run_dir / "engine.pid").write_text("4242 1700000000.0")
+    _legacy_macos_engine(monkeypatch)
+    monkeypatch.setattr(runs, "_write_stop_request", _raising(OSError("read only")))
+    with pytest.raises(runs.StopRunError, match="No stop is pending"):
+        runs.stop_run(run_dir)
+    assert runs.read_stop_request_mode(run_dir) is None
+    assert not load_state(run_dir).stopped
+
+
+@pytest.mark.parametrize("action", ["delete", "archive"])
+def test_other_unknown_identities_keep_existing_cleanup_contract(tmp_path, monkeypatch, action):
+    run_dir = _make_state_run(tmp_path, "unreadable", finished=True)
+    (run_dir / "engine.pid").write_text("4242 100.0")
+    _use_host(monkeypatch, _FakeHost(alive=True, identity=None))
+    assert runs.engine_liveness(run_dir) == "unknown"
+    assert runs.is_finished(run_dir) and runs.reclaimable(run_dir)
+    operation = runs.delete_run if action == "delete" else runs.archive_run
+    operation(tmp_path, run_dir, force=True)
+    assert not run_dir.exists()
+
+
+def test_prunable_sessions_protects_legacy_macos_engine(tmp_path, monkeypatch):
+    run_dir = _make_state_run(tmp_path, "legacy-mac")
+    (run_dir / "engine.pid").write_text("4242 1700000000.0")
+    _, alive = _legacy_macos_engine(monkeypatch)
+    monkeypatch.setattr(runs, "mux_sessions", lambda: ["bmad-loop-legacy-mac"])
+    monkeypatch.setattr(runs, "session_project_tags", lambda: {})
+    assert runs.prunable_sessions(tmp_path) == ([], ["legacy-mac"], set())
+    alive[0] = False
+    assert runs.prunable_sessions(tmp_path) == (["legacy-mac"], [], set())
 
 
 def test_delete_run_holds_lifecycle_lock_through_removal_and_state_discard(tmp_path, monkeypatch):

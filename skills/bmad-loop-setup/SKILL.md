@@ -55,6 +55,14 @@ Skip this step entirely if `{project-root}/_bmad/` does not exist.
 
 ## Install the Orchestrator Tool
 
+For native campaigns, include the `paradev` extra only when the project requests
+Paradev reflection, then run `bmad-loop campaign preflight CAMPAIGN.toml --json`
+against the target project. A successful legacy `validate` does not qualify
+campaign publication, source stores or native workspace ownership. Preserve live
+worker environments during upgrades. For an exact fork rollout, install its full
+merged Git SHA and run `bmad-loop campaign provenance --expected-commit SHA --json`;
+a matching version string alone is insufficient.
+
 The orchestrator is what spawns fresh coding CLI sessions through the selected adapter(s) to invoke `bmad-build-auto` (the upstream dev primitive; `bmad-dev-auto` on pre-rename releases) for the dev pass — then re-invokes it on the `done` spec for the follow-up review pass — and `bmad-loop-sweep`, watches their hook signals, and verifies their artifacts. Installing it is therefore part of setup, not an optional extra.
 
 > **Why from Git?** The BMAD installer copies only skill directories into a project — it does not carry sibling files, so the tool can't ride along in the skill folder. This skill installs the open-runtime fork from <https://github.com/open-runtime/bmad-loop>. (The reverse holds, though: the tool's wheel **bundles** the skills, so `bmad-loop init` lays them down into a project's skill trees on its own — see step 3.)

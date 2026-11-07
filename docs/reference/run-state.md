@@ -27,6 +27,7 @@ Each project gets a subtree keyed by the first 16 hex characters of the SHA-256 
 ```text
 <state root>/
 ├── locks/                      advisory-lock files, shared across this user's projects
+├── probe-workspaces/<profile>/ Codex `probe-adapter --probe` hook script + config (owner-only, emptied each run)
 └── <project key>/
     ├── <run-id>/               the run's control plane
     │   ├── events/             hook-event files written by `bmad-loop relay` (BMAD_LOOP_EVENTS_DIR)
@@ -35,6 +36,40 @@ Each project gets a subtree keyed by the first 16 hex characters of the SHA-256 
     ├── _plugin-snapshots/      verified copies of granted project plugins
     └── plugin-grants.json      project-plugin trust grants (`bmad-loop plugins`)
 ```
+
+## Campaign authority
+
+Campaigns use `<state root>/campaigns/<common-directory hash>/<campaign ID>/`.
+The hash binds all worktrees of a repository to the same canonical Git common
+directory; a repository-wide coordinator lock prevents competing local owners.
+Workers and independent reasoning jobs do not hold that coordinator lock.
+
+New campaigns store authority, outbound intents, jobs and append-only events in
+`campaign.sqlite`. `snapshot.json` is a versioned storage marker. `events.jsonl`
+is a recoverable projection, not an additional authority. Immutable worker
+envelopes, transcript snapshots, inputs, results and terminal-history projections
+remain separate files beneath the campaign directory. Finished jobs leave the hot
+snapshot and remain accessible through paginated `campaign jobs` queries.
+Repeated terminal effect receipts move into indexed action history. The hot outbox
+retains prepared and uncertain effects, current claim references and the latest
+terminal record per unit/kind. `campaign history ID --actions` retrieves archived
+receipts in creation order; snapshots read only history visible at their saved
+revision. Full snapshot exports include this terminal action history; archived
+read-only polling observations remain a separate `history --observations` export.
+
+Legacy JSON campaigns remain readable and writable. `campaign migrate-state ID`
+requires quiescent workers and reconciled effects, preserves the byte-exact
+`snapshot.v1.backup.json`, commits the new database and atomically switches the
+marker. Older binaries reject that marker. Copying only a live SQLite main file
+does not include its write-ahead log; use SQLite's consistent backup mechanism
+when copying authority. Keep original transcript and worktree evidence until its retention rules
+permit removal.
+
+SQLite storage version 3 supports indexed effect history. Version 2 remains
+readable and upgrades transactionally on the next save. A crash after the database
+commit but before the marker replacement remains readable by the current binary;
+older readers reject the new database version. A version 3 marker cannot refer
+to a version 2 database.
 
 ## Project `.bmad-loop/` directory
 
@@ -79,6 +114,14 @@ Each project gets a subtree keyed by the first 16 hex characters of the SHA-256 
 
 Entries other than `state.json`, `journal.jsonl`, `engine.pid`, `tasks/` and `logs/` appear only when the run reaches the step that writes them. Plugins may add their own files.
 
+On macOS, new process identities are negative immutable birth stamps, unaffected
+by clock corrections. A positive identity from an older installation cannot be
+authenticated while its PID exists and reports `unknown`. Resume, resolve, replay,
+cleanup and terminal pruning retain that owner even with `--force`; they can proceed
+after the PID is confirmed gone. Keep the original PID record while stopping the
+old process. Other unknown-identity recovery behavior is unchanged, as are Linux,
+Windows and legacy PID-only records.
+
 The opencode adapter's environment-fault classifier scans `<task_id>.server.out` and `<task_id>.provider-errors.log`, never the model-written `<task_id>.log`. On OpenCode 2.x provider failures appear only as session events, so the adapter writes each `session.retry.scheduled` / `session.step.failed` / `session.execution.failed` frame as one `provider-error event=… type=… status=… attempt=… message="…"` line built from the event's structured fields (the provider's response body is never copied). The file is created at spawn on both majors and is empty on a healthy session. As it writes a line, the adapter also matches it against the profile's usage-limit patterns: a match (the shipped profile's `provider.quota` line) is a live usage-limit sighting, so a session that then times out, stalls or crashes pauses as a usage limit rather than an environment fault.
 
 - **`state.json`** — the serialized run state (stories, phases, tokens, the `finished` / `stopped` / `crashed` flags, and `paused_reason` with the pause context). Written atomically under a per-run lock, through the pinned run-directory descriptor above; `bmad-loop status` reads it.
@@ -101,7 +144,11 @@ Codex bills each stretch of its cumulative counts to the model of the latest tur
 
 The key is absent when no split was read (antigravity, or an unread OpenCode 2.x transcript). `state.json` keeps it on the session record as `tokens_by_model`, written only when non-empty; it never feeds any token total or budget.
 
-Claude and Codex also report the model they launched on in their SessionStart hook. The first such hook of a session journals one `session-model` entry (`task_id`, `model`, `cli`); later SessionStart hooks of the same session (a subagent's, a `/clear`) add none. On Codex only the session's first SessionStart counts, even when it names no model. Claude may omit the model, and Gemini, Copilot and antigravity send none that bmad-loop reads, so the row may be absent. A journal write that fails leaves a `session-model-unjournaled` line in `session-lifecycle.jsonl` instead.
+Claude and Codex also report the model they launched on in their SessionStart hook. The first such hook of a session journals one `session-model` entry (`task_id`, `model`, `cli`); later SessionStart hooks of the same session (a subagent's, a `/clear`) add none. On Codex only the session's first SessionStart counts, even when it names no model.
+
+Antigravity fires no SessionStart and names its model only on its Stop hook (`modelName`), so for it the row comes from the session's first fully-idle Stop that names one and that the spawn-marker check judged the session's own: never a yield's, a subagent's it identifies, or one it could not judge or read (a subagent Stop that arrives before its marker can still supply the row). That Stop usually ends the session, so the TUI agent line seldom shows an antigravity model; session-end `models` stays untracked for antigravity.
+
+Claude may omit the model, and Gemini and Copilot send none that bmad-loop reads, so the row may be absent. A journal write that fails leaves a `session-model-unjournaled` line in `session-lifecycle.jsonl` instead.
 
 `state.json` records the run's work source. A bmad-loop that does not know that source refuses to resume the run rather than drive it as a sprint run, so finish or abandon a run before downgrading bmad-loop.
 
@@ -243,3 +290,11 @@ Both stop modes write `stop-request.json` (`{"requested_at": …, "mode": "hard"
 - `[cleanup] auto_clean_on_finish` makes each `run` and `sweep` start by tearing down worktrees left under finished runs.
 
 See the [`[cleanup]` settings](configuration.md#cleanup).
+
+Completed, superseded read-only campaign observations move transactionally into
+an indexed SQLite archive. The latest observation per unit/kind and all uncertain
+operations remain in hot state. Superseded mutation, launch and checkpoint
+receipts retain their exact IDs, payloads and creation order in indexed history.
+Recovery and synchronization use explicit historical reads. Repeated completed
+effect payloads no longer accumulate in the hot outbox; current units, acceptance
+records and tracking projections still scale with the selected work.

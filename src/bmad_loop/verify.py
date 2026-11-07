@@ -2179,6 +2179,7 @@ def git_bytes(
     *args: str,
     timeout_s: int | None = None,
     env: dict[str, str] | None = None,
+    input_data: bytes | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     """Run one `git -C <repo> …` through the chokepoint, capturing raw BYTES.
 
@@ -2203,7 +2204,17 @@ def git_bytes(
     expressed as a `CompletedProcess`.
 
     `env` is opt-in and mirrors `_git_out`'s: it replaces the inherited
-    environment for this one child (`LC_ALL=C` still merged on top)."""
+    environment for this one child (`LC_ALL=C` still merged on top). Optional
+    `input_data` supplies bounded binary stdin through the same chokepoint."""
+    if input_data is not None:
+        return _run_git(
+            ["git", "-C", str(repo), *args],
+            repo,
+            binary=True,
+            timeout_s=timeout_s,
+            env=env,
+            input_data=input_data,
+        )
     return _run_git(
         ["git", "-C", str(repo), *args], repo, binary=True, timeout_s=timeout_s, env=env
     )
@@ -10825,6 +10836,7 @@ def finalize_commit(
     publication_remote: str = "origin",
     publication_branch: str | None = None,
     on_plan: Callable[[FinalizationPlan], None] | None = None,
+    append_only: bool = False,
 ) -> str | None:
     """Finalize the story without rewriting published branch or merge history.
 
@@ -10892,8 +10904,12 @@ def finalize_commit(
     original_head = rev_parse_head(repo)
     recorded_baseline = baseline
     baseline_oid = rev_parse_revision(repo, baseline)
-    plan = _finalization_plan(
-        repo, baseline_oid, original_head, target_ref, publication_remote, publication_branch
+    plan = (
+        FinalizationPlan(original_head, "campaign-append-only", False)
+        if append_only
+        else _finalization_plan(
+            repo, baseline_oid, original_head, target_ref, publication_remote, publication_branch
+        )
     )
     baseline = plan.baseline
     if on_plan is not None:
@@ -10916,6 +10932,8 @@ def finalize_commit(
             try:
                 committed_validator(baseline, staged_snapshot)
             except BaseException as exc:
+                if append_only:
+                    raise
                 # HEAD already sits at `baseline` and the index is whatever the
                 # concurrent writer left; put both back on the accepted chain.
                 restore_rc, restore_out = _git(repo, "reset", "--mixed", original_head)
@@ -10928,6 +10946,8 @@ def finalize_commit(
         return baseline if adopted else None
     rc, out = _git(repo, "commit", "-m", message)
     if rc != 0:
+        if append_only:
+            raise GitError(f"campaign commit failed; branch retained for reconciliation: {out}")
         # The soft reset already rewound HEAD to baseline; a failed commit would
         # otherwise leave the branch pointer there, dropping the skill commit chain
         # from HEAD. Restore HEAD (the working tree is untouched) before raising.
@@ -10943,6 +10963,10 @@ def finalize_commit(
         if committed_validator is not None:
             committed_validator(committed_head, staged_snapshot)
     except BaseException as exc:
+        if append_only:
+            raise GitError(
+                "campaign finalization validation failed; committed history retained for recovery"
+            ) from exc
         # Restore the accepted skill chain and its index while leaving the
         # working tree untouched.  A soft reset would retain an ignored path
         # that a hook force-added, making every replay fail staged validation

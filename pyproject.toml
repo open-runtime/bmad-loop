@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "bmad-loop"
-version = "0.13.15"
+version = "0.14.0"
 description = "Deterministic ralph-loop orchestrator for the BMAD implementation phase"
 readme = "README.md"
 license = "MIT"
@@ -39,6 +39,8 @@ non-linux = ["psutil>=7.2.2"]
 # HTTP client for the opencode-http adapter (drives `opencode serve` over
 # HTTP/SSE). `pip install 'bmad-loop[opencode]'`.
 opencode = ["httpx>=0.28"]
+# Native Paradev terminal output stream; imported lazily by the explicit backend.
+paradev = ["websockets>=15,<17"]
 
 [dependency-groups]
 # dev gets tui via `uv sync --all-extras` (groups can't self-reference an extra).

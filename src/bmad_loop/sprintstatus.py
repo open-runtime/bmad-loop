@@ -58,12 +58,15 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import yaml
 
-from .platform_util import atomic_write_bytes, file_lock
-from .statemachine import check_board_regression
+from .platform_util import atomic_write_bytes, atomic_write_bytes_confined, file_lock, is_link_like
+from .statemachine import check_board_planning, check_board_regression
+
+if TYPE_CHECKING:
+    from .campaign_source_publication import AcceptedPlanPublication
 
 EPIC_RE = re.compile(r"^epic-(\d+)$")
 RETRO_RE = re.compile(r"^epic-(\d+)-retrospective$")
@@ -817,6 +820,34 @@ def _row_at_or_past(current: str, target: str) -> bool:
     )
 
 
+def planning_rows_in_bytes(source: bytes | None) -> dict[str, str]:
+    """Read an exact planning board without silently folding duplicate rows."""
+    if source is None:
+        return {}
+    try:
+        root = yaml.compose(source.decode("utf-8-sig"))
+    except (yaml.YAMLError, UnicodeDecodeError) as exc:
+        raise SprintStatusError("Planning sprint-status is not valid YAML") from exc
+    if not isinstance(root, yaml.MappingNode):
+        raise SprintStatusError("Planning sprint-status has no top-level mapping")
+    roots = [key.value for key, _ in root.value if isinstance(key, yaml.ScalarNode)]
+    if len(roots) != len(root.value) or len(set(roots)) != len(roots):
+        raise SprintStatusError("Planning sprint-status has ambiguous top-level keys")
+    boards = [value for key, value in root.value if key.value == "development_status"]
+    if len(boards) != 1 or not isinstance(boards[0], yaml.MappingNode):
+        raise SprintStatusError(
+            "Planning sprint-status lacks an unambiguous development_status map"
+        )
+    rows: dict[str, str] = {}
+    for key, value in boards[0].value:
+        if not isinstance(key, yaml.ScalarNode) or not isinstance(value, yaml.ScalarNode):
+            raise SprintStatusError("Planning sprint-status rows must be scalar keys/statuses")
+        if key.value in rows or key.value == "<<":
+            raise SprintStatusError("Planning sprint-status has ambiguous development rows")
+        rows[key.value] = value.value
+    return rows
+
+
 def advance(
     path: Path,
     story_key: str,
@@ -824,6 +855,9 @@ def advance(
     *,
     now: str | None = None,
     allow_regression: bool = False,
+    expected_current: tuple[str, ...] | None = None,
+    campaign_recovery: bool = False,
+    publication: AcceptedPlanPublication | None = None,
 ) -> str | None:
     """Advance a story's sprint-status to `target` for the generic-skill path.
 
@@ -834,6 +868,13 @@ def advance(
     refresh `last_updated` when `now` is given. Comments/structure are preserved
     via line edits. Returns the story's status after the call (== `target` on a
     write), or None when nothing was eligible.
+
+    A coordinator may instead supply an accepted campaign planning publication
+    with empty story/target. Its externally held receipt binds the exact reviewed
+    artifact, actual merged mirror, canonical preimage and owned rows. The board
+    lock protects the final byte CAS and atomic import. Planning may add native
+    backlog/ready rows or ready an owned backlog row; existing unrelated rows and
+    terminal work cannot change. Ordinary calls retain their legacy behavior.
 
     Raises :class:`SprintStatusWriteRefused` when the row exists, the call has
     decided to move it (below `target`, or an allowlisted regression), and the
@@ -927,6 +968,65 @@ def advance(
     the hold, because the probe swallows every exception it meets.
     :func:`advanced_bytes` never passes the flag.
     """
+    if publication is not None:
+        if (
+            story_key
+            or target
+            or now is not None
+            or allow_regression
+            or campaign_recovery
+            or expected_current is not None
+            or publication.source_kind != "sprint-status"
+            or publication.purpose != "planning"
+        ):
+            raise SprintStatusError(
+                "Board planning publication cannot waive ordinary row transitions"
+            )
+        # Receipt validation performs Git readback, so it precedes the narrow
+        # board lock; only exact source CAS and atomic publication run inside it.
+        data = publication.validate(publication.code_repo, publication.ref, path)
+        before_rows = planning_rows_in_bytes(publication.expected_preimage)
+        after_rows = planning_rows_in_bytes(data)
+        check_board_planning(before_rows, after_rows, publication.owned_rows)
+        for key in publication.owned_rows:
+            if key in after_rows and before_rows.get(key) != after_rows[key]:
+                editable = _set_mapping_value(
+                    data.decode("utf-8-sig").splitlines(keepends=True),
+                    key,
+                    "in-progress",
+                    scope="development_status",
+                )
+                if isinstance(editable, _Refused) or editable == "absent":
+                    raise SprintStatusError(
+                        "Planning sprint-status row cannot be advanced by its native writer: " + key
+                    )
+        with _board_lock(path):
+            if is_link_like(path):
+                raise SprintStatusError("Board planning publication refuses redirected source")
+            current = path.read_bytes() if path.exists() else None
+            if publication.check_preimage(current, data):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                atomic_write_bytes_confined(
+                    path, data, confine_root=publication.source_root, require_writable_target=True
+                )
+            if path.read_bytes() != data:
+                raise SprintStatusError("Accepted planning board failed exact readback")
+        return None
+    if expected_current is not None:
+        with _board_lock(path):
+            current = story_status(path, story_key)
+            if current not in expected_current:
+                raise SprintStatusError(
+                    f"{story_key}: canonical status changed before semantic publication"
+                )
+            return _advance_locked(
+                path,
+                story_key,
+                target,
+                now=now,
+                allow_regression=allow_regression,
+                campaign_recovery=campaign_recovery,
+            )
     if not path.is_file():
         return None  # no board, nothing to serialize against — take no lock
     try:
@@ -943,7 +1043,14 @@ def advance(
         # function's raises through.
         pass
     with _board_lock(path):
-        return _advance_locked(path, story_key, target, now=now, allow_regression=allow_regression)
+        return _advance_locked(
+            path,
+            story_key,
+            target,
+            now=now,
+            allow_regression=allow_regression,
+            campaign_recovery=campaign_recovery,
+        )
 
 
 def _advance_locked(
@@ -953,6 +1060,7 @@ def _advance_locked(
     *,
     now: str | None = None,
     allow_regression: bool = False,
+    campaign_recovery: bool = False,
 ) -> str | None:
     """:func:`advance`'s read-modify-write, run with the board's lock already held.
 
@@ -989,7 +1097,9 @@ def _advance_locked(
     if _row_at_or_past(current, target):
         if not allow_regression or current == target:
             return current  # already at or past target — never regress
-        check_board_regression(story_key, current, target)  # raises unless allowlisted
+        check_board_regression(
+            story_key, current, target, campaign_recovery=campaign_recovery
+        )  # raises unless allowlisted
 
     text = path.read_bytes().decode("utf-8")
     lines = text.splitlines(keepends=True)
@@ -1008,7 +1118,7 @@ def _advance_locked(
     if story_edit == "equal":
         return current  # an off-order value already spelled as `target` — nothing to write
 
-    if target == "in-progress":
+    if target == "in-progress" and not campaign_recovery:
         m = STORY_RE.match(story_key)
         if m:
             epic_key = f"epic-{int(m.group(1))}"
@@ -1032,7 +1142,14 @@ def _advance_locked(
     return target
 
 
-def advanced_bytes(source: bytes, story_key: str, target: str) -> bytes | None:
+def advanced_bytes(
+    source: bytes,
+    story_key: str,
+    target: str,
+    *,
+    allow_regression: bool = False,
+    campaign_recovery: bool = False,
+) -> bytes | None:
     """What :func:`advance` would leave behind, given ``source`` as the board's bytes.
 
     For the caller that has to know whether a board on disk holds THIS run's advance
@@ -1079,7 +1196,16 @@ def advanced_bytes(source: bytes, story_key: str, target: str) -> bytes | None:
         # only the shadow, so every ownership computation would strand another
         # dead lock file under `<state root>/locks` (#286).
         try:
-            if _advance_locked(shadow, story_key, target) is None:
+            if (
+                _advance_locked(
+                    shadow,
+                    story_key,
+                    target,
+                    allow_regression=allow_regression,
+                    campaign_recovery=campaign_recovery,
+                )
+                is None
+            ):
                 return None
         except SprintStatusWriteRefused as e:
             raise SprintStatusWriteRefused(None, e.story_key, e.current, e.target, e.reason) from e
@@ -1200,6 +1326,6 @@ def select_actionable(ss: SprintStatus, epic: int | None, story: str | None) -> 
     if sel.is_targeted and matches and not actionable:
         s = matches[0]
         raise SprintStatusError(
-            f"story {story} matched {s.key} but its status is " f"'{s.status}' (not actionable)"
+            f"story {story} matched {s.key} but its status is '{s.status}' (not actionable)"
         )
     return actionable

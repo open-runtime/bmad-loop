@@ -546,13 +546,13 @@ def test_owned_spec_restore_detects_parent_swap_after_first_callback_check(tmp_p
 
 @pytest.mark.skipif(sys.platform == "win32", reason="socket substitution is POSIX-only")
 @requires_descriptor_restoration
-def test_owned_spec_socket_swap_before_read(tmp_path, monkeypatch):
+def test_owned_spec_socket_swap_before_read(short_socket_dir, monkeypatch):
     """A socket planted between stat and open is typed authority loss.
 
     On Darwin, removing EOPNOTSUPP from read_target_at makes the raw OSError
     escape instead of the recovery boundary's actionable authority error.
     """
-    spec = tmp_path.resolve() / "owned.md"
+    spec = short_socket_dir / "owned.md"
     spec.write_bytes(b"operator bytes")
     real_open = recovery_flow.open_at
     swapped = False
@@ -583,7 +583,7 @@ def test_owned_spec_socket_swap_before_read(tmp_path, monkeypatch):
     "replacement", ["missing", "symlink", "junction", "fifo", "socket", "directory"]
 )
 def test_owned_spec_restore_types_final_entry_substitution_as_authority_loss(
-    tmp_path, monkeypatch, replacement
+    tmp_path, short_socket_dir, monkeypatch, replacement
 ):
     """Every shape the name can take after publication is authority loss, on
     both anchored arms. ``fifo``/``socket`` are POSIX entry types; ``symlink`` at
@@ -596,6 +596,8 @@ def test_owned_spec_restore_types_final_entry_substitution_as_authority_loss(
         pytest.skip("file symlink creation may need elevation")
     if replacement == "junction" and sys.platform != "win32":
         pytest.skip("junctions are a Windows reparse point")
+    if replacement == "socket":
+        tmp_path = short_socket_dir
     parent = tmp_path.resolve() / "artifacts"
     parent.mkdir()
     spec = parent / "owned.md"

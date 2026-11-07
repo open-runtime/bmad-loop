@@ -1805,6 +1805,9 @@ class RunState:
     # MUST be JSON-serializable. Empty + untouched on a zero-plugin run.
     plugin_shared: dict[str, Any] = field(default_factory=dict)
     tasks: dict[str, StoryTask] = field(default_factory=dict)
+    # Campaign children cannot be resumed through a legacy controller, even if
+    # their in-tree marker is lost. The authoritative envelope is out of tree.
+    campaign_binding: dict[str, Any] = field(default_factory=dict)
 
     @property
     def paused(self) -> bool:
@@ -1928,6 +1931,7 @@ class RunState:
             "run_dir_identity": _identity_record_to(self.run_dir_identity),
             "started_at": self.started_at,
             "policy_snapshot": self.policy_snapshot,
+            "campaign_binding": self.campaign_binding,
             "trusted_config_digest": self.trusted_config_digest,
             "current_epic": self.current_epic,
             "epic_filter": self.epic_filter,
@@ -1981,6 +1985,7 @@ class RunState:
             run_dir_identity=_identity_record_from(d.get("run_dir_identity")),
             started_at=d["started_at"],
             policy_snapshot=d.get("policy_snapshot", {}),
+            campaign_binding=d.get("campaign_binding", {}),
             trusted_config_digest=str(d.get("trusted_config_digest", "")),
             current_epic=d.get("current_epic"),
             epic_filter=d.get("epic_filter"),

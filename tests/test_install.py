@@ -30,7 +30,6 @@ from conftest import (
     refuse_to_resolve,
     render_probe_stub_skill_md,
     windows_relay_builder,
-    write_script_launcher,
 )
 
 import bmad_loop.install as install_mod
@@ -1728,7 +1727,7 @@ def test_cli_version_reads_the_binarys_version_output(monkeypatch):
     assert _REAL_CLI_VERSION(missing) is None
 
 
-def test_cli_version_runs_the_binary_under_the_profile_env(tmp_path, monkeypatch):
+def test_cli_version_runs_the_binary_under_the_profile_env(monkeypatch):
     """The probe runs the binary in the session's environment, not only resolves
     it there: a launcher whose answer depends on the profile's `env` (a
     version-manager shim, an `env node` launcher) reads the version the session
@@ -1737,12 +1736,10 @@ def test_cli_version_runs_the_binary_under_the_profile_env(tmp_path, monkeypatch
 
     ABLATION: drop `env=` from the `run_argv` call and the first read is None."""
     monkeypatch.setattr(install_mod, "_cli_versions", {})
-    launcher = write_script_launcher(
-        tmp_path,
-        "envcli",
-        "import os\nv = os.environ.get('BMAD_LOOP_TEST_CLI_VERSION')\n"
-        "print(v if v else 'no version')\n",
-    )
+    # An immutable fixture keeps this real environment/cache probe independent
+    # of macOS's first-execution assessment queue for newly generated programs.
+    suffix = ".cmd" if os.name == "nt" else ""
+    launcher = Path(__file__).parent / "fixtures" / "cli-probes" / f"env-version{suffix}"
     monkeypatch.delenv("BMAD_LOOP_TEST_CLI_VERSION", raising=False)
     claude = get_profile("claude")
     old = dataclasses.replace(

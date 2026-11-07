@@ -181,13 +181,17 @@ def _run_dir(project):
 
 
 def test_builtin_kinds_registered_with_needs_mux(fresh_adapter_registry):
-    """The two bundled kinds register with the correct transport requirement:
-    generic drives tmux (needs_mux), opencode-http is hookless HTTP/SSE (does not)."""
+    """Generic and bounded-headless own mux windows; HTTP/SSE does not."""
     generic = fresh_adapter_registry.get_adapter_kind("generic")
     http = fresh_adapter_registry.get_adapter_kind("opencode-http")
     assert generic.needs_mux is True
     assert http.needs_mux is False
-    assert fresh_adapter_registry.known_adapter_kinds() == ["generic", "opencode-http"]
+    assert fresh_adapter_registry.get_adapter_kind("bounded-headless").needs_mux is True
+    assert fresh_adapter_registry.known_adapter_kinds() == [
+        "bounded-headless",
+        "generic",
+        "opencode-http",
+    ]
 
 
 def test_builtin_name_constants_match_the_registered_names(fresh_adapter_registry):
@@ -199,6 +203,7 @@ def test_builtin_name_constants_match_the_registered_names(fresh_adapter_registr
     assert set(fresh_adapter_registry.known_adapter_kinds()) == {
         fresh_adapter_registry.GENERIC,
         fresh_adapter_registry.OPENCODE_HTTP,
+        fresh_adapter_registry.BOUNDED_HEADLESS,
     }
 
 
@@ -235,7 +240,8 @@ def test_detect_adapters_labels_builtin(fresh_adapter_registry):
     registry = fresh_adapter_registry
     registry.register_adapter("extra", needs_mux=False, load=lambda: _stub_builder())
     rows = {r.name: r for r in registry.detect_adapters()}
-    assert set(rows) == {"generic", "opencode-http", "extra"}
+    assert set(rows) == {"bounded-headless", "generic", "opencode-http", "extra"}
+    assert rows["bounded-headless"].builtin is True and rows["bounded-headless"].needs_mux is True
     assert rows["generic"].builtin is True and rows["generic"].needs_mux is True
     assert rows["opencode-http"].builtin is True and rows["opencode-http"].needs_mux is False
     assert rows["extra"].builtin is False

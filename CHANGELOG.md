@@ -7,6 +7,55 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Added
+
+- Add durable reasoning jobs, qualified headless adapters and portable transcript handoff contracts.
+- Prepare reusable native-history summaries during active work with bounded background jobs.
+- Bind required acceptance evidence to exact candidates and recruit configured GitHub reviewers.
+- Expose campaign job history, retained terminal history and scoped operator evidence.
+
+### Changed
+
+- Store new campaign authority transactionally with an append-only event journal and explicit legacy migration.
+- Execute maintained project merge commands and produce both PR-head and merge-group checks.
+
+### Fixed
+
+- Resume temporary GitHub waits and reconsider owner decisions when their evidence changes.
+- Preserve contributor attribution and admit independent work fairly using fresh provider capacity.
+- Reflect native task status and observe bounded hcom context through normal campaign operation.
+- Resume closure after external prerequisites complete without reserving an idle writer.
+- Preserve native quota telemetry and refresh fallback routing before continuing interrupted work.
+- Recheck publication holds before releasing merge groups and resume suppressed queue effects.
+- Bind native and semantic qualifications to their earned model, thinking level, permissions and purpose.
+- Preserve reasoning-job identity through late acknowledgements and coordinator restart.
+- Share session admission across reasoning and coding workers without spending deferred attempts.
+- Reuse capability checks within admission passes while revalidating every native launch.
+- Reconcile independent parent closures concurrently and resume them after temporary intake waits.
+- Preserve complete owner-source spans through handoff audits and invalidate obsolete audit contracts.
+- Enforce native stream limits after process exit and retain telemetry for rejected structured results.
+- Preserve macOS worker identity across clock corrections and refuse uncertain legacy process ownership.
+- Reap owned campaign workers before checking process liveness and refuse duplicate uncertain launches.
+
+## [0.14.0] — 2026-11-05
+
+### Added
+
+- Add native development campaigns with parallel unit ownership, draft PR delivery and recoverable GitHub synchronization.
+- Add campaign planning roles, evidence-based decisions and bounded escalation resolution.
+- Bundle optional Paradev workspace and terminal reflection with scoped hcom observations.
+- Qualify existing work and installation provenance before campaign migration.
+
+### Changed
+
+- Preserve campaign checkpoint commits through append-only recovery and merge-only publication.
+- Apply qualified native reasoning effort to fresh and resumed Claude and Codex sessions.
+
+### Fixed
+
+- Retain frozen campaign policy and retry budgets across worker recovery.
+- Reconcile canonical source publication before closing delivered issues and dependencies.
+
 ## [0.13.15] — 2026-11-05
 
 ### Fixed
@@ -205,10 +254,16 @@ breaking changes may land in a minor release.
   `max_usage_relaunches` per story (default 3), then pauses as before. The relaunched
   session gets `BMAD_LOOP_USAGE_RELAUNCH` for account-rotation wrappers (#959).
 - Record the models a session actually ran on: session-end `models` (Claude, Codex,
-  Gemini, Copilot, OpenCode; `models_unresolved` when none was found), `status --json`
-  `adapters_used.<role>.models_used`, and the CLI-reported launch model (`session-model`
-  journal row) on the TUI agent line. `session-start` `model` still records the configured
-  model (#859).
+  Gemini, Copilot, OpenCode — on 2.x its subagent sessions' models too; `models_unresolved`
+  when none was found), `status --json` `adapters_used.<role>.models_used`, and the
+  CLI-reported launch model (`session-model` journal row) on the TUI agent line.
+  `session-start` `model` still records the configured model (#859).
+- Split each session's tokens per observed model: session-end `tokens_by_model` (summing
+  to `tokens`, `<unattributed>` for usage a parser cannot pin on a model), kept on the
+  state.json session record and summed per task in `status --json`.
+- Record Antigravity token usage from agy's per-step transcript counts (checked against
+  1.4.9), subagent conversations included, and show its model on the TUI agent line from
+  the first fully-idle Stop's `modelName`; session-end `models` stays untracked.
 
 ### Changed
 
@@ -269,6 +324,37 @@ breaking changes may land in a minor release.
 - Preserve unfinished session-owned ledger edits when resuming dev or review conversations.
 - Keep StopFailure account and quota handling compatible with fork recovery, clear stale quota
   waits on new failures, and honor ignored errors in transcript classification.
+- Open agent task windows detached, so a tmux config `run` or `run-shell` that fails or
+  prints when bmad-loop starts the server lands in view-mode on the session's `shell`
+  window instead of the agent's pane, where it refused every wake nudge and TUI answer
+  until someone pressed `q`. `bmad-loop attach` and the TUI's `a` select the task window
+  before attaching, and a client already attached to the session still follows each new
+  task window.
+- Make `probe-adapter codex --probe` able to capture: Codex keys hook trust by config path,
+  so a fresh temp dir always read untrusted and the probe never launched. Its hook config
+  now lives in a stable per-user workspace under the state root; the untrusted report says
+  to open Codex there once and accept the trust prompts. Captures stay in the temp dir.
+- Keep email redaction and leak detection in `diagnose` and `probe-adapter` linear on a
+  long line: an 80k-character alphanumeric run with no `@` took seconds to scan, and now
+  takes milliseconds. What counts as an email is unchanged.
+- Match agy's workspace-trust entries the way agy does: a forward-slash spelling of the
+  project (`C:/Users/...`) now counts as trusted on Windows when seeding a worktree and
+  in `probe-adapter --workspace`; case and trailing-separator variants still do not.
+- Read hook stdin as bytes in `probe-adapter --probe` captures, so a UTF-8 payload with a
+  non-ASCII path no longer garbles or drops on a Windows code-page locale. The capture
+  also keeps each payload's raw bytes beside it.
+- Stop counting Copilot cache reads, cache writes and reasoning tokens twice: Copilot's
+  `inputTokens` already includes the cache tokens and `outputTokens` the reasoning tokens.
+- Read Copilot usage from each turn's `session.usage_checkpoint` (Copilot 1.0.105), so a
+  session that ends without a `session.shutdown` line still reports its tokens and models.
+  The post-session read still waits its grace for the shutdown totals.
+- Resume a dev attempt rejected for retry, after a manual-rollback pause or a host loss
+  before the next attempt, by re-deciding or restarting it instead of reviewing and
+  committing it.
+- Save an escalation before running its notify command, so a host loss during a slow
+  notify no longer resumes the escalated dev attempt into review and commit. Worktree
+  unit escalations, plugin `pause`/`defer` vetoes, the unknown `--story` pause, the
+  worktree-open defer and the sweep's intent and migration pauses save first too.
 - Commit the engine's own deferred-work ledger changes before review, repair and retry
   sessions and after an in-place defer, so a tracked ledger no longer pauses the run with
   `finalization left repository dirty`. The in-place defer notice now prints
@@ -359,6 +445,10 @@ breaking changes may land in a minor release.
 - Pin the run journal and `state.json` to the run dir's recorded identity: writes and
   re-reads refuse a run dir swapped for a link or another directory instead of acting
   outside the run, and Windows verify-stream logs refuse junctions.
+- Catch more credential shapes in the `diagnose` / `probe-adapter` egress guard: Stripe
+  `sk_`/`rk_` keys, Slack `xapp-`, SendGrid `SG.` and PyPI tokens, including inside URL
+  paths, and `user:password@` URL credentials under any scheme, not only http(s).
+  `scrub_text` now redacts a URL's whole userinfo, before emails.
 
 ## [0.13.2] — 2026-10-09
 
@@ -6857,7 +6947,8 @@ enforced in CI.
   implementation phase, driven by a Python control loop with hook-based session transport and
   resumable on-disk run state.
 
-[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.13.15...HEAD
+[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.14.0
 [0.13.15]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.15
 [0.13.14]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.14
 [0.13.13]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.13

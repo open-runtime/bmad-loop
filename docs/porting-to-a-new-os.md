@@ -206,7 +206,8 @@ matches nothing raises.
 - `is_alive(pid)`: read-only liveness probe, no signal sent.
 - `identity(pid) -> float | None`: the **PID-reuse guard**, a value constant for the life of
   `pid` that changes if the pid is reused (Linux reads `/proc/<pid>/stat` start time;
-  elsewhere psutil's `create_time()`). Return `None` where the platform cannot provide one;
+  macOS encodes psutil's immutable birth identity as a negative float; other platforms
+  use psutil's `create_time()`). Return `None` where the platform cannot provide one;
   callers then refuse to force-kill.
 - `hook_interpreter()`: seam 3, below.
 
@@ -215,6 +216,12 @@ never raises; psutil by default), `shell_quote(arg)` (default `shlex.quote`), an
 `unsafe_shell_chars(path)` (the shell metacharacters `shell_quote()` leaves exposed;
 `init` and `validate` warn on them). Override `unsafe_shell_chars` alongside `shell_quote`
 when quoting is conditional (Windows' `list2cmdline` quotes only on whitespace).
+
+On macOS, an existing process with an older positive identity stamp reports
+`unknown`: clock corrections can change the old epoch-based value, so it cannot
+prove ownership or death. Let the existing process finish or honor its normal
+stop-request channel; do not rewrite its recorded stamp to authorize a signal.
+A missing process still reports `dead`, and a new worker records the stable stamp.
 
 ---
 

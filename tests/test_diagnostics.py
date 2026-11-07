@@ -70,6 +70,18 @@ def test_native_recovery_journal_fields_are_redacted(kind, fields):
             assert result[key] == pseudo.alias(value, ns=expected_ns)
 
 
+def test_campaign_review_handoff_identifiers_are_aliased():
+    entry = {
+        "kind": "campaign-review-handoff",
+        "predecessor": "sensitive-customer-run",
+        "handoff_id": "sensitive-customer-operation",
+    }
+    result = diagnostics._scrub_entry(entry, sanitize.Pseudonymizer(), {}, None)
+    assert result["kind"] == entry["kind"]
+    assert result["predecessor"] != entry["predecessor"]
+    assert result["handoff_id"] != entry["handoff_id"]
+
+
 # Labelled canaries planted across the run dir. NONE may appear in the dump.
 EMAIL = "victim.canary@example.com"
 STORY_KEY = "1.2-AcmeQuantumBillingEngine"

@@ -440,6 +440,13 @@ def session_name(run_id: str) -> str:
     return f"bmad-loop-{run_id}"
 
 
+def task_window_name(task_id: str) -> str:
+    """Name of the window a task's agent session runs in, inside the run's
+    :func:`session_name` session: the task id's last 40 characters. The adapter
+    names the window with it, and an attach finds the task window by it."""
+    return task_id[-40:]
+
+
 def attach_target_argv(target: str) -> list[str]:
     """Multiplexer command to reach a target session/window (see
     :meth:`TerminalMultiplexer.attach_target_argv`)."""
@@ -2072,8 +2079,9 @@ def prunable_sessions(
 ) -> tuple[list[str], list[str], set[str]]:
     """Partition the bmad-loop-<id> agent sessions into (prunable, live) run ids,
     plus the subset of prunable ids whose engine liveness read 'unknown'
-    (unverifiable pid). Unknown never blocks cleanup — those sessions stay
-    prunable — but frontends surface a warning for them.
+    (unverifiable pid). Other unknown identities remain prunable with a warning;
+    an existing legacy macOS PID is protected with the live set until it exits,
+    because upgrading its identity representation cannot authorize cleanup.
 
     A control session (:func:`is_ctl_session_name` — the fixed name or a
     per-registry one) is never a candidate. Pruning is scoped
@@ -2125,7 +2133,7 @@ def prunable_sessions(
         elif require_tag or not is_run(run_dir):
             continue  # ownership unprovable: no tag, and no run dir here to stand in
         liveness = engine_liveness(run_dir)
-        if liveness == "alive":
+        if liveness == "alive" or legacy_engine_identity_unverifiable(run_dir):
             live.append(run_id)
             continue
         prunable.append(run_id)
@@ -3135,6 +3143,19 @@ def _stop_run_once(run_dir: Path) -> bool | None:
     # was unchanged, its liveness `"unknown"` (not `"dead"`), and `stop_run`'s
     # retry loop re-entered forever. A rival is a CHANGED pid file, nothing else.
     recorded_engine = (pid, identity)
+    legacy_unverifiable = getattr(host, "legacy_identity_unverifiable", lambda _pid, _stamp: False)
+    if pid is not None and legacy_unverifiable(pid, identity):
+        if lodged:
+            raise StopRunError(
+                f"run {run_dir.name}: a hard stop request is pending, but the existing "
+                "engine PID has a legacy macOS identity that cannot be verified; "
+                "refusing to signal it or mark the run stopped before it exits"
+            )
+        raise StopRunError(
+            f"run {run_dir.name}: the stop request could not be written and the existing "
+            "engine PID has a legacy macOS identity that cannot be verified. "
+            "No stop is pending — free space in the run directory and retry"
+        )
     if pid is not None and identity is not None and not host.alive_and_ours(pid, identity):
         # the pid we recorded is already gone, or was reused by an unrelated
         # process before stop_run ran — never signal a stranger; mark stopped below.
@@ -3826,6 +3847,33 @@ def refuse_held_sweep_closes(project: Path, run_dir: Path, action: str = "delete
         raise HeldSweepClosesError(run_dir.name, held, action=action)
 
 
+def legacy_engine_identity_unverifiable(run_dir: Path) -> bool:
+    """A live legacy macOS PID cannot be reclaimed after the stamp migration.
+
+    This is narrower than unknown liveness: unreadable/missing pid-file identity
+    and other platforms retain their established cleanup contracts. The host
+    owns the representation check; callers never interpret the stamp's sign.
+    """
+    pid, identity = read_pid_identity(run_dir)
+    if pid is None:
+        return False
+    host = get_process_host()
+    check = getattr(host, "legacy_identity_unverifiable", lambda _pid, _identity: False)
+    return check(pid, identity)
+
+
+def _refuse_live_engine_cleanup(run_dir: Path, action: str) -> None:
+    if legacy_engine_identity_unverifiable(run_dir):
+        raise LiveEngineError(
+            f"run {run_dir.name} has an existing engine PID with a legacy macOS identity "
+            f"that cannot be verified — refusing to {action} it; stop it first"
+        )
+    if engine_liveness(run_dir) == "alive":
+        raise LiveEngineError(
+            f"run {run_dir.name} is still live — refusing to {action} it; stop it first"
+        )
+
+
 def delete_run(
     project: Path,
     run_dir: Path,
@@ -3839,7 +3887,9 @@ def delete_run(
     """Permanently remove a run directory under one lifecycle transaction.
 
     Engine liveness is re-checked after acquiring the canonical per-run state
-    lock and a provably live engine raises :class:`LiveEngineError`. The private
+    lock and a provably live engine raises :class:`LiveEngineError`. An existing
+    PID carrying a legacy macOS stamp also refuses until it exits, including
+    under ``force``; other unknown-liveness cleanup semantics are unchanged. The private
     ``_expected_composer_pid`` and ``_expected_composer_claim`` escape exists only
     for ``runsetup``'s failed launch unwind: that composer may remove its own live
     pid publication only while the freshly read pid and the directory it
@@ -3908,10 +3958,8 @@ def delete_run(
             raise LiveEngineError(
                 f"run {run_dir.name} changed engine ownership — refusing to delete it"
             )
-        if _expected_composer_pid is None and engine_liveness(run_dir) == "alive":
-            raise LiveEngineError(
-                f"run {run_dir.name} is still live — refusing to delete it; stop it first"
-            )
+        if _expected_composer_pid is None:
+            _refuse_live_engine_cleanup(run_dir, "delete")
         if not force:
             _refuse_live_session(project, run_dir.name, "delete", warn=warn)
         if _expected_composer_claim is None:
@@ -4028,10 +4076,7 @@ def archive_run(
     an archived holder could never land or reopen its closes (DW-572)."""
     _refuse_uncontained_run_dir(project, run_dir, "archive")
     with state_lock(run_dir, blocking=wait_for_lock):
-        if engine_liveness(run_dir) == "alive":
-            raise LiveEngineError(
-                f"run {run_dir.name} is still live — refusing to archive it; stop it first"
-            )
+        _refuse_live_engine_cleanup(run_dir, "archive")
         if not force:
             _refuse_live_session(project, run_dir.name, "archive", warn=warn)
         refuse_held_sweep_closes(project, run_dir, "archive")
@@ -4126,7 +4171,7 @@ def is_finished(run_dir: Path) -> bool:
     """A finished, no-longer-live run. `resume` refuses these (cli checks
     state.finished), so tearing down their worktrees can never strand a resume —
     the safe predicate for the *automatic* reconcile paths."""
-    if engine_alive(run_dir):
+    if legacy_engine_identity_unverifiable(run_dir) or engine_alive(run_dir):
         return False
     state = _state_or_none(run_dir)
     return bool(state and state.finished)
@@ -4140,7 +4185,7 @@ def reclaimable(run_dir: Path) -> bool:
     runs are never reclaimed: paused/interrupted are actively resumable, and a
     missing pid could mean a foreign-host run, so we require positive local
     termination evidence (finished or stopped)."""
-    if engine_alive(run_dir):
+    if legacy_engine_identity_unverifiable(run_dir) or engine_alive(run_dir):
         return False
     state = _state_or_none(run_dir)
     return bool(state and (state.finished or state.stopped))
@@ -6563,6 +6608,10 @@ def rearm_escalation(
     project_root: Path | None = None,
 ) -> RearmOutcome:
     """Run the complete spec/git/state re-arm transaction under the run lock."""
+    from .campaign_execution import legacy_control_refusal
+
+    if refusal := legacy_control_refusal(run_dir):
+        raise ValueError(refusal)
     with state_lock(run_dir):
         return _rearm_escalation_locked(
             run_dir,

@@ -1,0 +1,1 @@
+@echo %BMAD_LOOP_TEST_CLI_VERSION%

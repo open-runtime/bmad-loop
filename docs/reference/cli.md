@@ -5,8 +5,8 @@ Every `bmad-loop` subcommand, its options, its `--json` document, the process ex
 ## Global options
 
 - The top-level parser documents only `-h` and `--version`. A subcommand is required; a missing or unknown one exits 2.
-- **`--project PROJECT`** — every subcommand except `relay` accepts it. It names the target project root; the default is the current directory. Before dispatch, these subcommands apply the project's `[mux] backend` choice; a broken `policy.toml` falls back to auto-selection there. Commands that need the policy load it themselves and fail with `error: …`, exit 1.
-- **`--json`** — accepted by `validate`, `plugins`, `probe-adapter`, `decisions`, `confirm`, `list`, `status`, `diagnose`, `cleanup` and `clean`. See [Machine-readable output](#machine-readable-output---json).
+- **`--project PROJECT`** — every subcommand except `relay` accepts it. It names the target project root; the default is the current directory. Legacy commands apply the project's `[mux] backend` choice; a broken `policy.toml` falls back to auto-selection there. Campaign validation and observations bypass this legacy mux setup. Commands that need the policy load it themselves and fail with `error: …`, exit 1.
+- **`--json`** — accepted by `validate`, `plugins`, `probe-adapter`, `decisions`, `confirm`, `list`, `status`, `diagnose`, `cleanup`, `clean` and campaign commands except `campaign attach`. See [Machine-readable output](#machine-readable-output---json).
 
 ### Run references
 
@@ -27,6 +27,71 @@ Every `bmad-loop` subcommand, its options, its `--json` document, the process ex
 ## Subcommands
 
 Listed in `bmad-loop --help` order. `--project` is omitted from the option tables below.
+
+### `campaign`
+
+Supervises a versioned dependency graph through planning, isolated workers,
+review, merge and tracking reconciliation. Each campaign uses exact IDs from
+`campaign list`; legacy partial run references do not apply.
+
+```text
+bmad-loop campaign validate SPEC [--json]
+bmad-loop campaign preflight SPEC [--json]
+bmad-loop campaign migration-inventory SPEC [--json]
+bmad-loop campaign migration-qualify SPEC MANIFEST [--json]
+bmad-loop campaign run SPEC [--paradev-reflect] [--paradev-project ID] [--json]
+bmad-loop campaign list [--json]
+bmad-loop campaign status ID [--json]
+bmad-loop campaign history ID [--unit UNIT] [--role ROLE] [--after SEQUENCE] [--limit N] [--json]
+bmad-loop campaign jobs ID [--unit UNIT] [--job JOB] [--after JOB_ID] [--limit N] [--details] [--json]
+bmad-loop campaign handoff ID --unit UNIT [--profile PROFILE] [--model MODEL] [--effort EFFORT] [--reason TEXT] [--json]
+bmad-loop campaign migrate-state ID [--json]
+bmad-loop campaign resume ID [--json]
+bmad-loop campaign stop ID [--terminate-workers] [--json]
+bmad-loop campaign hold ID --unit UNIT --reason TEXT [--json]
+bmad-loop campaign release ID --unit UNIT [--json]
+bmad-loop campaign attach ID --unit UNIT [--role ROLE]
+bmad-loop campaign reconcile ID [--json]
+bmad-loop campaign adoption-proposal ID --unit UNIT --pr NUMBER [--observer NAME] [--json]
+bmad-loop campaign adopt ID --unit UNIT --manifest FILE [--observer NAME] [--json]
+```
+
+`--project PROJECT` is accepted before or after the campaign action. Validation
+is offline and mutation-free. Preflight reports separate planning, execution,
+publication and reflection verdicts without starting agents or changing rules.
+Run/resume supervise in the foreground; reconcile does not launch workers.
+Controls enqueue durable requests. Stop drains bounded stages unless explicit
+termination is requested. Release only requests removal of an operator hold.
+It observes current process, source and Git identity before clearing that hold
+and invalidates affected acceptance evidence. Hold suppresses automatic input,
+retries and publication while an active actor can finish naturally.
+
+History uses an integer event sequence cursor; jobs use a string job-ID cursor.
+Both paginate durable records, including completed jobs outside the hot state.
+`--details` exposes sanitized lifecycle fields, not raw prompts or model results.
+Attach selects the requested role and returns retained file history when its
+terminal has finished. Handoff requests continuation through a frozen approved
+route; it does not move a live native session. Uncertain predecessor ownership,
+missing route qualification or incomplete constraint recovery remains visible.
+Storage migration requires drained workers and reconciled effects, preserves
+the exact old snapshot and makes the new authority unreadable to older binaries.
+
+Migration inventory caches an immutable external receipt and returns an owner
+manifest template. Qualification compares fresh authenticated service/object
+revisions with that reviewed receipt and actual replacement preflight. It never
+changes schedules or actors. Adoption proposals leave owner authorization empty;
+adopt queues only a fully qualified handoff with the explicitly selected installed
+observer. The native observer reports unsupported admission/drain fences as
+unavailable evidence.
+
+JSON results contain `schema_version`, `command` and `ok`. Status and execution
+results have a `campaign` projection; list has `campaigns`; controls have `request`.
+Invalid validation/preflight is a failing verdict document. Operational errors
+leave stdout empty and report on stderr. Status excludes private configuration
+and raw evidence; `delivered` requires confirmed merge and reconciled tracking.
+
+See the [campaign guide](../campaign-guide.md) for configuration, GitHub mapping,
+model pools, reflection and project activation requirements.
 
 ### `init`
 
@@ -127,18 +192,18 @@ bmad-loop probe-adapter [--project PROJECT] [--probe] [--transcript TRANSCRIPT] 
                         [--binary BINARY] [--model MODEL] [--workspace PATH] [--timeout TIMEOUT] [--out OUT] [--json] cli
 ```
 
-| Option                      | Description                                                                                                                               |
-| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| `cli`                       | Profile name. Hookless (HTTP) profiles are refused.                                                                                       |
-| `--probe`                   | Live capture: one trivial turn in a temp workspace, recording only the shape of each hook payload. Default: a scan that launches nothing. |
-| `--transcript TRANSCRIPT`   | Transcript file to inspect; skips discovery.                                                                                              |
-| `--session-dir SESSION_DIR` | Directory searched for the newest transcript.                                                                                             |
-| `--binary BINARY`           | Binary for a CLI with no profile; produces a reduced report.                                                                              |
-| `--model MODEL`             | Model for the probe turn (`--probe` only).                                                                                                |
-| `--workspace PATH`          | Also report whether PATH is in the profile's `[workspace_trust]` list; exit 1 unless trusted or when the profile declares no such list.   |
-| `--timeout TIMEOUT`         | Probe turn timeout in seconds. Default: 90.                                                                                               |
-| `--out OUT`                 | Write the report (or JSON document) to this file instead of stdout.                                                                       |
-| `--json`                    | Emit a JSON document instead of the Markdown report.                                                                                      |
+| Option                      | Description                                                                                                                                                                                                                                              |
+| --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `cli`                       | Profile name. Hookless (HTTP) profiles are refused.                                                                                                                                                                                                      |
+| `--probe`                   | Live capture: one trivial turn in a temp workspace (Codex: a stable per-user probe workspace under the state root; the first run exits 1 until you trust it once), recording only the shape of each hook payload. Default: a scan that launches nothing. |
+| `--transcript TRANSCRIPT`   | Transcript file to inspect; skips discovery.                                                                                                                                                                                                             |
+| `--session-dir SESSION_DIR` | Directory searched for the newest transcript.                                                                                                                                                                                                            |
+| `--binary BINARY`           | Binary for a CLI with no profile; produces a reduced report.                                                                                                                                                                                             |
+| `--model MODEL`             | Model for the probe turn (`--probe` only).                                                                                                                                                                                                               |
+| `--workspace PATH`          | Also report whether PATH is in the profile's `[workspace_trust]` list; exit 1 unless trusted or when the profile declares no such list.                                                                                                                  |
+| `--timeout TIMEOUT`         | Probe turn timeout in seconds. Default: 90.                                                                                                                                                                                                              |
+| `--out OUT`                 | Write the report (or JSON document) to this file instead of stdout.                                                                                                                                                                                      |
+| `--json`                    | Emit a JSON document instead of the Markdown report.                                                                                                                                                                                                     |
 
 - Exits 1 when the profile is unknown (without `--binary`), the leak self-check fires (nothing is written), or hook or workspace trust is not `trusted` (the report is still written).
 
@@ -349,7 +414,7 @@ Attaches the terminal to a run through the selected multiplexer backend.
 bmad-loop attach [--project PROJECT] [run_id]
 ```
 
-- Attaches to the run's control window when a sweep is waiting on a decision or no agent session is live; otherwise to the live agent session.
+- Attaches to the run's control window when a sweep is waiting on a decision or no agent session is live; otherwise to the live agent session, selecting its task window first (task windows open detached): the window named for the journal's open session, else the session's highest-index window.
 - Exits 1 with `nothing to attach for run <id>` when there is no target; otherwise exits with the multiplexer client's exit code.
 
 ### `stop`
@@ -738,3 +803,33 @@ Every finding's `check` is one of these ids. Severity is `ok`, `warning` or `pro
 | `tickets.capability-not-run`           | ok                     | tickets mode without `--probes`: the capability probe did not run                                                                                       |
 
 The set is closed (`checks.VALIDATE_CHECKS`); plugins cannot add check ids.
+
+`bmad-loop campaign authorize-scope ID --unit UNIT --expected-revision N --reason TEXT`
+queues explicit operator authorization for acceptance reductions already present in a
+delivered revised planning PR. Inspect the current acceptance ledger first. The
+coordinator rechecks the exact scope and graph revision; stale authorization fails.
+This command preserves unrelated holds and required GitHub reviews.
+
+### Native campaign qualification
+
+- `bmad-loop campaign qualify-headless PROPOSAL --directory DIRECTORY [--input-bytes N] [--output-tokens N] [--timeout SECONDS] [--json]`: explicitly run a fixed native no-tools canary and write observed route qualification. The default input is 16,384 bytes, requested output ceiling is 4,096 tokens and timeout is 180 seconds. Input coverage is limited to measured input. The configured output acceptance ceiling and actual observed output remain separate; external time/byte limits do not imply a native generation-token limit. No normal campaign launch bypasses qualification.
+- `bmad-loop campaign qualify-writer PROPOSAL --directory DIRECTORY [--input-bytes N] [--output-tokens N] [--timeout SECONDS] [--json]`: explicitly qualify a native workspace-tools route in a new disposable repository and isolated worktree. Defaults match `qualify-headless`. The fixed canary edits and commits one owned file; independent readback checks exact content, clean Git state, protected files/main, native attribution and quiescence. A separate descendant exercises the same OS sandbox against forbidden writes. The proposal must pin the exact managed-interpreter sandbox launcher, sandbox module and native executable dependencies. Existing occupied directories are refused; an identical interrupted qualification resumes its durable job. macOS confinement is required. This earns finite writer coverage separately from no-tools qualification.
+- `bmad-loop campaign trial-handoff SNAPSHOTS --capability CAPABILITY --directory DIRECTORY [--reducer-capability CAPABILITY] [--reuse PRIOR_DIRECTORY] [--parallel N] [--timeout SECONDS] [--prepare-only] [--drain] [--json]`: qualify sealed history using durable native map/reduce jobs. Parallelism defaults to four and is bounded to 1–64; each job defaults to 600 seconds. Preparation sends no prompt. Drain stops new admissions while admitted jobs finish. Structural completion does not grant semantic handoff qualification. Resume with identical source/capability hashes and bounds, or explicitly reuse prior validated coverage in a new trial after changing routes.
+
+These explicit operator commands may use the selected provider. Their automated
+regression tests always use scripted zero-token processes. Keep qualification
+artifacts in a private directory outside tracked source files.
+
+`bmad-loop campaign history ID --observations --after N --limit N [--unit UNIT]`
+reads archived, superseded observations with a separate sequence cursor. The
+latest completed observation per unit/kind remains hot, as do all uncertain
+operations and current claim references. These pages preserve
+polling history without replaying it; they are not the full mutation archive.
+
+`bmad-loop campaign history ID --actions --after N --limit N [--unit UNIT]`
+reads archived terminal effect receipts in their original creation order, including
+mutations, launches and checkpoints. It has its own sequence cursor and returns
+`scope="archived-actions"`. `--actions` and `--observations` are mutually exclusive;
+neither accepts `--role`. Current effects remain in the hot outbox, while full
+snapshot exports include archived terminal actions. Pure observation history stays
+in the separate observation export.

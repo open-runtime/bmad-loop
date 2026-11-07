@@ -183,6 +183,12 @@ _BLOCKED = ("blocked(escalation)", "blocked(park)")
 # reason -> {(current state, target): "write" | "noop"}; every other pair refuses.
 EXPECTED: dict[str, dict[tuple[str, str], str]] = {
     "accept": {("built", "done"): "write", ("done", "done"): "noop"},
+    "campaign-publish": {**{(c, "done"): "write" for c in _BUILT_SET}, ("done", "done"): "noop"},
+    "campaign-plan": {
+        (c, t): ("noop" if c == t else "write")
+        for c in ("draft", "ready-for-dev")
+        for t in ("draft", "ready-for-dev")
+    },
     "park": {
         **{(c, "blocked"): "write" for c in _BUILT_SET},
         ("awaiting-operator", "blocked"): "write",
@@ -389,7 +395,12 @@ def test_plan_transition_refused_is_an_illegal_transition():
 def test_unknown_reason_is_refused():
     with pytest.raises(PlanTransitionRefused, match="unknown reason"):
         check_plan_transition(
-            "1.1", "built", "done", "promote", has_plan=True, blocked_reason=""  # type: ignore[arg-type]
+            "1.1",
+            "built",
+            "done",
+            "promote",
+            has_plan=True,
+            blocked_reason="",  # type: ignore[arg-type]
         )
 
 
