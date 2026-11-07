@@ -1183,7 +1183,10 @@ def _ctl_window_candidates(
                 continue  # another project's window
         elif not runs.is_run(run_dir):
             continue  # untagged and no run dir here — ownership unprovable
-        # boolean gate on purpose: an 'unknown' engine stays a candidate (unknown
+        if runs.legacy_engine_identity_unverifiable(run_dir):
+            undetermined.append((name, "legacy macOS owner PID still exists; preserving window"))
+            continue
+        # boolean gate on purpose: other 'unknown' engines stay candidates (unknown
         # never blocks cleanup) with no per-window warning — the session-level
         # unknown warning from prunable_sessions covers the operator surface.
         if runs.engine_alive(run_dir):

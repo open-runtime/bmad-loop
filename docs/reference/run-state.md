@@ -114,6 +114,14 @@ to a version 2 database.
 
 Entries other than `state.json`, `journal.jsonl`, `engine.pid`, `tasks/` and `logs/` appear only when the run reaches the step that writes them. Plugins may add their own files.
 
+On macOS, new process identities are negative immutable birth stamps, unaffected
+by clock corrections. A positive identity from an older installation cannot be
+authenticated while its PID exists and reports `unknown`. Resume, resolve, replay,
+cleanup and terminal pruning retain that owner even with `--force`; they can proceed
+after the PID is confirmed gone. Keep the original PID record while stopping the
+old process. Other unknown-identity recovery behavior is unchanged, as are Linux,
+Windows and legacy PID-only records.
+
 The opencode adapter's environment-fault classifier scans `<task_id>.server.out` and `<task_id>.provider-errors.log`, never the model-written `<task_id>.log`. On OpenCode 2.x provider failures appear only as session events, so the adapter writes each `session.retry.scheduled` / `session.step.failed` / `session.execution.failed` frame as one `provider-error event=… type=… status=… attempt=… message="…"` line built from the event's structured fields (the provider's response body is never copied). The file is created at spawn on both majors and is empty on a healthy session. As it writes a line, the adapter also matches it against the profile's usage-limit patterns: a match (the shipped profile's `provider.quota` line) is a live usage-limit sighting, so a session that then times out, stalls or crashes pauses as a usage limit rather than an environment fault.
 
 - **`state.json`** — the serialized run state (stories, phases, tokens, the `finished` / `stopped` / `crashed` flags, and `paused_reason` with the pause context). Written atomically under a per-run lock, through the pinned run-directory descriptor above; `bmad-loop status` reads it.

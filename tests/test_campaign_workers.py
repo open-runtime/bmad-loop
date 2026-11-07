@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -198,6 +199,29 @@ def test_alive_or_uncertain_actor_cannot_be_finished_by_early_receipt(
     monkeypatch.setattr(runs, "probe_liveness", lambda *args: "alive")
     assert workers.observe(tmp_path, expected=startup)["state"] == "running"
     monkeypatch.setattr(runs, "probe_liveness", lambda *args: "unknown")
+    assert workers.observe(tmp_path, expected=startup)["state"] == "unknown"
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="native macOS process birth stamps")
+def test_worker_observation_keeps_live_claim_across_clock_adjustment(tmp_path, monkeypatch):
+    native = pytest.importorskip("psutil._psosx")
+
+    startup = {
+        "campaign_id": "campaign",
+        "unit_id": "unit",
+        "attempt": 1,
+        "generation": 1,
+        "launch_id": "clock-adjustment",
+    }
+    (tmp_path / "startup.json").write_text(json.dumps(startup), encoding="utf-8")
+    runs.write_named_pid(tmp_path / "engine.pid", os.getpid())
+    pid, stamp = runs.read_named_pid_identity(tmp_path / "engine.pid")
+    assert pid == os.getpid() and stamp is not None and stamp < -2
+    monkeypatch.setattr(native, "boot_time", lambda: native.INIT_BOOT_TIME + 8)
+    # Normal observation reads the real persisted identity. No receipt exists:
+    # false death would fabricate interruption and permit unsafe replacement.
+    assert workers.observe(tmp_path, expected=startup)["state"] == "running"
+    (tmp_path / "engine.pid").write_text(f"{pid} {-stamp}", encoding="utf-8")
     assert workers.observe(tmp_path, expected=startup)["state"] == "unknown"
 
 

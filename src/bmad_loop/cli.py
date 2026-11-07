@@ -6913,6 +6913,19 @@ def _unresumable_source(state: RunState) -> str | None:
     return None
 
 
+def _legacy_engine_control_refused(run_dir: Path) -> bool:
+    """Do not replace a live owner whose pre-upgrade macOS stamp is ambiguous."""
+    if not runs.legacy_engine_identity_unverifiable(run_dir):
+        return False
+    print(
+        f"run {run_dir.name}: a legacy macOS process identity is unverifiable while "
+        "its PID still exists — wait for the original process to exit before "
+        "resuming or resolving; --force cannot replace this owner",
+        file=sys.stderr,
+    )
+    return True
+
+
 def _resume_paused_run(
     project: Path,
     run_dir: Path,
@@ -6942,6 +6955,8 @@ def _resume_paused_run(
         # Repeat the command's liveness decision after exclusion.  A concurrent
         # resume publishes its pid under this same hold, so the waiter refuses
         # instead of reloading the predecessor's old paused state and double-driving.
+        if _legacy_engine_control_refused(run_dir):
+            return ExitCode.FAILURE
         if runs.engine_liveness(run_dir) == "alive":
             print(
                 f"run {run_dir.name} is still live — resuming would double-drive it; stop it first",
@@ -7074,11 +7089,14 @@ def cmd_resume(args: argparse.Namespace) -> int:
     if refusal := legacy_control_refusal(run_dir):
         print(refusal, file=sys.stderr)
         return ExitCode.FAILURE
-    # Gate here, NOT in _resume_paused_run: that helper is also resolve's re-arm
+    # Warn here, not in _resume_paused_run: that helper is also resolve's re-arm
     # path, which is already gated at resolve entry. A provably-live engine blocks
     # outright (the TUI warns in its confirm modal instead; the CLI has no confirm
-    # step). 'unknown' warns but proceeds: resume is the recovery path that
-    # rewrites engine.pid, so it must stay usable when liveness is unverifiable.
+    # step). Other 'unknown' states warn but proceed: resume remains a recovery
+    # path. An existing PID with an ambiguous legacy macOS stamp is fenced here
+    # and at the locked preparation boundary; rewriting it could replace its owner.
+    if _legacy_engine_control_refused(run_dir):
+        return ExitCode.FAILURE
     live = runs.engine_liveness(run_dir)
     if live == "alive":
         print(
@@ -7542,9 +7560,12 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     # unpaused, and the true refusal is "still live", not "not paused".
     # Not a cleanup path, so the "unknown must not block" invariant does not apply:
     # an unverifiable-but-live pid must not be re-driven. A provably-live engine
-    # always blocks (--force never bypasses it); unknown blocks unless the operator
+    # always blocks (--force never bypasses it); other unknown states block unless the operator
     # vouches with --force — `stop` cannot verify or clear an unverifiable pid, so
-    # without an escape hatch a squatted pid would lock resolve out forever.
+    # without an escape hatch a squatted pid would lock resolve out forever. A live
+    # legacy macOS PID is the narrow migration exception checked separately below.
+    if _legacy_engine_control_refused(run_dir):
+        return ExitCode.FAILURE
     live = runs.engine_liveness(run_dir)
     if live == "alive":
         print(f"run {args.run_id} is still live — stop it first", file=sys.stderr)
@@ -7754,6 +7775,8 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         from .tui import launch  # import-safe: launch.py has no textual imports
 
         with state_lock(run_dir):
+            if _legacy_engine_control_refused(run_dir):
+                return ExitCode.FAILURE
             live = runs.engine_liveness(run_dir)
             if live == "alive":
                 print(f"run {args.run_id} is still live — stop it first", file=sys.stderr)
@@ -8026,6 +8049,8 @@ def cmd_resolve(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
                 return 1
+            if _legacy_engine_control_refused(run_dir):
+                return ExitCode.FAILURE
             fresh_live = runs.engine_liveness(run_dir)
             if fresh_live == "alive":
                 print(f"run {args.run_id} is still live — stop it first", file=sys.stderr)
@@ -8346,6 +8371,8 @@ def _resolve_epic_close(
         from .tui import launch  # import-safe: launch.py has no textual imports
 
         with state_lock(run_dir):
+            if _legacy_engine_control_refused(run_dir):
+                return ExitCode.FAILURE
             live = runs.engine_liveness(run_dir)
             if live == "alive":
                 print(f"run {run_id} is still live — stop it first", file=sys.stderr)
@@ -8473,6 +8500,8 @@ def _resolve_epic_close(
                 file=sys.stderr,
             )
             return 1
+        if _legacy_engine_control_refused(run_dir):
+            return ExitCode.FAILURE
         fresh_live = runs.engine_liveness(run_dir)
         if fresh_live == "alive":
             print(f"run {run_id} is still live — stop it first", file=sys.stderr)
@@ -8696,6 +8725,8 @@ def _resolve_adopt(
                     file=sys.stderr,
                 )
                 return 1
+            if _legacy_engine_control_refused(run_dir):
+                return ExitCode.FAILURE
             fresh_live = runs.engine_liveness(run_dir)
             if fresh_live == "alive":
                 print(f"run {args.run_id} is still live — stop it first", file=sys.stderr)
@@ -8792,6 +8823,8 @@ def _resolve_abandon(
                     file=sys.stderr,
                 )
                 return 1
+            if _legacy_engine_control_refused(run_dir):
+                return ExitCode.FAILURE
             fresh_live = runs.engine_liveness(run_dir)
             if fresh_live == "alive":
                 print(f"run {args.run_id} is still live — stop it first", file=sys.stderr)
@@ -9034,6 +9067,8 @@ def _resolve_reverify(
                     file=sys.stderr,
                 )
                 return 1
+            if _legacy_engine_control_refused(run_dir):
+                return ExitCode.FAILURE
             fresh_live = runs.engine_liveness(run_dir)
             if fresh_live == "alive":
                 print(f"run {args.run_id} is still live — stop it first", file=sys.stderr)
@@ -9117,6 +9152,8 @@ def _resolve_reverify_finished(
             file=sys.stderr,
         )
         return 1
+    if _legacy_engine_control_refused(run_dir):
+        return ExitCode.FAILURE
     live = runs.engine_liveness(run_dir)
     if live == "alive":
         print(f"run {args.run_id} is still live — stop it first", file=sys.stderr)

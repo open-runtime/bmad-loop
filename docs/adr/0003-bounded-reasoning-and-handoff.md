@@ -1,6 +1,6 @@
 # ADR 0003: Bounded reasoning jobs and portable session handoff
 
-- **Status:** Implemented in the development PR; native qualification and review gates remain incomplete
+- **Status:** Implemented in the development PR; bounded native qualifications passed, full-suite failures block review readiness
 - **Date:** 2026-11-06
 - **Extends:** [ADR 0002](0002-native-sdlc-campaign.md) and its [implementation contract](0002-campaign-implementation.md)
 - **Delivery:** The same campaign implementation PR, before autonomous project activation
@@ -598,14 +598,51 @@ usage and owned quiescence. `trial-handoff` operates on sealed explicit historie
 outside the repository test suite. Transport qualification is distinct from the
 independent semantic-fidelity receipt required for automatic summarized handoff.
 Native account exhaustion is a retained failed probe or capacity wait, never a
-reason to manufacture qualification or silently omit history. Current full-history
-and independent-fidelity qualification remain incomplete.
+reason to manufacture qualification or silently omit history. Earned full-history
+fidelity and successor retrieval are bounded by the qualification below.
 
 A delivered revised plan does not itself waive prior acceptance. The explicit
 `authorize-scope` control binds the operator's reason to the exact ledger revision,
 before/after scope and delivered planning revision; changed coordinates refuse it.
 Reintroducing a waived criterion makes it required again. This operation never
 clears another owner hold or supplies a GitHub review approval.
+
+## Qualification achieved and remaining gates
+
+The sealed whole-conversation trial processed 28 sources containing 191,223,107
+captured bytes and 53,494 unique events through 809 maps and 69 reducers. An actual
+independent Muse assessment found no missing critical owner obligations, invented
+authority or lost unresolved conflicts; a separate Grok assessment qualified the
+Muse history-audit interpretations. All 37 native owner records and their 178
+complete source spans remain indexed. These receipts bind the exact source corpus,
+route, effort and used reader/schema/prompt contracts. They establish critical-owner
+fidelity for this corpus, not lossless compression of arbitrary tool history.
+
+A native Muse successor retrieved omitted summaries through the retained tree,
+verified exact source bytes and owner text, and respected the packet's read-only
+boundary. The packet remains read-only because it lacks live canonical acceptance
+and current repository reconciliation; opaque historical content remains visibly
+opaque. This qualification does not establish writable continuation of that packet.
+Scripted runtime coverage of quota replacement through delivery and finite native
+writer canaries provide separate evidence. Failed qualification attempts remain
+retained alongside successful results.
+
+The scripted load qualification delivered 48 stories across 24 active epics,
+reached eight verification slots, eight review slots and four reasoning jobs, and
+completed parent tracking after stop, drain and resume. Stop acknowledgement was
+0.291 seconds in that run. This demonstrates tested concurrency and responsiveness,
+not maximum throughput or a REM/provider benchmark.
+
+Only exact earned Grok and Muse routes have the applicable native qualification;
+the five shipped harness contracts are not a claim that every model, effort,
+permission mode or continuation path is qualified. Claude/Codex/AGY deployment
+routes and approved Astra/Fable reasoning roles need their matching evidence.
+Two independent scoped reviews found no outstanding issue against `9f806480`, but
+its full suite reported 58 failures, 20,260 passes and 261 skips. Those failures
+block review readiness; repairs require affected regression checks and refreshed
+reviews. Hosted Actions remain disabled, and unrun platform gates remain explicit.
+Merge, exact-commit installation, canonical-base update and REM activation remain
+later gates, unchanged by these qualifications.
 
 ## Capability evidence and limits
 
@@ -686,8 +723,9 @@ admissions while admitted jobs drain; rerunning the same frozen trial reuses its
 validated results. Its structural-completion report cannot grant semantic
 qualification. A separate independent-provider review must establish critical
 constraint fidelity and absence of invented authority before automatic handoff.
-The real whole-thread trial remains a qualification gate; a successful fixed
-transport canary and scripted regression coverage do not satisfy it.
+The qualified whole-thread trial above satisfies that finite corpus gate for its
+exact routes and contracts; a fixed transport canary or scripted regression alone
+does not satisfy it or qualify a different route.
 
 Rendered-input planning splits an oversized map or reducer independently rather
 than shrinking every job's payload. Map splits retain exact native ranges; reducer

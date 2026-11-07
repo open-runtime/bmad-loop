@@ -106,7 +106,8 @@ def mint_replay_run(
 
     ``expected_generation`` is the task generation the caller's lock-free checks
     saw; a different one under the lock refuses (the story changed meanwhile).
-    ``force`` admits an ``unknown`` engine liveness, as `resolve --force` does; a
+    ``force`` admits an ``unknown`` engine liveness, as `resolve --force` does;
+    a live legacy macOS PID with an ambiguous old stamp remains fenced. A
     provably-live engine always refuses. Raises ReplayError."""
     new_dir: Path | None = None
     claim = None
@@ -126,6 +127,11 @@ def mint_replay_run(
             )
             if refusal is not None:
                 raise ReplayError(refusal)
+            if runs.legacy_engine_identity_unverifiable(finished_run_dir):
+                raise ReplayError(
+                    f"run {finished.run_id}: legacy macOS process identity is unverifiable "
+                    "while its PID exists — wait for it to exit; --force cannot replay it"
+                )
             live = runs.engine_liveness(finished_run_dir)
             if live == "alive":
                 raise ReplayError(f"run {finished.run_id} is still live — stop it first")

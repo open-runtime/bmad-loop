@@ -772,22 +772,34 @@ def diagnose(snapshot):
     }
 
 
-def run_case(case, *, ticks=None, timeout_s=300.0):
+def run_case(case, *, ticks=None, timeout_s=None):
     """Wait for the real terminal predicate; ticks are only for intermediate-state tests."""
-    deadline = time.monotonic() + timeout_s
+    from campaign_runtime_watchdog import ProgressWatchdog, TimedDriver, failure_details
+
+    watchdog = ProgressWatchdog(
+        case.store.load(case.snapshot.id), now=time.monotonic(), timeout_s=timeout_s
+    )
+    next_check = 0.0
+    timed_driver = TimedDriver(case.runtime)
 
     def bounded_clock():
-        if time.monotonic() >= deadline:
-            details = diagnose(case.store.load(case.snapshot.id))
-            details["active_effects"] = sorted(supervisor._active)
-            raise AssertionError(
-                f"campaign did not reach its terminal state within {timeout_s:g}s: "
-                + json.dumps(details, indent=2)
-            )
+        nonlocal next_check
+        now = time.monotonic()
+        if now >= next_check:
+            current = case.store.load(case.snapshot.id)
+            reason = watchdog.check(current, now=now)
+            if reason:
+                details = diagnose(current)
+                details.update(failure_details(case, current, supervisor._active))
+                details.update(timed_driver.details())
+                raise AssertionError(
+                    f"campaign did not reach its {reason}: " + json.dumps(details, indent=2)
+                )
+            next_check = now + 0.25
         return case.runtime.clock()
 
     supervisor = CampaignSupervisor(
-        case.store, case.runtime, clock=bounded_clock, progress=lambda _: None
+        case.store, timed_driver, clock=bounded_clock, progress=lambda _: None
     )
     return supervisor.run(case.snapshot.id, max_ticks=ticks)
 

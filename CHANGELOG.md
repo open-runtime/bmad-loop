@@ -33,6 +33,7 @@ breaking changes may land in a minor release.
 - Reconcile independent parent closures concurrently and resume them after temporary intake waits.
 - Preserve complete owner-source spans through handoff audits and invalidate obsolete audit contracts.
 - Enforce native stream limits after process exit and retain telemetry for rejected structured results.
+- Preserve macOS worker identity across clock corrections and refuse uncertain legacy process ownership.
 
 ## [0.14.0] — 2026-11-05
 

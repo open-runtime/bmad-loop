@@ -609,6 +609,13 @@ inputs. Omitted final summaries remain retrievable after audited context fitting
 their child references lead to the detailed summary tree. Retrieval verifies the
 catalog, summary bytes and original input, and refuses missing or changed data.
 
+For retrieval inside the macOS execution sandbox, prefer a direct interpreter
+command such as `python -c` or an explicitly granted script file. Shell heredocs
+may need temporary files outside the permitted paths even when `TMPDIR` names a
+private directory. A denied temporary-file operation does not establish missing
+history; use a compatible command without widening the frozen grants.
+Preserve exact JSON escaping and newlines when returning source quotations.
+
 When reasoning is enabled, changed campaign facts trigger qualified jobs for model
 routing, bulk triage, priority, graph review, GitHub/source reconciliation and
 reports. `campaign status --json` includes unavailable-route/input-bound errors and

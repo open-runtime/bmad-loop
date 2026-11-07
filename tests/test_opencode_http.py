@@ -17,6 +17,7 @@ import json
 import os
 import queue
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -729,15 +730,24 @@ def make_adapter(tmp_path: Path, binary: str = "opencode", **kwargs) -> Opencode
     return _shrink_timing(adapter)
 
 
+@pytest.fixture(scope="session")
+def fake_opencode_launcher(tmp_path_factory):
+    """An immutable CLI per worker; every session's data comes from its env.
+
+    Recreating the executable for each case needlessly queues a fresh macOS
+    executable assessment before the version probe can execute its first line.
+    Tests that change binary identity must first make a private physical copy.
+    """
+    bin_dir = tmp_path_factory.mktemp("fake-opencode-bin")
+    return write_script_launcher(bin_dir, "opencode", FAKE_OPENCODE)
+
+
 @pytest.fixture
-def fake_opencode(tmp_path):
-    """The fake `opencode` launcher plus its recording dir."""
+def fake_opencode(tmp_path, fake_opencode_launcher):
+    """The immutable fake `opencode` plus this test's private recording dir."""
     rec = tmp_path / "recordings"
     rec.mkdir()
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    launcher = write_script_launcher(bin_dir, "opencode", FAKE_OPENCODE)
-    return launcher, rec
+    return fake_opencode_launcher, rec
 
 
 def make_spec(
@@ -3191,6 +3201,13 @@ def test_version_detection_is_cached_per_binary_identity(tmp_path, fake_opencode
     reuses the answer, and a binary changed in place (an upgrade mid-run) is
     asked again."""
     launcher, rec = fake_opencode
+    # Never mutate the session fixture (or a linked alias of it). The launcher
+    # refers to its immutable Python sidecar by absolute path, so a physical copy
+    # retains the CLI behavior while giving this upgrade test its own identity.
+    private_launcher = tmp_path / launcher.name
+    shutil.copy2(launcher, private_launcher)
+    assert not os.path.samefile(launcher, private_launcher)
+    launcher = private_launcher
     calls = _count_version_probes(monkeypatch)
     adapter = make_adapter(tmp_path, binary=str(launcher))
     resolved = opencode_http.shutil.which(str(launcher))

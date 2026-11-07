@@ -12,6 +12,163 @@ from bmad_loop.campaign_model import UnitState
 from bmad_loop.campaign_supervisor import Observation, Proposal
 
 
+def test_progress_watchdog_waits_for_new_milestones_beyond_old_absolute_deadline(campaign_store):
+    from campaign_runtime_watchdog import ProgressWatchdog
+
+    store, campaign_id = campaign_store
+    snapshot = store.load(campaign_id)
+    watch = ProgressWatchdog(snapshot, now=0, idle_s=10)
+    unit = next(iter(snapshot.units.values()))
+    unit.state = UnitState.RUNNING
+    assert watch.check(snapshot, now=9) == ""
+    unit.state = UnitState.LOCALLY_COMPLETE
+    assert watch.check(snapshot, now=18) == ""
+    unit.state = UnitState.DELIVERED
+    assert watch.check(snapshot, now=27) == ""
+
+
+def test_progress_watchdog_poll_retry_and_repeated_states_do_not_reset_guard(campaign_store):
+    from campaign_runtime_watchdog import ProgressWatchdog
+
+    store, campaign_id = campaign_store
+    snapshot = store.load(campaign_id)
+    watch = ProgressWatchdog(snapshot, now=0, idle_s=10)
+    unit = next(iter(snapshot.units.values()))
+    unit.state = UnitState.REVIEWING
+    assert watch.check(snapshot, now=1) == ""
+    unit.state = UnitState.READY  # Already observed at initialization.
+    assert watch.check(snapshot, now=2) == ""
+    for now in range(3, 11):
+        unit.state = UnitState.REVIEWING
+        unit.bindings["head"] = f"new-head-{now}"
+        unit.failure_attempts = now
+        snapshot.revision += 1
+        snapshot.events.append({"kind": "poll-completed", "observed_at": now})
+        assert watch.check(snapshot, now=now) == ""
+    assert watch.check(snapshot, now=11) == "new durable milestone within 10s"
+
+
+def test_progress_watchdog_validated_stage_counts_once(campaign_store):
+    from campaign_runtime_watchdog import ProgressWatchdog
+
+    store, campaign_id = campaign_store
+    snapshot = store.load(campaign_id)
+    watch = ProgressWatchdog(snapshot, now=0, idle_s=10)
+    stages = {}
+    next(iter(snapshot.units.values())).evidence["planning_flow"] = {"stages": stages}
+    stages["requirements"] = {"validated": {"proof": "first"}}
+    assert watch.check(snapshot, now=9) == ""
+    stages["requirements"] = {"validated": {"proof": "second"}}
+    stages["arbitrary-attempt-id"] = {"validated": {"proof": "not a defined stage"}}
+    assert watch.check(snapshot, now=18) == ""
+    assert watch.check(snapshot, now=19) == "new durable milestone within 10s"
+
+
+def test_progress_watchdog_absolute_ceiling_wins_even_with_new_progress(campaign_store):
+    from campaign_runtime_watchdog import ProgressWatchdog
+
+    store, campaign_id = campaign_store
+    snapshot = store.load(campaign_id)
+    watch = ProgressWatchdog(snapshot, now=0, idle_s=10)
+    unit = next(iter(snapshot.units.values()))
+    for now, state in (
+        (9, UnitState.RUNNING),
+        (18, UnitState.LOCALLY_COMPLETE),
+        (27, UnitState.REVIEWING),
+    ):
+        unit.state = state
+        assert watch.check(snapshot, now=now) == ""
+    unit.state = UnitState.DELIVERED
+    assert watch.check(snapshot, now=30) == "terminal state within 30s absolute ceiling"
+
+
+def test_progress_watchdog_explicit_deadline_does_not_extend(campaign_store):
+    from campaign_runtime_watchdog import ProgressWatchdog
+
+    store, campaign_id = campaign_store
+    snapshot = store.load(campaign_id)
+    watch = ProgressWatchdog(snapshot, now=0, timeout_s=10)
+    next(iter(snapshot.units.values())).state = UnitState.DELIVERED
+    assert watch.check(snapshot, now=9) == ""
+    assert watch.check(snapshot, now=10) == "terminal state within 10s absolute ceiling"
+
+
+def test_progress_watchdog_unbounded_intake_does_not_extend_initial_budget(campaign_store):
+    from dataclasses import replace
+
+    from campaign_runtime_watchdog import ProgressWatchdog
+
+    from bmad_loop.campaign_model import CampaignUnit
+
+    store, campaign_id = campaign_store
+    snapshot = store.load(campaign_id)
+    watch = ProgressWatchdog(snapshot, now=0, idle_s=10)
+    initial = set(snapshot.units)
+    spec = next(iter(snapshot.units.values())).spec
+    for now in range(1, 11):
+        key = f"unexpected-{now}"
+        snapshot.units[key] = CampaignUnit(replace(spec, id=key), UnitState.DELIVERED)
+        reason = watch.check(snapshot, now=now)
+        assert watch.units == initial
+    assert reason == "new durable milestone within 10s"
+
+
+def test_failure_details_preserves_interrupted_worker_evidence(campaign_store, tmp_path):
+    from campaign_runtime_watchdog import failure_details
+
+    from bmad_loop.campaign_model import Hold, WorkerClaim
+
+    store, campaign_id = campaign_store
+    snapshot = store.load(campaign_id)
+    unit = next(iter(snapshot.units.values()))
+    directory = tmp_path / "failed-worker"
+    directory.mkdir()
+    (directory / "engine.pid").write_text("123 456.0")
+    (directory / "startup.json").write_text('{"launch_id": "old-actor"}')
+    (directory / "script.log").write_text("x" * 10000 + "failure tail")
+    unit.claim = WorkerClaim(unit.id, 1, 1, "old-actor", run_dir=str(directory), quiescent=True)
+    unit.hold = Hold("technical_failure", "interrupted without receipt")
+    unit.bindings["head"] = "bound-head"
+    process = SimpleNamespace(pid=123, poll=lambda: 17)
+    details = failure_details(SimpleNamespace(processes={directory: process}), snapshot, {})
+    worker = details["workers"][unit.id]
+    assert worker["bound_head"] == "bound-head"
+    assert worker["owned_returncode"] == 17
+    assert worker["files"]["engine.pid"]["tail"] == "123 456.0"
+    assert worker["files"]["script.log"]["tail"].endswith("failure tail")
+    assert len(worker["files"]["script.log"]["tail"]) == 4096
+    assert "error" in worker["files"]["receipt.json"]
+
+
+def test_effect_timings_preserve_results_exceptions_and_active_call_evidence():
+    from campaign_runtime_watchdog import TimedDriver
+
+    now = [0.0]
+    action = SimpleNamespace(id="action", kind="launch", unit="unit")
+    expected = Observation("confirmed", {"observed": True})
+
+    def perform(snapshot, received):
+        assert snapshot == "snapshot" and received is action
+        now[0] = 3.0
+        assert timed.details()["active_effect_timings"][0]["elapsed_s"] == 3.0
+        now[0] = 5.0
+        return expected
+
+    def reconcile(snapshot, received):
+        now[0] += 7.0
+        raise ValueError("original failure")
+
+    timed = TimedDriver(
+        SimpleNamespace(perform=perform, reconcile_action=reconcile), clock=lambda: now[0]
+    )
+    assert timed.perform("snapshot", action) is expected
+    with pytest.raises(ValueError, match="original failure"):
+        timed.reconcile_action("snapshot", action)
+    details = timed.details()
+    assert details["active_effect_timings"] == []
+    assert [row["duration_s"] for row in details["slowest_effects"]] == [7.0, 5.0]
+
+
 def test_completion_wait_includes_delayed_hierarchy_close_after_600_ticks(campaign_store):
     store, campaign_id = campaign_store
     started, release, past_old_limit, finished = (threading.Event() for _ in range(4))

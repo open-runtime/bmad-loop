@@ -1,6 +1,6 @@
 # ADR 0002: A deterministic SDLC campaign with GitHub delivery
 
-- **Status:** Partially implemented in the development PR; audited runtime gaps and activation qualification remain
+- **Status:** Implementation under qualification; full-suite failures block review readiness and activation remains separate
 - **Date:** 2026-11-05
 - **Scope:** An opt-in campaign supervisor, isolated workers, planning, GitHub synchronization and native Paradev reflection
 
@@ -44,6 +44,14 @@ production-path regression coverage, native qualification and independent review
 Merge, exact-commit installation, canonical-base update and qualified REM delivery
 remain later gates of the original objective. A green suite, disabled automations
 or a locally completed story cannot substitute for those gates.
+
+The scripted 48-story load and stop/resume qualification passed, as did the
+sealed-history fidelity assessment and native read-only successor retrieval.
+These establish the bounded capabilities recorded in
+[ADR 0003](0003-bounded-reasoning-and-handoff.md#qualification-achieved-and-remaining-gates),
+not universal harness support or writable continuation of the historical packet.
+Full-suite failures still block review readiness despite two independent scoped
+reviews finding no outstanding issue in their reviewed candidate.
 
 Optimize useful parallel work through dependencies, ownership and token/session
 capacity. Preserve initiatives and sprints as existing source structure and GitHub
