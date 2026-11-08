@@ -7,6 +7,8 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+## [0.15.0] — 2026-11-08
+
 ### Added
 
 - Require optional native main/custom review pairs separately from independent publication review.
@@ -26,6 +28,10 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Preserve read-only stage permissions through quota fallback and successor handoff.
+- Honor stop and operator holds at reasoning admission and the final native launch boundary.
+- Select queued steering by exact target before paging so unrelated jobs cannot hide messages.
+- Bound summary input and total context separately without charging output twice against input capacity.
 - Refresh obsolete publication reviews after live intake changes the execution graph, retaining uncertain merge receipts.
 - Split output-limited handoff reducers at whole-child boundaries without discarding completed summaries or retry debt.
 - Permit Git's private AUTO_MERGE cleanup transaction after scoped commits.
@@ -6971,7 +6977,8 @@ enforced in CI.
   implementation phase, driven by a Python control loop with hook-based session transport and
   resumable on-disk run state.
 
-[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.15.0
 [0.14.0]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.14.0
 [0.13.15]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.15
 [0.13.14]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.14
