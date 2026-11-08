@@ -46,6 +46,9 @@ for line in sys.stdin:
   assert p['dynamicTools'][0]['name']=='bmad_shell'
   emit({'id':r['id'],'result':{'thread':{'id':'native'},'model':p['model'],'reasoningEffort':p['config']['model_reasoning_effort'],'sandbox':{'type':'readOnly'}}})
  elif method=='turn/start':
+  schema=p['outputSchema']
+  assert schema['additionalProperties'] is False, 'native strict schema requires additionalProperties=false'
+  assert set(schema['required'])==set(schema['properties']), 'native strict schema requires every property'
   prompt=p['input'][0]['text'];nonce=re.search(r'QUALIFICATION NONCE ([a-f0-9]+)',prompt)[1]
   emit({'id':r['id'],'result':{'turn':{'id':'turn'}}})
   code="from pathlib import Path; import subprocess; Path('src/owned.txt').write_text('native writer qualification: "+nonce+"\\n'); subprocess.run(['git','add','src/owned.txt'],check=True); subprocess.run(['git','commit','-qm','native tool qualification'],check=True)"
@@ -56,6 +59,7 @@ for line in sys.stdin:
   responses+=1
   if responses==1:emit(call);continue
   result={'nonce':re.search(r'QUALIFICATION NONCE ([a-f0-9]+)',prompt)[1],'markers':re.findall(r'CANARY [0-9]+: ([a-f0-9]+)',prompt)}
+  if 'bmad_result_json' in schema['properties']:result={'bmad_result_json':json.dumps(result)}
   emit({'method':'thread/tokenUsage/updated','params':{'threadId':'native','turnId':'turn','tokenUsage':{'total':{'inputTokens':100,'outputTokens':80,'cachedInputTokens':0,'reasoningOutputTokens':1}}}})
   emit({'method':'turn/completed','params':{'threadId':'native','turn':{'id':'turn','status':'completed','items':[{'id':'result','type':'agentMessage','text':json.dumps(result)}]}}})
 """)

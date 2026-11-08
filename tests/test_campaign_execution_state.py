@@ -1,5 +1,6 @@
 """Production adapter composition keeps native control state outside writable trees."""
 
+import json
 import sys
 from pathlib import Path
 
@@ -90,6 +91,12 @@ def test_worker_composition_runs_scoped_writer_with_external_control_state(
     result = adapter.run(spec)
     request = adapter.requests[spec.task_id]
     assert result.status == "completed", (request.parent / "stderr.log").read_text()
+    native_result = read_json(request.parent / "receipt.json")["result"]
+    assert json.loads(native_result["bmad_result_json"]) == {"nonce": "a" * 32, "markers": []}
+    qualification_result = read_json(Path(report["capability_path"]).parent / "receipt.json")[
+        "result"
+    ]
+    assert set(qualification_result) == {"nonce", "markers"}
     assert not request.resolve().is_relative_to(workspace.resolve())
     assert request.is_relative_to(context.directory)
     assert run_dir.name in request.parts

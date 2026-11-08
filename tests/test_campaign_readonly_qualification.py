@@ -89,29 +89,42 @@ def test_readonly_route_earns_readback_and_product_git_descendant_write_denial(r
         capability_for(routes, candidate.profile, candidate.model, effort=candidate.effort)
 
 
-def test_readonly_grants_discard_worker_authority_and_cannot_write_product_or_git(
+def test_readonly_grants_discard_worker_authority_and_cannot_write_product_git_or_lifecycle(
     project, tmp_path
 ):
     cap = {"permissions": "read-only-tools"}
     grants = readonly_grants(project.project, {"config_revision": 1}, cap)
-    workspace, paths, _ = write_paths(grants, tmp_path)
+    directory = tmp_path / "controller" / "job"
+    directory.mkdir(parents=True)
+    workspace, paths, _ = write_paths(grants, directory)
     assert workspace == project.project.resolve()
-    assert paths == ((tmp_path / "sandbox-runtime").resolve(),)
+    assert paths == ((directory / "sandbox-runtime").resolve(),)
+    # A disjoint approved native cache still works. This isolates overlap
+    # rejection from a blanket refusal of every runtime grant.
+    runtime = tmp_path / "native-cache"
+    runtime.mkdir()
+    assert write_paths({**grants, "runtime_write_paths": [str(runtime)]}, directory)[1] == (
+        *paths,
+        runtime.resolve(),
+    )
     for key, value in (
         ("scopes", ["src"]),
         ("write_paths", ["test.txt"]),
         ("git_branch", "worker"),
     ):
         with pytest.raises(CampaignError, match="cannot grant"):
-            write_paths({**grants, key: value}, tmp_path)
+            write_paths({**grants, key: value}, directory)
     for path in (
         project.project,
         project.project / "src",
         project.project / ".git",
         project.project.parent,
+        directory,
+        directory / "request.json",
+        directory.parent,
     ):
-        with pytest.raises(CampaignError, match="overlaps product or Git"):
-            write_paths({**grants, "runtime_write_paths": [str(path)]}, tmp_path)
+        with pytest.raises(CampaignError, match="overlaps product, Git or lifecycle authority"):
+            write_paths({**grants, "runtime_write_paths": [str(path)]}, directory)
 
 
 def test_readonly_adapter_minimizes_frozen_grants(prepared, project, tmp_path):

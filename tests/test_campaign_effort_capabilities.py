@@ -170,16 +170,25 @@ def test_worker_adapter_selection_uses_exact_effort_and_permission(
         }
 
     monkeypatch.setattr(runsetup, "make_adapters", adapters)
+    project = tmp_path / "workspace"
+    project.mkdir()
+    run_dir = project / ".bmad-loop" / "runs" / "worker-run"
+    authority = tmp_path / "controller" / "worker"
     result = campaign_workers._adapters(
         {"read_only": read_only, "headless_capabilities": routes, "headless_coordinates": {}},
-        SimpleNamespace(profiles=profiles),
-        tmp_path,
-        tmp_path / "run",
+        SimpleNamespace(profiles=profiles, directory=authority),
+        project,
+        run_dir,
         policy,
     )
     if read_only:
         assert set(result) == set(profiles)
         assert all(adapter.capability == selected for adapter in result.values())
+        assert all(
+            adapter.native_job_root == authority / "native" / run_dir.name
+            and not adapter.native_job_root.is_relative_to(project)
+            for adapter in result.values()
+        )
     else:
         assert captured == profiles
         assert result == {}

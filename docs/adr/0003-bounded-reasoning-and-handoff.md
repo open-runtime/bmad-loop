@@ -820,6 +820,13 @@ The Claude scoped MCP route shares this bounded command boundary. Reusing an
 unchanged nested native executable's served-model alias evidence never transfers
 permission qualification to either writer route.
 
+Ordinary Codex worker and stage results use a closed native transport schema
+containing a serialized BMAD result object. The adapter validates and unwraps
+that object before applying the existing stage contract or folding native review
+findings. This preserves arbitrary required artifact fields without sending an
+open schema that the native API rejects. Transport qualification and ordinary
+worker composition must both exercise their actual schemas.
+
 AGY's private no-tools hooks deny general tools and bound model invocations across
 the complete job. Its native schema `finish` is an output operation, narrowly
 allowed only with arguments matching the frozen schema. A model-generated tool

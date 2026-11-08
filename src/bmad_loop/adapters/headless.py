@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -123,6 +124,23 @@ class HeadlessAdapter(CodingCLIAdapter):
         prompt = spec.prompt
         if self.paths is not None:
             prompt += "\nWhen finished, return a JSON object with status and spec_file (the actual BMAD spec path). Keep writing the native BMAD spec and Auto Run Result as instructed."
+        if self.capability.get("protocol") in {"codex-app-server", "codex-native-review"}:
+            # Codex requires a closed native output schema. The stage's actual
+            # result has its own contract; preserve every field inside a string
+            # instead of narrowing that contract to a guessed list of keys.
+            schema = {
+                "type": "object",
+                "properties": {"bmad_result_json": {"type": "string"}},
+                "required": ["bmad_result_json"],
+                "additionalProperties": False,
+            }
+            prompt += (
+                "\nNative transport result: serialize the complete JSON result object requested "
+                "above as a JSON string, preserving every field. Return exactly one object "
+                "with that string in bmad_result_json, for example "
+                '{"bmad_result_json":"{\\"status\\":\\"done\\"}"}. '
+                "This wrapper changes only the final response, not the requested work or files."
+            )
         request = JobRequest(
             identifier,
             "triage",
@@ -204,6 +222,22 @@ class HeadlessAdapter(CodingCLIAdapter):
         self.receipts[handle.task_id] = receipt
         outcome = receipt["outcome"]
         result_json = receipt.get("result")
+        if outcome == "completed" and (self.capability or {}).get("protocol") in {
+            "codex-app-server",
+            "codex-native-review",
+        }:
+            if (
+                not isinstance(result_json, dict)
+                or set(result_json) != {"bmad_result_json"}
+                or not isinstance(result_json["bmad_result_json"], str)
+            ):
+                raise CampaignError("Codex result wrapper is missing or malformed")
+            try:
+                result_json = json.loads(result_json["bmad_result_json"])
+            except (ValueError, RecursionError) as exc:
+                raise CampaignError("Codex result wrapper contains malformed JSON") from exc
+            if not isinstance(result_json, dict):
+                raise CampaignError("Codex result wrapper must contain a JSON object")
         if (
             outcome == "completed"
             and (self.capability or {}).get("protocol") == "codex-native-review"
