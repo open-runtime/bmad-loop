@@ -62,7 +62,8 @@ class ProgressWatchdog:
     Only a unit's first visit to a state or first validated planning stage counts.
     Polls, retry attempts, fresh heads and repeated review cycles do not count.
     The absolute ceiling is fixed from the initial graph and configured intake
-    budget: one no-progress interval per possible unit/control, plus closure.
+    budget and bounded landing-repair allowance: one no-progress interval per
+    possible unit/control, plus closure.
     Explicit caller deadlines retain their original absolute-time semantics.
     """
 
@@ -72,9 +73,16 @@ class ProgressWatchdog:
         self.timeout_s = timeout_s
         # Each allowed incoming unit can require its own planning control.
         incoming = snapshot.spec.intake.max_new_units if snapshot.spec.intake.allow_new_units else 0
-        self.unit_budget = max(
-            1, len(snapshot.units) + 2 * incoming + int(snapshot.spec.planning.enabled)
+        initial_units = len(snapshot.units) + 2 * incoming + int(snapshot.spec.planning.enabled)
+        repairs = (
+            snapshot.spec.resolution.max_attempts_per_unit
+            if snapshot.spec.resolution.mode == "bounded-auto"
+            else 0
         )
+        # A root retains one lifetime repair budget across nested landing
+        # failures. Reserve it up front; dynamic graph growth cannot extend
+        # the absolute deadline or buy unbounded fresh milestone identities.
+        self.unit_budget = max(1, initial_units * (1 + repairs))
         self.total_s = timeout_s if timeout_s is not None else idle_s * (self.unit_budget + 1)
         self.units = set(snapshot.units)
         self.seen = self._milestones(snapshot)

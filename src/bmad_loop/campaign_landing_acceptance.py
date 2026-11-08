@@ -8,11 +8,19 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import hashlib
 from dataclasses import asdict
 from pathlib import Path
 
 from . import verify
-from .campaign_model import CampaignError, CampaignUnit, Hold, UnitState, validate_graph
+from .campaign_model import (
+    CampaignError,
+    CampaignUnit,
+    Hold,
+    UnitState,
+    source_to_dict,
+    validate_graph,
+)
 from .campaign_publication import Candidate
 from .campaign_supervisor import Observation, Proposal
 from .platform_util import safe_segment
@@ -156,7 +164,7 @@ def checkout(runtime, snapshot, action):
         {
             "workspace": str(workspace),
             "group": asdict(group),
-            "source": asdict(source),
+            "source": source_to_dict(source),
             "private_paths": private_paths,
         },
     )
@@ -281,6 +289,42 @@ def admit_repair(runtime, snapshot, unit, data):
         unit=key,
         original=unit.id,
         merge_commit=debt["merge_commit"],
+    )
+
+
+def repair_product_input(snapshot, unit, workspace):
+    """Read the original accepted draft at its immutable reviewed head.
+
+    A native ticket may keep acceptance only in its source plan. The repair has
+    no lifecycle selector; inheriting that selector would grant source writes.
+    Its root's delivered draft already embeds the exact selected native input,
+    including ignored/private plans, and remains reachable through the merge.
+    """
+    root = snapshot.units[unit.bindings["landing_root"]]
+    head = root.evidence.get("integrated", {}).get("head", "")
+    relative = root.bindings.get("spec_path", "")
+    path = Path(relative)
+    if not head or not relative or path.is_absolute() or ".." in path.parts:
+        raise CampaignError("Landing repair lacks its original accepted product identity")
+    if not verify.is_ancestor(workspace, head, "HEAD"):
+        raise CampaignError("Landing repair base does not contain its accepted product")
+    object_name = head + ":" + relative
+    size = verify.git_bytes(workspace, "cat-file", "-s", object_name)
+    try:
+        length = int(size.stdout)
+    except ValueError as exc:
+        raise CampaignError("Landing repair accepted product is unavailable") from exc
+    if size.returncode or not 0 < length <= 1024 * 1024:
+        raise CampaignError("Landing repair accepted product exceeds its byte bound")
+    data = verify.file_bytes_at_revision(workspace, head, relative)
+    if data is None or len(data) != length:
+        raise CampaignError("Landing repair accepted product observation is incomplete")
+    return (
+        {
+            "path": relative + "@" + head,
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "text": data.decode("utf-8"),
+        },
     )
 
 

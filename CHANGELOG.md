@@ -9,6 +9,7 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- Deliver explicitly selected native tickets without closing their ongoing parent epics or milestones.
 - Add durable reasoning jobs, qualified headless adapters and portable transcript handoff contracts.
 - Prepare reusable native-history summaries during active work with bounded background jobs.
 - Bind required acceptance evidence to exact candidates and recruit configured GitHub reviewers.
@@ -24,6 +25,9 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Preserve native acceptance in landing-repair drafts without granting source lifecycle writes.
+- Keep native control records outside product workspaces and preserve owner staging during private Git publication recovery.
+- Isolate nested pytest temporary roots and wait for bounded landing-repair progress under parallel test load.
 - Lead managed Paradev labels with observed hcom names, epics, issues and PRs, refreshing discovered bindings.
 - Preserve the configured hcom room across headless launches without inheriting another agent's identity.
 - Resume temporary GitHub waits and reconsider owner decisions when their evidence changes.

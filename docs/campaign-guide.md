@@ -107,6 +107,36 @@ an initiative, epic slugs and ticket refs. Stories sources name the spec folder
 and optionally story IDs. Source IDs form part of qualified unit identities;
 a short epic-local number cannot identify work across initiatives.
 
+Ticket sources default to `completion_scope = "epic"`: selecting only some
+children still retains the native epic closure obligation, which waits for every
+required child and a substantive retrospective. To deliver a bounded selection
+from an ongoing epic, explicitly select ticket refs and opt into
+`completion_scope = "selected-units"`:
+
+```toml
+[[sources]]
+id = "selected-stories"
+kind = "tickets"
+initiative = "initiative-api"
+units = ["1.2", "3.4"]
+completion_scope = "selected-units"
+```
+
+This mode completes only after selected work, required dependencies and repair
+descendants pass the normal review, merge, actual-landing acceptance and source/
+issue reconciliation gates. It creates no new epic closure work, writes no parent
+retrospective and does not close parent issues or milestones, even if the current
+GitHub projection has no remaining open children. Unselected native siblings stay
+untouched. Status reports **Selected work delivered; parent scope remains open**
+and exposes `tracking.source_completion_scopes` and `tracking.selected_work`.
+The persisted choice survives resume; omitted fields retain legacy epic scope.
+
+Selection does not erase native dependencies. An omitted done ticket still needs
+verified reconciliation. A hard dependency on whole-epic closure must already
+have complete native closure evidence, including its retrospective, before it can
+be reconciled in this mode. Missing closure work requires a separate full-epic
+campaign; a selected-units worker cannot author it as an implicit expansion.
+
 Already-done sources are reconciled explicitly. An actual earlier campaign
 delivery can be reused only after current source bytes, its merged PR/history
 and closed tracker are independently read back. Other done work gets a new
@@ -331,6 +361,10 @@ configured checks, selected local reviews, verification and history preservation
 It does not claim server-enforced atomic freshness of the base. The actual landed
 commit must pass acceptance before delivery; failed landing proof creates one
 linked repair PR and keeps original tracking pending until the repair is accepted.
+Repair drafts retain the original accepted product specification from its exact
+reviewed Git head, including embedded native plan text and source hashes. This
+also works when ticket acceptance lives in the native plan rather than duplicated
+campaign criteria; the repair does not acquire the parent's lifecycle selector.
 
 Queue verification uses a separately owned, detached checkout of GitHub's
 synthetic group head, preserving the PR head and both the accepted and current
@@ -820,6 +854,15 @@ the proposal. No-tools qualification cannot substitute for this proof. Passing
 qualifies the measured input and configured budgets for this finite operation;
 it does not qualify every coding workflow, cross-provider continuation or a
 provider's advertised limits.
+
+Native control files live outside the writable checkout. Tool grants cannot
+expose requests, lifecycle receipts, the worktree's Git pointer, controller state
+or shared Git storage. The writer uses private staging and refs; checkpoint and
+completion publication seal objects before advancing the owned canonical branch.
+Comparisons can read a snapshot of main and other refs. If an owner changes
+canonical staging during publication, the campaign preserves it and reports a
+reconciliation hold. Replaying completed publication does not replace newer
+staging.
 
 For Grok, large prompt files require its native `--verbatim` option to avoid
 abbreviated input that would require a later tool read. For Muse, the qualified

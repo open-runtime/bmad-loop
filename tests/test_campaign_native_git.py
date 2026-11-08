@@ -103,23 +103,143 @@ def test_ref_index_crash_reconciles_exact_pending_tree_without_losing_staging(
     head = native("rev-parse", "HEAD")
     (workspace / "src.txt").write_text("staged after commit")
     native("add", "src.txt")
-    real = campaign_native_git._git
+    real = campaign_native_git._install_index
 
-    def crash(repo, *args, **kwargs):
-        if args[0] == "read-tree":
-            raise CampaignError("simulated controller death after CAS")
-        return real(repo, *args, **kwargs)
+    def crash(*args, **kwargs):
+        raise CampaignError("simulated controller death after CAS")
 
-    monkeypatch.setattr(campaign_native_git, "_git", crash)
+    monkeypatch.setattr(campaign_native_git, "_install_index", crash)
     with pytest.raises(CampaignError, match="controller death"):
         publish(workspace, baseline, directory=directory, final=True)
     assert git(workspace, "rev-parse", "HEAD").strip() == head
-    monkeypatch.setattr(campaign_native_git, "_git", real)
+    monkeypatch.setattr(campaign_native_git, "_install_index", real)
     # Recovery runs through the live observer too; it cannot rely on a second
     # finalization call to reconstruct the lost canonical index.
     assert publish(workspace, baseline, directory=directory) == head
     assert git(workspace, "show", ":src.txt") == "staged after commit"
     assert (workspace / "src.txt").read_text() == "staged after commit"
+
+
+@pytest.mark.parametrize("installed", [False, True])
+def test_real_publisher_death_recovers_owned_lock_and_exact_staging(private_view, installed):
+    workspace, baseline, directory, native = private_view
+    (workspace / "src.txt").write_text("committed")
+    native("add", "src.txt")
+    native("commit", "-qm", "committed")
+    (workspace / "src.txt").write_text("staged intention")
+    native("add", "src.txt")
+    script = """import os,sys
+from pathlib import Path
+from bmad_loop import campaign_native_git as module
+real=module._install_index
+def death(*args):
+ if sys.argv[4]=='True':real(*args)
+ os._exit(73)
+module._install_index=death
+module.publish(Path(sys.argv[1]),sys.argv[2],directory=Path(sys.argv[3]),final=True)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(workspace), baseline, str(directory), str(installed)],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 73, result.stderr
+    assert git(workspace, "rev-parse", "HEAD").strip() == native("rev-parse", "HEAD")
+    publish(workspace, baseline, directory=directory)
+    assert git(workspace, "show", ":src.txt") == "staged intention"
+    index = Path(
+        git(workspace, "rev-parse", "--path-format=absolute", "--git-path", "index").strip()
+    )
+    assert not Path(str(index) + ".lock").exists()
+
+
+def test_pending_recovery_preserves_intervening_owner_staging(private_view, monkeypatch):
+    from bmad_loop import campaign_native_git
+
+    workspace, baseline, directory, native = private_view
+    (workspace / "src.txt").write_text("native")
+    native("add", "src.txt")
+    native("commit", "-qm", "native")
+    real = campaign_native_git.atomic_write_text
+
+    def interrupted(path, text, **kwargs):
+        if path.suffix == ".publication" and json.loads(text).get("state") == "complete":
+            raise CampaignError("death after index installation")
+        return real(path, text, **kwargs)
+
+    monkeypatch.setattr(campaign_native_git, "atomic_write_text", interrupted)
+    with pytest.raises(CampaignError, match="death after index"):
+        publish(workspace, baseline, directory=directory, final=True)
+    monkeypatch.setattr(campaign_native_git, "atomic_write_text", real)
+    (workspace / "src.txt").write_text("owner staged after crash")
+    git(workspace, "add", "src.txt")
+    (workspace / "src.txt").write_text("owner unstaged after crash")
+    with pytest.raises(CampaignError, match="staging changed"):
+        publish(workspace, baseline, directory=directory)
+    assert git(workspace, "show", ":src.txt") == "owner staged after crash"
+    assert (workspace / "src.txt").read_text() == "owner unstaged after crash"
+    assert native("show", ":src.txt") == "native"
+
+
+def test_completed_final_retry_does_not_replay_staging(private_view):
+    workspace, baseline, directory, native = private_view
+    (workspace / "src.txt").write_text("native staged")
+    native("add", "src.txt")
+    publish(workspace, baseline, directory=directory, final=True)
+    (workspace / "src.txt").write_text("owner staged")
+    git(workspace, "add", "src.txt")
+    publish(workspace, baseline, directory=directory, final=True)
+    assert git(workspace, "show", ":src.txt") == "owner staged"
+
+
+def test_owner_staging_during_native_work_is_not_adopted_as_publication_baseline(private_view):
+    workspace, baseline, directory, native = private_view
+    (workspace / "src.txt").write_text("native staged")
+    native("add", "src.txt")
+    (workspace / "src.txt").write_text("owner staged")
+    git(workspace, "add", "src.txt")
+    with pytest.raises(CampaignError, match="staging changed"):
+        publish(workspace, baseline, directory=directory, final=True)
+    assert git(workspace, "show", ":src.txt") == "owner staged"
+
+
+def test_unrelated_git_index_lock_is_never_reclaimed(private_view):
+    workspace, baseline, directory, native = private_view
+    (workspace / "src.txt").write_text("native staged")
+    native("add", "src.txt")
+    index = Path(
+        git(workspace, "rev-parse", "--path-format=absolute", "--git-path", "index").strip()
+    )
+    lock = Path(str(index) + ".lock")
+    lock.write_bytes(b"another owner's Git transaction")
+    with pytest.raises(CampaignError, match="another or uncertain writer"):
+        publish(workspace, baseline, directory=directory, final=True)
+    assert lock.read_bytes() == b"another owner's Git transaction"
+    assert git(workspace, "rev-parse", "HEAD").strip() == baseline
+
+
+def test_noop_publication_death_after_receipt_does_not_strand_index_lock(private_view):
+    workspace, baseline, directory, _ = private_view
+    script = """import json,os,sys
+from pathlib import Path
+from bmad_loop import campaign_native_git as module
+real=module.atomic_write_text
+def death(path,text,**kwargs):
+ real(path,text,**kwargs)
+ if path.suffix=='.publication' and json.loads(text).get('state')=='complete':os._exit(74)
+module.atomic_write_text=death
+module.publish(Path(sys.argv[1]),sys.argv[2],directory=Path(sys.argv[3]),final=True)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(workspace), baseline, str(directory)],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 74, result.stderr
+    publish(workspace, baseline, directory=directory)
+    (workspace / "src.txt").write_text("owner can stage after completed publication")
+    git(workspace, "add", "src.txt")
+    assert git(workspace, "show", ":src.txt") == "owner can stage after completed publication"
 
 
 def test_exact_final_session_does_not_replay_prior_session_staging(private_view, tmp_path):

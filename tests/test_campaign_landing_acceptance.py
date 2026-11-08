@@ -159,7 +159,9 @@ def test_native_campaign_rechecks_actual_landing_then_completes_tracking(
     monkeypatch.setattr(
         campaign_native_merge, "execute", functools.partial(original_execute, runner=native_gh)
     )
-    result = run_case(case, timeout_s=90)
+    # Real Git, worker and GitHub effects may be slow under the full xdist
+    # workload. Wait for delivery with the shared finite progress guard.
+    result = run_case(case)
     assert result.phase == "delivered", diagnose(result)
     expected = 4 if repair_needed else 3
     assert len(calls) == expected and len(set(calls)) == expected

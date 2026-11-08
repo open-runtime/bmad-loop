@@ -23,7 +23,13 @@ from typing import Any, Callable, Mapping, cast
 from . import runs, verify
 from .campaign_github import GithubGateway, MutationIntent, managed_marker
 from .campaign_migration import MigrationItem, ServiceInventory
-from .campaign_model import CampaignError, CampaignSnapshot, SourceSelector, UnitState
+from .campaign_model import (
+    CampaignError,
+    CampaignSnapshot,
+    SourceSelector,
+    UnitState,
+    source_to_dict,
+)
 from .campaign_source_publication import SourcePublication
 from .campaign_store import add_event
 from .platform_util import atomic_write_text, is_link_like, safe_segment
@@ -267,7 +273,7 @@ def source_binding(
     binding = SourcePublication(project, root).capture(source, unit.spec).to_dict()
     identity = digest(
         {
-            "selector": dataclasses.asdict(source),
+            "selector": source_to_dict(source),
             "unit": dataclasses.asdict(unit.spec),
             "binding": binding,
         }
@@ -422,7 +428,7 @@ def qualify(
         now,
         manifest.head,
         manifest.base,
-        {"selector": dataclasses.asdict(source), "binding": binding, "identity": identity},
+        {"selector": source_to_dict(source), "binding": binding, "identity": identity},
         dataclasses.asdict(actor),
         {},
     )
@@ -1045,7 +1051,7 @@ def prepare(runtime, snapshot, action) -> dict[str, Any]:
             else runtime._source_publisher(snapshot).capture(selector, unit.spec)
         )
         state["source"] = {
-            "effective_source": dataclasses.asdict(prepared.selector),
+            "effective_source": source_to_dict(prepared.selector),
             "canonical_source": canonical.to_dict(),
             "initial_source": (
                 {
@@ -1096,7 +1102,7 @@ def prepare(runtime, snapshot, action) -> dict[str, Any]:
             "url": f"https://github.com/{snapshot.repository}/pull/{manifest.pr_number}",
         },
         "spec_path": spec_path.relative_to(workspace).as_posix(),
-        "canonical_selector": dataclasses.asdict(selector),
+        "canonical_selector": source_to_dict(selector),
         "source_authority_root": str(runtime.store.directory(snapshot.id) / "source-publication"),
         "preserved_adoption_ref": preserved_ref,
         **state["source"],

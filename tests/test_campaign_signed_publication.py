@@ -15,8 +15,9 @@ from bmad_loop.campaign_scoped_tools import ScopedTools
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="actual macOS scoped writer")
+@pytest.mark.parametrize("config_layer", ["local", "worktree"])
 def test_scoped_ssh_signed_commit_preserves_exact_signature_on_publication(
-    project, tmp_path, monkeypatch
+    project, tmp_path, monkeypatch, config_layer
 ):
     ssh_keygen = shutil.which("ssh-keygen")
     if ssh_keygen is None:
@@ -38,6 +39,16 @@ def test_scoped_ssh_signed_commit_preserves_exact_signature_on_publication(
     identity = "bmad-signing-fixture@example.invalid"
     allowed.write_text(identity + ' namespaces="git" ' + key.with_suffix(".pub").read_text())
     root = project.project
+    if config_layer == "worktree":
+        git(root, "config", "extensions.worktreeConfig", "true")
+    workspace = tmp_path / "signed-worker"
+    branch = "bmad-signed-native"
+    git(root, "worktree", "add", "-b", branch, str(workspace))
+    hooks = tmp_path / "signing-hooks"
+    hooks.mkdir()
+    hook = hooks / "pre-commit"
+    hook.write_text('#!/bin/sh\nprintf hook > "$TMPDIR/worktree-hook-ran"\n')
+    hook.chmod(0o700)
     for name, value in {
         "commit.gpgsign": "true",
         "gpg.format": "ssh",
@@ -45,11 +56,15 @@ def test_scoped_ssh_signed_commit_preserves_exact_signature_on_publication(
         "gpg.ssh.allowedSignersFile": str(allowed),
         "user.signingKey": str(key),
         "user.email": identity,
+        "core.hooksPath": str(hooks),
     }.items():
-        git(root, "config", "--local", name, value)
-    workspace = tmp_path / "signed-worker"
-    branch = "bmad-signed-native"
-    git(root, "worktree", "add", "-b", branch, str(workspace))
+        git(
+            workspace if config_layer == "worktree" else root,
+            "config",
+            "--" + config_layer,
+            name,
+            value,
+        )
     baseline = git(workspace, "rev-parse", "HEAD")
     (workspace / "src").mkdir()
     directory = tmp_path / "signed-job"
@@ -75,7 +90,7 @@ def test_scoped_ssh_signed_commit_preserves_exact_signature_on_publication(
                 str(Path(sys.executable).resolve()),
                 "-c",
                 """
-import base64,json,subprocess
+import base64,json,os,subprocess
 from pathlib import Path
 def git(*args):
     result=subprocess.run(['git',*args],capture_output=True,check=True)
@@ -84,6 +99,7 @@ assert git('config','--bool','commit.gpgsign').strip()==b'true'
 Path('src/signed.txt').write_text('signed owned contribution\\n')
 git('add','src/signed.txt')
 git('commit','-qm','Preserve a real scoped signature')
+assert (Path(os.environ['TMPDIR'])/'worktree-hook-ran').read_text()=='hook'
 head=git('rev-parse','HEAD').decode().strip()
 raw=git('cat-file','commit',head)
 assert b'gpgsig -----BEGIN SSH SIGNATURE-----' in raw

@@ -12,14 +12,13 @@ import base64
 import hashlib
 import os
 import stat
-from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import frontmatter
 from . import platform_util as fs
 from . import ticketlayout, verify
-from .campaign_model import CampaignError, SourceSelector, UnitSpec
+from .campaign_model import CampaignError, SourceSelector, UnitSpec, source_to_dict
 from .campaign_sources import source_paths
 from .tickettree import TicketTree
 
@@ -115,6 +114,8 @@ def prepare(
     workspace = workspace.resolve()
     if source.kind != "tickets" or unit.kind != "closure":
         raise CampaignError("native closure requires an exact ticket epic selector")
+    if source.completion_scope == "selected-units":
+        raise CampaignError("selected-units completion cannot author native parent closure")
     if not verify.worktree_clean(workspace):
         raise CampaignError("closure requires a clean owned draft candidate")
     children_terminal(workspace, source, unit)
@@ -135,7 +136,7 @@ def prepare(
         "selector": unit.selector,
         "workspace": str(workspace),
         "head": verify.rev_parse_head(workspace),
-        "source": asdict(source),
+        "source": source_to_dict(source),
         "source_root": str(paths.initiative_folder),
         "epic": epic.relative_to(workspace).as_posix(),
         "retrospective": retrospective.relative_to(workspace).as_posix(),

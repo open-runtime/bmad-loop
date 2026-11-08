@@ -24,6 +24,7 @@ from .campaign_model import (
     SourceSelector,
     UnitSpec,
     UnitState,
+    source_to_dict,
     validate_graph,
 )
 from .campaign_source_publication import (
@@ -120,7 +121,7 @@ def prepare(
         "original_unit": original.id,
         "original_spec": dataclasses.asdict(original.spec),
         "project": str(project),
-        "source": dataclasses.asdict(source),
+        "source": source_to_dict(source),
         "binding": binding.to_dict() if binding else None,
         "artifact": _encoded(artifact),
         "merge": merge,

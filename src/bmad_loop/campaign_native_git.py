@@ -8,10 +8,12 @@ checks append-only ancestry and compare-and-swaps the exact owned branch.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import shutil
+from contextlib import contextmanager
 from pathlib import Path
 
 from . import verify
@@ -38,6 +40,13 @@ def _audit_index(workspace, *, env=None):
             raise CampaignError(
                 "Native Git index hides paths with assume-unchanged or skip-worktree flags; explicit reconciliation required"
             )
+
+
+def _index_identity(workspace, *, env=None):
+    """Bind staged paths, modes and flags, excluding harmless stat-cache refreshes."""
+    return hashlib.sha256(
+        _git(workspace, "ls-files", "--stage", "-v", "-z", env=env).stdout
+    ).hexdigest()
 
 
 def environment(record):
@@ -91,16 +100,34 @@ def prepare(bank, objects, workspace, directory, branch):
             "--object-format=" + format_name,
             str(private),
         )
-        config = common / "config"
-        if is_link_like(config):
-            raise CampaignError("Canonical Git configuration is redirected")
-        shutil.copyfile(config, private / "config")
-        _git(workspace, "config", "--file", str(private / "config"), "core.bare", "false")
-        _git(
-            workspace, "config", "--file", str(private / "config"), "core.worktree", str(workspace)
-        )
         hooks = Path(_text(workspace, "rev-parse", "--path-format=absolute", "--git-path", "hooks"))
-        _git(workspace, "config", "--file", str(private / "config"), "core.hooksPath", str(hooks))
+        worktree_config = Path(
+            _text(workspace, "rev-parse", "--path-format=absolute", "--git-path", "config.worktree")
+        )
+        configurations = [(common / "config", private / "config")]
+        if worktree_config.exists():
+            configurations.append((worktree_config, private / "config.worktree"))
+        for source, target in configurations:
+            if is_link_like(source):
+                raise CampaignError("Canonical Git configuration is redirected")
+            shutil.copyfile(source, target)
+            # An enabled worktreeConfig layer wins over common config. Preserve
+            # its signing/hooks policy, but bind both layers to this private view.
+            for key, value in (
+                ("core.bare", "false"),
+                ("core.worktree", str(workspace)),
+                ("core.hooksPath", str(hooks)),
+            ):
+                _git(workspace, "config", "--file", str(target), key, value)
+        # Keep ordinary main/origin/main/tag inspection available without
+        # exposing canonical refs to native writes. The owned loose ref below
+        # overrides this immutable launch-time snapshot.
+        references = _text(workspace, "for-each-ref", "--format=%(objectname) %(refname)")
+        atomic_write_text(
+            private / "packed-refs",
+            "# pack-refs with: sorted\n" + (references + "\n" if references else ""),
+            follow_symlinks=False,
+        )
         atomic_write_text(
             private / "HEAD", "ref: refs/heads/" + branch + "\n", follow_symlinks=False
         )
@@ -112,7 +139,11 @@ def prepare(bank, objects, workspace, directory, branch):
             raise CampaignError("Canonical Git index is redirected")
         if index.exists():
             shutil.copyfile(index, private / "index")
-        record = {**identity, "baseline": baseline}
+        record = {
+            **identity,
+            "baseline": baseline,
+            "initial_index": _index_identity(workspace, env=environment(identity)),
+        }
         atomic_write_text(path, json.dumps(record, sort_keys=True), follow_symlinks=False)
         return record
 
@@ -171,37 +202,155 @@ def _records(workspace, common, *, directory=None, run_id=None):
         yield row
 
 
+def _inode(path):
+    try:
+        stat = path.lstat()
+    except FileNotFoundError:
+        return None
+    return [stat.st_dev, stat.st_ino]
+
+
+@contextmanager
+def _index_lock(workspace):
+    """Use Git's own lock; reclaim only our exact dead process's lock inode."""
+    from .process_host import get_process_host
+
+    index = Path(_text(workspace, "rev-parse", "--path-format=absolute", "--git-path", "index"))
+    lock = Path(str(index) + ".lock")
+    lease = index.parent / "bmad-loop-native-index-lease.json"
+    if any(is_link_like(path) for path in (index, lock, lease)):
+        raise CampaignError("Canonical Git index or lock is redirected")
+    host = get_process_host()
+    identity = host.identity(os.getpid())
+    if identity is None:
+        raise CampaignError("Cannot establish native index publisher identity")
+    if lock.exists():
+        prior = json.loads(lease.read_text(encoding="utf-8")) if lease.exists() else {}
+        if (
+            prior.get("index") != str(index)
+            or prior.get("inode") != _inode(lock)
+            or type(prior.get("pid")) is not int
+            or not prior.get("identity")
+            or host.liveness_of(prior["pid"], prior["identity"]) != "dead"
+        ):
+            raise CampaignError("Canonical Git index is locked by another or uncertain writer")
+        lock.unlink()
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError as exc:
+        raise CampaignError("Canonical Git index acquired by another writer") from exc
+    stat = os.fstat(fd)
+    owned = [stat.st_dev, stat.st_ino]
+    try:
+        atomic_write_text(
+            lease,
+            json.dumps(
+                {"index": str(index), "inode": owned, "pid": os.getpid(), "identity": identity}
+            ),
+            follow_symlinks=False,
+        )
+        yield index, lock, fd
+    finally:
+        os.close(fd)
+        if _inode(lock) == owned:
+            lock.unlink()
+        if lease.exists() and json.loads(lease.read_text(encoding="utf-8")).get("inode") == owned:
+            lease.unlink()
+
+
+def _desired_index(workspace, row, tree):
+    path = Path(row["bank"]).with_suffix(".index")
+    if is_link_like(path):
+        raise CampaignError("Native publication index is redirected")
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env["GIT_INDEX_FILE"] = str(path)
+    _git(workspace, "read-tree", tree, env=env)
+    return path, _index_identity(workspace, env=env)
+
+
+def _install_index(index, lock, fd, desired):
+    # Holding this exact lock excludes ordinary git add/reset/status writers.
+    # Never rename a lock replaced by another process.
+    stat = os.fstat(fd)
+    if _inode(lock) != [stat.st_dev, stat.st_ino]:
+        raise CampaignError("Canonical Git index lock identity changed")
+    with os.fdopen(os.dup(fd), "wb") as stream:
+        stream.write(desired.read_bytes())
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(lock, index)
+
+
+def _apply_publication(workspace, row, path, pending, locked):
+    index, lock, fd = locked
+    current_index = _index_identity(workspace)
+    if current_index not in {pending["prior_index"], pending["desired_index"]}:
+        raise CampaignError(
+            "Canonical staging changed during native publication; reconcile explicitly"
+        )
+    current = _text(workspace, "rev-parse", "HEAD")
+    if current == pending["before"]:
+        _git(
+            workspace,
+            "update-ref",
+            "refs/heads/" + row["branch"],
+            pending["head"],
+            pending["before"],
+        )
+    elif current != pending["head"]:
+        raise CampaignError("Unfinished native publication diverged from the owned branch")
+    if current_index != pending["desired_index"]:
+        desired, identity = _desired_index(workspace, row, pending["tree"])
+        if identity != pending["desired_index"]:
+            raise CampaignError("Native publication staged-tree identity changed")
+        _install_index(index, lock, fd, desired)
+    else:
+        # No install consumed the lock. Release it before recording completion,
+        # so a death immediately after the receipt cannot strand an otherwise
+        # completed no-op publication behind our own stale Git lock.
+        stat = os.fstat(fd)
+        if _inode(lock) != [stat.st_dev, stat.st_ino]:
+            raise CampaignError("Canonical Git index lock identity changed")
+        lock.unlink()
+    pending["state"] = "complete"
+    atomic_write_text(path, json.dumps(pending, sort_keys=True), follow_symlinks=False)
+
+
 def _finish_publication(workspace, row, *, head=None, before=None, tree=None):
-    """Recover the ref/index boundary without replaying unrelated staging."""
+    """Recover exact prior/desired staging; never overwrite an intervening owner."""
     path = Path(row["bank"]).with_suffix(".publication")
     if is_link_like(path):
         raise CampaignError("Native publication receipt is redirected")
     prior = json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
-    if prior and prior.get("state") == "pending":
+    if prior:
         if (
             prior.get("workspace") != str(workspace)
             or prior.get("branch") != row["branch"]
+            or prior.get("state") not in {"pending", "complete"}
             or any(
                 not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", str(prior.get(key, "")))
                 for key in ("head", "before", "tree")
             )
-        ):
-            raise CampaignError("Native publication receipt identity differs")
-        current = _text(workspace, "rev-parse", "HEAD")
-        if current == prior["before"]:
-            _git(
-                workspace,
-                "update-ref",
-                "refs/heads/" + row["branch"],
-                prior["head"],
-                prior["before"],
+            or any(
+                not re.fullmatch(r"[0-9a-f]{64}", str(prior.get(key, "")))
+                for key in ("prior_index", "desired_index")
             )
-        elif current != prior["head"]:
-            raise CampaignError("Unfinished native publication diverged from the owned branch")
-        _git(workspace, "read-tree", prior["tree"])
-        prior["state"] = "complete"
-        atomic_write_text(path, json.dumps(prior, sort_keys=True), follow_symlinks=False)
-    if head is not None:
+        ):
+            raise CampaignError("Native publication receipt identity differs; reconcile explicitly")
+        if prior["state"] == "pending":
+            with _index_lock(workspace) as locked:
+                _apply_publication(workspace, row, path, prior, locked)
+    if head is None or (
+        prior and prior["state"] == "complete" and prior["head"] == head and prior["tree"] == tree
+    ):
+        return
+    expected = prior["desired_index"] if prior else row.get("initial_index")
+    with _index_lock(workspace) as locked:
+        if _index_identity(workspace) != expected:
+            raise CampaignError(
+                "Canonical staging changed since native launch/publication; reconcile explicitly"
+            )
+        _, desired_identity = _desired_index(workspace, row, tree)
         pending = {
             "state": "pending",
             "workspace": str(workspace),
@@ -209,9 +358,11 @@ def _finish_publication(workspace, row, *, head=None, before=None, tree=None):
             "head": head,
             "before": before,
             "tree": tree,
+            "prior_index": expected,
+            "desired_index": desired_identity,
         }
         atomic_write_text(path, json.dumps(pending, sort_keys=True), follow_symlinks=False)
-        _finish_publication(workspace, row)
+        _apply_publication(workspace, row, path, pending, locked)
 
 
 def publish(workspace, baseline, *, directory=None, run_id=None, final=False):

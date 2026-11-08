@@ -846,6 +846,24 @@ modify an accepted checkpoint. A baseline available only in an unsealed bank, a
 corrupt object, or an older global bank-alternate registration produces a visible
 hold. Banks remain retained until a separate verified reachability cleanup; this
 promotion path does not collect them.
+
+Each writer also has a private index and owned branch ref, with a read-only
+snapshot of other canonical refs for comparisons. Publishing a checkpoint first
+seals its objects, then compares and swaps the canonical owned ref. The real Git
+index lock protects staging installation. Recovery compares the recorded prior
+and desired index content, preserves intervening owner staging, and reclaims only
+an exact controller lock whose process death is confirmed. Completed publication
+retries do not overwrite later staging. A lock or staging identity that cannot be
+reconciled remains a visible hold.
+
+Native launch requests, grants, lifecycle records and result receipts live outside
+the writable product workspace, including when the legacy child engine keeps its
+journal inside that workspace. Preparation, launch and worker startup enforce the
+separation; explicit runtime write grants cannot expose those records or shared
+Git storage. Broad product ownership still excludes the worktree's Git pointer
+and controller run/campaign state. Private source views remain writable under
+their exact grants. Protecting files also prevents moving their containing
+directories to evade the boundary.
 The CLI retains failed startup attempts and resumes only the same immutable job.
 
 The separate `campaign trial-handoff` command reads explicitly sealed prefixes,

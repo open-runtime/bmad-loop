@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Mapping
 
+from .campaign_completion_scope import retained_parent_reason
 from .campaign_github import GithubError, GithubGateway, JsonObject, MutationIntent, managed_marker
 from .campaign_model import CampaignSnapshot, CampaignUnit, UnitState
 
@@ -386,6 +387,9 @@ class HierarchyCoordinator:
             ]
             if not members or any(not _settled_member(unit) for unit in members):
                 continue
+            reason = retained_parent_reason(snapshot, key)
+            if reason:
+                return TrackingStep("", None, bindings, {}, reason=reason)
             action_key = self._action(snapshot, key, "close")
             existing = saved.get(action_key)
             if existing:
@@ -431,6 +435,9 @@ class HierarchyCoordinator:
             ]
             if not members or any(not _settled_member(unit) for unit in members):
                 continue
+            reason = retained_parent_reason(snapshot, key)
+            if reason:
+                return TrackingStep("", None, bindings, {}, reason=reason)
             if any(
                 k.startswith("epic:" + namespace + ":") and not b.get("closed_confirmed")
                 for k, b in bindings.items()

@@ -13,7 +13,13 @@ import subprocess
 import time
 from pathlib import Path
 
-from .campaign_headless import read_json, validate_capability, validate_probe_capability, write_json
+from .campaign_headless import (
+    read_json,
+    validate_capability,
+    validate_control_directory,
+    validate_probe_capability,
+    write_json,
+)
 from .campaign_headless_protocol import parse_output
 from .campaign_jobs import digest, request_from_dict
 from .campaign_model import CampaignError, CommunicationSpec, RoleCandidate
@@ -91,6 +97,7 @@ def child_main(path: Path) -> int:
             or digest(read_json(directory / "grants.json")) != envelope["grants_digest"]
         ):
             raise CampaignError("Headless execution grants changed")
+        validate_control_directory(directory, envelope["permissions"], envelope["grants"])
         if digest(envelope.get("environment", {})) != envelope["environment_digest"]:
             raise CampaignError("Headless environment changed")
         if "steering" in envelope and digest(envelope["steering"]) != envelope.get(

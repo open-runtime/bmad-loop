@@ -17,6 +17,7 @@ from __future__ import annotations
 import ast
 import errno
 import functools
+import getpass
 import hashlib
 import json
 import os
@@ -2322,6 +2323,8 @@ def _run_grouping_probe(tmp_path, dist: str) -> dict[str, tuple[str, str]]:
             "2",
             "-o",
             "addopts=",
+            "--basetemp",
+            str(tmp_path / ("nested-pytest-" + dist)),
             "--dist",
             dist,
         ],
@@ -2342,6 +2345,20 @@ def _run_grouping_probe(tmp_path, dist: str) -> dict[str, tuple[str, str]]:
         reported[nodeid.split("::")[-1].split("@")[0]] = (worker, nodeid)
     assert len(reported) == 4, f"expected 4 reported tests under --dist {dist}, got {reported}"
     return reported
+
+
+def test_grouping_probe_does_not_clean_ambient_run_history(tmp_path, monkeypatch):
+    ambient = tmp_path / "ambient-temp"
+    history = ambient / ("pytest-of-" + getpass.getuser())
+    sentinels = []
+    for index in range(4):
+        path = history / f"pytest-{index}" / "retained.txt"
+        path.parent.mkdir(parents=True)
+        path.write_text("another run's retained evidence", encoding="utf-8")
+        sentinels.append(path)
+    monkeypatch.setenv("PYTEST_DEBUG_TEMPROOT", str(ambient))
+    _run_grouping_probe(tmp_path, "loadgroup")
+    assert all(path.is_file() for path in sentinels), "nested pytest cleaned unrelated history"
 
 
 def test_loadgroup_actually_schedules_the_group_onto_one_worker(tmp_path):

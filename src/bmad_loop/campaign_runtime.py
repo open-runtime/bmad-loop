@@ -45,6 +45,7 @@ from .campaign_model import (
     UnitState,
     WorkerClaim,
     scopes_overlap,
+    source_to_dict,
 )
 from .campaign_planning import StageCoordinates, execution_spec, stage_packet, validate_result
 from .campaign_preflight import repository_name, resolve_roles
@@ -1449,7 +1450,7 @@ class CampaignRuntime:
                         **payload,
                         "unit": dataclasses.asdict(unit.spec),
                         "source": unit.bindings.get(
-                            "effective_source", dataclasses.asdict(self.source(snapshot, unit))
+                            "effective_source", source_to_dict(self.source(snapshot, unit))
                         ),
                         "sources": unit.bindings.get("effective_sources", []),
                     }
@@ -2420,7 +2421,7 @@ class CampaignRuntime:
                 json.dumps(
                     {
                         "output_folder": str(prepared.paths.output_folder),
-                        "effective_source": dataclasses.asdict(prepared.selector),
+                        "effective_source": source_to_dict(prepared.selector),
                         "private_paths": [str(path) for path in prepared.private_paths],
                     }
                 ),
@@ -2460,7 +2461,7 @@ class CampaignRuntime:
             planning_manifest = str(manifest_path)
         if unit.spec.kind not in {"planning", "tracking", "landing_repair"}:
             effective = SourceSelector(
-                **source_binding.get("effective_source", dataclasses.asdict(source))
+                **source_binding.get("effective_source", source_to_dict(source))
             )
             observed_source = self._source_publisher(snapshot, project=workspace).capture(
                 effective, unit.spec
@@ -2482,13 +2483,18 @@ class CampaignRuntime:
         from .campaign_product_input import collect as selected_product_input
 
         try:
-            native_input = selected_product_input(
-                workspace,
-                SourceSelector(
-                    **source_binding.get("effective_source", dataclasses.asdict(source))
-                ),
-                unit.spec,
-            )
+            if unit.spec.kind == "landing_repair":
+                from .campaign_landing_acceptance import repair_product_input
+
+                native_input = repair_product_input(snapshot, unit, workspace)
+            else:
+                native_input = selected_product_input(
+                    workspace,
+                    SourceSelector(
+                        **source_binding.get("effective_source", source_to_dict(source))
+                    ),
+                    unit.spec,
+                )
             specification = execution_spec(
                 unit.spec,
                 campaign_id=snapshot.id,
@@ -2522,12 +2528,10 @@ class CampaignRuntime:
                 "base": base,
                 "head": head,
                 "native": native,
-                "effective_source": source_binding.get(
-                    "effective_source", dataclasses.asdict(source)
-                ),
+                "effective_source": source_binding.get("effective_source", source_to_dict(source)),
                 "private_paths": list(dict.fromkeys(private_paths)),
                 "canonical_source": canonical_binding,
-                "canonical_selector": dataclasses.asdict(self.source(snapshot, unit)),
+                "canonical_selector": source_to_dict(self.source(snapshot, unit)),
                 "source_authority_root": str(
                     self.store.directory(snapshot.id) / "source-publication"
                 ),
@@ -3244,7 +3248,7 @@ class CampaignRuntime:
             "launch_id": action.id,
             "run_id": claim.run_id,
             "source": unit.bindings.get(
-                "effective_source", dataclasses.asdict(self.source(snapshot, unit))
+                "effective_source", source_to_dict(self.source(snapshot, unit))
             ),
             "unit": dataclasses.asdict(unit.spec),
             "remote": snapshot.spec.remote,
@@ -3427,7 +3431,7 @@ class CampaignRuntime:
 
                 context.update(planning_context(snapshot, unit.id))
                 context["sources"] = unit.bindings.get("effective_sources") or [
-                    dataclasses.asdict(row) for row in snapshot.spec.sources
+                    source_to_dict(row) for row in snapshot.spec.sources
                 ]
                 context["source_observations"] = snapshot.bindings.get("source_observations", {})
                 context["existing_units"] = [

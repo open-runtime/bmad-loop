@@ -102,6 +102,21 @@ The publication boundary requires all of the following:
 7. Source records, linked issues and milestone/parent progress are reconciled.
    Only then does the campaign release dependent units and report delivery.
 
+Completion scope is explicit per native ticket source. The compatible default,
+`completion_scope = "epic"`, retains whole-epic child and retrospective closure.
+An explicit ticket `units` selection may instead use `"selected-units"`. It owes
+the same publication, actual-landing, dependency, required-repair and child-tracking
+gates, but never creates new native parent closure work or treats delivery of a
+selection as delivery of the epic/initiative. Parent issues and milestones remain
+outside its closure authority, including prepared-write retries and sparse GitHub
+projections. Status distinguishes selected work delivered with retained parent
+scope. Unselected source siblings and parent lifecycle files remain unchanged.
+Hard parent dependencies are preserved: only already-complete native closure with
+its existing retrospective can enter verification reconciliation in this scope;
+missing closure cannot silently become a selected worker's parent-writing task.
+Persist the opt-in through restart while preserving legacy source/configuration
+identity hashes for snapshots that omit the field.
+
 Tracked BMAD plan status on an isolated branch is a proposed change until its PR
 lands. Shared or ignored stores require private worker snapshots and publication
 through the existing sole-writer APIs after verified landing. They must never

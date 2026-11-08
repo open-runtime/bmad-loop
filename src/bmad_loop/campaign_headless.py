@@ -448,6 +448,22 @@ def render_input(
     }
 
 
+def validate_control_directory(directory: Path, permissions: str, grants: dict[str, Any]):
+    """A tool-capable process must not be able to rewrite its launch authority."""
+    if permissions not in {"workspace-tools", "read-only-tools"}:
+        return
+    from .campaign_execution_sandbox import _path
+
+    control = _path(str(directory.absolute()))
+    workspace = _path(grants.get("workspace"))
+    if control.is_relative_to(workspace):
+        raise CampaignError("Native control records must be outside the product workspace")
+    for raw in grants.get("runtime_write_paths", []):
+        writable = _path(raw)
+        if writable.is_relative_to(control) or control.is_relative_to(writable):
+            raise CampaignError("Native runtime write grant overlaps control records")
+
+
 class HeadlessRunner:
     def __init__(self, mux=None):
         self.mux = mux or get_multiplexer()
@@ -598,6 +614,7 @@ class HeadlessRunner:
         if not launch_id or type(generation) is not int or generation < 1:
             raise CampaignError("Headless launch ownership is invalid")
         directory = directory.absolute()
+        validate_control_directory(directory, permissions, grants or {})
         if presentation:
             if (
                 not {"workspace", "workspace_id"}.issubset(presentation)
@@ -687,6 +704,7 @@ class HeadlessRunner:
     def launch(self, request_path: Path) -> dict[str, Any]:
         envelope = read_json(request_path)
         directory = request_path.parent
+        validate_control_directory(directory, envelope["permissions"], envelope.get("grants", {}))
         candidate = RoleCandidate(**envelope["selection"])
         if envelope.get("probe") is not None:
             from .campaign_qualification import validate_probe_envelope

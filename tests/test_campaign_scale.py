@@ -207,22 +207,9 @@ def test_48_stories_24_epics_verify8_and_reasoning_drain_resume(
         live = [unit for unit in snapshot.units.values() if unit.claim and not unit.claim.quiescent]
         metrics["max_live"] = max(metrics["max_live"], len(live))
         if fake is not None:
-            from test_campaign_managed_communication import send
+            from campaign_scripted_native import inject_execution_messages
 
-            manager = case.runtime.communication_manager(case.store.directory(snapshot.id))
-            for endpoint in manager.endpoints(state="accepting", limit=100):
-                selected = endpoint["target"]
-                if selected["job_id"] or selected["unit_id"] in sent_mail:
-                    continue
-                unit = snapshot.units[selected["unit_id"]]
-                if unit.claim and unit.claim.role == "execution" and unit.claim.status == "running":
-                    send(
-                        fake,
-                        endpoint,
-                        "Preserve each accepted criterion and report its evidence.",
-                        intent="inform",
-                    )
-                    sent_mail.add(selected["unit_id"])
+            inject_execution_messages(case, snapshot, fake, sent_mail)
         for resource in ("execution", "verify", "review"):
             metrics["max_" + resource] = max(
                 metrics["max_" + resource], sum(unit.claim.resource == resource for unit in live)

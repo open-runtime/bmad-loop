@@ -101,6 +101,26 @@ def apply(runtime, snapshot, unit, action, data):
 def guard(runtime, snapshot, action, intent):
     """Fresh scope and native-child checks immediately before a write or retry."""
     current = runtime.store.load(snapshot.id)
+    from .campaign_completion_scope import retained_parent_reason
+
+    keys = [action.payload.get("parent_key", "")]
+    # Old aggregate-close intents have no parent_key. Resolve their immutable
+    # remote identity too, including aliases bound by another source selector.
+    kind = "issue" if intent.kind == "close_issue" else "milestone"
+    number = intent.path.rsplit("/", 1)[-1]
+    keys.extend(
+        key
+        for key, binding in current.bindings.get("github_hierarchy", {}).items()
+        if key.startswith(("epic:", "initiative:"))
+        and binding.get("kind") == kind
+        and str(binding.get("number")) == number
+    )
+    reason = next((value for key in keys if (value := retained_parent_reason(current, key))), "")
+    if reason:
+        return Observation(
+            "confirmed",
+            {"intent": intent.to_dict(), "canceled_before_write": True, "reason": reason},
+        )
     if action.payload.get("scope_revision") != current.graph_revision:
         return Observation("confirmed", {"intent": intent.to_dict(), "canceled_before_write": True})
     if not runtime._units_settled(current):

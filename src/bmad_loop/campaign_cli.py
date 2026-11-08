@@ -482,6 +482,20 @@ def status_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
         ),
         "counts": counts,
         "tracking": {
+            "source_completion_scopes": {
+                source.id: source.completion_scope for source in snapshot.spec.sources
+            },
+            "selected_work": (
+                (
+                    "Selected work delivered; parent scope remains open"
+                    if snapshot.phase == "delivered"
+                    else "Selected work delivery pending; parent scope remains open"
+                )
+                if any(
+                    source.completion_scope == "selected-units" for source in snapshot.spec.sources
+                )
+                else ""
+            ),
             "hierarchy_complete": snapshot.bindings.get("hierarchy_finalized_graph")
             == snapshot.graph_revision,
             "remaining_external_scope": snapshot.bindings.get("hierarchy_remaining_scope", ""),

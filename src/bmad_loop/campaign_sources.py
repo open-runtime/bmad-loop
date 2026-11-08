@@ -169,7 +169,7 @@ def import_sources(
                     )
             for epic in board.epics:
                 children = tuple(u.id for u in selected if u.epic == epic.slug)
-                if not children:
+                if not children or source.completion_scope == "selected-units":
                     continue
                 closure = qualified(source, f"closure/{epic.slug}")
                 selected.append(
@@ -210,7 +210,8 @@ def import_sources(
         from .campaign_existing import dependency_reconciliation
 
         all_sources = tuple(
-            dataclasses.replace(source, epics=(), units=()) for source in spec.sources
+            dataclasses.replace(source, epics=(), units=(), completion_scope="epic")
+            for source in spec.sources
         )
         complete = import_sources(
             project,
@@ -229,6 +230,15 @@ def import_sources(
             raise CampaignError(
                 f"{unit.id}: dependencies outside selected graph: {sorted(missing)}"
             )
+        if unit.kind == "closure":
+            source = next((row for row in spec.sources if row.id == unit.source), None)
+            if source and source.completion_scope == "selected-units":
+                # A hard native parent prerequisite is not erased by selection.
+                # It may only reconcile already-complete native closure; this
+                # scope cannot author the missing epic or retrospective.
+                from .campaign_existing import terminal_path
+
+                terminal_path(project, source, unit)
     validate_graph(units)
     return ImportedGraph(tuple(units), observations)
 

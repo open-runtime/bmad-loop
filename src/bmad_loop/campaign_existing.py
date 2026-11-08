@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from . import sprintstatus, stories, ticketlayout, verify
-from .campaign_model import CampaignError, SourceSelector, UnitSpec
+from .campaign_model import CampaignError, SourceSelector, UnitSpec, source_to_dict
 from .tickettree import TicketTree
 
 
@@ -140,7 +140,7 @@ def prior_delivery(runtime, snapshot, unit) -> PriorDeliveryProof | None:
         retrospective = path.parent / (unit.spec.selector + "-retrospective.md")
         retrospective_digest = hashlib.sha256(retrospective.read_bytes()).hexdigest()
         products[retrospective.relative_to(runtime.project).as_posix()] = retrospective_digest
-    current_selector = asdict(source)
+    current_selector = source_to_dict(source)
     for previous in reversed(runtime.store.list()[-1000:]):
         if (
             previous.id == snapshot.id
@@ -159,7 +159,7 @@ def prior_delivery(runtime, snapshot, unit) -> PriorDeliveryProof | None:
         selected = next(
             (value for value in previous.spec.sources if value.id == prior.spec.source), None
         )
-        if selected is None or asdict(selected) != current_selector:
+        if selected is None or source_to_dict(selected) != current_selector:
             continue
         artifact = next(
             (

@@ -36,6 +36,7 @@ class HeadlessAdapter(CodingCLIAdapter):
                 "Headless extra arguments must be included in the qualified capability"
             )
         self.run_dir = Path(run_dir)
+        self.native_job_root = self.run_dir
         self.profile, self.policy, self.paths = profile, policy, paths
         self.runner = HeadlessRunner(mux)
         self.capability = None
@@ -80,6 +81,10 @@ class HeadlessAdapter(CodingCLIAdapter):
 
     def set_managed_communication(self, binding):
         self.managed_binding = copy.deepcopy(binding)
+
+    def set_native_job_root(self, directory: Path):
+        """Keep native authority records outside the engine's writable checkout."""
+        self.native_job_root = Path(directory)
 
     def start_session(self, spec: SessionSpec) -> SessionHandle:
         from ..campaign_hold import held
@@ -134,7 +139,7 @@ class HeadlessAdapter(CodingCLIAdapter):
             candidates=(candidate,),
         )
         path = self.runner.prepare(
-            self.run_dir / "headless" / identifier,
+            self.native_job_root / "headless" / identifier,
             request,
             candidate,
             self.capability,

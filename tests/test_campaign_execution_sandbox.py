@@ -87,6 +87,20 @@ def test_global_native_home_is_not_an_implicit_write_grant(grants):
         write_paths({**value, "runtime_write_paths": [str(Path.home())]}, path.parent)
 
 
+@pytest.mark.parametrize("target", ["git", "git-parent", "product", "lifecycle"])
+def test_explicit_runtime_grants_cannot_expose_controller_authority(grants, target):
+    value, path = grants
+    workspace = Path(value["workspace"])
+    targets = {
+        "git": workspace / ".git",
+        "git-parent": workspace.parent,
+        "product": workspace / "src",
+        "lifecycle": path.parent,
+    }
+    with pytest.raises(CampaignError, match="runtime grant overlaps"):
+        write_paths({**value, "runtime_write_paths": [str(targets[target])]}, path.parent)
+
+
 def test_isolated_git_commit_succeeds_without_permission_to_change_target_ref(
     grants, project, tmp_path
 ):
@@ -156,6 +170,76 @@ def _native(path, code, *arguments):
     result = subprocess.run(argv, cwd=cwd, env=environment, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     return result, environment
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS execution confinement")
+def test_whole_product_scope_keeps_git_and_controller_state_readonly(git_writer):
+    path, workspace = git_writer
+    value = json.loads(path.read_text())
+    value["scopes"] = ["."]
+    path.write_text(json.dumps(value))
+    before = (workspace / ".git").read_bytes()
+    for area in ("runs", "campaigns"):
+        directory = workspace / ".bmad-loop" / area
+        directory.mkdir(parents=True)
+        (directory / "authority.json").write_text("controller")
+    _native(
+        path,
+        """import os,subprocess
+from pathlib import Path
+Path('owned.txt').write_text('product')
+Path('.bmad-loop/campaign-source').mkdir()
+Path('.bmad-loop/campaign-source/story.md').write_text('owned story')
+Path('.bmad-loop/policy.toml').write_text('explicitly owned config')
+for name in ['.git','.bmad-loop/runs/authority.json','.bmad-loop/campaigns/authority.json']:
+ p=Path(name)
+ for action in [lambda:p.write_text('forged'),lambda:p.unlink(),lambda:p.rename(Path('moved')),
+                lambda:os.replace(Path('owned.txt'),p),lambda:os.link(p,Path('alias'))]:
+  try:action()
+  except PermissionError:pass
+  else:raise AssertionError('protected metadata mutation escaped: '+name)
+try:Path('.bmad-loop').rename('.bmad-loop-moved')
+except PermissionError:pass
+else:raise AssertionError('controller ancestor rename escaped')
+subprocess.run(['git','add','owned.txt'],check=True)
+subprocess.run(['git','commit','-qm','owned whole-product change'],check=True)
+""",
+    )
+    assert (workspace / ".git").read_bytes() == before
+    assert (workspace / ".bmad-loop/campaign-source/story.md").read_text() == "owned story"
+    for area in ("runs", "campaigns"):
+        assert (workspace / ".bmad-loop" / area / "authority.json").read_text() == "controller"
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS execution confinement")
+def test_native_ref_snapshot_reads_main_and_remote_without_granting_ref_writes(
+    git_writer, project, tmp_path
+):
+    path, workspace = git_writer
+    baseline = git(project.project, "rev-parse", "HEAD").strip()
+    git(project.project, "update-ref", "refs/remotes/origin/main", baseline)
+    code = """import subprocess,sys
+def git(*args):return subprocess.check_output(['git',*args],text=True).strip()
+assert git('rev-parse','main')==sys.argv[1]
+assert git('rev-parse','origin/main')==sys.argv[1]
+for ref in ['refs/heads/main','refs/remotes/origin/main']:
+ result=subprocess.run(['git','update-ref',ref,'HEAD'],capture_output=True)
+ assert result.returncode!=0, 'protected ref mutation allowed'
+result=subprocess.run(['git','pack-refs','--all'],capture_output=True)
+assert result.returncode!=0, 'immutable packed refs became writable'
+"""
+    _native(path, code, baseline)
+    successor = git(
+        project.project, "commit-tree", baseline + "^{tree}", "-p", baseline, "-m", "new main"
+    ).strip()
+    git(project.project, "update-ref", "refs/heads/main", successor)
+    git(project.project, "update-ref", "refs/remotes/origin/main", successor)
+    _native(path, code, baseline)  # Existing session keeps its frozen ref view.
+    next_directory = tmp_path / "next-ref-job"
+    next_directory.mkdir()
+    next_grants = next_directory / "grants.json"
+    next_grants.write_text(path.read_text())
+    _native(next_grants, code, successor)
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="macOS execution confinement")

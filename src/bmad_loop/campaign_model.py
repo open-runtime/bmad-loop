@@ -55,6 +55,7 @@ class SourceSelector:
     store_remote: str = ""
     store_branch: str = ""
     scheduler_config: str = ""
+    completion_scope: str = "epic"
 
 
 @dataclass(frozen=True)
@@ -620,6 +621,14 @@ def spec_from_dict(value: Mapping[str, Any]) -> CampaignSpec:
             raise CampaignError("source.scheduler_config applies only to tickets")
         if "independent" in params and type(params["independent"]) is not bool:
             raise CampaignError("source.independent must be boolean")
+        if not isinstance(params.get("completion_scope", "epic"), str) or params.get(
+            "completion_scope", "epic"
+        ) not in {"epic", "selected-units"}:
+            raise CampaignError("source.completion_scope must be epic or selected-units")
+        if params.get("completion_scope") == "selected-units" and (
+            params["kind"] != "tickets" or not params["units"]
+        ):
+            raise CampaignError("selected-units completion requires explicit ticket source.units")
         store_remote, store_branch = params.get("store_remote", ""), params.get("store_branch", "")
         if bool(store_remote) != bool(store_branch):
             raise CampaignError(
@@ -793,8 +802,17 @@ def parse_spec(path: Path | str) -> CampaignSpec:
         raise CampaignError(f"cannot read campaign specification: {exc}") from exc
 
 
+def source_to_dict(source: SourceSelector) -> dict[str, Any]:
+    """Preserve existing source identity hashes for the legacy default scope."""
+    raw = asdict(source)
+    if source.completion_scope == "epic":
+        raw.pop("completion_scope")
+    return raw
+
+
 def spec_to_dict(spec: CampaignSpec) -> dict[str, Any]:
     raw = asdict(spec)
+    raw["sources"] = tuple(source_to_dict(source) for source in spec.sources)
     raw["role_pools"] = {
         name: {"candidates": [asdict(c) for c in candidates]}
         for name, candidates in spec.role_pools

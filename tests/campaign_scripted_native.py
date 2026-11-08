@@ -154,3 +154,31 @@ raise SystemExit(workers.child_main(Path(sys.argv[1])))
 """
     (tmp_path / "scripted-coding-cli.py").write_text(bootstrap)
     return manifest
+
+
+def inject_execution_messages(case, snapshot, fake, sent):
+    """Send once to each actual launched execution, through its public actor."""
+    from test_campaign_managed_communication import send
+
+    manager = case.runtime.communication_manager(case.store.directory(snapshot.id))
+    for endpoint in manager.endpoints(state="accepting", limit=100):
+        selected = endpoint["target"]
+        if selected["job_id"] or selected["unit_id"] in sent:
+            continue
+        unit = snapshot.units[selected["unit_id"]]
+        claim = unit.claim
+        if (
+            claim is not None
+            and claim.role == "execution"
+            and claim.status == "launched"
+            and not claim.quiescent
+            and (claim.launch_id, claim.generation)
+            == (selected["launch_id"], selected["generation"])
+        ):
+            send(
+                fake,
+                endpoint,
+                "Preserve each accepted criterion and report its evidence.",
+                intent="inform",
+            )
+            sent.add(unit.id)

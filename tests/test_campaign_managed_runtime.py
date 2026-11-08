@@ -94,7 +94,7 @@ def test_normal_reasoning_claim_freezes_public_bridge_and_native_private_room(
 def test_qualified_coding_workers_deliver_with_managed_public_bridges(
     production_case, prepared, tmp_path, monkeypatch
 ):
-    from campaign_scripted_native import qualify_case
+    from campaign_scripted_native import inject_execution_messages, qualify_case
     from test_campaign_runtime import run_case
 
     from bmad_loop import campaign_runtime
@@ -118,6 +118,14 @@ def test_qualified_coding_workers_deliver_with_managed_public_bridges(
         unit="source:project:first",
         text="Preserve the original acceptance and report its recorded evidence.",
     )
+    original_proposals = case.runtime.proposals
+    sent = set()
+
+    def proposals(snapshot):
+        inject_execution_messages(case, snapshot, fake, sent)
+        return original_proposals(snapshot)
+
+    case.runtime.proposals = proposals
     result = run_case(case, timeout_s=240)
     assert result.phase == "delivered"
     manager = case.runtime.communication_manager(case.store.directory(case.snapshot.id))
@@ -126,11 +134,26 @@ def test_qualified_coding_workers_deliver_with_managed_public_bridges(
     assert len(endpoints) >= 6 and all(row["state"] == "closed" for row in endpoints)
     assert fake.count("start") == fake.count("stop") == len(endpoints)
     assert ledger.list(unit="source:project:first")[0]["state"] == "applied"
+    injected = [row for row in ledger.list() if row["id"] != "before-stage"]
+    assert sent and {row["unit"] for row in injected} == sent
+    assert all(row["state"] == "applied" for row in injected)
     requests = list((case.store.directory(case.snapshot.id) / "workers").glob("*/request.json"))
     coding = [
         read_json(path) for path in requests if read_json(path)["kind"] in {"execution", "stage"}
     ]
     assert coding and all(row.get("managed_communication") for row in coding)
+    by_launch = {row["launch_id"]: row for row in coding}
+    for message in injected:
+        target = message["source"]["target"]
+        execution = by_launch[target["launch_id"]]
+        assert execution["kind"] == "execution"
+        assert execution["generation"] == target["generation"]
+        successors = [
+            row
+            for row in coding
+            if any(item["id"] == message["id"] for item in row.get("steering", []))
+        ]
+        assert successors and all(row["kind"] == "stage" for row in successors)
     for row in coding:
         binding = row["managed_communication"]
         assert set(binding) == {"kind", "name", "room", "target"}

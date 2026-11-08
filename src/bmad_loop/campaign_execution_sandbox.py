@@ -52,6 +52,8 @@ def write_paths(grants, directory):
     if grants.get("schema_version") != 1 or not grants.get("config_digest"):
         raise CampaignError("Execution sandbox requires frozen versioned grants")
     workspace = _path(grants.get("workspace"))
+    if directory.resolve().is_relative_to(workspace):
+        raise CampaignError("Execution lifecycle records must be outside the workspace")
     readonly_mode = grants.get("permissions") == "read-only-tools"
     if not workspace.is_dir() or (not readonly_mode and not grants.get("scopes")):
         raise CampaignError("Execution sandbox requires a real workspace and scopes")
@@ -64,8 +66,19 @@ def write_paths(grants, directory):
         product.append(_path(item, root=workspace))
     scratch = directory / "sandbox-runtime"
     scratch.mkdir(mode=0o700, exist_ok=True)
-    allowed = [*product, scratch.resolve()]
-    allowed.extend(_path(item) for item in grants.get("runtime_write_paths", []))
+    runtime = [_path(item) for item in grants.get("runtime_write_paths", [])]
+    common = Path(
+        _git(workspace, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    ).resolve()
+    if any(
+        protected == writable
+        or protected.is_relative_to(writable)
+        or writable.is_relative_to(protected)
+        for protected in (workspace, common, directory.resolve())
+        for writable in runtime
+    ):
+        raise CampaignError("Native runtime grant overlaps product, Git or lifecycle authority")
+    allowed = [*product, scratch.resolve(), *runtime]
     if readonly_mode:
         common = Path(
             _git(workspace, "rev-parse", "--path-format=absolute", "--git-common-dir")
@@ -185,7 +198,7 @@ def _object_bank(grants, directory, workspace):
     return bank, objects
 
 
-def macos_profile(paths, *, object_bank=None, native_git=None):
+def macos_profile(paths, *, object_bank=None, native_git=None, protected=(), ancestors=()):
     """Seatbelt applies write confinement to child tools as well as the native CLI."""
     clauses = []
     for path in paths:
@@ -228,6 +241,16 @@ def macos_profile(paths, *, object_bank=None, native_git=None):
         profile += (
             "(allow file-write* (regex #" + json.dumps(index_pattern).replace("\\\\", "\\") + "))\n"
         )
+    # Broad product ownership never grants Git-pointer or controller authority.
+    # Deny ancestor moves too: renaming .bmad-loop would otherwise relocate all
+    # protected run records while avoiding a direct write to their children.
+    for path in protected:
+        encoded = json.dumps(str(path), ensure_ascii=True)
+        profile += f"(deny file-write* file-link (literal {encoded}) (subpath {encoded}))\n"
+    for path in ancestors:
+        profile += (
+            f"(deny file-write-unlink (literal {json.dumps(str(path), ensure_ascii=True)}))\n"
+        )
     return profile
 
 
@@ -251,13 +274,19 @@ def command(grants_path, native, *, platform=None):
         native_git = prepare(bank, objects, workspace, grants_path.parent, grants["git_branch"])
         allowed = (*allowed, *native_write_paths(native_git))
     profile = grants_path.parent / "execution.sb"
-
+    protected = (
+        workspace / ".git",
+        workspace / ".bmad-loop/runs",
+        workspace / ".bmad-loop/campaigns",
+    )
     atomic_write_text(
         profile,
         macos_profile(
             allowed,
             object_bank=bank,
             native_git=Path(native_git["git_dir"]) if native_git else None,
+            protected=protected,
+            ancestors=(workspace, workspace / ".bmad-loop"),
         ),
         follow_symlinks=False,
     )
@@ -277,6 +306,7 @@ def command(grants_path, native, *, platform=None):
         assert native_git is not None
         environment["GIT_DIR"] = native_git["git_dir"]
         environment["GIT_WORK_TREE"] = str(workspace)
+        environment["GIT_NO_REPLACE_OBJECTS"] = "1"
         environment["GIT_OBJECT_DIRECTORY"] = str(bank)
         environment["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = json.dumps(
             str(objects), ensure_ascii=False

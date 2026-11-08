@@ -1,6 +1,6 @@
 # ADR 0002 implementation contract
 
-- **Status:** Delivery completion in progress; review repairs and activation extension pending
+- **Status:** Delivery completion in progress; final qualification, reviews and activation pending
 - **Date:** 2026-11-05
 - **Parent:** [Native SDLC campaign](0002-native-sdlc-campaign.md)
 - **Delivery:** One bmad-loop PR, including code, tests, documentation and local deployment tooling
@@ -15,7 +15,7 @@ extends this work without weakening its acceptance or publication gates.
 
 ## Implementation goals and traceability
 
-The prior review-ready candidate established the G0–G8 foundation below. The
+The prior review-ready candidate established the historical G0–G8 foundation below. The
 accepted delivery extension additionally requires the following concrete work.
 The owner's administrative-publication decision supersedes this ADR's strict-only
 REM activation requirement; strict and queue modes retain their existing contracts.
@@ -97,7 +97,7 @@ An actual detached-and-reparented child can evade periodic observation. Keep tha
 limitation explicit: filesystem confinement is not universal daemon containment,
 and no qualification may turn a finite foreground check into such a claim.
 
-The matrix identifies implementation responsibilities, production entry points
+The matrix records the earlier candidate's implementation responsibilities, production entry points
 and acceptance evidence. Paths identify the implemented runtime integration seams.
 Pending means the named qualification remains to be demonstrated. Update each
 row from concrete evidence, keeping implementation, runtime-tested, native-qualified,
@@ -149,8 +149,10 @@ records the completed history, integrated regression and fresh load checks, with
 remaining route and activation gates. The frozen code candidate `276daa62` passed
 20,391 tests with 261 skips; its separate 48-story scale case also passed. Pyright,
 Trunk, package build, isolated wheel checks and release checks passed. Both
-independent reviews closed without open findings against that candidate. The
-implementation is review-ready; the later delivery and activation gates remain.
+independent reviews closed without open findings against that candidate. That
+earlier candidate was review-ready. The delivery extension changes its
+implementation and requires fresh qualification and independent reviews before
+the current candidate can claim the same status.
 
 ## Command and configuration contract
 
@@ -1349,11 +1351,12 @@ absence of registrations or an idle engine observation does not establish that
 preserved worktree callers are retired. Relay removal requires explicit migration
 or retirement of those callers, outside this campaign implementation milestone.
 
-The present implementation milestone stops before those deployment actions:
-review-ready means committed and pushed code/docs, normal-path qualification and
+Review-ready is an intermediate boundary before those deployment actions:
+it means committed and pushed code/docs, normal-path qualification and
 two fresh independent reviews against the same candidate. One review covers
 completion/authority/publication; the other covers runtime wiring, harness/handoff
-and throughput. Substantive later changes invalidate affected evidence. Report
+and throughput. The accepted completion extension includes deployment and the
+controlled target delivery after that boundary. Substantive later changes invalidate affected evidence. Report
 disabled hosted Actions and unrun platform gates accurately; do not enable
 repository settings or claim CI success implicitly.
 
@@ -1362,10 +1365,11 @@ TeamRouter capacity observations do not establish execution through its wrapper;
 optional hcom observation does not establish enrollment or a receive loop. Before
 claiming every worker and reasoning job can receive outside-agent check-ins,
 qualify each selected route's enrollment, exact job/session identity, delivery,
-reply and closing/drain behavior. This universal messaging contract is not yet
-implemented by the headless job path. Carry the configured room into immutable
-headless launch requests without inheriting a parent actor's identity, and show
-unbound identities explicitly. Include an actual delegated check-in in the
+reply and closing/drain behavior. The managed bridge implements this contract
+for headless workers and reasoning jobs; direct native messaging remains a
+separate capability. The configured room and managed binding travel in immutable
+headless launch requests without inheriting a parent actor's identity; unbound
+identities are explicit. Include an actual delegated check-in in the
 controlled target pilot alongside draft PR creation, main synchronization,
 review/fix/merge, tracking reconciliation and interruption recovery.
 

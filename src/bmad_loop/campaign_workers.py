@@ -592,6 +592,10 @@ def _adapters(
         cap = selected_caps.get(role) or capability_for(
             routes, selected.name, selected.model, permission, effort=selected.effort
         )
+        # Legacy engines keep journals in their worktree. Native lifecycle,
+        # grants and result authority must stay in the controller-owned root.
+        # Preserve run_id in the path for checkpoint publication selection.
+        adapter.set_native_job_root(envelope.directory / "native" / run_dir.name)
         adapter.set_capability(
             cap,
             request.get("headless_grants"),
