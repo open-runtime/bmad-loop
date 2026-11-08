@@ -242,12 +242,15 @@ The supported adapters are `claude` (the default), `codex`, `gemini`, `copilot`,
 `antigravity` (Google's `agy`, experimental — worktree isolation needs the project root trusted; see [First-run notes](#first-run-notes)), and `opencode`
 (OpenCode 1.x ≥ 1.18 or 2.x ≥ 2.0.21 over HTTP/SSE, profile `opencode-http` — no tmux
 window; needs the `bmad-loop[opencode]` extra and `model` set as `provider/model`). You can pick more
-than one — register every CLI you intend to use for dev, review, or sweep triage.
+than one — initialize every CLI you intend to use for dev, review, or sweep triage.
+The bundled `grok` and `muse` profiles use bounded-headless campaign sessions; initialize
+their skills, then qualify their exact model, effort and permissions before campaign use.
 
 There are **two layers** here, and confusing them is the usual stumbling block:
 
-- `bmad-loop init --cli <name>` registers the orchestrator's **hooks** for that CLI. Without
-  registered hooks, a CLI can't signal the engine.
+- `bmad-loop init --cli <name>` installs skills and registers the orchestrator's
+  **hooks** when that profile uses them. Hookless profiles use their own adapter
+  lifecycle; initialization alone does not qualify a bounded-headless campaign route.
 - `.bmad-loop/policy.toml` `[adapter]` selects which CLI actually **runs** each stage.
 
 So a mixed setup — say `claude` for dev and `codex` for review — needs _both_: the hooks
@@ -346,7 +349,7 @@ bmad-loop init --project <project-root> --cli claude --cli codex --cli gemini
 
 Run with no `--cli` and `init` registers hooks for every CLI the `policy.toml` references,
 so a dual-client setup that's already configured in policy needs no extra flags. Names must
-be exactly `claude`, `codex`, `gemini`, `copilot`, `antigravity`, or `opencode-http` (alias
+be exactly `claude`, `codex`, `gemini`, `copilot`, `antigravity`, `grok`, `muse`, or `opencode-http` (alias
 `opencode`) — `init` errors on an unknown profile and lists the valid ones. A hookless
 profile like `opencode-http` installs its skills but registers no hooks (it signals over
 HTTP/SSE).

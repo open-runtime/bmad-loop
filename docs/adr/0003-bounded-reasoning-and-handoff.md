@@ -165,6 +165,16 @@ boundary, using current persisted authority and the scoped hold channel. A defer
 launch consumes no failure budget and can resume after release; existing native
 receipts and monotonic attempt identities remain intact.
 
+Serialize the final control read and a fresh native launch intent with control
+acknowledgement using the existing campaign state lock. Capability validation,
+launch-lock waits and multiplexer's empty-session preparation precede that short
+critical section; terminal RPC follows it outside the lock. If control commits
+first, refuse the new intent. If intent commits first, account for the admitted
+work through its existing lifecycle. Direct headless child stages use the same
+scoped authority boundary. Ordinary drain still permits an already admitted
+bounded child stage; an operator hold or hard stop suppresses its next session.
+Never turn an uncertain existing intent into permission to launch another worker.
+
 Use a dedicated reasoning-worker mode with immutable input manifests, not a
 development stage that assumes its whole working tree stays unchanged. Concurrent
 snapshot readers must tolerate legitimate unit edits elsewhere without accepting
@@ -634,8 +644,16 @@ headroom. The actual normalized byte count remains the hard check. Oversize
 results report both observed and permitted sizes, retain immutable sources and
 consume the existing bounded failure budget. Coverage, owner-obligation audits,
 final packet limits and the eight-round convergence bound remain mandatory.
-This reducer prompt is `history-reduce-v4` and requires fresh reducer semantic
-qualification; unchanged extraction, audit and finite-contract proofs remain valid.
+Extraction and reduction prompts embed their exact job-bound native schema,
+including eligible citations and quote IDs. The corrected `history-extract-v3`
+and `history-reduce-v5` contracts require fresh extraction and reducer semantic
+qualification. Earlier receipts remain historical evidence, not grants for the
+new prompts; unchanged audit and finite-contract proofs retain their own validity.
+This applies to queued jobs, applied summaries and already assembled packets.
+Keep old requests and results immutable, observe any live or uncertain claim to
+quiescence, then use the existing safe refresh path before releasing a successor.
+Preserve lifetime retry debt and source artifacts; neither restart nor a contract
+change grants a fresh failure budget.
 The working brief retains current obligations and uncertainty while a cited index
 points to historical technical details in the complete retained children. Known
 historical limitations remain qualified facts; `gaps` identifies missing supplied
@@ -656,6 +674,11 @@ The independent native result also carries `semantic_contract_digests`, keyed by
 operation. Each digest binds the actual readers, summary schema and that
 operation's prompt; history audit additionally binds its audit schema. Extraction
 and reduction do not depend on the unused audit schema or each other's prompt.
+Their schema binding covers the job-specialized template, including required
+quote-ID fields, allowed properties and empty-catalog variants. Normalize dynamic
+job IDs and source-catalog values for this reusable semantic grant; the immutable
+native request digest independently binds those exact values for each execution.
+The legacy unbound schema is not sufficient evidence for a specialized shape.
 Editing only a manifest and its outer hash cannot requalify a native result for
 changed code contracts. Older generic receipts without this attestation require
 renewed independent qualification. Existing finite constraint/recovery receipts
@@ -727,10 +750,11 @@ reasoning work. Only trusted hook-bound native prefixes qualify for live warmup;
 active managed-headless streams retain their quiescent-export boundary. No
 native-store import writer or universal live-history capability is claimed.
 
-The fresh scripted load qualification on `276daa62` delivered 48 stories across
+The frozen scripted load qualification on `402879e9` delivered 48 stories across
 24 active epics, reached eight verification slots, eight review slots and four
-reasoning jobs, and completed parent tracking after stop, drain and resume. Stop
-acknowledgement was 0.617 seconds; the measured scenario took 994.09 seconds. This
+reasoning jobs within 32 shared sessions, and completed parent tracking after stop,
+drain and resume. It applied 47 messages and closed 293 managed endpoints. Stop
+acknowledgement was 0.968 seconds; the measured scenario took 1,101.34 seconds. This
 demonstrates tested concurrency and responsiveness, not maximum throughput or a
 REM/provider benchmark.
 
@@ -745,15 +769,17 @@ fresh proof. The actual main/custom native review pair has since earned separate
 proof: both native reviews precede a third schema-mapping turn, with retained
 delegate artifacts and exact candidate/base identity. Writable continuation remains
 a separate gate, followed by installation-bound revalidation.
-The frozen code candidate `276daa62` passed the integrated regression suite with
-20,391 passes and 261 skips in 664.86 seconds; the dedicated scale case is run
-separately. Pyright, Trunk, package build, isolated wheel installation and release
-checks passed. Two independent reviews against that same candidate closed without
-open findings. The earlier full-suite failures have been repaired and no longer
-block this milestone.
+The frozen code candidate `7c43140a` passed the integrated regression suite with
+20,886 passes and 261 skips in 563.59 seconds; the dedicated scale case runs
+separately. All 620 source/test hashes remained unchanged during that run.
+Pyright, Trunk, package build, isolated wheel installation and release checks
+passed. Subsequent independent review reproduced a launch-lock control race and
+an embedded-versus-enforced history schema mismatch. Those findings require
+repairs, affected qualification renewal and fresh review; the green suite alone
+does not establish readiness.
 
-Those regression, load and independent-review results qualify the named earlier
-candidate. The delivery completion extension requires fresh final checks and
+Those regression and load results qualify their named earlier candidates.
+The delivery completion extension requires fresh final checks and
 reviews after its changes. Hosted Actions remain disabled; unrun platform gates
 remain explicit. Merge, exact-commit installation, canonical-base update and REM
 activation are required completion work, not satisfied by earlier qualification.
@@ -994,6 +1020,17 @@ window. Output consumes total context, but is not charged a second time against
 the input-only allowance. Conservative JSON wrapping and prompt/working reserves
 still bound planned payloads; the fully rendered request must independently pass
 native admission. No budget adjustment grants a larger native capability.
+An optional `claude-code-v1` native-limit recipe binds
+`CLAUDE_CODE_MAX_OUTPUT_TOKENS` to the requested output allowance and freezes
+`MAX_STRUCTURED_OUTPUT_RETRIES=1`. Apply those values after inherited environment
+restoration, retain them in the native receipt and pin their helper/worker
+implementations. Adding these controls requires a fresh transport qualification;
+an existing proof cannot acquire them through a manifest edit. These documented
+[Claude controls](https://code.claude.com/docs/en/env-vars) request a per-request
+output ceiling and one structured-output attempt; model caps may lower the output
+allowance. Whole-job elapsed time and aggregate
+token/turn validation remain independent limits, including provider reasoning
+and any internal turns. Do not claim a per-request ceiling is an aggregate cap.
 Reducer grouping measures the exact native-event projection, including its
 source-input wrapper. The complete child summaries remain hash-bound and retained.
 This avoids rejecting a usable route because internal metadata omitted from the

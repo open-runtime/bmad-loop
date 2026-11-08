@@ -474,6 +474,31 @@ def _requires_replan(row):
     )
 
 
+def _obsolete_summaries(runtime, snapshot, value):
+    from .campaign_summary import (
+        EXTRACT_PROMPT_VERSION,
+        REDUCE_PROMPT_VERSION,
+        summary_contract_current,
+    )
+
+    for key in value.get("jobs", ()):
+        row = snapshot.jobs.get(key)
+        if row is None and runtime is not None:
+            row = _job(runtime, snapshot, key)
+        if row is None:
+            # Applied jobs can leave the hot snapshot. This controller-written
+            # projection was captured from their immutable requests, never from
+            # a new route's proof. Older snapshots without it refresh safely.
+            if value.get("summary_contracts", {}).get(key) not in {
+                EXTRACT_PROMPT_VERSION,
+                REDUCE_PROMPT_VERSION,
+            }:
+                return True
+        elif not summary_contract_current(row["request"]):
+            return True
+    return False
+
+
 def _failure_keys(raw):
     coordinates = raw["coordinates"]
     if raw["purpose"] == "handoff_reduce" and coordinates.get("reduction_failure_keys"):
@@ -578,6 +603,21 @@ def proposals(runtime, snapshot):
                 and unit.bindings.get("stop_requested_for") != claim.launch_id
             ):
                 result.append(Proposal("terminate-worker", unit.id, {"launch_id": claim.launch_id}))
+            continue
+        if phase not in {"drain", "capture"} and _obsolete_summaries(runtime, snapshot, value):
+            # A version transition retains all native history/attempt debt but
+            # cannot release an already assembled packet as fresh evidence.
+            live_jobs = any(
+                row.get("claim") and not row["claim"].get("quiescent")
+                for row in snapshot.jobs.values()
+                if row["request"].get("coordinates", {}).get("handoff_id") == value["id"]
+            )
+            if (
+                not live_jobs
+                and (not unit.hold or unit.hold.id == value["id"])
+                and not _pending(snapshot, unit, "handoff-refresh")
+            ):
+                result.append(Proposal("handoff-refresh", unit.id, {"handoff_id": value["id"]}))
             continue
         alternate = _available_alternative(runtime, snapshot, value)
         if alternate is not None and (not unit.hold or unit.hold.id == value["id"]):
@@ -1042,6 +1082,7 @@ def _maps(runtime, snapshot, unit, value):
     from .campaign_summary import (
         SummaryJobSpec,
         plan_remaining_maps,
+        summary_contract_current,
         summary_prompt,
         summary_schema,
     )
@@ -1061,6 +1102,7 @@ def _maps(runtime, snapshot, unit, value):
         and _job(runtime, snapshot, key)["request"]["purpose"] == "handoff_map"
         and _job(runtime, snapshot, key)["request"]["coordinates"]["config_revision"]
         == snapshot.config_revision
+        and summary_contract_current(_job(runtime, snapshot, key)["request"])
     )
     from .campaign_history_warmup import reusable
 
@@ -1233,6 +1275,7 @@ def _reduction_failure_keys(runtime, snapshot, spec):
 def _summary_replan(runtime, snapshot, unit, value):
     """Retry the current reduction frontier, never discard it to re-extract maps."""
     from .campaign_summary import (
+        REDUCE_PROMPT_VERSION,
         SummaryJobSpec,
         load_input,
         split_reduction_input,
@@ -1288,6 +1331,7 @@ def _summary_replan(runtime, snapshot, unit, value):
                 id=digest([value["id"], planned.id, value["plan_epoch"], snapshot.config_revision]),
                 route=_budget(candidate, cap).route,
                 output_tokens=min(planned.output_tokens, cap["output_tokens"]),
+                prompt_version=REDUCE_PROMPT_VERSION,
             )
             coordinates = {
                 **_coordinates(snapshot, unit, value),
@@ -1361,6 +1405,7 @@ def _audit_plan(runtime, snapshot, unit, value):
     map_families = {
         (_job(runtime, snapshot, key).get("receipt") or {}).get("provider_family")
         for key in value.get("all_jobs", value["jobs"])
+        if _job(runtime, snapshot, key)["state"] == "applied"
     }
     candidate, cap = _summary_route(runtime, snapshot, "handoff_audit", value, map_families)
     from .campaign_headless import provider_family
@@ -1473,7 +1518,13 @@ def apply_audit(runtime, snapshot, row):
     if not contract or contract.endswith("audit-v1"):
         observed_family = (row.get("receipt") or {}).get("provider_family")
         reviewed = (
-            row["request"]["dependencies"] if contract else value.get("all_jobs", value["jobs"])
+            row["request"]["dependencies"]
+            if contract
+            else [
+                key
+                for key in value.get("all_jobs", value["jobs"])
+                if _job(runtime, snapshot, key)["state"] == "applied"
+            ]
         )
         writers = {
             (_job(runtime, snapshot, key).get("receipt") or {}).get("provider_family")
@@ -2055,6 +2106,12 @@ def _perform(runtime, snapshot, action, *, reconcile=False):
     value = unit.evidence["handoff"]
     if action.payload.get("handoff_id", value["id"]) != value["id"]:
         raise CampaignError("Handoff action no longer owns its continuation")
+    if (
+        action.kind != "handoff-refresh"
+        and value["phase"] not in {"drain", "capture"}
+        and _obsolete_summaries(runtime, snapshot, value)
+    ):
+        return Observation("confirmed", {"superseded": True})
     expected_phase = EXPECTED_PHASE.get(action.kind)
     if (
         expected_phase
@@ -2091,6 +2148,12 @@ def _perform(runtime, snapshot, action, *, reconcile=False):
     if unit.claim and not unit.claim.quiescent or _debt(snapshot, unit):
         return Observation("unknown", reason="Predecessor or external writes still draining")
     if action.kind == "handoff-refresh":
+        if any(
+            row.get("claim") and not row["claim"].get("quiescent")
+            for row in snapshot.jobs.values()
+            if row["request"].get("coordinates", {}).get("handoff_id") == value["id"]
+        ):
+            return Observation("unknown", reason="Prior reasoning attempts still draining")
         data = _capture(runtime, snapshot, unit, value)
     elif action.kind == "handoff-failed":
         data = {"exhausted_jobs": action.payload["jobs"]}
@@ -2229,6 +2292,11 @@ def apply(runtime, snapshot, action, observation):
     data = observation.data
     if (
         data.get("superseded")
+        or (
+            action.kind != "handoff-refresh"
+            and value["phase"] not in {"drain", "capture"}
+            and _obsolete_summaries(runtime, snapshot, value)
+        )
         or data.get("retry_from_epoch", value.get("plan_epoch", 0)) != value.get("plan_epoch", 0)
         or data.get("effect_phase", value["phase"]) != value["phase"]
         or data.get("effect_context", _audit_context(snapshot, unit))
@@ -2446,6 +2514,12 @@ def apply(runtime, snapshot, action, observation):
             value["map_jobs"] = ids
         if field == "jobs":
             value["all_jobs"] = list(dict.fromkeys([*value.get("all_jobs", []), *ids]))
+            value["summary_contracts"] = {
+                key: _job(runtime, snapshot, key)["request"]["coordinates"]["summary_spec"][
+                    "prompt_version"
+                ]
+                for key in ids
+            }
         if data.get("reduction"):
             value["reduction_level"] = value.get("reduction_level", 0) + 1
         value[field], value["phase"] = ids, phase
@@ -2467,7 +2541,8 @@ def apply(runtime, snapshot, action, observation):
 def resume_proposal(snapshot, unit, runtime=None):
     value = unit.evidence.get("handoff") or {}
     if (
-        value.get("phase") != "ready"
+        _obsolete_summaries(runtime, snapshot, value)
+        or value.get("phase") != "ready"
         or value["capture"].get("audit_context") != _audit_context(snapshot, unit)
         or value.get("packet", {}).get("read_only") != (_permission(value) != "workspace-tools")
         or (unit.claim and unit.claim.launch_id != value["predecessor"]["launch_id"])
@@ -2502,6 +2577,8 @@ def decorate_launch(snapshot, unit, request):
     value = unit.evidence.get("handoff") or {}
     if value.get("phase") not in {"ready", "continuing"}:
         return
+    if value["phase"] == "ready" and _obsolete_summaries(None, snapshot, value):
+        raise CampaignError("Continuation summary contract changed before launch")
     if value["phase"] == "continuing" and not request.get("handoff_id"):
         return  # later verification/review/publication stages use ordinary fresh input
     if value["phase"] == "continuing" and request.get("launch_id") != value.get(

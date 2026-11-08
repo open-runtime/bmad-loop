@@ -1073,13 +1073,36 @@ def child_main(request_path: Path) -> int:
     )
     from . import campaign_hold
 
+    hold_channel = Path(request["hold_channel"]) if request.get("hold_channel") else None
+    # The immutable channel is <store>/<campaign>/holds/<unit>.json. Share the
+    # existing store-save lock; never introduce another control authority.
+    state_root = hold_channel.parent.parent.parent if hold_channel else None
+
+    def admission_held():
+        if state_root is None:
+            return False
+        from .campaign_store import CampaignStore
+
+        try:
+            latest = CampaignStore(state_root).load(envelope.campaign_id)
+            if latest.bindings.get("terminate_requested"):
+                from .adapters.multiplexer import MultiplexerError
+
+                raise MultiplexerError("campaign hard stop suppresses automatic session launch")
+            unit = latest.units.get(envelope.unit_id)
+            return unit is None or bool(unit.hold and unit.hold.kind == "operator")
+        except (CampaignError, OSError, ValueError):
+            return True
+
     hold_probe = campaign_hold.install(
         lambda: (
             bool(request.get("hold_channel"))
             and campaign_hold.active(
                 Path(request["hold_channel"]), campaign=envelope.campaign_id, unit=envelope.unit_id
             )
-        )
+        ),
+        admission_lock=state_root / ".state.lock" if state_root else None,
+        admission_probe=admission_held,
     )
     result: dict[str, Any]
     monitor = None

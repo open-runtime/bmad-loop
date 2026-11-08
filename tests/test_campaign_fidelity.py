@@ -13,7 +13,12 @@ from bmad_loop.campaign_fidelity import (
 from bmad_loop.campaign_headless import file_digest, read_json, write_json
 from bmad_loop.campaign_jobs import digest
 from bmad_loop.campaign_model import RoleCandidate
-from bmad_loop.campaign_summary import EXTRACT_PROMPT_VERSION, REDUCE_PROMPT_VERSION, summary_schema
+from bmad_loop.campaign_summary import (
+    EXTRACT_PROMPT_VERSION,
+    REDUCE_PROMPT_VERSION,
+    summary_schema,
+    summary_schema_template,
+)
 from bmad_loop.campaign_transcripts import READER_VERSIONS
 
 
@@ -67,6 +72,7 @@ def proof(tmp_path):
             "route_bindings": bindings,
             "reader_versions": READER_VERSIONS,
             "summary_schema_digest": digest(summary_schema()),
+            "summary_job_schema_digest": digest(summary_schema_template()),
             "audit_schema_digest": digest(flow.AUDIT_SCHEMA),
             "prompt_versions": [EXTRACT_PROMPT_VERSION, REDUCE_PROMPT_VERSION],
             "structural_pass": True,
@@ -239,8 +245,11 @@ def test_editable_manifest_cannot_relabel_used_native_semantic_contract(
         monkeypatch.setattr(transcripts, "READER_VERSIONS", {"changed": 999})
         evidence["reader_versions"] = transcripts.READER_VERSIONS
     elif changed == "summary-schema":
-        monkeypatch.setattr(summary, "summary_schema", lambda: {"changed": "schema"})
+        monkeypatch.setattr(
+            summary, "summary_schema", lambda *args, **kwargs: {"changed": "schema"}
+        )
         evidence["summary_schema_digest"] = digest(summary.summary_schema())
+        evidence["summary_job_schema_digest"] = digest(summary.summary_schema_template())
     elif changed == "prompt":
         if purpose == "handoff_audit":
             monkeypatch.setattr(fidelity, "HISTORY_AUDIT_PROMPT_VERSION", "changed-audit-prompt")
@@ -309,3 +318,31 @@ def test_map_proof_ignores_unused_audit_schema_and_reducer_prompt(proof, monkeyp
     monkeypatch.setattr(summary, "REDUCE_PROMPT_VERSION", "changed-unused-prompt")
     flow.validate_fidelity_qualification(cap, purpose="handoff_map")
     assert path.read_bytes() == manifest
+
+
+@pytest.mark.parametrize("change", ["additionalProperties", "required"])
+def test_specialized_native_schema_change_cannot_borrow_generic_semantic_proof(
+    proof, monkeypatch, change
+):
+    from bmad_loop import campaign_summary as summary
+
+    cap, path = proof
+    flow.validate_fidelity_qualification(cap, purpose="handoff_map")
+    before = path.read_bytes()
+    original = summary.summary_schema
+
+    def changed(job=None, **kwargs):
+        schema = original(job, **kwargs)
+        if job is not None:
+            facts = schema["properties"]["facts"]["items"]
+            if change == "additionalProperties":
+                facts["additionalProperties"] = True
+            else:
+                facts["required"].remove("source_quote_id")
+        return schema
+
+    monkeypatch.setattr(summary, "summary_schema", changed)
+    assert digest(summary.summary_schema()) == read_json(path)["summary_schema_digest"]
+    with pytest.raises(flow.HandoffRouteWait, match="does not match"):
+        flow.validate_fidelity_qualification(cap, purpose="handoff_map")
+    assert path.read_bytes() == before

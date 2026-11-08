@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import asdict
 from functools import wraps
@@ -170,6 +170,9 @@ def _validate_capability(
     binary = Path(raw.get("binary", ""))
     if not binary.is_absolute() or raw["argv"][0] != str(binary):
         raise CampaignError("Qualified argv must name its exact absolute executable")
+    from .campaign_native_limits import validate as validate_native_limits
+
+    validate_native_limits(raw, verify_files=verify_files)
     aliases = raw.get("served_model_aliases", [])
     if (
         not isinstance(aliases, list)
@@ -701,7 +704,7 @@ class HeadlessRunner:
         return path
 
     @fresh_reads()
-    def launch(self, request_path: Path) -> dict[str, Any]:
+    def launch(self, request_path: Path, *, admission=None) -> dict[str, Any]:
         envelope = read_json(request_path)
         directory = request_path.parent
         validate_control_directory(directory, envelope["permissions"], envelope.get("grants", {}))
@@ -719,14 +722,6 @@ class HeadlessRunner:
             intent = directory / "launch-intent.json"
             if intent.exists() and read_json(intent).get("phase") != "before-window":
                 return self.observe(request_path)
-            write_json(
-                intent,
-                {
-                    "launch_id": envelope["launch_id"],
-                    "generation": envelope["generation"],
-                    "phase": "before-window",
-                },
-            )
             try:
                 presentation = envelope.get("presentation", {})
                 terminal_cwd = Path(presentation.get("workspace", str(directory)))
@@ -737,9 +732,10 @@ class HeadlessRunner:
                         self.mux.new_session(envelope["session"], terminal_cwd)
             except (OSError, MultiplexerError) as exc:
                 write_json(
-                    intent,
+                    directory / "launch-preparation-error.json",
                     {
-                        **read_json(intent),
+                        "launch_id": envelope["launch_id"],
+                        "generation": envelope["generation"],
                         "pre_window_error": {"type": type(exc).__name__, "message": str(exc)},
                     },
                 )
@@ -747,7 +743,18 @@ class HeadlessRunner:
             argv = [sys.executable, "-m", "bmad_loop.campaign_headless_worker", str(request_path)]
             # From this point, a lost acknowledgement is uncertain and must be
             # reconciled by window/startup identity rather than blindly replayed.
-            write_json(intent, {**read_json(intent), "phase": "window-pending"})
+            # Validation and every known pre-window wait precede admission.
+            # Campaign guards hold the state-save lock only across their fresh
+            # authority read and this irreversible intent, never terminal RPC.
+            with admission() if admission is not None else nullcontext():
+                write_json(
+                    intent,
+                    {
+                        "launch_id": envelope["launch_id"],
+                        "generation": envelope["generation"],
+                        "phase": "window-pending",
+                    },
+                )
             native_id = self.mux.new_window(
                 envelope["session"],
                 envelope["window_name"],

@@ -10,12 +10,21 @@ from __future__ import annotations
 import contextvars
 import dataclasses
 import json
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Callable
 
-from .platform_util import atomic_write_text, is_link_like, safe_segment
+from .platform_util import atomic_write_text, file_lock, is_link_like, safe_segment
 
-_probe: contextvars.ContextVar[Callable[[], bool] | None] = contextvars.ContextVar(
+
+@dataclasses.dataclass(frozen=True)
+class _Probe:
+    held: Callable[[], bool]
+    admission_lock: Path | None = None
+    admission_held: Callable[[], bool] | None = None
+
+
+_probe: contextvars.ContextVar[_Probe | None] = contextvars.ContextVar(
     "campaign_operator_hold", default=None
 )
 
@@ -97,8 +106,8 @@ def active(path: Path, *, campaign: str, unit: str) -> bool:
         return True
 
 
-def install(probe: Callable[[], bool]):
-    return _probe.set(probe)
+def install(probe: Callable[[], bool], *, admission_lock=None, admission_probe=None):
+    return _probe.set(_Probe(probe, admission_lock, admission_probe))
 
 
 def reset(token) -> None:
@@ -107,4 +116,20 @@ def reset(token) -> None:
 
 def held() -> bool:
     probe = _probe.get()
-    return probe is not None and probe()
+    return probe is not None and probe.held()
+
+
+@contextmanager
+def admission():
+    """Serialize final child session admission with committed operator controls."""
+    from .adapters.multiplexer import MultiplexerError
+    from .childrun import hard_stop_pending
+
+    probe = _probe.get()
+    lock = probe.admission_lock if probe is not None else None
+    with file_lock(lock) if lock is not None else nullcontext():
+        if held() or (probe and probe.admission_held and probe.admission_held()):
+            raise MultiplexerError("campaign operator hold suppresses automatic session launch")
+        if hard_stop_pending():
+            raise MultiplexerError("campaign hard stop suppresses automatic session launch")
+        yield

@@ -381,6 +381,9 @@ def _reuse_maps(roots, events, capability, runner):
         for path in sorted((root / "jobs").glob("*/validated.json")):
             saved = read_json(path)
             envelope = read_json(path.parent / "request.json")
+            spec = SummaryJobSpec(**envelope["request"]["coordinates"]["summary_spec"])
+            if spec.purpose != "handoff-map" or spec.prompt_version != EXTRACT_PROMPT_VERSION:
+                continue  # Historical artifacts cannot earn current prompt coverage.
             prior_cap = envelope["capability"]
             validate_capability(
                 prior_cap,
@@ -390,16 +393,29 @@ def _reuse_maps(roots, events, capability, runner):
             )
             receipt_path = path.parent / "receipt.json"
             receipt = _observed_receipt(path.parent / "request.json", runner)
-            spec = SummaryJobSpec(**envelope["request"]["coordinates"]["summary_spec"])
-            if spec.purpose != "handoff-map":
-                continue
             if (
                 envelope["capability"]["profile"] != capability["profile"]
                 or envelope["capability"]["model"] != capability["model"]
+                or envelope["selection"]["effort"] not in capability["efforts"]
             ):
                 raise CampaignError(
                     "Reused summary route differs from this explicitly selected route"
                 )
+            expected = trial_request(
+                spec,
+                capability,
+                tuple(
+                    HistorySnapshot(**item)
+                    for item in envelope["request"]["coordinates"]["history_snapshots"]
+                ),
+                envelope["request"]["limits"]["timeout_s"],
+            )
+            if (
+                prior_cap["qualification"]["sha256"] != capability["qualification"]["sha256"]
+                or expected.prompt != envelope["request"]["prompt"]
+                or expected.output_schema != envelope["request"]["output_schema"]
+            ):
+                continue
             if (
                 saved["receipt_sha256"] != file_digest(receipt_path)
                 or saved["artifact_sha256"] != file_digest(Path(saved["artifact_path"]))
@@ -485,6 +501,30 @@ def _draining(directory):
     return True
 
 
+def _plan_reducers(current, capability, directory, planning):
+    """New trials use production context accounting and project before admission."""
+    if planning == "adaptive-render-v2":
+        from .campaign_handoff_flow import _budget
+
+        candidate = RoleCandidate(
+            capability["profile"], capability["model"], capability["efforts"][0]
+        )
+        budget = _budget(candidate, capability)
+        return plan_reduction(tuple(current), budget, directory, project_native_events=True)
+    # Already-frozen trial identities retain their original deterministic plan.
+    output = capability["output_tokens"]
+    payload = max(1024, capability["input_tokens"] * 3 // 4 - 8192)
+    budget = ContextBudget(
+        capability["profile"] + ":" + capability["model"],
+        payload + output,
+        output,
+        prompt_tokens=0,
+        working_tokens=0,
+        qualified=True,
+    )
+    return plan_reduction(tuple(current), budget, directory)
+
+
 def run_trial(
     snapshot_path: Path,
     capability_path: Path,
@@ -522,6 +562,14 @@ def run_trial(
             "state": "drain-requested",
             "semantic_fidelity": "unqualified",
         }
+    binding_path = directory / "binding.json"
+    if binding_path.exists() and read_json(binding_path).get("prompt_versions") != [
+        EXTRACT_PROMPT_VERSION,
+        REDUCE_PROMPT_VERSION,
+    ]:
+        raise CampaignError(
+            "Trial has an obsolete prompt contract; use an explicit fresh trial directory"
+        )
     capability = read_json(capability_path)
     selection = RoleCandidate(capability["profile"], capability["model"], capability["efforts"][0])
     validate_capability(capability, selection)
@@ -572,7 +620,7 @@ def run_trial(
             control = directory / "drain.json"
             blob(directory / "control-history", control.read_bytes())
             control.unlink()
-        planning = "adaptive-render-v1"
+        planning = "adaptive-render-v2"
         if path.exists():
             prior = read_json(path)
             budget = ContextBudget(**prior["budget"])
@@ -583,7 +631,7 @@ def run_trial(
                 events, reusable, budget, directory / "inputs", overlap_tokens=payload // 8
             )
             try:
-                if planning == "adaptive-render-v1":
+                if planning in {"adaptive-render-v1", "adaptive-render-v2"}:
                     jobs = _fit_maps(jobs, capability, snapshots, timeout_s, directory / "inputs")
                     break
                 for job in jobs:
@@ -617,7 +665,7 @@ def run_trial(
             "prompt_versions": [EXTRACT_PROMPT_VERSION, REDUCE_PROMPT_VERSION],
             "correction_budget": 2,
         }
-        if planning == "adaptive-render-v1":
+        if planning in {"adaptive-render-v1", "adaptive-render-v2"}:
             binding["planning"] = planning
         if reducer_capability_path:
             binding["reducer_capability_sha256"] = file_digest(reducer_capability_path)
@@ -735,17 +783,7 @@ def run_trial(
                     layer=layer,
                 )
                 break
-            reducer_output = reducer_capability["output_tokens"]
-            reducer_payload = max(1024, reducer_capability["input_tokens"] * 3 // 4 - 8192)
-            reducer_budget = ContextBudget(
-                reducer_capability["profile"] + ":" + reducer_capability["model"],
-                reducer_payload + reducer_output,
-                reducer_output,
-                prompt_tokens=0,
-                working_tokens=0,
-                qualified=True,
-            )
-            next_jobs = plan_reduction(tuple(current), reducer_budget, directory / "inputs")
+            next_jobs = _plan_reducers(current, reducer_capability, directory / "inputs", planning)
             next_jobs = _fit_maps(
                 next_jobs, reducer_capability, snapshots, timeout_s, directory / "inputs"
             )

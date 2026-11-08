@@ -4,6 +4,7 @@ import copy
 import dataclasses
 import json
 import time
+from contextlib import nullcontext
 
 from test_campaign_handoff_flow import campaign as campaign
 from test_campaign_headless import prepared as prepared
@@ -21,7 +22,11 @@ class ScriptedReasoning:
     def __init__(self):
         self.prepare = HeadlessRunner().prepare
 
-    def launch(self, path):
+    def launch(self, path, *, admission=None):
+        with admission() if admission is not None else nullcontext():
+            return self._launch(path)
+
+    def _launch(self, path):
         envelope = read_json(path)
         request = envelope["request"]
         coordinate = request["coordinates"]

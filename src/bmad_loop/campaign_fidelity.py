@@ -49,7 +49,12 @@ def semantic_contract(purpose, audit_schema, contract=""):
     not merely in the editable outer manifest. Finite contracts retain their
     separately earned schema digest protocol; unused history headers do not apply.
     """
-    from .campaign_summary import EXTRACT_PROMPT_VERSION, REDUCE_PROMPT_VERSION, summary_schema
+    from .campaign_summary import (
+        EXTRACT_PROMPT_VERSION,
+        REDUCE_PROMPT_VERSION,
+        summary_schema,
+        summary_schema_template,
+    )
     from .campaign_transcripts import READER_VERSIONS
 
     result = {"schema_version": 1, "purpose": purpose}
@@ -75,6 +80,8 @@ def semantic_contract(purpose, audit_schema, contract=""):
         "handoff_reduce": REDUCE_PROMPT_VERSION,
         "handoff_audit": HISTORY_AUDIT_PROMPT_VERSION,
     }[purpose]
+    if purpose in {"handoff_map", "handoff_reduce"}:
+        result["summary_job_schema_digest"] = digest(summary_schema_template())
     if purpose == "handoff_audit":
         result["audit_schema_digest"] = digest(audit_schema)
     return result
@@ -112,6 +119,8 @@ def validate(cap, audit_schema, *, candidate=None, purpose="handoff_audit", cont
         expected.update(
             {key: actual_contract[key] for key in ("reader_versions", "summary_schema_digest")}
         )
+        if purpose in {"handoff_map", "handoff_reduce"}:
+            expected["summary_job_schema_digest"] = actual_contract["summary_job_schema_digest"]
         if purpose == "handoff_audit":
             expected.update(
                 audit_schema_digest=actual_contract["audit_schema_digest"],

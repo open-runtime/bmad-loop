@@ -99,7 +99,7 @@ def test_trial_planning_accounts_for_rendered_json_escaping(tmp_path, prepared):
         bounds["context_tokens"] - bounds["output_tokens"]
         == read_json(capability)["input_tokens"] * 3 // 4 - 8192
     )
-    assert read_json(directory / "binding.json")["planning"] == "adaptive-render-v1"
+    assert read_json(directory / "binding.json")["planning"] == "adaptive-render-v2"
 
 
 def test_trial_corrects_rejected_completed_result_as_distinct_bounded_job(tmp_path, prepared):
@@ -420,6 +420,68 @@ def test_trial_reuses_verified_prior_coverage_without_native_relaunch(tmp_path, 
     )
     assert third["ok"] and third["reused_jobs"] == 1 and third["new_map_jobs"] == 0
     assert len(runner.mux.processes) == count
+
+
+def test_new_trial_retains_old_maps_without_reusing_obsolete_prompt_coverage(
+    tmp_path, prepared, monkeypatch
+):
+    from bmad_loop import campaign_history_trial as trial
+    from bmad_loop import campaign_summary as summary
+
+    runner, capability, snapshots = fixture_route(prepared, tmp_path)
+    first = tmp_path / "old"
+    with monkeypatch.context() as prior:
+        prior.setattr(summary, "EXTRACT_PROMPT_VERSION", "history-extract-v2")
+        prior.setattr(trial, "EXTRACT_PROMPT_VERSION", "history-extract-v2")
+        defaults = list(summary.SummaryJobSpec.__init__.__defaults__)
+        defaults[2] = "history-extract-v2"
+        prior.setattr(summary.SummaryJobSpec.__init__, "__defaults__", tuple(defaults))
+        assert run_trial(snapshots, capability, first, runner=runner, timeout_s=20)["ok"]
+    old_requests = {
+        str(path): path.read_bytes() for path in (first / "jobs").glob("*/request.json")
+    }
+    count = len(runner.mux.processes)
+    report = run_trial(
+        snapshots,
+        capability,
+        tmp_path / "fresh",
+        runner=runner,
+        timeout_s=20,
+        reuse_directory=first,
+    )
+    assert report["ok"] and report["reused_jobs"] == 0 and report["new_map_jobs"] == 1
+    assert len(runner.mux.processes) == count + 1
+    from pathlib import Path
+
+    assert all(Path(path).read_bytes() == content for path, content in old_requests.items())
+    with pytest.raises(CampaignError, match="obsolete prompt contract"):
+        run_trial(snapshots, capability, first, runner=runner, timeout_s=20)
+
+
+def test_fresh_trial_projects_whole_children_before_production_admission(tmp_path):
+    from test_campaign_reduction_projection import recorded_size_children
+
+    from bmad_loop.campaign_history_trial import _plan_reducers
+    from bmad_loop.campaign_summary import load_input
+
+    children = recorded_size_children(tmp_path)
+    cap = {
+        "profile": "claude",
+        "model": "claude-fable-test",
+        "efforts": ["high"],
+        "input_tokens": 99662,
+        "output_tokens": 32768,
+        "context_tokens": 200000,
+        "reserved_tokens": 65536,
+        "qualification": {"sha256": "proof"},
+    }
+    jobs = _plan_reducers(children, cap, tmp_path / "v2", "adaptive-render-v2")
+    assert len(jobs) == 2
+    assert {key for job in jobs for key in job.primary_ids} == {job.id for job, _ in children}
+    assert all(job.input_tokens <= 33447 for job in jobs)
+    assert all(load_input(job)["citation_presentation"] == "native-events-v1" for job in jobs)
+    legacy = _plan_reducers(children, cap, tmp_path / "v1", "adaptive-render-v1")
+    assert len(legacy) == 1 and "citation_presentation" not in load_input(legacy[0])
 
 
 def test_adaptive_partition_keeps_fitting_jobs_and_every_source_character(tmp_path, prepared):

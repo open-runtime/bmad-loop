@@ -38,8 +38,17 @@ PLAN_BYTES = 2 * 1024 * 1024
 
 
 def _identity(snapshot, unit):
+    from .campaign_summary import EXTRACT_PROMPT_VERSION
+
     return digest(
-        [snapshot.id, unit.id, unit.claim.launch_id, snapshot.config_revision, "warmup-v1"]
+        [
+            snapshot.id,
+            unit.id,
+            unit.claim.launch_id,
+            snapshot.config_revision,
+            "warmup-v1",
+            EXTRACT_PROMPT_VERSION,
+        ]
     )
 
 
@@ -99,6 +108,8 @@ def proposals(runtime, snapshot):
 
 def current(snapshot, request):
     """Already admitted maps can finish after quiescence, but not another claim."""
+    from .campaign_summary import summary_contract_current
+
     unit = snapshot.units.get(request.unit)
     coordinate = request.coordinates.get("history_warmup", {})
     state = unit.evidence.get("history_warmup", {}) if unit else {}
@@ -106,6 +117,7 @@ def current(snapshot, request):
         unit
         and unit.claim
         and request.purpose == "handoff_map"
+        and summary_contract_current(request)
         and not request.required
         and coordinate.get("id") == state.get("id") == _identity(snapshot, unit)
         and coordinate.get("launch_id") == unit.claim.launch_id
@@ -231,7 +243,13 @@ def reusable(runtime, snapshot, unit, sources):
         _job,
         validate_fidelity_qualification,
     )
-    from .campaign_summary import SummaryJobSpec, load_input, summary_prompt, summary_schema
+    from .campaign_summary import (
+        SummaryJobSpec,
+        load_input,
+        summary_contract_current,
+        summary_prompt,
+        summary_schema,
+    )
 
     try:
         index = _index(runtime, snapshot, unit)
@@ -253,6 +271,9 @@ def reusable(runtime, snapshot, unit, sources):
         if not row or row.get("state") != "applied":
             continue
         request = request_from_dict(row["request"])
+        if not summary_contract_current(request):
+            rejected.append(key)
+            continue
         if (
             request.purpose != "handoff_map"
             or request.coordinates["config_revision"] != snapshot.config_revision
@@ -356,7 +377,7 @@ def perform(runtime, snapshot, action):
         root = runtime.store.directory(snapshot.id) / "history-warmup" / state["id"]
         sizes = {digest(binding): Path(binding["path"]).stat().st_size for binding in bindings}
         prior_sizes = index.get("sizes", {})
-        changed = any(
+        changed = unit.evidence.get("history_warmup", {}).get("id") != state["id"] or any(
             key not in prior_sizes
             or size < prior_sizes[key]
             or size - prior_sizes[key] >= MIN_BYTES
@@ -407,12 +428,15 @@ def perform(runtime, snapshot, action):
         # sources. Bind attempts to this claim/config, preserve lifetime limits,
         # and retain partial events until all their fragments have been attempted.
         attempted = []
+        from .campaign_summary import summary_contract_current
+
         for key in index["jobs"]:
             row = _job(runtime, snapshot, key)
             coordinates = row["request"]["coordinates"]
             if (
                 coordinates.get("history_warmup", {}).get("id") == state["id"]
                 and coordinates["config_revision"] == snapshot.config_revision
+                and summary_contract_current(row["request"])
             ):
                 attempted.append(SummaryJobSpec(**coordinates["summary_spec"]))
         # Bound map planning as well as launches. Oversized events remain for

@@ -7,6 +7,18 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Added
+
+- Bind optional Claude native request-output and structured-output retry limits to qualified recipes.
+
+### Fixed
+
+- Serialize final headless admission with acknowledged campaign controls.
+- Present the exact enforced history schema in extraction and reduction prompts.
+- Bind map and reducer fidelity grants to the specialized output schema template.
+- Refresh obsolete handoff summary contracts before resuming a successor, retaining history and failure debt.
+- Include bounded-headless Grok and Muse profiles in project setup instructions.
+
 ## [0.15.1] — 2026-11-08
 
 ### Fixed

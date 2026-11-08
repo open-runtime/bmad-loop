@@ -6,6 +6,7 @@ never borrows a unit's write claim. Every effect carries a distinct job identity
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
 
@@ -51,7 +52,11 @@ def _launch_guard(runtime, snapshot, row, action, path):
     current_row = latest.jobs.get(row["id"])
     if current_row is None or _binding(current_row) != _binding(row):
         return Observation("confirmed", {"state": "settled", "effect_binding": _binding(row)})
-    reason = admission_reason(latest, row["request"]["unit"])
+    reason = (
+        admission_reason(latest, row["request"]["unit"])
+        if current(latest, request_from_dict(current_row["request"]))
+        else "reasoning request is no longer current"
+    )
     if not reason and campaign_hold.active(
         campaign_hold.channel(runtime.store.directory(snapshot.id), row["request"]["unit"]),
         campaign=snapshot.id,
@@ -67,6 +72,24 @@ def _launch_guard(runtime, snapshot, row, action, path):
         ):
             reason = "reasoning launch no longer owns admission"
     return _deferred(row, reason) if reason else None
+
+
+class _LaunchDeferred(Exception):
+    def __init__(self, observation):
+        self.observation = observation
+
+
+@contextmanager
+def _admission(runtime, snapshot, row, action, path):
+    from .platform_util import file_lock
+
+    # Store.save is the control acknowledgement boundary. No terminal RPC or
+    # capability validation may run while this repository-wide lock is held.
+    with file_lock(runtime.store.root / ".state.lock"):
+        deferred = _launch_guard(runtime, snapshot, row, action, path)
+        if deferred is not None:
+            raise _LaunchDeferred(deferred)
+        yield
 
 
 def defer_never_submitted(runtime, snapshot, action):
@@ -485,11 +508,16 @@ def perform(runtime, snapshot, action, *, reconcile: bool = False) -> Observatio
         deferred = _launch_guard(runtime, snapshot, row, action, path)
         if deferred is not None:
             return deferred
-        observed = (
-            runner.observe(path)
-            if (path.parent / "launch-intent.json").exists()
-            else runner.launch(path)
-        )
+        try:
+            observed = (
+                runner.observe(path)
+                if (path.parent / "launch-intent.json").exists()
+                else runner.launch(
+                    path, admission=lambda: _admission(runtime, snapshot, row, action, path)
+                )
+            )
+        except _LaunchDeferred as exc:
+            return exc.observation
     elif action.kind == "reasoning-terminate":
         if not path.exists():
             return Observation(

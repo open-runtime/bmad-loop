@@ -94,7 +94,7 @@ class HeadlessAdapter(CodingCLIAdapter):
         self.native_job_root = Path(directory)
 
     def start_session(self, spec: SessionSpec) -> SessionHandle:
-        from ..campaign_hold import held
+        from ..campaign_hold import admission, held
         from .multiplexer import MultiplexerError
 
         if held():
@@ -193,7 +193,7 @@ class HeadlessAdapter(CodingCLIAdapter):
         launched_ns = time.time_ns()
         if held():
             raise MultiplexerError("campaign operator hold suppresses automatic session launch")
-        launched = self.runner.launch(path)
+        launched = self.runner.launch(path, admission=admission)
         return SessionHandle(
             spec.task_id, launched.get("native_id", identifier), launched_ns=launched_ns
         )

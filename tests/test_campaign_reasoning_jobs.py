@@ -390,8 +390,8 @@ def test_real_child_completion_can_archive_before_launch_ack_arrives(tmp_path, p
     launch = runner.launch
     started, release = threading.Event(), threading.Event()
 
-    def delayed_launch(path):
-        observed = launch(path)
+    def delayed_launch(path, **kwargs):
+        observed = launch(path, **kwargs)
         started.set()
         assert release.wait(60), "launch acknowledgement was never released"
         return observed

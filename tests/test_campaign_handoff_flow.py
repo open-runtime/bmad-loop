@@ -58,6 +58,7 @@ def campaign(prepared, project, tmp_path):
             EXTRACT_PROMPT_VERSION,
             REDUCE_PROMPT_VERSION,
             summary_schema,
+            summary_schema_template,
         )
         from bmad_loop.campaign_transcripts import READER_VERSIONS, digest
 
@@ -113,6 +114,7 @@ def campaign(prepared, project, tmp_path):
             "route_bindings": route_bindings,
             "reader_versions": READER_VERSIONS,
             "summary_schema_digest": digest(summary_schema()),
+            "summary_job_schema_digest": digest(summary_schema_template()),
             "audit_schema_digest": digest(flow.AUDIT_SCHEMA),
             "constraint_schemas_digest": digest([REDUCTION_SCHEMA, CONSTRAINT_AUDIT_SCHEMA]),
             "recovery_schemas_digest": digest([RECOVERY_SCHEMA, RECOVERY_AUDIT_SCHEMA]),

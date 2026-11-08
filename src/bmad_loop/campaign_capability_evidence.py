@@ -146,6 +146,13 @@ def _validate(capability, candidate) -> None:
         covered_input = report.get("coverage", {}).get("input_tokens")
         covered_output = report.get("coverage", {}).get("configured_output_tokens")
     limits = envelope["request"]["limits"]
+    if "native_limits" in capability:
+        from .campaign_native_limits import environment
+
+        if receipt.get("native_request_limits") != environment(capability, limits["output_tokens"]):
+            raise CampaignError(
+                "Native qualification did not apply its requested output/retry limits"
+            )
     # The worker writes its native receipt before process exit. The owning
     # observer adds quiescence and window-death evidence after independent readback.
     projected = {"quiescent", "completion_evidence", "presentation_status"}

@@ -188,6 +188,14 @@ def child_main(path: Path) -> int:
         environment, native_context = restore(environment, os.environ, envelope.get("presentation"))
         if native_context:
             receipt["native_terminal"] = native_context
+        from .campaign_native_limits import environment as native_limit_environment
+
+        native_limits = native_limit_environment(capability, request.limits.output_tokens)
+        if native_limits:
+            # These limits belong to the exact qualified recipe. Inherited or
+            # restored native settings must not silently widen the job's bound.
+            environment.update(native_limits)
+            receipt["native_request_limits"] = native_limits
         if capability["protocol"] == "muse-json":
             # The launcher can otherwise replace the pinned native executable
             # after qualification and before exec. Account routing is unchanged.

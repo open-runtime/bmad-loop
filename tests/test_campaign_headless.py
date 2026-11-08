@@ -105,6 +105,12 @@ def fixture_capability(tmp_path, capability, candidate=None):
         "usage": {"input_tokens": 1000, "output_tokens": 8},
         "result": envelope["probe"]["expected"],
     }
+    if "native_limits" in proposal:
+        from bmad_loop.campaign_native_limits import environment
+
+        receipt["native_request_limits"] = environment(
+            proposal, envelope["request"]["limits"]["output_tokens"]
+        )
     write_json(path.parent / "receipt.json", receipt)
     report = result(path, {"state": "finished", "receipt": receipt})
     return {
@@ -838,14 +844,18 @@ def test_headless_profiles_are_explicitly_qualified():
         assert get_adapter_kind(profile.adapter).load().plain.__name__ == "HeadlessAdapter"
 
 
+@pytest.mark.parametrize("control", ["channel", "stored", "terminate", "drain"])
 def test_child_stage_hold_after_startup_is_receipted_and_release_completes(
-    prepared, project, tmp_path, monkeypatch
+    prepared, project, tmp_path, monkeypatch, control
 ):
+    from test_campaign_core import make_snapshot
     from test_campaign_workers import envelope, worker_request
 
     from bmad_loop import campaign_hold, campaign_workers, runsetup
     from bmad_loop.adapters.headless import HeadlessAdapter
     from bmad_loop.adapters.profile import get_profile
+    from bmad_loop.campaign_model import Hold
+    from bmad_loop.campaign_store import CampaignStore
 
     runner, _, job, candidate, original = prepared
     script = tmp_path / "completed-stage.py"
@@ -865,7 +875,15 @@ def test_child_stage_hold_after_startup_is_receipted_and_release_completes(
         },
         candidate,
     )
-    channel = tmp_path / "operator-hold.json"
+    snapshot = make_snapshot(epics=["a"])
+    snapshot.id = "campaign-1"
+    unit = next(iter(snapshot.units.values()))
+    unit.spec = replace(unit.spec, id="s:project:unit")
+    snapshot.units = {unit.id: unit}
+    snapshot.spec = replace(snapshot.spec, units=(unit.spec,))
+    store = CampaignStore(tmp_path / "campaigns")
+    store.create(snapshot)
+    channel = campaign_hold.channel(store.directory(snapshot.id), unit.id)
     hold_during_construction = True
     contexts = []
 
@@ -873,9 +891,19 @@ def test_child_stage_hold_after_startup_is_receipted_and_release_completes(
         context = contexts[-1]
         assert (context.directory / "startup.json").exists()
         if hold_during_construction:
-            campaign_hold.write(
-                channel, campaign=context.campaign_id, unit=context.unit_id, hold="operator"
-            )
+            if control == "channel":
+                campaign_hold.write(
+                    channel, campaign=context.campaign_id, unit=context.unit_id, hold="operator"
+                )
+            else:
+                latest = store.load(snapshot.id)
+                if control == "stored":
+                    latest.units[unit.id].hold = Hold("operator", "Owner paused this unit")
+                else:
+                    latest.phase = "draining"
+                    latest.bindings["terminate_requested"] = control == "terminate"
+                store.save(latest, latest.revision)
+            assert not (context.directory / "stop-request.json").exists()
         return {
             "triage": HeadlessAdapter(
                 run_dir=run_dir, profile=profiles["triage"], policy=policy, mux=runner.mux
@@ -883,7 +911,12 @@ def test_child_stage_hold_after_startup_is_receipted_and_release_completes(
         }
 
     monkeypatch.setattr(runsetup, "make_adapters", make_adapters)
-    for attempt, outcome in ((1, "operator_held"), (2, "stage_complete")):
+    outcomes = (
+        ("stage_complete",)
+        if control == "drain"
+        else ("failed" if control == "terminate" else "operator_held", "stage_complete")
+    )
+    for attempt, outcome in enumerate(outcomes, 1):
         context = replace(
             envelope(project.project, tmp_path / f"stage-attempt-{attempt}"), attempt=attempt
         )
@@ -918,13 +951,20 @@ def test_child_stage_hold_after_startup_is_receipted_and_release_completes(
         code = campaign_workers.child_main(path)
         receipt = read_json(context.directory / "receipt.json")
         assert receipt["outcome"] == outcome, receipt
-        assert code == (1 if attempt == 1 else 0)
-        if attempt == 1:
+        assert code == (0 if outcome == "stage_complete" else 1)
+        if outcome != "stage_complete":
             assert not runner.mux.processes
             assert not receipt["accounting"]["session_observed"]
+            if control == "terminate":
+                assert "campaign hard stop" in receipt["error"]
             campaign_hold.write(
                 channel, campaign=context.campaign_id, unit=context.unit_id, hold=""
             )
+            latest = store.load(snapshot.id)
+            latest.units[unit.id].hold = None
+            latest.phase = "active"
+            latest.bindings.pop("terminate_requested", None)
+            store.save(latest, latest.revision)
             hold_during_construction = False
         else:
             assert len(runner.mux.processes) == 1

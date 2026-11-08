@@ -207,7 +207,11 @@ def current(
     *,
     semantic_fingerprints: dict[str, str] | None = None,
 ) -> bool:
+    from .campaign_summary import summary_contract_current
+
     coordinates = request.coordinates
+    if not summary_contract_current(request):
+        return False
     if coordinates["config_revision"] != snapshot.config_revision:
         return False
     if coordinates.get("history_warmup"):

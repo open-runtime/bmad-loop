@@ -19,12 +19,23 @@ from .campaign_transcripts import HistoryEvent, blob, digest, encoded
 from .platform_util import atomic_write_text, is_link_like
 
 TokenCounter = Callable[[str], int]
-EXTRACT_PROMPT_VERSION = "history-extract-v2"
-REDUCE_PROMPT_VERSION = "history-reduce-v4"
+EXTRACT_PROMPT_VERSION = "history-extract-v3"
+REDUCE_PROMPT_VERSION = "history-reduce-v5"
 
 
 class SummaryResultRejected(CampaignError):
     """A completed model result failed validation; immutable source remains valid."""
+
+
+def summary_contract_current(request) -> bool:
+    """Version-check a saved job without rewriting it or reading its source blobs."""
+    purpose = request["purpose"] if isinstance(request, dict) else request.purpose
+    coordinates = request["coordinates"] if isinstance(request, dict) else request.coordinates
+    if purpose not in {"handoff_map", "handoff_reduce"} or "summary_spec" not in coordinates:
+        return True  # Non-summary/legacy generic jobs have their own contracts.
+    spec = coordinates["summary_spec"]
+    expected = EXTRACT_PROMPT_VERSION if purpose == "handoff_map" else REDUCE_PROMPT_VERSION
+    return isinstance(spec, dict) and spec.get("prompt_version") == expected
 
 
 def byte_token_bound(text: str) -> int:
@@ -685,6 +696,8 @@ def plan_remaining_maps(
     """
     ranges: dict[str, list[tuple[int, int]]] = {}
     for job, result in completed:
+        if job.prompt_version != EXTRACT_PROMPT_VERSION:
+            continue  # Retained historical evidence does not earn current map coverage.
         if (
             result.get("structural_coverage") is not True
             or result.get("job_id") != job.id
@@ -863,7 +876,9 @@ def split_reduction_input(job: SummaryJobSpec, artifact_root: Path) -> tuple[Sum
     return tuple(result)
 
 
-def summary_schema(job: SummaryJobSpec | None = None) -> dict[str, Any]:
+def summary_schema(
+    job: SummaryJobSpec | None = None, *, quote_ids: tuple[str, ...] | None = None
+) -> dict[str, Any]:
     """Portable structured-output schema; semantic/source checks remain local."""
     schema: dict[str, Any] = {
         "type": "object",
@@ -906,7 +921,7 @@ def summary_schema(job: SummaryJobSpec | None = None) -> dict[str, Any]:
             facts["properties"]["citations"]["items"]["enum"] = list(job.event_ids)
         else:
             props["facts"]["maxItems"] = 0
-        catalog = quote_catalog(job)
+        catalog = tuple(quote_catalog(job)) if quote_ids is None else quote_ids
         facts["properties"].pop("source_quote")
         facts["properties"]["source_quote_id"] = {"type": "string", "enum": ["", *catalog]}
         facts["required"].append("source_quote_id")
@@ -915,6 +930,32 @@ def summary_schema(job: SummaryJobSpec | None = None) -> dict[str, Any]:
         facts["additionalProperties"] = False
         schema["additionalProperties"] = False
     return schema
+
+
+def summary_schema_template() -> dict[str, Any]:
+    """Bind actual specialized shapes without binding one job's source identities.
+
+    These variants call the same schema builder used for native requests. Only
+    canonical source values are supplied; schemas containing no events or no
+    owner quotes have distinct restrictions and therefore need separate cases.
+    """
+    job = SummaryJobSpec(
+        "job",
+        "handoff-map",
+        "",
+        "input-sha256",
+        1,
+        1,
+        "schema-template",
+        ("primary",),
+        ("event",),
+    )
+    return {
+        "schema_version": 1,
+        "events_with_owner_quotes": summary_schema(job, quote_ids=("quote",)),
+        "events_without_owner_quotes": summary_schema(job, quote_ids=()),
+        "no_events": summary_schema(replace(job, event_ids=()), quote_ids=()),
+    }
 
 
 def summary_prompt(job: SummaryJobSpec) -> str:
@@ -979,7 +1020,7 @@ def summary_prompt(job: SummaryJobSpec) -> str:
                 "input_sha256": job.input_sha256,
                 "primary_ids": job.primary_ids,
                 "quote_catalog": quote_catalog(job),
-                "schema": summary_schema(),
+                "schema": summary_schema(job),
             }
         ).decode()
     )
