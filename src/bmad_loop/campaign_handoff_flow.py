@@ -393,6 +393,43 @@ def _prepare_with_failures(snapshot, request, value):
     return row
 
 
+def _retry_context(runtime, value, rows):
+    """Charge one cooldown to each exact attempt, including a deferred replan.
+
+    A route with no alternate must become eligible after its first cooldown.
+    Recording only successful plans would restart that cooldown on every poll.
+    """
+    value = dict(value)
+    value["plan_epoch"] = value.get("plan_epoch", 0) + 1
+    events = dict(value.get("route_cooldown_events", {}))
+    cooldowns = dict(value.get("route_cooldowns", {}))
+    for row in rows:
+        selected = row.get("selection")
+        if not selected or not _requires_replan(row):
+            continue
+        claim = row.get("claim") or {}
+        identity = digest(
+            [
+                row["id"],
+                row.get("attempt", 0),
+                row.get("failure_attempts", 0),
+                claim.get("launch_id"),
+                claim.get("generation"),
+                selected,
+            ]
+        )
+        route = selected["profile"] + ":" + selected["model"]
+        if identity not in events:
+            # Receipt acceptance timestamps the attempt in controller time.
+            # Older snapshots without that field anchor at their first replan.
+            started = row.get("updated_at", runtime.clock())
+            events[identity] = {"route": route, "until": started + 60}
+        cooldowns[route] = max(cooldowns.get(route, 0), events[identity]["until"])
+    value["route_cooldowns"] = cooldowns
+    value["route_cooldown_events"] = events
+    return value
+
+
 @capability_admission
 def proposals(runtime, snapshot):
     result = []
@@ -946,10 +983,15 @@ def _reduce(runtime, snapshot, unit, value):
         runtime, snapshot, "summarization", value, purpose="handoff_reduce", contract=""
     )
     budget = _budget(candidate, cap)
-    budget = dataclasses.replace(
-        budget, output_tokens=min(budget.output_tokens, max(1024, ceiling // 8))
+    # Native output includes provider reasoning and is independent of the
+    # destination's byte budget. Summaries occupy at most one third of the
+    # packet; provenance is included in the checked artifact, never clipped.
+    planned = plan_reduction(
+        children,
+        budget,
+        _root(runtime, snapshot, value) / "reductions",
+        artifact_bytes=ceiling // 3,
     )
-    planned = plan_reduction(children, budget, _root(runtime, snapshot, value) / "reductions")
     jobs = []
     for planned_spec in planned:
         planned_spec = project_reduction_input(
@@ -1493,15 +1535,6 @@ def _contract_replan(runtime, snapshot, unit, value):
     }
     field = fields[value["phase"]]
     rows = [_job(runtime, snapshot, key) for key in value[field]]
-    value = dict(value)
-    value["plan_epoch"] = value.get("plan_epoch", 0) + 1
-    value["route_cooldowns"] = dict(value.get("route_cooldowns", {}))
-    for row in rows:
-        selected = row.get("selection")
-        if selected and _requires_replan(row):
-            value["route_cooldowns"][selected["profile"] + ":" + selected["model"]] = (
-                runtime.clock() + 60
-            )
     requests, reuse = [], []
     for row in rows:
         if row["state"] == "applied":
@@ -1742,30 +1775,38 @@ def _perform(runtime, snapshot, action, *, reconcile=False):
         data = _capture(runtime, snapshot, unit, value)
     elif action.kind == "handoff-failed":
         data = {"exhausted_jobs": action.payload["jobs"]}
-    elif action.kind in {"handoff-replan", "handoff-audit-replan"}:
-        value = dict(value)
-        value["plan_epoch"] = value.get("plan_epoch", 0) + 1
-        failed_routes = {
-            _job(runtime, snapshot, key)["selection"]["profile"]
-            + ":"
-            + _job(runtime, snapshot, key)["selection"]["model"]
-            for key in value["jobs" if action.kind == "handoff-replan" else "audits"]
-            if _job(runtime, snapshot, key).get("selection")
-            and _job(runtime, snapshot, key)["state"] in {"capacity_wait", "failed"}
-        }
-        value["route_cooldowns"] = {
-            **value.get("route_cooldowns", {}),
-            **{route: runtime.clock() + 60 for route in failed_routes},
-        }
-        data = {
-            **(
-                _maps(runtime, snapshot, unit, value)
-                if action.kind == "handoff-replan"
-                else _audit_plan(runtime, snapshot, unit, value)
-            ),
-            "plan_epoch": value["plan_epoch"],
+    elif action.kind in {"handoff-replan", "handoff-audit-replan", "handoff-contract-replan"}:
+        field = {
+            "summarize": "jobs",
+            "audit": "audits",
+            "constraint_reduce": "constraint_jobs",
+            "constraint_audit": "constraint_audits",
+            "recovery_extract": "recovery_jobs",
+            "recovery_audit": "recovery_audits",
+        }[value["phase"]]
+        rows = [_job(runtime, snapshot, key) for key in value[field]]
+        if any(row.get("claim") and not row["claim"].get("quiescent") for row in rows):
+            return Observation("unknown", reason="Prior reasoning attempts still draining")
+        prior_epoch = value.get("plan_epoch", 0)
+        value = _retry_context(runtime, value, rows)
+        planner = {
+            "handoff-replan": _maps,
+            "handoff-audit-replan": _audit_plan,
+            "handoff-contract-replan": _contract_replan,
+        }[action.kind]
+        try:
+            data = {
+                **planner(runtime, snapshot, unit, value),
+                "plan_epoch": value["plan_epoch"],
+                "route_cooldowns": value["route_cooldowns"],
+            }
+        except HandoffRouteWait as exc:
+            data = {"wait_reason": str(exc), "retry_at": runtime.clock() + 30}
+        data["retry_bookkeeping"] = {
             "route_cooldowns": value["route_cooldowns"],
+            "route_cooldown_events": value["route_cooldown_events"],
         }
+        data["retry_from_epoch"] = prior_epoch
     elif action.kind == "handoff-capture":
         data = _capture(runtime, snapshot, unit, value)
     elif action.kind == "handoff-plan":
@@ -1804,8 +1845,6 @@ def _perform(runtime, snapshot, action, *, reconcile=False):
             "artifact": row["applied_result"],
             "reason": "; ".join(result.get("unresolved", [])),
         }
-    elif action.kind == "handoff-contract-replan":
-        data = _contract_replan(runtime, snapshot, unit, value)
     elif action.kind == "handoff-release":
         from .campaign_fingerprint import capture
 
@@ -1865,6 +1904,7 @@ def apply(runtime, snapshot, action, observation):
     data = observation.data
     if (
         data.get("superseded")
+        or data.get("retry_from_epoch", value.get("plan_epoch", 0)) != value.get("plan_epoch", 0)
         or data.get("effect_phase", value["phase"]) != value["phase"]
         or data.get("effect_context", _audit_context(snapshot, unit))
         != _audit_context(snapshot, unit)
@@ -1892,13 +1932,16 @@ def apply(runtime, snapshot, action, observation):
             reason="another authority replaced the hold",
         )
         return
+    _remember_failures(runtime, snapshot, value)
+    if data.get("retry_bookkeeping"):
+        for field in ("route_cooldowns", "route_cooldown_events"):
+            value[field] = {**value.get(field, {}), **data["retry_bookkeeping"][field]}
     if data.get("wait_reason"):
         value["retry_at"] = data["retry_at"]
         unit.hold.reason = data["wait_reason"]
         add_event(snapshot, "handoff-capacity-wait", unit=unit.id, reason=data["wait_reason"])
         return
     value.pop("retry_at", None)
-    _remember_failures(runtime, snapshot, value)
     if data.get("exhausted_jobs"):
         value["phase"] = "failed"
         value["exhausted_jobs"] = data["exhausted_jobs"]

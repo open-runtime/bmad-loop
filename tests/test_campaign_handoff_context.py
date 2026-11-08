@@ -348,6 +348,33 @@ def test_reducers_retain_child_dependencies_and_citations(tmp_path):
         assert job.input_tokens <= budget().payload_tokens
 
 
+def test_reduction_native_reasoning_budget_is_separate_from_artifact_bytes(tmp_path):
+    from bmad_loop.campaign_summary import summary_prompt
+
+    snapshot = capture(tmp_path, [native_row("codex")])
+    events = load_events(snapshot)
+    child = plan_maps(events, budget(), tmp_path / "maps")[0]
+    validated = validate_summary(child, result(child, events), events)
+    native_budget = replace(budget(), context_tokens=100000, output_tokens=16384)
+    reducer = plan_reduction(
+        ((child, validated),), native_budget, tmp_path / "reducers", artifact_bytes=4164
+    )[0]
+    prompt = summary_prompt(reducer)
+    assert "16384 tokens, including any reasoning" in prompt
+    assert "4164 bytes" in prompt and "2082 UTF-8 bytes" in prompt
+    assert "every distinct current owner obligation" in prompt
+    value = result(reducer, events)
+    compact = validate_summary(reducer, value, events, observed_output_tokens=6940)
+    assert len(encoded(compact)) <= 4164
+    assert compact["output_measurement"]["tokens"] == 6940
+    assert compact["facts"][0]["source_quote_ref"]
+    value["facts"][0]["text"] = "x" * 4000
+    # Known native token telemetry cannot bypass the independent artifact size.
+    with pytest.raises(CampaignError, match=r"reduction byte limit: .* > 4164.*6940/16384"):
+        validate_summary(reducer, value, events, observed_output_tokens=6940)
+    assert Path(child.input_path).exists() and Path(reducer.input_path).exists()
+
+
 def test_reducer_presentation_keeps_native_sources_without_competing_fact_ids(tmp_path):
     snapshot = capture(tmp_path, [native_row("codex")])
     events = load_events(snapshot)

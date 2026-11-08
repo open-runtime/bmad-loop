@@ -20,7 +20,7 @@ from .platform_util import atomic_write_text, is_link_like
 
 TokenCounter = Callable[[str], int]
 EXTRACT_PROMPT_VERSION = "history-extract-v2"
-REDUCE_PROMPT_VERSION = "history-reduce-v2"
+REDUCE_PROMPT_VERSION = "history-reduce-v3"
 
 
 class SummaryResultRejected(CampaignError):
@@ -149,6 +149,7 @@ class SummaryJobSpec:
     prompt_version: str = EXTRACT_PROMPT_VERSION
     correction_of: str = ""
     correction_reason: str = ""
+    artifact_bytes: int = 0
 
     def request(
         self, *, unit: str, coordinates: dict[str, Any], candidates: list[dict[str, Any]]
@@ -525,7 +526,7 @@ def validate_summary(
                 ),
             }
         )
-    return {
+    validated = {
         **result,
         "facts": normalized,
         "structural_coverage": True,
@@ -536,6 +537,20 @@ def validate_summary(
             "tokens": output_count,
         },
     }
+    if job.artifact_bytes:
+        if type(job.artifact_bytes) is not int or job.artifact_bytes < 1:
+            raise CampaignError("Invalid summary artifact byte limit")
+        validated["reduction_budget"] = {
+            "artifact_byte_limit": job.artifact_bytes,
+            "result_bytes": len(encoded(result)),
+        }
+        actual_bytes = len(encoded(validated))
+        if actual_bytes > job.artifact_bytes:
+            raise SummaryResultRejected(
+                f"summary artifact exceeds reduction byte limit: {actual_bytes} > {job.artifact_bytes}; "
+                f"native output {output_count}/{job.output_tokens}; immutable sources retained"
+            )
+    return validated
 
 
 def plan_reduction(
@@ -544,6 +559,7 @@ def plan_reduction(
     artifact_root: Path,
     *,
     count: TokenCounter = byte_token_bound,
+    artifact_bytes: int = 0,
 ) -> tuple[SummaryJobSpec, ...]:
     """Partition cited child summaries into bounded reducer jobs; never clip a child."""
     jobs, batch = [], []
@@ -557,7 +573,7 @@ def plan_reduction(
         path = blob(artifact_root, data)
         jobs.append(
             SummaryJobSpec(
-                digest([payload, asdict(budget), REDUCE_PROMPT_VERSION]),
+                digest([payload, asdict(budget), REDUCE_PROMPT_VERSION, artifact_bytes]),
                 "handoff-reduce",
                 str(path),
                 hashlib.sha256(data).hexdigest(),
@@ -575,6 +591,7 @@ def plan_reduction(
                 ),
                 tuple(job.id for job, _ in items),
                 prompt_version=REDUCE_PROMPT_VERSION,
+                artifact_bytes=artifact_bytes,
             )
         )
 
@@ -900,6 +917,21 @@ def summary_prompt(job: SummaryJobSpec) -> str:
         "Return coverage of every primary fragment (or child job for reduction); report "
         "missing input or ambiguity in gaps. No tools or external writes. Return only "
         "the schema-conforming JSON result. "
+        + (
+            f"Reduce this history into a compact successor brief. The native output allowance is "
+            f"{job.output_tokens} tokens, including any reasoning counted by the provider; "
+            f"it is not the allowed brief size. Target at most {job.artifact_bytes // 2} UTF-8 "
+            f"bytes of compact JSON, reserving the remainder for controller provenance. "
+            f"The complete validated artifact must fit {job.artifact_bytes} bytes. "
+            "Consolidate repeated facts with their citations, shorten contextual explanations, "
+            "and use exact quote IDs instead of copying source text. Preserve every distinct "
+            "current owner obligation, correction, unresolved conflict and required next action; "
+            "do not silently omit them to meet the size goal. Report any inability to preserve "
+            "required meaning within the bound in gaps. Sources and detailed child summaries "
+            "remain retrievable; this compact brief grants no new authority. "
+            if job.artifact_bytes
+            else ""
+        )
         + (
             "A prior completed attempt was rejected: "
             + job.correction_reason

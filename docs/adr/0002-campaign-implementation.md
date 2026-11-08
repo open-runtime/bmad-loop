@@ -20,14 +20,14 @@ accepted delivery extension additionally requires the following concrete work.
 The owner's administrative-publication decision supersedes this ADR's strict-only
 REM activation requirement; strict and queue modes retain their existing contracts.
 
-| Delivery goal                                | Implementation and acceptance                                                                                                                                                                                              | Status                                                      |
-| -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
-| D1 — Hold and route admission                | Headless hold before preparation/launch; inherited developer; shared frozen launcher/permission readiness; standalone writer capabilities; no attempt charge while unavailable; old snapshot compatibility                 | Implemented; focused regressions and ablations passed       |
-| D2 — Owner-authorized publication            | Repository-bound opt-in; ordinary exact-head GitHub merge with authorized administrative fallback; no independent GitHub approver requirement; durable uncertain execution and landing verification/repair before tracking | In progress                                                 |
-| D3 — Native routes and writable continuation | Qualify enabled Claude/Codex/Grok/AGY/Muse model/effort/permission recipes; real writable Claude↔Codex continuation; installation-bound proofs                                                                             | In progress                                                 |
-| D4 — Managed communication                   | Own actor per unit/job; factual bridge status; durable safe-boundary steering; accepting/closing/closed generations; no identity borrowing or reopened writers; Paradev bindings                                           | In progress                                                 |
-| D5 — Final candidate qualification           | Full suite, type/lint/package checks, 48 stories/24 epics/eight verification slots with managed communication, two independent candidate-bound reviews                                                                     | In progress; native load exposed shared Git publication gap |
-| D6 — Deployment and REM delivery             | History-preserving PR merge, exact fork installation and canonical base, refreshed fork setup skill, controlled two-epic real delivery, verified automation responsibility and concurrency configuration                   | Pending qualification                                       |
+| Delivery goal                                | Implementation and acceptance                                                                                                                                                                                              | Status                                                                                              |
+| -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| D1 — Hold and route admission                | Headless hold before preparation/launch; inherited developer; shared frozen launcher/permission readiness; standalone writer capabilities; no attempt charge while unavailable; old snapshot compatibility                 | Implemented; focused regressions and ablations passed                                               |
+| D2 — Owner-authorized publication            | Repository-bound opt-in; ordinary exact-head GitHub merge with authorized administrative fallback; no independent GitHub approver requirement; durable uncertain execution and landing verification/repair before tracking | Implemented and regression tested; real target delivery pending                                     |
+| D3 — Native routes and writable continuation | Qualify enabled Claude/Codex/Grok/AGY/Muse model/effort/permission recipes; real writable Claude↔Codex continuation; installation-bound proofs                                                                             | Five exact writer recipes earned evidence; continuation and paired review qualification in progress |
+| D4 — Managed communication                   | Own actor per unit/job; factual bridge status; durable safe-boundary steering; accepting/closing/closed generations; no identity borrowing or reopened writers; Paradev bindings                                           | Implemented; actual isolated hcom and scripted managed-load qualification passed                    |
+| D5 — Final candidate qualification           | Full suite, type/lint/package checks, 48 stories/24 epics/eight verification slots with managed communication, two independent candidate-bound reviews                                                                     | Managed load passed; final source freeze, full checks and independent reviews pending               |
+| D6 — Deployment and REM delivery             | History-preserving PR merge, exact fork installation and canonical base, refreshed fork setup skill, controlled two-epic real delivery, verified automation responsibility and concurrency configuration                   | Pending qualification                                                                               |
 
 The completion contract includes
 accepted reviews, synchronization with main, history-preserving merge, exact-commit
@@ -88,9 +88,17 @@ Real hcom qualification covers an outside peer's status request, durable steerin
 delivered through a normal reasoning child, and closed-generation late mail.
 The larger qualified-native load exposed a separate Git visibility defect: a
 shared branch ref could advance before its quarantined objects were promoted.
-Private writer refs/index and seal-before-CAS publication must resolve that defect
-before the native load gate can pass. Neither the smaller native run nor the
-legacy load result substitutes for this gate.
+Private writer refs/index and seal-before-CAS publication now resolve that defect.
+The subsequent zero-token managed load delivered all 48 stories, reconciled parent
+tracking and closed all 347 public bindings without bridge errors. It reached
+24 execution workers/active epics, eight verification slots, eight review slots,
+four reasoning jobs and 31 of 32 shared sessions. All 47 injected messages were
+applied. Stop acknowledgement took 0.429 seconds; the complete test took 1,384.99
+seconds. The controller, scheduler, Git publication and bridge sources were stable
+through this run. Four native-protocol leaves changed during the run but are not
+executed by its scripted Claude transport; this result is not a whole-tree frozen
+qualification or a real-provider throughput benchmark. Final candidate regression
+and independent reviews remain required after those native changes settle.
 
 Scoped command lifecycle evidence covers owned sessions and observed descendants.
 An actual detached-and-reparented child can evade periodic observation. Keep that

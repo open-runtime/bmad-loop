@@ -1,6 +1,6 @@
 # ADR 0003: Bounded reasoning jobs and portable session handoff
 
-- **Status:** Delivery completion in progress; native routes and managed communication pending
+- **Status:** Delivery completion in progress; writable continuation, final reviews and activation pending
 - **Date:** 2026-11-06
 - **Extends:** [ADR 0002](0002-native-sdlc-campaign.md) and its [implementation contract](0002-campaign-implementation.md)
 - **Delivery:** The same campaign implementation PR, before autonomous project activation
@@ -601,6 +601,24 @@ counts by immutable source coverage; changing routes, job IDs or chunk geometry
 cannot renew those attempts. Exhaustion produces an explicit continuation hold,
 while quota waits themselves do not consume that budget.
 
+Each failed attempt receives one persisted route cooldown, bound to its job,
+launch, generation and attempt identity. A deferred replan stores that cooldown
+and the lifetime failure ledger even when every route is unavailable. Polling or
+coordinator restart cannot move its expiry; a later failed attempt receives its
+own cooldown. Unknown native claims must drain before replanning, and replayed
+observations cannot cancel a replacement from a newer plan epoch.
+
+Campaign history reduction separates native output tokens from destination
+artifact bytes. The qualified native allowance includes provider reasoning. Each
+reducer's normalized artifact must fit the successor's existing one-third summary
+allocation; its prompt requests compact JSON at half that size to leave provenance
+headroom. The actual normalized byte count remains the hard check. Oversize
+results report both observed and permitted sizes, retain immutable sources and
+consume the existing bounded failure budget. Coverage, owner-obligation audits,
+final packet limits and the eight-round convergence bound remain mandatory.
+This reducer prompt is `history-reduce-v3` and requires fresh reducer semantic
+qualification; unchanged extraction, audit and finite-contract proofs remain valid.
+
 Semantic qualification uses schema-2 proofs for exact operation, effort and
 earned transport-evidence hash. A capability may reference several independent
 proofs for history extraction, reduction, audit and the separate constraint or
@@ -693,10 +711,15 @@ acknowledgement was 0.617 seconds; the measured scenario took 994.09 seconds. Th
 demonstrates tested concurrency and responsiveness, not maximum throughput or a
 REM/provider benchmark.
 
-Only exact earned Grok and Muse routes have the applicable native qualification;
-the five shipped harness contracts are not a claim that every model, effort,
-permission mode or continuation path is qualified. Claude/Codex/AGY deployment
-routes and approved Astra/Fable reasoning roles need their matching evidence.
+At that earlier milestone only exact Grok and Muse routes had applicable native
+qualification. The delivery extension has since earned writer evidence for exact
+Claude/Fable, Codex/Astra, Grok, AGY/Flash and Muse recipes, plus separate read-only
+and single native-review recipes. These exercise roughly 128 KiB of input, actual
+scoped edits/commits, protected paths, native identity, usage and lifecycle. Input
+bytes are not tokens; the results do not qualify every model, effort, permission
+mode or full-history continuation path. Changed transport dependencies require
+fresh proof. Writable continuation and the actual main/custom native review pair
+remain separate gates, followed by installation-bound revalidation.
 The frozen code candidate `276daa62` passed the integrated regression suite with
 20,391 passes and 261 skips in 664.86 seconds; the dedicated scale case is run
 separately. Pyright, Trunk, package build, isolated wheel installation and release

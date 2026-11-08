@@ -1,6 +1,6 @@
 # ADR 0002: A deterministic SDLC campaign with GitHub delivery
 
-- **Status:** Delivery completion in progress; review repairs and activation extension pending
+- **Status:** Delivery completion in progress; native continuation, final reviews and activation pending
 - **Date:** 2026-11-05
 - **Scope:** An opt-in campaign supervisor, isolated workers, planning, GitHub synchronization and native Paradev reflection
 
@@ -45,8 +45,9 @@ Merge, exact-commit installation, canonical-base update and qualified REM delive
 remain later gates of the original objective. A green suite, disabled automations
 or a locally completed story cannot substitute for those gates.
 
-The frozen implementation passed its integrated regression suite, packaging and
-static checks, and two independent reviews found no open findings. Normal-runtime
+The earlier `276daa62` implementation passed its integrated regression suite,
+packaging and static checks, and two independent reviews found no open findings.
+These results do not qualify the later delivery extension. Normal-runtime
 coverage also demonstrates live history warmup, quota handoff, exact prefix reuse,
 fresh owner-constraint audits and fenced successor delivery. The fresh scripted
 48-story load and stop/resume qualification passed against the same frozen

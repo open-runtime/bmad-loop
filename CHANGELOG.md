@@ -25,6 +25,7 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Persist handoff retry cooldowns and bound reduced artifacts separately from native reasoning output.
 - Preserve BMAD stage result fields through Codex's closed native output schema.
 - Bound native stream and hook framing separately from model output, and preserve Grok terminal-result attribution.
 - Preserve native acceptance in landing-repair drafts without granting source lifecycle writes.

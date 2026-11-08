@@ -901,6 +901,14 @@ Output token limits use verified native telemetry when available, including the
 provider's reported reasoning contribution. Unknown usage retains a conservative
 UTF-8 byte bound. Model-supplied usage fields do not establish that measurement.
 
+Campaign reducers separately bound the normalized summary artifact in UTF-8 bytes.
+Their prompts state both the native token allowance and the compact-result goal;
+provider reasoning does not consume the artifact's byte allocation. Provenance
+expansion must fit the same checked artifact limit. Oversized results retain their
+sources and fail with explicit observed/bound sizes, without dropping owner
+obligations. Retry cooldowns are persisted per failed attempt, so polling and
+restart do not continually postpone the only available route.
+
 Completed job receipts and validated results allow the same command to resume;
 changed sources, route or limits require a new trial directory. Failure stops new
 admissions while existing bounded jobs drain. `--reuse PRIOR_DIRECTORY` follows
