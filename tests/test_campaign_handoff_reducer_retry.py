@@ -16,6 +16,28 @@ from bmad_loop.campaign_summary import SummaryJobSpec, load_input, quote_catalog
 from bmad_loop.campaign_supervisor import Observation
 
 
+@pytest.mark.parametrize(
+    ("input_limit", "context", "reserved", "expected"),
+    [(99662, 200000, 65536, 33447), (500000, 100000, 10000, 40848)],
+)
+def test_input_delivery_and_total_context_have_independent_output_reserves(
+    input_limit, context, reserved, expected
+):
+    from bmad_loop.campaign_model import RoleCandidate
+
+    cap = {
+        "input_tokens": input_limit,
+        "output_tokens": 32768,
+        "context_tokens": context,
+        "reserved_tokens": reserved,
+        "qualification": {"sha256": "bound-native-proof"},
+    }
+    budget = handoff._budget(RoleCandidate("claude", "claude-test", "max"), cap)
+    assert budget.payload_tokens == expected
+    assert (budget.payload_tokens + budget.prompt_tokens + budget.working_tokens) * 2 <= input_limit
+    assert budget.payload_tokens + 16384 + budget.output_tokens + reserved <= context
+
+
 def summary_result(row, size):
     spec = SummaryJobSpec(**row["request"]["coordinates"]["summary_spec"])
     facts = [

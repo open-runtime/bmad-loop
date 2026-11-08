@@ -1555,6 +1555,11 @@ class CampaignRuntime:
         elif kind in {"stop", "terminate-workers"}:
             snapshot.phase = "draining"
             for pending in snapshot.outbox:
+                if pending.kind == "reasoning-launch":
+                    from .campaign_reasoning_flow import defer_never_submitted
+
+                    defer_never_submitted(self, snapshot, pending)
+                    continue
                 if pending.kind != "launch" or pending.state != "prepared":
                     continue
                 pending.state = "rejected"

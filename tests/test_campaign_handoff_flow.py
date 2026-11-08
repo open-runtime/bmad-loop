@@ -524,6 +524,7 @@ def test_native_review_uses_explicit_review_pool_and_preserves_dev_candidate(cam
     flow.apply(runtime, snapshot, action, flow.perform(runtime, snapshot, action))
     value["capture"] = {"audit_context": flow._audit_context(snapshot, unit)}
     value["phase"] = "ready"
+    value["packet"] = {"read_only": False}
     proposal = flow.resume_proposal(snapshot, unit)
     assert proposal.payload["candidate"] == original
     assert proposal.payload["review_candidate"]["profile"] == "claude"

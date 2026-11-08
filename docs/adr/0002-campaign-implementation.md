@@ -62,6 +62,9 @@ steering. Acknowledgement distinguishes transport submission, BMAD acceptance,
 model delivery and application. Never reopen a writer for late mail. An hcom PR
 is not a prerequisite for this design. TeamRouter is required where the selected
 route supports it; other routes explicitly report their native routing backend.
+Steering selects the exact unit/job before applying page and byte bounds, so
+another job's backlog cannot hide the target's accepted message. Prepared context
+remains immutable; later mail waits for the next boundary.
 
 Qualify actual native review invocation separately from prompted model review.
 REM's selected base comparison and complementary native review retain exact

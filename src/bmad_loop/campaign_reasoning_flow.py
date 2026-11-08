@@ -18,6 +18,80 @@ PREFIX = "reasoning-"
 WORKSPACE_WAIT = "Waiting for an owned Paradev workspace; unit allocation will resume this job"
 
 
+def admission_reason(snapshot, unit_id):
+    """Controls prevent new reasoning sessions, never observation of existing ones."""
+    if snapshot.phase != "active":
+        return "campaign is not active"
+    unit = snapshot.units.get(unit_id)
+    if unit and unit.hold and unit.hold.kind == "operator":
+        return "unit is held by the operator"
+    return ""
+
+
+def _deferred(row, reason):
+    return Observation(
+        "confirmed", {"state": "deferred", "reason": reason, "effect_binding": _binding(row)}
+    )
+
+
+def _launch_guard(runtime, snapshot, row, action, path):
+    """Recheck committed control authority and the immediate scoped hold channel.
+
+    A native intent is already an uncertain external effect. Its real outcome
+    must be observed even if a hold/stop arrived while preparation was running.
+    """
+    from . import campaign_hold
+
+    if (path.parent / "launch-intent.json").exists():
+        return None
+    try:
+        latest = runtime.store.load(snapshot.id)
+    except (CampaignError, OSError, ValueError) as exc:
+        return Observation("unknown", reason=str(exc), retry_at=runtime.clock() + 5)
+    current_row = latest.jobs.get(row["id"])
+    if current_row is None or _binding(current_row) != _binding(row):
+        return Observation("confirmed", {"state": "settled", "effect_binding": _binding(row)})
+    reason = admission_reason(latest, row["request"]["unit"])
+    if not reason and campaign_hold.active(
+        campaign_hold.channel(runtime.store.directory(snapshot.id), row["request"]["unit"]),
+        campaign=snapshot.id,
+        unit=row["request"]["unit"],
+    ):
+        reason = "unit is held by the operator channel"
+    if not reason:
+        owned = next((item for item in latest.outbox if item.id == action.id), None)
+        if (
+            owned is None
+            or owned.state not in {"prepared", "sent_unknown"}
+            or (current_row.get("claim") or {}).get("quiescent")
+        ):
+            reason = "reasoning launch no longer owns admission"
+    return _deferred(row, reason) if reason else None
+
+
+def defer_never_submitted(runtime, snapshot, action):
+    """Cancel only an exact durably prepared attempt, preserving resumability."""
+    row = snapshot.jobs.get(action.payload.get("job_id"))
+    claim = (row or {}).get("claim") or {}
+    if (
+        action.state != "prepared"
+        or not row
+        or row["state"] != "prepared"
+        or claim.get("quiescent")
+        or claim.get("status") != "prepared"
+        or claim.get("launch_id") != action.id
+        or _superseded(row, action)
+        or (Path(claim["run_dir"]) / "launch-intent.json").exists()
+    ):
+        return False
+    apply(runtime, snapshot, action, _deferred(row, "campaign drained before launch submission"))
+    if not claim.get("quiescent"):
+        return False
+    action.state = "rejected"
+    action.error = row["reason"]
+    return True
+
+
 def presentation(snapshot, request):
     """Bind read-only jobs to an existing owned workspace, never the coordinator's cwd."""
     if not snapshot.spec.paradev.reflect:
@@ -102,7 +176,7 @@ def proposals(runtime, snapshot) -> tuple[Proposal, ...]:
             ):
                 result.append(Proposal(kind, request.unit, {"job_id": job_id}))
             continue
-        if row["state"] in TERMINAL or snapshot.phase != "active":
+        if row["state"] in TERMINAL or admission_reason(snapshot, request.unit):
             continue
         # Canonical context can change without a graph edit (a hold, remote
         # answer, head or delivery). Retire obsolete advice before retry clocks
@@ -185,6 +259,20 @@ def prepare_effect(runtime, snapshot, action) -> None:
     if live(row):
         raise CampaignError("reasoning job already has an unreconciled claim")
     request = request_from_dict(row["request"])
+    reason = admission_reason(snapshot, request.unit)
+    if reason:
+        action.payload["job_binding"] = _binding(row)
+        action.state = "confirmed"
+        action.receipt = {"state": "deferred", "reason": reason, "effect_binding": _binding(row)}
+        row["reason"] = reason
+        add_event(
+            snapshot,
+            "reasoning-admission-deferred",
+            unit=request.unit,
+            job_id=row["id"],
+            reason=reason,
+        )
+        return
     candidate = RoleCandidate(
         **{
             **action.payload["candidate"],
@@ -295,8 +383,23 @@ def perform(runtime, snapshot, action, *, reconcile: bool = False) -> Observatio
         return Observation("confirmed", {})
     claim = row.get("claim") or {}
     path = Path(claim["run_dir"]) / "request.json"
+    if (
+        claim.get("quiescent")
+        and claim.get("status") == "not_launched"
+        and not (path.parent / "launch-intent.json").exists()
+    ):
+        return Observation("confirmed", {"state": "settled", "effect_binding": _binding(row)})
     runner = _runner(runtime, snapshot)
     if action.kind == "reasoning-launch":
+        deferred = _launch_guard(runtime, snapshot, row, action, path)
+        if deferred is not None:
+            return deferred
+        if (path.parent / "launch-intent.json").exists() and not path.exists():
+            return Observation(
+                "unknown",
+                reason="reasoning launch intent has no readable request",
+                retry_at=runtime.clock() + 5,
+            )
         if not path.exists():
             candidate = RoleCandidate(
                 **{
@@ -356,6 +459,9 @@ def perform(runtime, snapshot, action, *, reconcile: bool = False) -> Observatio
                             **{**nav, "names": (managed_binding["name"],)}
                         ),
                     }
+                deferred = _launch_guard(runtime, snapshot, row, action, path)
+                if deferred is not None:
+                    return deferred
                 path = runner.prepare(
                     path.parent,
                     request,
@@ -376,9 +482,12 @@ def perform(runtime, snapshot, action, *, reconcile: bool = False) -> Observatio
                 if (path.parent / "launch-intent.json").exists():
                     return Observation("unknown", reason=str(exc), retry_at=runtime.clock() + 5)
                 return Observation("confirmed", {"state": "preparation_failed", "reason": str(exc)})
+        deferred = _launch_guard(runtime, snapshot, row, action, path)
+        if deferred is not None:
+            return deferred
         observed = (
             runner.observe(path)
-            if reconcile and (path.parent / "launch-intent.json").exists()
+            if (path.parent / "launch-intent.json").exists()
             else runner.launch(path)
         )
     elif action.kind == "reasoning-terminate":
@@ -503,6 +612,18 @@ def apply(runtime, snapshot, action, observation) -> None:
                 row["retry_at"] = runtime.clock() + 15
             else:
                 row["application"], row["state"] = "applied", "applied"
+    elif data.get("state") == "deferred":
+        claim = row.get("claim")
+        if claim and (Path(claim["run_dir"]) / "launch-intent.json").exists():
+            claim["quiescent"] = False
+            row["state"], row["reason"] = (
+                "uncertain",
+                "native launch intent requires reconciliation",
+            )
+        else:
+            if claim:
+                claim.update(quiescent=True, status="not_launched")
+            row["state"], row["reason"], row["retry_at"] = "proposed", data["reason"], None
     elif data.get("state") == "preparation_failed":
         row["claim"]["quiescent"] = True
         row["state"], row["reason"] = "failed", data["reason"]

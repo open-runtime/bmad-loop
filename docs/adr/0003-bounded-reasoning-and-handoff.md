@@ -158,6 +158,13 @@ background reports may be explicitly canceled and journaled, but a campaign cann
 report stopped or fully drained while a job remains live or ownership is unknown.
 Parent cancellation cannot leave untracked orphan workers.
 
+Stop cancels a durably prepared reasoning launch only when no native launch intent
+exists. Sent or uncertain launches remain under observation. Operator holds block
+new unit-scoped reasoning at admission and again at the last native launch
+boundary, using current persisted authority and the scoped hold channel. A deferred
+launch consumes no failure budget and can resume after release; existing native
+receipts and monotonic attempt identities remain intact.
+
 Use a dedicated reasoning-worker mode with immutable input manifests, not a
 development stage that assumes its whole working tree stays unchanged. Concurrent
 snapshot readers must tolerate legitimate unit edits elsewhere without accepting
@@ -389,6 +396,12 @@ when selecting independent reviewers. Attach hcom/Paradev to the new session and
 retain old history; late predecessor events cannot act as current control input.
 The successor re-observes work state before continuing the interrupted stage.
 Transfer success never marks implementation, review or delivery complete.
+
+The interrupted stage's frozen permission contract also survives replacement.
+Read-only planning or publication review does not require a writer capability or
+receive a writable packet. Legacy development reviews that are explicitly allowed
+to repair retain that existing contract. The native review pair additionally
+requires its own qualified two-review operation; generic review cannot replace it.
 
 ## Implementation sequence and qualification
 
@@ -970,6 +983,12 @@ an unknown worker claim prevents replacement. Other limit kinds retry the curren
 reducer without re-extracting the complete conversation. Scripted regression
 coverage follows failed receipt, persisted cooldown, restart, splitting, successful
 combination, auditing and successor assembly through the normal proposal path.
+
+Planning treats the earned input allowance separately from the total context
+window. Output consumes total context, but is not charged a second time against
+the input-only allowance. Conservative JSON wrapping and prompt/working reserves
+still bound planned payloads; the fully rendered request must independently pass
+native admission. No budget adjustment grants a larger native capability.
 
 Explicit trial reuse follows only retained bindings and revalidates each source,
 native receipt and earned route qualification. Map and reducer routes may use
