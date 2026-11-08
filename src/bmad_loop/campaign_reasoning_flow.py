@@ -52,11 +52,17 @@ def _launch_guard(runtime, snapshot, row, action, path):
     current_row = latest.jobs.get(row["id"])
     if current_row is None or _binding(current_row) != _binding(row):
         return Observation("confirmed", {"state": "settled", "effect_binding": _binding(row)})
+    request = request_from_dict(current_row["request"])
     reason = (
-        admission_reason(latest, row["request"]["unit"])
-        if current(latest, request_from_dict(current_row["request"]))
+        admission_reason(latest, request.unit)
+        if current(latest, request)
         else "reasoning request is no longer current"
     )
+    if not reason and request.coordinates.get("history_warmup"):
+        from .campaign_history_warmup import launch_allowed
+
+        if not launch_allowed(latest, request):
+            reason = "history warmup no longer admits new sessions"
     if not reason and campaign_hold.active(
         campaign_hold.channel(runtime.store.directory(snapshot.id), row["request"]["unit"]),
         campaign=snapshot.id,

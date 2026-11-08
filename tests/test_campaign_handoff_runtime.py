@@ -4,8 +4,9 @@ import copy
 import dataclasses
 import json
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 
+import pytest
 from test_campaign_handoff_flow import campaign as campaign
 from test_campaign_headless import prepared as prepared
 from test_campaign_runtime import diagnose
@@ -21,10 +22,14 @@ class ScriptedReasoning:
 
     def __init__(self):
         self.prepare = HeadlessRunner().prepare
+        self.completed = {}
 
     def launch(self, path, *, admission=None):
-        with admission() if admission is not None else nullcontext():
-            return self._launch(path)
+        if path not in self.completed:
+            with admission() if admission is not None else nullcontext():
+                observed = self._launch(path)
+            self.completed[path] = copy.deepcopy(observed)
+        return self.observe(path)
 
     def _launch(self, path):
         envelope = read_json(path)
@@ -92,7 +97,90 @@ class ScriptedReasoning:
             },
         }
 
-    observe = launch
+    def observe(self, path):
+        if path not in self.completed:
+            return {"state": "unknown", "reason": "No admitted scripted launch completed"}
+        return copy.deepcopy(self.completed[path])
+
+
+@pytest.fixture
+def scripted_reasoning(tmp_path, prepared, monkeypatch):
+    from bmad_loop.campaign_handoff_flow import AUDIT_SCHEMA
+
+    _, _, request, candidate, capability = prepared
+    request = dataclasses.replace(
+        request,
+        purpose="handoff_audit",
+        role="handoff_audit",
+        coordinates={
+            **request.coordinates,
+            "handoff_id": "handoff",
+            "capture_digest": "capture",
+            "owner_ids": [],
+            "owner_spans": [],
+            "obligation_ids": [],
+        },
+        output_schema=AUDIT_SCHEMA,
+    )
+    runner = ScriptedReasoning()
+    path = runner.prepare(
+        tmp_path / "scripted",
+        request,
+        candidate,
+        capability,
+        launch_id="scripted",
+        generation=1,
+    )
+    launches = []
+    original = runner._launch
+
+    def launched(path):
+        launches.append(path)
+        return original(path)
+
+    monkeypatch.setattr(runner, "_launch", launched)
+    return runner, path, launches
+
+
+def test_scripted_observation_cannot_complete_a_rejected_launch(scripted_reasoning):
+    runner, path, launches = scripted_reasoning
+
+    @contextmanager
+    def rejected():
+        raise RuntimeError("admission denied")
+        yield
+
+    assert runner.observe(path)["state"] == "unknown"
+    with pytest.raises(RuntimeError, match="admission denied"):
+        runner.launch(path, admission=rejected)
+    observed = runner.observe(path)
+    assert observed["state"] == "unknown"
+    assert "receipt" not in observed
+    assert launches == []
+
+
+def test_scripted_observation_replays_only_recorded_completion(scripted_reasoning):
+    runner, path, launches = scripted_reasoning
+    admissions = []
+
+    @contextmanager
+    def admitted():
+        admissions.append("enter")
+        yield
+        admissions.append("exit")
+
+    first = runner.launch(path, admission=admitted)
+    assert first["state"] == "finished"
+    assert first["receipt"]["outcome"] == "completed"
+    assert first["receipt"]["quiescent"] is True
+    expected = copy.deepcopy(first)
+    first["receipt"]["result"]["constraints"].append({"caller": "mutation"})
+    observed = runner.observe(path)
+    assert observed == expected
+    observed["receipt"]["usage"]["output_tokens"] = 999
+    assert runner.observe(path) == expected
+    assert launches == [path]
+    assert admissions == ["enter", "exit"]
 
 
 def test_real_worker_quota_continues_same_pr_through_normal_supervisor(

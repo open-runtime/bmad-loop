@@ -30,7 +30,7 @@ class ObservedReasoning(ScriptedReasoning):
         self.campaign_id = campaign_id
         self.launches = []
 
-    def launch(self, path):
+    def _launch(self, path):
         request = read_json(path)["request"]
         coordinates = request["coordinates"]
         if coordinates.get("history_warmup"):
@@ -41,7 +41,7 @@ class ObservedReasoning(ScriptedReasoning):
             pid, identity = runs.read_named_pid_identity(Path(unit.claim.run_dir) / "engine.pid")
             assert runs.probe_liveness(pid, identity) == "alive"
         self.launches.append(copy.deepcopy(request))
-        return super().launch(path)
+        return super()._launch(path)
 
 
 @pytest.mark.parametrize("initial_profile", ["codex", "claude"])

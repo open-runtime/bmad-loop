@@ -2,6 +2,7 @@
 
 import dataclasses
 import json
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,6 +11,7 @@ from test_campaign_handoff_flow import campaign as campaign
 from test_campaign_headless import prepared as prepared
 
 from bmad_loop import campaign_history_warmup as warmup
+from bmad_loop import campaign_reasoning_flow as reasoning
 from bmad_loop import runs
 from bmad_loop.adapters.base import SessionHandle, SessionSpec
 from bmad_loop.campaign_jobs import current, request_from_dict
@@ -125,6 +127,109 @@ def test_hook_bound_live_capture_is_optional_and_survives_graph_change(active):
     assert not warmup.launch_allowed(snapshot, request)
     unit.claim.launch_id = "replacement"
     assert not current(snapshot, request)
+
+
+@pytest.fixture
+def prepared_warmup(active):
+    runtime, snapshot, unit, _ = active
+    snapshot.generation = 1
+    runtime._role = lambda snapshot, role, **kwargs: kwargs["allowed_candidates"][0]
+    observe(active)
+    proposal = next(
+        row for row in reasoning.proposals(runtime, snapshot) if row.kind == "reasoning-launch"
+    )
+    action = OutboxAction(
+        "warmup-launch", proposal.kind, unit.id, proposal.payload, snapshot.generation
+    )
+    reasoning.prepare_effect(runtime, snapshot, action)
+    snapshot.outbox.append(action)
+    snapshot = runtime.store.save(snapshot, snapshot.revision)
+    row = snapshot.jobs[action.payload["job_id"]]
+    return (
+        runtime,
+        snapshot,
+        snapshot.units[unit.id],
+        row,
+        action,
+        Path(row["claim"]["run_dir"]) / "request.json",
+    )
+
+
+@pytest.mark.parametrize("boundary", ["quiescence", "handoff"])
+def test_final_admission_defers_unstarted_warmup_after_preparation(prepared_warmup, boundary):
+    runtime, snapshot, unit, row, action, path = prepared_warmup
+    request = request_from_dict(row["request"])
+    assert warmup.launch_allowed(snapshot, request)
+    if boundary == "quiescence":
+        unit.claim.quiescent = True
+    else:
+        unit.evidence["handoff"] = {"phase": "drain"}
+    runtime.store.save(snapshot, snapshot.revision)
+    assert current(snapshot, request)
+    assert not warmup.launch_allowed(snapshot, request)
+    guarded = reasoning._launch_guard(runtime, snapshot, row, action, path)
+    assert guarded is not None
+    assert guarded.data["state"] == "deferred"
+    reasoning.apply(runtime, snapshot, action, guarded)
+    assert row["claim"]["quiescent"] and row["claim"]["status"] == "not_launched"
+    assert row["state"] == "proposed" and row.get("failure_attempts", 0) == 0
+    assert not (path.parent / "launch-intent.json").exists()
+
+
+def test_issued_warmup_completes_and_reuses_after_writer_quiescence(
+    active, prepared_warmup, tmp_path, monkeypatch
+):
+    from test_campaign_handoff_runtime import ScriptedReasoning
+
+    from bmad_loop.campaign_handoff_flow import _cap
+    from bmad_loop.campaign_headless import write_json
+    from bmad_loop.campaign_supervisor import Observation
+
+    runtime, snapshot, unit, row, action, path = prepared_warmup
+    request = request_from_dict(row["request"])
+    candidate = request.candidates[0]
+    runner = ScriptedReasoning()
+    runtime.reasoning_runner = runner
+    runner.prepare(
+        path.parent,
+        request,
+        candidate,
+        _cap(snapshot, candidate, "reasoning"),
+        launch_id=action.id,
+        generation=action.generation,
+    )
+
+    @contextmanager
+    def admitted():
+        with reasoning._admission(runtime, snapshot, row, action, path):
+            write_json(
+                path.parent / "launch-intent.json",
+                {
+                    "launch_id": action.id,
+                    "generation": action.generation,
+                    "phase": "window-pending",
+                },
+            )
+            yield
+
+    completed = runner.launch(path, admission=admitted)
+    unit.claim.quiescent = True
+    runtime.store.save(snapshot, snapshot.revision)
+    assert not warmup.launch_allowed(snapshot, request)
+    monkeypatch.setattr(runner, "launch", lambda *a, **kw: pytest.fail("replacement launch"))
+    assert reasoning._launch_guard(runtime, snapshot, row, action, path) is None
+    observed = reasoning.perform(runtime, snapshot, action, reconcile=True)
+    assert observed.data["receipt"] == completed["receipt"]
+    reasoning.apply(runtime, snapshot, action, observed)
+    assert row["state"] == "validated" and row["claim"]["quiescent"]
+    apply_action = OutboxAction(
+        "warmup-apply", "reasoning-apply", unit.id, {"job_id": row["id"]}, snapshot.generation
+    )
+    reasoning.prepare_effect(runtime, snapshot, apply_action)
+    reasoning.apply(runtime, snapshot, apply_action, Observation("confirmed", {}))
+    assert row["state"] == "applied"
+    completed, rejected = warmup.reusable(runtime, snapshot, unit, final_sources(active, tmp_path))
+    assert [spec.id for spec, _ in completed] == [row["id"]] and not rejected
 
 
 def test_appended_tail_reuses_complete_prefix_but_rewrite_drops_old_facts(active, tmp_path):

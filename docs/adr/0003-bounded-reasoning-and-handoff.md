@@ -174,6 +174,10 @@ work through its existing lifecycle. Direct headless child stages use the same
 scoped authority boundary. Ordinary drain still permits an already admitted
 bounded child stage; an operator hold or hard stop suppresses its next session.
 Never turn an uncertain existing intent into permission to launch another worker.
+Optional history warmup has a separate launch condition: recheck that its writer
+is still eligible before a new native intent. A prefix can remain valid for
+completion or reuse after its writer exits without authorizing a fresh optional
+session. Keep observation of admitted work separate from new launch eligibility.
 
 Use a dedicated reasoning-worker mode with immutable input manifests, not a
 development stage that assumes its whole working tree stays unchanged. Concurrent

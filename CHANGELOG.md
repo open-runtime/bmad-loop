@@ -7,6 +7,10 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Fixed
+
+- Recheck optional history warmup eligibility at final native admission while retaining admitted work.
+
 ## [0.15.2] — 2026-11-08
 
 ### Added

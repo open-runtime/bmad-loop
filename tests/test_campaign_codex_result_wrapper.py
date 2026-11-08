@@ -44,9 +44,13 @@ def run_result(tmp_path, protocol, result, *, outcome="completed", native_review
         write_json(path.parent / "receipt.json", receipt)
         return path
 
+    def launch(request, *, admission):
+        with admission():
+            return {"native_id": "native"}
+
     adapter.runner = SimpleNamespace(
         prepare=prepare,
-        launch=lambda request: {"native_id": "native"},
+        launch=launch,
         observe=lambda request: {"state": "finished", "receipt": receipt},
     )
     spec = SessionSpec(
