@@ -173,6 +173,43 @@ def _native(path, code, *arguments):
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="macOS execution confinement")
+@pytest.mark.parametrize("existing_auto_merge", [False, True])
+def test_commit_cleans_private_auto_merge_ref_without_permission_errors(
+    git_writer, project, existing_auto_merge
+):
+    path, workspace = git_writer
+    baseline = git(project.project, "rev-parse", "main").strip()
+    script = """import os,subprocess
+from pathlib import Path
+Path('src/owned.txt').write_text('resolved product')
+subprocess.run(['git','add','src/owned.txt'],check=True)
+result=subprocess.run(['git','commit','-qm','accepted resolution'],capture_output=True,text=True)
+assert result.returncode==0, result.stderr
+assert not result.stderr.strip(), result.stderr
+assert not (Path(os.environ['GIT_DIR'])/'AUTO_MERGE').exists()
+"""
+    argv, cwd, environment = command(path, [str(Path(sys.executable).resolve()), "-c", script])
+    if existing_auto_merge:
+        # Controller seeds an actual private merge-tree ref; the native commit
+        # must remove it through Git's own ref transaction inside confinement.
+        result = subprocess.run(
+            ["git", "update-ref", "AUTO_MERGE", "HEAD^{tree}"],
+            cwd=cwd,
+            env=environment,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+    result = subprocess.run(argv, cwd=cwd, env=environment, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    from bmad_loop.campaign_native_git import publish
+
+    head = publish(workspace, baseline, directory=path.parent, final=True)
+    assert git(project.project, "show", head + ":src/owned.txt") == "resolved product"
+    assert git(project.project, "rev-parse", "main").strip() == baseline
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS execution confinement")
 def test_whole_product_scope_keeps_git_and_controller_state_readonly(git_writer):
     path, workspace = git_writer
     value = json.loads(path.read_text())

@@ -165,6 +165,11 @@ def write_paths(record):
             "MERGE_MSG",
             "MERGE_MODE",
             "AUTO_MERGE",
+            "AUTO_MERGE.lock",
+            # Git locks the packed-ref snapshot when deleting AUTO_MERGE even
+            # when that pseudo-ref has no packed entry. The snapshot itself
+            # remains immutable, so pack-refs cannot replace protected refs.
+            "packed-refs.lock",
             "CHERRY_PICK_HEAD",
             "REVERT_HEAD",
             "sequencer",
