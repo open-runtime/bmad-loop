@@ -402,6 +402,11 @@ Read-only planning or publication review does not require a writer capability or
 receive a writable packet. Legacy development reviews that are explicitly allowed
 to repair retain that existing contract. The native review pair additionally
 requires its own qualified two-review operation; generic review cannot replace it.
+Initial fallback, route refresh and final successor admission use the same current
+contributor-family exclusions for independent publication review. An explicit
+author-family choice is refused with its reason. Replacement capacity or an
+inadmissible saved route cannot prevent the owned predecessor from draining;
+unknown claims and unrelated operator holds remain authoritative.
 
 ## Implementation sequence and qualification
 
@@ -989,6 +994,10 @@ window. Output consumes total context, but is not charged a second time against
 the input-only allowance. Conservative JSON wrapping and prompt/working reserves
 still bound planned payloads; the fully rendered request must independently pass
 native admission. No budget adjustment grants a larger native capability.
+Reducer grouping measures the exact native-event projection, including its
+source-input wrapper. The complete child summaries remain hash-bound and retained.
+This avoids rejecting a usable route because internal metadata omitted from the
+model input exceeds its window, while still refusing an oversized projected child.
 
 Explicit trial reuse follows only retained bindings and revalidates each source,
 native receipt and earned route qualification. Map and reducer routes may use

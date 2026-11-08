@@ -7,6 +7,11 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Fixed
+
+- Apply contributor-family exclusions during review handoff and drain predecessors before replacement capacity waits.
+- Plan reducer windows from the exact projected input while retaining complete original summaries.
+
 ## [0.15.0] — 2026-11-08
 
 ### Added

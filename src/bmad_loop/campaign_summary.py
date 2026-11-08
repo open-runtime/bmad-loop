@@ -560,58 +560,72 @@ def plan_reduction(
     *,
     count: TokenCounter = byte_token_bound,
     artifact_bytes: int = 0,
+    project_native_events: bool = False,
 ) -> tuple[SummaryJobSpec, ...]:
-    """Partition cited child summaries into bounded reducer jobs; never clip a child."""
+    """Partition whole children using exactly the representation the model receives."""
     jobs, batch = [], []
 
-    def emit(items: list[tuple[SummaryJobSpec, dict[str, Any]]]) -> None:
+    def prepare(
+        items: list[tuple[SummaryJobSpec, dict[str, Any]]],
+    ) -> tuple[SummaryJobSpec, bytes, int]:
         payload = {
             "schema_version": 1,
             "children": [{"job_id": job.id, "summary": result} for job, result in items],
         }
         data = encoded(payload)
-        path = blob(artifact_root, data)
-        jobs.append(
-            SummaryJobSpec(
-                digest([payload, asdict(budget), REDUCE_PROMPT_VERSION, artifact_bytes]),
-                "handoff-reduce",
-                str(path),
-                hashlib.sha256(data).hexdigest(),
-                count(data.decode()),
-                budget.output_tokens,
-                budget.route,
-                tuple(job.id for job, _ in items),
-                tuple(
-                    dict.fromkeys(
-                        ref
-                        for _, result in items
-                        for fact in result["facts"]
-                        for ref in fact["citations"]
-                    )
-                ),
-                tuple(job.id for job, _ in items),
-                prompt_version=REDUCE_PROMPT_VERSION,
-                artifact_bytes=artifact_bytes,
-            )
+        sha256 = hashlib.sha256(data).hexdigest()
+        # blob() has a content-addressed path; rejected candidate groups do not
+        # need to write transient copies merely to measure their source wrapper.
+        spec = SummaryJobSpec(
+            digest([payload, asdict(budget), REDUCE_PROMPT_VERSION, artifact_bytes]),
+            "handoff-reduce",
+            str(artifact_root / (sha256 + ".json")),
+            sha256,
+            count(data.decode()),
+            budget.output_tokens,
+            budget.route,
+            tuple(job.id for job, _ in items),
+            tuple(
+                dict.fromkeys(
+                    ref
+                    for _, result in items
+                    for fact in result["facts"]
+                    for ref in fact["citations"]
+                )
+            ),
+            tuple(job.id for job, _ in items),
+            prompt_version=REDUCE_PROMPT_VERSION,
+            artifact_bytes=artifact_bytes,
         )
+        size = (
+            count(encoded(_native_reduction_payload(spec, payload)).decode())
+            if project_native_events
+            else spec.input_tokens
+        )
+        return spec, data, size
+
+    def emit(items: list[tuple[SummaryJobSpec, dict[str, Any]]]) -> None:
+        spec, data, planned_size = prepare(items)
+        if str(blob(artifact_root, data)) != spec.input_path:
+            raise CampaignError("Reduction source path differs from its measured wrapper")
+        if project_native_events:
+            spec = project_reduction_input(spec, artifact_root, count=count)
+        if spec.input_tokens != planned_size or spec.input_tokens > budget.payload_tokens:
+            raise CampaignError("Emitted reduction differs from its qualified input budget")
+        jobs.append(spec)
 
     for child in children:
         if child[1].get("job_id") != child[0].id or child[1].get("structural_coverage") is not True:
             raise CampaignError("reduction requires validated child identity and coverage")
         proposed = [*batch, child]
-        payload = {
-            "schema_version": 1,
-            "children": [{"job_id": job.id, "summary": result} for job, result in proposed],
-        }
-        if count(encoded(payload).decode()) > budget.payload_tokens:
+        if prepare(proposed)[2] > budget.payload_tokens:
             if not batch:
                 raise CampaignError(
                     "child summary exceeds reducer window; re-extract with smaller output"
                 )
             emit(batch)
             batch = []
-            payload["children"] = [{"job_id": child[0].id, "summary": child[1]}]
-            if count(encoded(payload).decode()) > budget.payload_tokens:
+            if prepare([child])[2] > budget.payload_tokens:
                 raise CampaignError(
                     "child summary exceeds reducer window; re-extract with smaller output"
                 )
@@ -707,18 +721,8 @@ def corrective_spec(
     )
 
 
-def project_reduction_input(job: SummaryJobSpec, artifact_root: Path) -> SummaryJobSpec:
-    """Separate native citations from internal fact identities without losing sources.
-
-    A reducer needs child coverage identities, semantic facts and native source
-    citations. Internal fact/fragment hashes are provenance, not eligible model
-    citations; their complete original payload remains hash-bound and retained.
-    """
-    payload = load_input(job)
-    if job.purpose != "handoff-reduce":
-        raise CampaignError("Citation presentation applies only to reducer inputs")
-    if payload.get("citation_presentation") == "native-events-v1":
-        return job
+def _native_reduction_payload(job: SummaryJobSpec, payload: dict[str, Any]) -> dict[str, Any]:
+    """The shared native-events-v1 view, including its complete original-source binding."""
     fields = {
         "kind",
         "text",
@@ -728,7 +732,7 @@ def project_reduction_input(job: SummaryJobSpec, artifact_root: Path) -> Summary
         "source_quote_id",
         "authority",
     }
-    value = {
+    return {
         "schema_version": 1,
         "citation_presentation": "native-events-v1",
         "source_input": {"path": job.input_path, "sha256": job.input_sha256, "job_id": job.id},
@@ -746,6 +750,18 @@ def project_reduction_input(job: SummaryJobSpec, artifact_root: Path) -> Summary
             for child in payload["children"]
         ],
     }
+
+
+def project_reduction_input(
+    job: SummaryJobSpec, artifact_root: Path, *, count: TokenCounter = byte_token_bound
+) -> SummaryJobSpec:
+    """Present native citations while retaining the hash-bound complete original payload."""
+    payload = load_input(job)
+    if job.purpose != "handoff-reduce":
+        raise CampaignError("Citation presentation applies only to reducer inputs")
+    if payload.get("citation_presentation") == "native-events-v1":
+        return job
+    value = _native_reduction_payload(job, payload)
     content = encoded(value)
     path = blob(artifact_root, content)
     return replace(
@@ -753,7 +769,7 @@ def project_reduction_input(job: SummaryJobSpec, artifact_root: Path) -> Summary
         id=digest([job.id, value, "native-citation-presentation-v1"]),
         input_path=str(path),
         input_sha256=hashlib.sha256(content).hexdigest(),
-        input_tokens=len(content),
+        input_tokens=count(content.decode()),
         dependencies=job.dependencies,
     )
 

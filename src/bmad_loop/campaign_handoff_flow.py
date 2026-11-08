@@ -103,8 +103,32 @@ def _permission(value):
     return expected
 
 
-def _target_cap(snapshot, candidate, role, *, permissions=None):
-    """Continue with the same permission boundary; native pairs remain pair-only."""
+def _unit_admission(unit):
+    """Use current writer provenance, including mixed-family predecessor sessions."""
+    return {
+        "developer_family": unit.evidence.get("developer_family", ""),
+        "developer_families": tuple(unit.evidence.get("developer_families", ())),
+    }
+
+
+def _target_cap(snapshot, candidate, role, *, unit, permissions=None):
+    """One frozen permission and author policy for selection through adoption."""
+    from .campaign_headless import provider_family
+
+    if candidate not in snapshot.spec.candidates(role):
+        raise CampaignError("Handoff target is not in the frozen approved role pool")
+    authors = _unit_admission(unit)
+    family = candidate.provider_family or provider_family(candidate.model)
+    if (
+        role == "publication_review"
+        and snapshot.spec.github.require_independent_review
+        and (authors["developer_family"] or authors["developer_families"])
+        and family in {authors["developer_family"], *authors["developer_families"]}
+    ):
+        raise CampaignError(
+            "Publication review handoff requires a different provider family; "
+            f"{candidate.profile}:{candidate.model} belongs to author family {family!r}"
+        )
     from .campaign_route_readiness import permissions_for
 
     mode = permissions or permissions_for(role)
@@ -118,7 +142,7 @@ def _target_cap(snapshot, candidate, role, *, permissions=None):
     return cap
 
 
-def _fallback(snapshot, role, previous, requested=None, *, permissions=None):
+def _fallback(snapshot, role, previous, requested=None, *, unit, permissions=None):
     candidates = snapshot.spec.candidates(role)
     if requested is not None:
         selectors = {
@@ -136,13 +160,16 @@ def _fallback(snapshot, role, previous, requested=None, *, permissions=None):
                 "Handoff target is ambiguous; specify the exact approved profile/model/effort"
             )
         candidate = matching[0]
-        _target_cap(snapshot, candidate, role, permissions=permissions)
+        try:
+            _target_cap(snapshot, candidate, role, unit=unit, permissions=permissions)
+        except CampaignError as exc:
+            raise CampaignError(f"Requested handoff target is inadmissible: {exc}") from exc
         return candidate
     for candidate in candidates:
         if (candidate.profile, candidate.model) == previous:
             continue
         try:
-            _target_cap(snapshot, candidate, role, permissions=permissions)
+            _target_cap(snapshot, candidate, role, unit=unit, permissions=permissions)
         except CampaignError:
             continue
         return candidate
@@ -159,12 +186,24 @@ def _available_alternative(runtime, snapshot, value):
         return None
     role = value.get("route_role", value["role"])
     permissions = _permission(value)
+    unit = snapshot.units[value["predecessor"]["unit"]]
     selected = _candidate(value["candidate"])
-    if (
-        runtime._role(snapshot, role, permissions=permissions, allowed_candidates=(selected,))
-        is not None
-    ):
-        return None
+    try:
+        _target_cap(snapshot, selected, role, unit=unit, permissions=permissions)
+    except CampaignError:
+        pass
+    else:
+        if (
+            runtime._role(
+                snapshot,
+                role,
+                permissions=permissions,
+                allowed_candidates=(selected,),
+                **_unit_admission(unit),
+            )
+            is not None
+        ):
+            return None
     allowed = []
     for candidate in snapshot.spec.candidates(role):
         if candidate == selected or (candidate.profile, candidate.model) == tuple(
@@ -172,12 +211,18 @@ def _available_alternative(runtime, snapshot, value):
         ):
             continue
         try:
-            _target_cap(snapshot, candidate, role, permissions=permissions)
+            _target_cap(snapshot, candidate, role, unit=unit, permissions=permissions)
         except CampaignError:
             continue
         allowed.append(candidate)
     return (
-        runtime._role(snapshot, role, permissions=permissions, allowed_candidates=tuple(allowed))
+        runtime._role(
+            snapshot,
+            role,
+            permissions=permissions,
+            allowed_candidates=tuple(allowed),
+            **_unit_admission(unit),
+        )
         if allowed
         else None
     )
@@ -270,7 +315,9 @@ def begin(runtime, snapshot, unit, *, requested=None, reason, receipt=None):
     if route_role == "execution_review" and route_role not in dict(snapshot.spec.roles):
         target = None
     else:
-        target = _fallback(snapshot, route_role, previous, requested, permissions=permissions)
+        target = _fallback(
+            snapshot, route_role, previous, requested, unit=unit, permissions=permissions
+        )
     identifier = (
         "handoff-" + digest([snapshot.id, unit.id, claim.launch_id, snapshot.generation])[:24]
     )
@@ -518,6 +565,20 @@ def proposals(runtime, snapshot):
         phase = value.get("phase")
         if phase not in ACTIVE or snapshot.phase != "active":
             continue
+        claim = unit.claim
+        if claim and not claim.quiescent:
+            # The old role slot must be released before replacement admission.
+            # A foreign hold still owns controls for this unit.
+            if not unit.hold or unit.hold.id != value["id"]:
+                continue
+            if claim.launch_id != value["predecessor"]["launch_id"]:
+                raise CampaignError("Another writer replaced the fenced predecessor")
+            if (
+                not _pending(snapshot, unit, "terminate-worker")
+                and unit.bindings.get("stop_requested_for") != claim.launch_id
+            ):
+                result.append(Proposal("terminate-worker", unit.id, {"launch_id": claim.launch_id}))
+            continue
         alternate = _available_alternative(runtime, snapshot, value)
         if alternate is not None and (not unit.hold or unit.hold.id == value["id"]):
             if not _pending(snapshot, unit, "handoff-route"):
@@ -529,6 +590,36 @@ def proposals(runtime, snapshot):
                     )
                 )
             continue
+        if value.get("candidate"):
+            try:
+                _target_cap(
+                    snapshot,
+                    _candidate(value["candidate"]),
+                    value.get("route_role", value["role"]),
+                    unit=unit,
+                    permissions=_permission(value),
+                )
+            except CampaignError:
+                needs_route = True
+            else:
+                needs_route = bool(value.get("route_wait"))
+            if needs_route:
+                if (
+                    (not unit.hold or unit.hold.id == value["id"])
+                    and value.get("retry_at", 0) <= runtime.clock()
+                    and not _pending(snapshot, unit, "handoff-route")
+                ):
+                    result.append(
+                        Proposal(
+                            "handoff-route",
+                            unit.id,
+                            {
+                                "handoff_id": value["id"],
+                                "candidate": value["candidate"],
+                            },
+                        )
+                    )
+                continue
         if phase == "ready":
             if unit.hold:
                 continue
@@ -545,22 +636,13 @@ def proposals(runtime, snapshot):
                 snapshot,
                 value.get("route_role", value["role"]),
                 tuple(value["previous_route"]),
+                unit=unit,
                 permissions=_permission(value),
             )
             if target and not _pending(snapshot, unit, "handoff-route"):
                 result.append(
                     Proposal("handoff-route", unit.id, {"candidate": dataclasses.asdict(target)})
                 )
-            continue
-        claim = unit.claim
-        if claim and not claim.quiescent:
-            if claim.launch_id != value["predecessor"]["launch_id"]:
-                raise CampaignError("Another writer replaced the fenced predecessor")
-            if (
-                not _pending(snapshot, unit, "terminate-worker")
-                and unit.bindings.get("stop_requested_for") != claim.launch_id
-            ):
-                result.append(Proposal("terminate-worker", unit.id, {"launch_id": claim.launch_id}))
             continue
         if _debt(snapshot, unit):
             continue
@@ -1046,7 +1128,6 @@ def _reduce(runtime, snapshot, unit, value):
     from .campaign_summary import (
         SummaryJobSpec,
         plan_reduction,
-        project_reduction_input,
         summary_prompt,
         summary_schema,
     )
@@ -1062,7 +1143,11 @@ def _reduce(runtime, snapshot, unit, value):
     )
     target = _candidate(value["candidate"])
     target_cap = _target_cap(
-        snapshot, target, value.get("route_role", value["role"]), permissions=_permission(value)
+        snapshot,
+        target,
+        value.get("route_role", value["role"]),
+        unit=unit,
+        permissions=_permission(value),
     )
     ceiling = min(
         snapshot.spec.reasoning.packet_token_limit, _budget(target, target_cap).payload_tokens
@@ -1083,12 +1168,10 @@ def _reduce(runtime, snapshot, unit, value):
         budget,
         _root(runtime, snapshot, value) / "reductions",
         artifact_bytes=ceiling // 3,
+        project_native_events=True,
     )
     jobs = []
     for planned_spec in planned:
-        planned_spec = project_reduction_input(
-            planned_spec, _root(runtime, snapshot, value) / "reductions"
-        )
         spec = dataclasses.replace(
             planned_spec,
             id=digest(
@@ -1581,6 +1664,7 @@ def _constraint_plan(runtime, snapshot, unit, value):
                 snapshot,
                 target,
                 value.get("route_role", value["role"]),
+                unit=unit,
                 permissions=_permission(value),
             ),
         ).payload_tokens,
@@ -1838,7 +1922,11 @@ def _assemble(runtime, snapshot, unit, value):
         )
     target = _candidate(value["candidate"])
     cap = _target_cap(
-        snapshot, target, value.get("route_role", value["role"]), permissions=_permission(value)
+        snapshot,
+        target,
+        value.get("route_role", value["role"]),
+        unit=unit,
+        permissions=_permission(value),
     )
     summaries = tuple(_applied(_job(runtime, snapshot, key)) for key in value["jobs"])
     packet = assemble_packet(
@@ -1976,14 +2064,17 @@ def _perform(runtime, snapshot, action, *, reconcile=False):
         return Observation("confirmed", {"superseded": True})
     if action.kind == "handoff-route":
         candidate = _candidate(action.payload["candidate"])
-        cap = _target_cap(
-            snapshot,
-            candidate,
-            value.get("route_role", value["role"]),
-            permissions=_permission(value),
-        )
-        if candidate not in snapshot.spec.candidates(value.get("route_role", value["role"])):
-            raise CampaignError("Refreshed handoff route left its approved role pool")
+        try:
+            cap = _target_cap(
+                snapshot,
+                candidate,
+                value.get("route_role", value["role"]),
+                unit=unit,
+                permissions=_permission(value),
+            )
+        except CampaignError as exc:
+            label = "Requested" if value.get("requested_candidate") else "Selected"
+            raise HandoffRouteWait(f"{label} handoff target is inadmissible: {exc}") from exc
         packet = value.get("packet")
         fits = not packet or packet["tokens"] <= min(
             snapshot.spec.reasoning.packet_token_limit, _budget(candidate, cap).payload_tokens
@@ -2091,6 +2182,7 @@ def _perform(runtime, snapshot, action, *, reconcile=False):
             snapshot,
             _candidate(value["candidate"]),
             value.get("route_role", value["role"]),
+            unit=unit,
             permissions=_permission(value),
         )
         data = {"ready": True}
@@ -2170,6 +2262,8 @@ def apply(runtime, snapshot, action, observation):
         for field in ("route_cooldowns", "route_cooldown_events"):
             value[field] = {**value.get(field, {}), **data["retry_bookkeeping"][field]}
     if data.get("wait_reason"):
+        if action.kind == "handoff-route":
+            value["route_wait"] = data["wait_reason"]
         value["retry_at"] = data["retry_at"]
         unit.hold.reason = data["wait_reason"]
         add_event(snapshot, "handoff-capacity-wait", unit=unit.id, reason=data["wait_reason"])
@@ -2251,6 +2345,7 @@ def apply(runtime, snapshot, action, observation):
                 dict.fromkeys([*value.get("constraint_all_jobs", []), *ids])
             )
     elif action.kind == "handoff-route":
+        value.pop("route_wait", None)
         value["candidate"] = data["candidate"]
         if value["phase"] in {"ready", "assemble"}:
             if data.get("packet_fits", True):
@@ -2303,6 +2398,7 @@ def apply(runtime, snapshot, action, observation):
                     value["route_role"],
                     tuple(value["previous_route"]),
                     value.get("requested_candidate"),
+                    unit=unit,
                     permissions=_permission(value),
                 )
                 if value["route_role"] in dict(snapshot.spec.roles)
@@ -2381,6 +2477,16 @@ def resume_proposal(snapshot, unit, runtime=None):
         runtime is not None and _available_alternative(runtime, snapshot, value) is not None
     ):
         return None
+    try:
+        _target_cap(
+            snapshot,
+            _candidate(value["candidate"]),
+            value.get("route_role", value["role"]),
+            unit=unit,
+            permissions=_permission(value),
+        )
+    except CampaignError:
+        return None  # The durable route action reports the wait and can recover it.
     payload = dict(value["original_payload"])
     payload["read_only"] = _permission(value) != "workspace-tools"
     target_key = (
@@ -2408,6 +2514,13 @@ def decorate_launch(snapshot, unit, request):
         raise CampaignError("Replacement launch must explicitly claim its ready handoff")
     if request.get("role", value["role"]) != value["role"]:
         raise CampaignError("Handoff cannot turn review or planning into development")
+    _target_cap(
+        snapshot,
+        _candidate(value["candidate"]),
+        value.get("route_role", value["role"]),
+        unit=unit,
+        permissions=_permission(value),
+    )
     read_only = _permission(value) != "workspace-tools"
     if request.get("read_only", read_only) != read_only:
         raise CampaignError("Handoff successor changed the frozen permission boundary")
@@ -2487,6 +2600,13 @@ def adopt_launch(snapshot, unit, payload, claim):
         raise CampaignError("Replacement candidate differs from approved handoff route")
     if claim.launch_id == value["predecessor"]["launch_id"] or claim.role != value["role"]:
         raise CampaignError("Replacement must own a fresh launch with the original role")
+    _target_cap(
+        snapshot,
+        _candidate(value["candidate"]),
+        value.get("route_role", value["role"]),
+        unit=unit,
+        permissions=_permission(value),
+    )
     read_only = _permission(value) != "workspace-tools"
     if payload.get("read_only", read_only) != read_only or claim.writes == read_only:
         raise CampaignError("Replacement claim changed the frozen permission boundary")

@@ -365,7 +365,7 @@ def test_ready_fallback_reuses_or_replans_packet_for_fresh_destination_capacity(
     cap = runtime.fixture_cap(alternative, True)
     cap["input_tokens"] = min(input_limit, cap["input_tokens"])
     snapshot.config_snapshot["reasoning_capabilities"]["codex:gpt-available"] = {"execution": cap}
-    runtime._role = lambda snapshot, role, *, permissions, allowed_candidates: next(
+    runtime._role = lambda snapshot, role, *, permissions, allowed_candidates, **kwargs: next(
         (candidate for candidate in allowed_candidates if candidate == alternative), None
     )
     assert flow.resume_proposal(snapshot, unit, runtime=runtime) is None
