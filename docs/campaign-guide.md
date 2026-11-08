@@ -865,7 +865,11 @@ reconciliation hold. Replaying completed publication does not replace newer
 staging.
 
 For Grok, large prompt files require its native `--verbatim` option to avoid
-abbreviated input that would require a later tool read. For Muse, the qualified
+abbreviated input that would require a later tool read. Writable sessions use
+`streaming-messages-json` so the native terminal result preserves final assistant
+text separately from progress prose. Native usage counters and turn counts still
+supply attribution and limits; prose is never stripped heuristically to invent
+a result. For Muse, the qualified
 recipe uses the empty preset and disables web, reminders, shell, writes and user
 input; the runner disables launcher updates so the pinned executable remains
 stable. A changed executable, dependency or native output schema requires renewed

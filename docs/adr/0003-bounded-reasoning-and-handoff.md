@@ -828,6 +828,13 @@ remain required. Preserve genuine native attribution and usage on malformed
 structured output, without accepting concatenated JSON or tool parameters as the
 missing terminal result.
 
+Native transport framing has its own finite byte budget. Codex app-server input
+echoes and token-delta events are not model output tokens; its wire allowance
+accounts for the frozen input, model output and bounded scoped-tool results.
+Model turn/token limits remain unchanged. AGY hook input
+accounts for its complete frozen prompt and bounded arguments rather than a
+small fixed read that can truncate native JSON.
+
 The AGY scoped-writer recipe admits only `run_command` and schema-valid `finish`.
 Its documented pre-tool `overwrite` replaces each `CommandLine` with the pinned
 bounded command worker, binding native conversation/step identity to the original
@@ -835,6 +842,9 @@ argv. It denies all other direct file, messaging and MCP operations. The shared
 scoped executor owns write authority and retained call outcomes; native invocation
 limits and terminal completion remain independent checks. This route earns fresh
 writer proof and inherits the foreground-command lifecycle limitation above.
+Per-launch AGY permission settings allow only the exact pinned command frontend
+prefix. They do not disable native permissions globally or expand its scoped
+write grant.
 
 Native Git writes use a private object bank for each launch. Canonical objects and
 earlier banks remain read-only, and banks are never canonical Git alternates:

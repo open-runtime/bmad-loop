@@ -126,9 +126,20 @@ def tool_hook(payload, *, launcher, grants, directory, schema):
     return {"decision": "allow", "overwrite": {"CommandLine": shlex.join(executable)}}
 
 
-def prepare(directory, launcher, grants, schema, maximum):
+def prepare(directory, launcher, grants, schema, maximum, *, input_bytes, output_tokens):
     directory.mkdir(mode=0o700)
     (directory / ".agents").mkdir(mode=0o700)
+    # Native hooks repeat lastUserInput, including JSON string escaping. Allow
+    # that frozen input plus bounded tool/result data; never truncate JSON and
+    # silently turn a valid large prompt into a pre-inference termination.
+    if type(input_bytes) is not int or type(output_tokens) is not int:
+        raise CampaignError("AGY hook budget requires frozen input/output bounds")
+    hook_bytes = 6 * input_bytes + 96 * output_tokens + 262144
+    if input_bytes < 1 or output_tokens < 1 or hook_bytes > 64 * 1024 * 1024:
+        raise CampaignError("AGY hook input exceeds the supported bounded envelope")
+    (directory / "hook-budget.json").write_text(
+        json.dumps({"max_bytes": hook_bytes}), encoding="utf-8"
+    )
 
     def hook(event):
         return shlex.join(
@@ -192,7 +203,16 @@ def main(argv=None):
         return 0 if response["success"] else 1
     if args.hook:
         try:
-            payload = json.loads(sys.stdin.buffer.read(131073))
+            budget_path = args.directory / "hook-budget.json"
+            if is_link_like(budget_path):
+                raise CampaignError("AGY hook budget is redirected")
+            maximum = json.loads(budget_path.read_text(encoding="utf-8"))["max_bytes"]
+            if type(maximum) is not int or not 1 <= maximum <= 64 * 1024 * 1024:
+                raise CampaignError("AGY hook input budget is invalid")
+            raw = sys.stdin.buffer.read(maximum + 1)
+            if len(raw) > maximum:
+                raise CampaignError("AGY hook input exceeds its frozen byte bound")
+            payload = json.loads(raw)
             schema = json.loads(args.schema.read_text(encoding="utf-8"))
             if args.hook == "tool":
                 result = tool_hook(
@@ -251,12 +271,17 @@ def main(argv=None):
     ):
         raise CampaignError("AGY writer requires frozen ownership scopes")
     directory = args.grants.absolute().parent / "agy-native"
+    request = json.loads(
+        (args.grants.absolute().parent / "request.json").read_text(encoding="utf-8")
+    )
     prepare(
         directory,
         Path(sys.argv[0]).absolute(),
         args.grants.absolute(),
         args.schema.absolute(),
         args.max_invocations,
+        input_bytes=args.input.stat().st_size,
+        output_tokens=request["request"]["limits"]["output_tokens"],
     )
     native = [
         str(args.native),
@@ -270,7 +295,27 @@ def main(argv=None):
         str(args.schema.absolute()),
         "--disable-slash-commands",
         "--settings",
-        json.dumps({"trustedWorkspaces": [str(directory)]}),
+        json.dumps(
+            {
+                "trustedWorkspaces": [str(directory)],
+                "permissions": {
+                    "allow": [
+                        "command("
+                        + shlex.join(
+                            [
+                                str(Path(sys.argv[0]).absolute()),
+                                "--execute",
+                                "--grants",
+                                str(args.grants.absolute()),
+                                "--directory",
+                                str(directory),
+                            ]
+                        )
+                        + ")"
+                    ]
+                },
+            }
+        ),
     ]
     if args.effort:
         native.extend(["--effort", args.effort])

@@ -197,6 +197,17 @@ def child_main(path: Path) -> int:
         wire_limit = request.limits.output_tokens * 16 + 65536
         if capability["protocol"] == "muse-json":
             wire_limit = envelope["input"]["bytes"] * 3 + request.limits.output_tokens * 128 + 65536
+        elif capability["protocol"] in {"codex-app-server", "codex-native-review"}:
+            # Native RPC echoes input and emits one framed event per text delta.
+            # Scoped command results can be echoed and JSON-escaped; reserve
+            # the finite32-call *64KiB tool ceiling independently of model
+            # tokens. Neither transport overhead nor tool text buys tokens.
+            wire_limit = (
+                envelope["input"]["bytes"] * 6
+                + request.limits.output_tokens * 512
+                + 32 * 65536 * 12
+                + 65536
+            )
         receipt["wire_output_limit_bytes"] = wire_limit
         with (
             (directory / "input.txt").open("rb") as source,

@@ -519,6 +519,66 @@ def test_native_grok_schema_rejection_preserves_telemetry_without_success():
         parse_output(json.dumps(frame), protocol="grok-json", selected_model="other")
 
 
+def grok_messages():
+    return [
+        {"type": "system", "subtype": "init", "session_id": "native", "model": "grok-alias"},
+        {
+            "type": "assistant",
+            "session_id": "native",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "Working on it"}],
+                "usage": {"output_tokens": 999},
+            },
+        },
+        {
+            "type": "result",
+            "session_id": "native",
+            "is_error": False,
+            "stop_reason": "end_turn",
+            "result": '{"answer":true}',
+            "num_turns": 4,
+            "modelUsage": {"grok-served": {"inputTokens": 1234, "outputTokens": 789}},
+            "usage": {"input_tokens": 1234, "output_tokens": 789},
+        },
+    ]
+
+
+def test_grok_messages_use_native_final_result_and_actual_cumulative_model_telemetry():
+    frames = grok_messages()
+    result = parse_output(
+        "\n".join(json.dumps(row) for row in frames),
+        protocol="grok-json",
+        selected_model="grok-alias",
+        served_model_aliases=("grok-served",),
+    )
+    assert result["outcome"] == "completed" and result["result"] == {"answer": True}
+    assert result["observed_model"] == "grok-served" and result["turns"] == 4
+    assert result["usage"] == frames[-1]["usage"]
+    frames[-1]["result"] = 'Working on it {"answer":true}'
+    failed = parse_output(json.dumps(frames), protocol="grok-json", selected_model="grok-served")
+    assert failed["outcome"] == "failed" and failed["result"] is None
+
+
+@pytest.mark.parametrize(
+    "invalid", ["session", "after-terminal", "missing-terminal", "turns", "model"]
+)
+def test_grok_messages_refuse_missing_or_ambiguous_native_evidence(invalid):
+    frames = grok_messages()
+    if invalid == "session":
+        frames[-1]["session_id"] = "other"
+    elif invalid == "after-terminal":
+        frames.append(frames[-1])
+    elif invalid == "missing-terminal":
+        frames.pop()
+    elif invalid == "turns":
+        frames[-1].pop("num_turns")
+    else:
+        frames[-1]["modelUsage"] = {}
+    with pytest.raises(CampaignError):
+        parse_output(json.dumps(frames), protocol="grok-json", selected_model="grok-served")
+
+
 @pytest.mark.parametrize("bound", ["stdout-wire-bytes", "stderr-bytes", "wall-time"])
 def test_finished_native_child_cannot_bypass_final_whole_job_bounds(
     prepared, tmp_path, monkeypatch, bound

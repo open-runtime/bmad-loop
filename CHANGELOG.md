@@ -25,6 +25,7 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Bound native stream and hook framing separately from model output, and preserve Grok terminal-result attribution.
 - Preserve native acceptance in landing-repair drafts without granting source lifecycle writes.
 - Keep native control records outside product workspaces and preserve owner staging during private Git publication recovery.
 - Isolate nested pytest temporary roots and wait for bounded landing-repair progress under parallel test load.

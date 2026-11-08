@@ -2,6 +2,7 @@
 
 import json
 import shlex
+import subprocess
 import sys
 from pathlib import Path
 
@@ -20,6 +21,68 @@ from bmad_loop import (
 from bmad_loop.campaign_execution_qualification import qualify
 from bmad_loop.campaign_headless import HeadlessRunner, file_digest, read_json, validate_capability
 from bmad_loop.campaign_model import RoleCandidate
+
+
+@pytest.mark.parametrize("over_budget", [False, True], ids=["large-input", "over-budget"])
+def test_native_hook_accepts_frozen_large_prompt_and_rejects_byte_overflow(tmp_path, over_budget):
+    directory = tmp_path / "private-native"
+    launcher = tmp_path / "hook-launcher"
+    launcher.write_text(campaign_agy_scoped.launcher_text())
+    launcher.chmod(0o700)
+    grants, schema = tmp_path / "grants.json", tmp_path / "schema.json"
+    grants.write_text(json.dumps({"workspace": str(tmp_path / "product")}))
+    schema.write_text(json.dumps({"type": "object"}))
+    prompt = "owner request \u263a\n" * 16384
+    campaign_agy_scoped.prepare(
+        directory,
+        launcher,
+        grants,
+        schema,
+        8,
+        input_bytes=len(prompt.encode()),
+        output_tokens=4096,
+    )
+    payload = json.dumps(
+        {
+            "conversationId": "native",
+            "invocationNum": 0,
+            "lastUserInput": prompt,
+        }
+    )
+    assert len(payload.encode()) > 131073
+    if over_budget:
+        # A complete valid envelope one byte over the exact bound isolates the
+        # bound check: removing it must admit this invocation, not fail JSON.
+        (directory / "hook-budget.json").write_text(
+            json.dumps({"max_bytes": len(payload.encode()) - 1})
+        )
+    completed = subprocess.run(
+        [
+            str(launcher),
+            "--hook",
+            "invocation",
+            "--grants",
+            str(grants),
+            "--directory",
+            str(directory),
+            "--schema",
+            str(schema),
+            "--max-invocations",
+            "8",
+        ],
+        input=payload,
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=10,
+    )
+    result = json.loads(completed.stdout)
+    if over_budget:
+        assert result == {"terminationBehavior": "terminate"}
+        assert not (directory / "invocations.json").exists()
+    else:
+        assert "injectSteps" in result
+        assert json.loads((directory / "invocations.json").read_text())["count"] == 1
 
 
 def test_hook_rewrites_exact_shell_input_and_rejects_other_tools_or_changed_call(tmp_path):
@@ -69,6 +132,12 @@ text=json.load(sys.stdin)['message']['content'];nonce=re.search(r'QUALIFICATION 
 code="from pathlib import Path; import subprocess; Path('src/owned.txt').write_text('native writer qualification: "+nonce+"\\n'); subprocess.run(['git','add','src/owned.txt'],check=True); subprocess.run(['git','commit','-qm','native agy proof'],check=True)"
 payload={'conversationId':'native','stepIdx':1,'toolCall':{'name':'run_command','args':{'CommandLine':shlex.join([sys.executable,'-c',code])}}}
 rewritten=hook(tool,payload);assert rewritten['decision']=='allow'
+settings=json.loads(sys.argv[sys.argv.index('--settings')+1])
+rules=settings['permissions']['allow'];assert len(rules)==1
+assert rules[0].startswith('command(') and rules[0].endswith(')')
+prefix=shlex.split(rules[0][8:-1]);command=shlex.split(rewritten['overwrite']['CommandLine'])
+assert len(prefix)==6 and prefix==command[:6]
+assert prefix[1]=='--execute' and prefix[2]=='--grants' and prefix[4]=='--directory'
 completed=subprocess.run(shlex.split(rewritten['overwrite']['CommandLine']),capture_output=True,text=True)
 assert completed.returncode==0,completed.stderr+completed.stdout
 assert json.loads(completed.stdout)['success']

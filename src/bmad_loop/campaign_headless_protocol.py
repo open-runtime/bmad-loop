@@ -27,6 +27,49 @@ _ERRORS = {
 }
 
 
+def _grok_messages(frames, *, partial=False):
+    """Use the native terminal's final text and cumulative model-call ledger.
+
+    Grok's plain JSON text concatenates progress with the final answer. Its
+    Messages stream retains those boundaries; assistant/tool text is never
+    parsed as a completion or a substitute for the native terminal receipt.
+    """
+    session = model = ""
+    terminal = None
+    for frame in frames:
+        if terminal is not None:
+            raise CampaignError("Grok native stream continues after its terminal receipt")
+        identifier = frame.get("session_id")
+        if identifier is not None:
+            if (
+                not isinstance(identifier, str)
+                or not identifier
+                or (session and identifier != session)
+            ):
+                raise CampaignError("Grok native output mixes session identities")
+            session = identifier
+        if frame.get("type") == "system" and frame.get("subtype") == "init":
+            model = frame.get("model", "")
+        if frame.get("type") == "result":
+            terminal = frame
+    if terminal is None:
+        if partial:
+            return [{"type": "system", "session_id": session, "model": model}]
+        raise CampaignError("Grok native terminal receipt is missing")
+    if not session or not isinstance(terminal.get("is_error"), bool):
+        raise CampaignError("Grok native terminal identity or outcome is missing")
+    if not terminal["is_error"] and terminal.get("stop_reason") not in {"end_turn", "max_tokens"}:
+        raise CampaignError("Grok native terminal has no completed stop reason")
+    return [
+        {
+            **terminal,
+            "sessionId": session,
+            "stopReason": terminal.get("stop_reason"),
+            "structuredOutput": terminal.get("structured_output"),
+        }
+    ]
+
+
 def _agy_envelopes(frames, *, partial=False):
     """Normalize AGY's cumulative native receipt, not assistant-authored JSON.
 
@@ -224,6 +267,12 @@ def parse_output(
         frames = _muse_envelopes(frames, partial=partial)
     if protocol == "agy-json":
         frames = _agy_envelopes(frames, partial=partial)
+    if protocol == "grok-json" and any(
+        (row.get("type") == "system" and row.get("subtype") == "init")
+        or ("session_id" in row and "modelUsage" in row)
+        for row in frames
+    ):
+        frames = _grok_messages(frames, partial=partial)
     if protocol == "codex-app-server":
         from .campaign_codex_appserver import envelopes
 
@@ -257,7 +306,24 @@ def parse_output(
                 for model, usage_row in model_usage.items()
                 if isinstance(model, str)
                 and isinstance(usage_row, dict)
-                and usage_row.get("modelCalls", 0) > 0
+                and (
+                    (type(usage_row.get("modelCalls")) is int and usage_row["modelCalls"] > 0)
+                    or (
+                        # Messages-native modelUsage omits modelCalls. Its
+                        # disjoint positive token buckets still prove which
+                        # served model actually ran; num_turns stays native.
+                        "session_id" in frame
+                        and any(
+                            type(usage_row.get(key)) is int and usage_row[key] > 0
+                            for key in (
+                                "inputTokens",
+                                "outputTokens",
+                                "cacheReadInputTokens",
+                                "cacheCreationInputTokens",
+                            )
+                        )
+                    )
+                )
             ]
             # The native modelUsage keys are served identities, not model-authored text.
             frame = {
