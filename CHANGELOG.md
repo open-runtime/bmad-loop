@@ -7,6 +7,8 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+## [0.15.2] — 2026-11-08
+
 ### Added
 
 - Bind optional Claude native request-output and structured-output retry limits to qualified recipes.
@@ -6996,7 +6998,8 @@ enforced in CI.
   implementation phase, driven by a Python control loop with hook-based session transport and
   resumable on-disk run state.
 
-[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.15.1...HEAD
+[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.15.2...HEAD
+[0.15.2]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.15.2
 [0.15.1]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.15.1
 [0.15.0]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.15.0
 [0.14.0]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.14.0
