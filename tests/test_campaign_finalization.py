@@ -16,7 +16,7 @@ from bmad_loop.campaign_finalization import resume, validate_resume
 from bmad_loop.campaign_recovery import CheckpointPusher, RecoveryHold
 from bmad_loop.campaign_workers import common_directory, prepare_launch
 from bmad_loop.engine import RunPaused
-from bmad_loop.journal import load_state
+from bmad_loop.journal import Journal, load_state
 from bmad_loop.model import Phase, StoryTask, TokenUsage
 
 
@@ -33,7 +33,11 @@ def finalization(project, tmp_path, request):
             + (
                 "Path('owned.py').write_text('unexpected verifier mutation\\n')\n"
                 if verify_mode == "mutating"
-                else "sys.exit(0 if Path('.bmad-loop/allow-retained').exists() else 1)\n"
+                else (
+                    "print('fresh retained verification')\n"
+                    if verify_mode == "green-reuse"
+                    else "sys.exit(0 if Path('.bmad-loop/allow-retained').exists() else 1)\n"
+                )
             )
         )
     git(repo, "add", "-A")
@@ -56,6 +60,8 @@ def finalization(project, tmp_path, request):
     if verify_mode:
         command = f'"{sys.executable}" verify-retained.py'
         policy_text += "\n[verify]\ncommands = [" + json.dumps(command) + "]\n"
+        if verify_mode == "green-reuse":
+            policy_text += "reuse_unchanged = true\n"
     policy = policy_mod.loads(policy_text)
     context = CampaignExecution(
         "campaign-retained",
@@ -128,6 +134,7 @@ def invoke(case, **kwargs):
     )
 
 
+@pytest.mark.parametrize("finalization", ["", "green-reuse"], indirect=True)
 def test_retained_finalization_finishes_append_only_without_new_dev_and_keeps_all_counters(
     finalization,
 ):
@@ -153,6 +160,12 @@ def test_retained_finalization_finishes_append_only_without_new_dev_and_keeps_al
     assert pusher.remote_head() == head and pusher.fenced() is None
     assert result["recovery"]["state"] == "complete"
     assert not adapter.sessions
+    if context.policy.verify.reuse_unchanged:
+        entries = Journal(project.project / ".bmad-loop/runs/retained-run").entries()
+        commands = [row for row in entries if row["kind"] == "verify-command-result"]
+        assert len(commands) == 1 and commands[0]["verification_stage"] == "review"
+        assert commands[0]["returncode"] == 0
+        assert not any(row["kind"] == "verify-pass-reused" for row in entries)
 
 
 @pytest.mark.parametrize("change", ["phase", "head", "selector", "config", "quiescence"])
