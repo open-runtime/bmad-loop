@@ -63,6 +63,24 @@ def test_job_mail_is_not_consumed_by_another_job_and_payloads_are_bounded(tmp_pa
     assert ledger.pending("unit", job="one", max_bytes=1) == []
 
 
+@pytest.mark.parametrize("target", ["", "target-job"])
+def test_unrelated_job_backlog_cannot_starve_frozen_target_context(tmp_path, target):
+    ledger = MessageLedger(tmp_path)
+    for index in range(50):
+        ledger.accept(
+            message_id=f"other-{index}", unit="unit", job="other-job", text="other job steering"
+        )
+    ledger.accept(message_id="target-first", unit="unit", job=target, text="preserve acceptance")
+    frozen = ledger.freeze("unit", "launch", job=target)
+    assert [row["id"] for row in frozen] == ["target-first"]
+    ledger.accept(message_id="target-next", unit="unit", job=target, text="check final ancestry")
+    assert ledger.freeze("unit", "launch", job=target) == frozen
+    ledger.applied(["target-first"], launch_id="launch", unit="unit", job=target)
+    assert [row["id"] for row in ledger.freeze("unit", "next", job=target)] == ["target-next"]
+    # The public unfiltered listing retains its existing cross-job semantics.
+    assert len(ledger.list(unit="unit", job="", limit=100)) == 52
+
+
 def test_cli_steer_and_messages_use_same_durable_ledger(runtime, capsys):
     store, snapshot, calls = runtime
     assert (

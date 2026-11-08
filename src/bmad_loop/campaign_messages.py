@@ -112,10 +112,19 @@ class MessageLedger:
         return [self._document(row) for row in rows]
 
     def pending(self, unit: str, *, job="", max_bytes=32768):
+        if not self.path.exists():
+            return []
+        # Empty job means this unit's coding stage here, unlike list()'s public
+        # wildcard. Filter the exact target before limiting the bounded page.
+        with self._connection() as db:
+            rows = db.execute(
+                "SELECT * FROM messages WHERE unit = ? AND job = ? AND state = 'queued' "
+                "ORDER BY sequence LIMIT 50",
+                (unit, job),
+            ).fetchall()
         selected, size = [], 0
-        for row in self.list(unit=unit, state="queued", limit=50):
-            if row["job"] != job:
-                continue
+        for saved in rows:
+            row = self._document(saved)
             item = {key: row[key] for key in ("id", "text", "source", "authority")}
             cost = len(json.dumps(item).encode())
             if size + cost > max_bytes:
