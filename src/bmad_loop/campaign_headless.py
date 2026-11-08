@@ -19,13 +19,23 @@ from typing import Any
 
 from .adapters.multiplexer import MultiplexerError, get_multiplexer
 from .adapters.tmux_base import native_window_command
+from .campaign_admission_files import fresh_reads
 from .campaign_jobs import JobRequest, digest
 from .campaign_model import CampaignError, RoleCandidate
 from .platform_util import atomic_write_text, file_lock, is_link_like
 from .process_host import get_process_host
 
 PROTOCOLS = frozenset(
-    {"claude-stream", "codex-jsonl", "agy-json", "grok-json", "muse-json", "bmad-test-v1"}
+    {
+        "claude-stream",
+        "codex-jsonl",
+        "codex-app-server",
+        "codex-native-review",
+        "agy-json",
+        "grok-json",
+        "muse-json",
+        "bmad-test-v1",
+    }
 )
 MAX_RECORD_BYTES = 16 * 1024 * 1024
 _ADMISSION_VALIDATIONS: ContextVar[dict[str, Exception | None] | None] = ContextVar(
@@ -56,12 +66,9 @@ def capability_admission(function):
 
 
 def read_json(path: Path, *, limit: int = MAX_RECORD_BYTES) -> dict[str, Any]:
-    if is_link_like(path) or not path.is_file() or path.stat().st_size > limit:
-        raise CampaignError(f"Headless record is redirected, missing or oversized: {path.name}")
-    value = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(value, dict):
-        raise CampaignError("Headless record must be an object")
-    return value
+    from .campaign_admission_files import read_json as read
+
+    return read(path, limit=limit)
 
 
 def write_json(path: Path, value: dict[str, Any]) -> None:
@@ -69,13 +76,9 @@ def write_json(path: Path, value: dict[str, Any]) -> None:
 
 
 def file_digest(path: Path) -> str:
-    if is_link_like(path) or not path.is_file():
-        raise CampaignError("Qualified executable/input must be a regular non-symlink file")
-    hasher = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            hasher.update(chunk)
-    return hasher.hexdigest()
+    from .campaign_admission_files import file_digest as read
+
+    return read(path)
 
 
 def provider_family(model: str) -> str:
@@ -118,7 +121,7 @@ def _validate_capability(
         raise CampaignError("Selected thinking level is not qualified")
     if not raw.get("cli_version") or raw.get("permissions") != permissions:
         raise CampaignError("Headless route requires the exact versioned permission qualification")
-    if permissions not in {"no-tools", "workspace-tools"}:
+    if permissions not in {"no-tools", "read-only-tools", "workspace-tools"}:
         raise CampaignError("Unsupported headless tool grant")
     runtime_paths = raw.get("runtime_write_paths", [])
     if not isinstance(runtime_paths, list) or any(
@@ -148,8 +151,22 @@ def _validate_capability(
         or any(not isinstance(arg, str) for arg in raw["argv"])
     ):
         raise CampaignError("Qualified argv must be a nonempty string list")
-    if permissions == "workspace-tools" and not any("{grants_path}" in arg for arg in raw["argv"]):
+    if permissions != "no-tools" and not any("{grants_path}" in arg for arg in raw["argv"]):
         raise CampaignError("Execution route must consume the frozen grants file")
+    if permissions == "workspace-tools":
+        from . import campaign_native_git, campaign_object_promotion
+
+        dependencies = {row["path"]: row["sha256"] for row in raw.get("dependencies", [])}
+        for module in (campaign_native_git, campaign_object_promotion):
+            if module.__file__ is None:
+                raise CampaignError("Writer private Git module has no source binding")
+            path = Path(module.__file__).resolve()
+            if str(path) not in dependencies or (
+                verify_files and dependencies[str(path)] != file_digest(path)
+            ):
+                raise CampaignError(
+                    "Writer private Git publication lacks an exact dependency binding; requalification required"
+                )
     binary = Path(raw.get("binary", ""))
     if not binary.is_absolute() or raw["argv"][0] != str(binary):
         raise CampaignError("Qualified argv must name its exact absolute executable")
@@ -172,7 +189,11 @@ def _validate_capability(
             raise CampaignError("Served model alias lacks earned qualification evidence")
         required = {
             "full_input",
-            "no_tools" if permissions == "no-tools" else "scoped_tools",
+            {
+                "no-tools": "no_tools",
+                "workspace-tools": "scoped_tools",
+                "read-only-tools": "read_only_tools",
+            }[permissions],
             "window_completion",
             "quiescence",
             "model_attribution",
@@ -220,7 +241,7 @@ def validate_capability(raw, candidate, *, verify_files=True, permissions="no-to
 
 def validate_probe_capability(raw, candidate) -> None:
     """Operator canaries validate exact binaries but cannot claim qualification."""
-    if raw.get("permissions") == "workspace-tools":
+    if raw.get("permissions") in {"workspace-tools", "read-only-tools"}:
         from .campaign_execution_qualification import validate_proposal
 
         validate_proposal(raw, candidate)
@@ -254,9 +275,11 @@ def load_capabilities(path: Path) -> dict[str, Any]:
                     "Headless effort variant must contain a capability or permission mapping"
                 )
             modes = (
-                variant if "reasoning" in variant or "execution" in variant else {"flat": variant}
+                variant
+                if set(variant) & {"reasoning", "review", "execution"}
+                else {"flat": variant}
             )
-            if modes is variant and set(modes) - {"reasoning", "execution"}:
+            if modes is variant and set(modes) - {"reasoning", "review", "execution"}:
                 raise CampaignError("Headless permission mapping contains ambiguous fields")
             for mode, cap in modes.items():
                 if (
@@ -274,9 +297,18 @@ def load_capabilities(path: Path) -> dict[str, Any]:
                 )
                 if key != candidate.profile + ":" + candidate.model:
                     raise CampaignError("Headless capability key differs from its route")
-                permission = {"reasoning": "no-tools", "execution": "workspace-tools"}.get(
-                    mode, cap.get("permissions", "no-tools")
-                )
+                permission = {
+                    "reasoning": cap.get("permissions"),
+                    "execution": "workspace-tools",
+                }.get(mode, cap.get("permissions", "no-tools"))
+                if mode == "reasoning" and permission not in {"no-tools", "read-only-tools"}:
+                    raise CampaignError("Reasoning routes cannot grant product writes")
+                if (mode == "review") != (cap.get("protocol") == "codex-native-review"):
+                    raise CampaignError(
+                        "Native review requires its separate review capability slot"
+                    )
+                if mode == "review" and permission != "read-only-tools":
+                    raise CampaignError("Native review requires read-only tools")
                 if not isinstance(permission, str):
                     raise CampaignError("Headless capability permission must be explicit")
                 validate_capability(cap, candidate, permissions=permission)
@@ -309,10 +341,24 @@ def capability_for(
         raise CampaignError(
             "Headless effort variant must contain a capability or permission mapping"
         )
-    if "reasoning" in value or "execution" in value:
-        value = value.get("reasoning" if permissions == "no-tools" else "execution", {})
-    if not isinstance(value, dict) or value.get("permissions") != permissions:
+    if permissions == "review" and "review" in value:
+        value = value["review"]
+    elif set(value) & {"reasoning", "review", "execution"}:
+        value = value.get(
+            (
+                "reasoning"
+                if permissions in {"reasoning", "review", "no-tools", "read-only-tools"}
+                else "execution"
+            ),
+            {},
+        )
+    allowed = (
+        {"no-tools", "read-only-tools"} if permissions in {"reasoning", "review"} else {permissions}
+    )
+    if not isinstance(value, dict) or value.get("permissions") not in allowed:
         raise CampaignError(f"No qualified {permissions} route for {profile}/{model}")
+    if value.get("protocol") == "codex-native-review" and permissions != "review":
+        raise CampaignError("Native review route cannot be borrowed for general reasoning")
     if by_effort and value.get("efforts") != [effort]:
         raise CampaignError("Headless effort variant differs from its earned thinking level")
     if effort is not None and effort not in value.get("efforts", []):
@@ -322,9 +368,31 @@ def capability_for(
     return value
 
 
-def render_input(request: JobRequest, capability: dict[str, Any]) -> tuple[bytes, dict[str, Any]]:
+def readonly_grants(workspace, coordinates, capability, *, generation=1, read_only_paths=()):
+    """Construct a minimum read grant without inheriting any worker write authority."""
+    if capability.get("permissions") != "read-only-tools":
+        raise CampaignError("Read-only grant requires an explicitly selected read-only route")
+    return {
+        "schema_version": 1,
+        "permissions": "read-only-tools",
+        "workspace": str(Path(workspace).resolve()),
+        "scopes": [],
+        "config_digest": digest(coordinates),
+        "generation": generation,
+        "read_only_paths": list(read_only_paths),
+        "runtime_write_paths": list(capability.get("runtime_write_paths", [])),
+    }
+
+
+def render_input(
+    request: JobRequest, capability: dict[str, Any], *, steering=()
+) -> tuple[bytes, dict[str, Any]]:
     """Deliver source bytes inline, with explicit identities and no tool reads."""
     pieces = [request.prompt, "\nReturn only the requested JSON result.\n"]
+    if steering:
+        from .campaign_messages import context
+
+        pieces.append(context(steering))
     identities = []
     for source in request.inputs:
         path = Path(source["path"])
@@ -398,6 +466,8 @@ class HeadlessRunner:
         environment=None,
         communication_room="",
         presentation=None,
+        managed_binding=None,
+        steering=None,
     ) -> Path:
         return self._prepare(
             directory,
@@ -411,6 +481,8 @@ class HeadlessRunner:
             environment=environment,
             communication_room=communication_room,
             presentation=presentation,
+            managed_binding=managed_binding,
+            steering=steering,
         )
 
     def prepare_probe(
@@ -447,6 +519,7 @@ class HeadlessRunner:
             presentation=presentation,
         )
 
+    @fresh_reads()
     def _prepare(
         self,
         directory: Path,
@@ -462,6 +535,8 @@ class HeadlessRunner:
         communication_room: str = "",
         probe: dict[str, Any] | None = None,
         presentation: dict[str, str] | None = None,
+        managed_binding: dict[str, Any] | None = None,
+        steering: list[dict[str, Any]] | None = None,
     ) -> Path:
         request.validate()
         if not isinstance(communication_room, str) or (
@@ -483,13 +558,16 @@ class HeadlessRunner:
         else:
             from .campaign_qualification import validate_probe_request
 
-            writer_probe = probe.get("kind") == "workspace-tools-v1"
+            writer_probe = probe.get("kind") in {"workspace-tools-v1", "read-only-tools-v1"}
             if (
                 environment
                 or communication_room
                 or (
                     writer_probe
-                    and (permissions != "workspace-tools" or grants != probe.get("grants"))
+                    and (
+                        permissions != probe.get("kind", "").removesuffix("-v1")
+                        or grants != probe.get("grants")
+                    )
                 )
                 or (not writer_probe and (permissions != "no-tools" or grants))
             ):
@@ -498,14 +576,20 @@ class HeadlessRunner:
                 )
             validate_probe_capability(capability, selection)
             validate_probe_request(request, probe)
-        if permissions == "workspace-tools" and (
+        if permissions in {"workspace-tools", "read-only-tools"} and (
             not grants
             or grants.get("schema_version") != 1
             or not grants.get("workspace")
-            or not grants.get("scopes")
+            or (permissions == "workspace-tools" and not grants.get("scopes"))
             or not grants.get("config_digest")
         ):
             raise CampaignError("Workspace tools require frozen, scoped execution grants")
+        if permissions == "read-only-tools" and (
+            not grants
+            or grants.get("permissions") != permissions
+            or any(grants.get(key) for key in ("scopes", "write_paths", "git_branch"))
+        ):
+            raise CampaignError("Read-only tools cannot acquire product or Git writes")
         if (
             request.limits.output_tokens > capability["output_tokens"]
             or request.limits.max_turns > capability["max_turns"]
@@ -524,7 +608,7 @@ class HeadlessRunner:
             ):
                 raise CampaignError("Headless terminal requires an exact workspace binding")
             if (
-                permissions == "workspace-tools"
+                permissions != "no-tools"
                 and grants
                 and Path(presentation["workspace"]).resolve() != Path(grants["workspace"]).resolve()
             ):
@@ -534,7 +618,9 @@ class HeadlessRunner:
         if is_link_like(directory):
             raise CampaignError("Headless directory is redirected")
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        payload, delivery = render_input(request, capability)
+        if steering and probe is not None:
+            raise CampaignError("Qualification canaries cannot receive steering")
+        payload, delivery = render_input(request, capability, steering=steering or ())
         raw_request = json.loads(json.dumps(asdict(request)))
         envelope = {
             "schema_version": 1,
@@ -550,7 +636,7 @@ class HeadlessRunner:
             "environment_digest": digest(environment or {}),
             "workspace": (
                 str(Path(grants["workspace"]).resolve())
-                if permissions == "workspace-tools" and grants
+                if permissions != "no-tools" and grants
                 else str(directory)
             ),
             "launch_id": launch_id,
@@ -566,6 +652,14 @@ class HeadlessRunner:
             # selected room is configuration, never inherited actor identity.
             envelope["communication_room"] = communication_room
             envelope["communication_room_digest"] = digest(communication_room)
+        if managed_binding:
+            if not isinstance(managed_binding, dict) or probe is not None:
+                raise CampaignError("Managed communication requires a frozen campaign binding")
+            envelope["managed_binding"] = managed_binding
+            envelope["managed_binding_digest"] = digest(managed_binding)
+        if steering:
+            envelope["steering"] = steering
+            envelope["steering_digest"] = digest(steering)
         if probe is not None:
             envelope.update(probe=probe, probe_digest=digest(probe))
         if presentation:
@@ -589,6 +683,7 @@ class HeadlessRunner:
             write_json(path, envelope)
         return path
 
+    @fresh_reads()
     def launch(self, request_path: Path) -> dict[str, Any]:
         envelope = read_json(request_path)
         directory = request_path.parent

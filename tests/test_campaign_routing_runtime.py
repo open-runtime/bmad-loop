@@ -42,7 +42,10 @@ def test_execution_and_child_review_candidates_reach_frozen_launch(checkpoint_ca
     assert request["headless_grants"]["workspace"] == str(case.workspace.resolve())
     assert request["headless_grants"]["generation"] == case.unit.claim.generation
     assert request["headless_grants"]["config_digest"]
-    assert request["headless_grants"]["write_paths"] == request["private_paths"]
+    assert request["headless_grants"]["write_paths"] == [
+        *request["private_paths"],
+        str(case.workspace / "specs/epic/stories/first-story.md"),
+    ]
     assert request["headless_grants"]["git_branch"] == case.unit.bindings["branch"]
     assert case.snapshot.spec.target in request["headless_grants"]["protected_branches"]
     assert template.policy.adapter.resolved("dev").model != "dev-model"

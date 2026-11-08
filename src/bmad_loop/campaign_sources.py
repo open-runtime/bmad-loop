@@ -308,6 +308,40 @@ class PreparedSource:
     private_paths: tuple[Path, ...] = ()
 
 
+def worker_story_write_paths(
+    workspace: Path, source: SourceSelector, unit: UnitSpec
+) -> tuple[Path, ...]:
+    """Grant the selected tracked story's lifecycle file, never its shared index.
+
+    Ticket/sprint source views already supply their private artifact grants.
+    Stories-mode specs can instead live outside that artifact tree. Resolve the
+    native selector again in the owned checkout; neither a receipt nor a model
+    may invent the path or widen it to the shared stories directory.
+    """
+    if source.kind != "stories" or unit.kind != "story":
+        return ()
+    state = stories.resolve_story_spec(
+        stories.resolve_spec_folder(workspace, source.path), unit.selector
+    )
+    if state.kind == stories.KIND_AMBIGUOUS:
+        raise CampaignError("worker story write identity is ambiguous")
+    if state.path is None:
+        return ()
+    path = state.path
+    root = workspace.resolve()
+    if (
+        is_link_like(path)
+        or not path.resolve().is_relative_to(root)
+        or any(
+            is_link_like(parent)
+            for parent in path.parents
+            if parent != root and parent.is_relative_to(root)
+        )
+    ):
+        raise CampaignError("worker story write path escapes or redirects its checkout")
+    return (path.resolve(),)
+
+
 def _check_source_tree(root: Path) -> None:
     """Reject implicit redirects before copying an explicitly selected source."""
     if not root.is_dir() or is_link_like(root):

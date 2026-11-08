@@ -56,10 +56,12 @@ class HcomObserver:
         runner: Callable | None = None,
         timeout: float = 10,
         max_bytes: int = 512 * 1024,
+        anonymous: bool = False,
     ):
         if not room.is_absolute() or not re.fullmatch(r"[a-z][a-z0-9_-]{2,31}", observer_name):
             raise CommunicationError("Explicit room and observer identity required")
         self.room, self.name = room.resolve(), observer_name
+        self.anonymous = anonymous
         self.executable = executable or shutil.which("hcom")
         self.runner, self.timeout, self.max_bytes = runner or subprocess.run, timeout, max_bytes
 
@@ -78,9 +80,15 @@ class HcomObserver:
         if not self.executable:
             raise CommunicationError("hcom is unavailable")
         try:
+            env = {**os.environ, "HCOM_DIR": str(self.room)}
+            if self.anonymous:
+                from .campaign_model import CommunicationSpec
+                from .campaign_reflection_flow import sanitized_actor_env
+
+                env = sanitized_actor_env(env, communication=CommunicationSpec(room=str(self.room)))
             result = self.runner(
-                [self.executable, *args, "--name", self.name],
-                env={**os.environ, "HCOM_DIR": str(self.room)},
+                [self.executable, *args, *([] if self.anonymous else ["--name", self.name])],
+                env=env,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",

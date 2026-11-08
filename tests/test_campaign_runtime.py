@@ -551,6 +551,17 @@ raise SystemExit(workers.child_main(Path(sys.argv[1])))
 @pytest.fixture
 def production_case(project, tmp_path, monkeypatch, request):
     from bmad_loop import platform_util
+    from bmad_loop.adapters import profile as profile_module
+
+    real_profile = profile_module.get_profile
+
+    def scripted_profile(*args, **kwargs):
+        return dataclasses.replace(real_profile(*args, **kwargs), binary=sys.executable)
+
+    # The fixture launches scripted Python children, so readiness must prove
+    # their real executable rather than depend on developer-installed CLIs.
+    monkeypatch.setattr(profile_module, "get_profile", scripted_profile)
+    monkeypatch.setattr(campaign_runtime, "get_profile", scripted_profile)
 
     if not platform_util.HANDLE_ANCHORED_WRITES:
         pytest.skip(

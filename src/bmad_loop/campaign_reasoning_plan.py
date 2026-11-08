@@ -132,9 +132,9 @@ def _routes(snapshot, purpose: str):
     for candidate in snapshot.spec.candidates(role):
         try:
             cap = capability_for(
-                configured, candidate.profile, candidate.model, effort=candidate.effort
+                configured, candidate.profile, candidate.model, "reasoning", effort=candidate.effort
             )
-            validate_capability(cap, candidate, verify_files=False)
+            validate_capability(cap, candidate, verify_files=False, permissions=cap["permissions"])
             accepted.append((candidate, cap))
         except CampaignError as exc:
             errors.append(str(exc))
@@ -160,6 +160,14 @@ def proposals(runtime, snapshot) -> tuple[Proposal, ...]:
     ):
         return ()
     state = snapshot.bindings.get("semantic_jobs", {})
+    from .campaign_reasoning_partition import ready as partition_ready
+
+    advance = [
+        key
+        for key, pipeline in state.get("pipelines", {}).items()
+        if fingerprint(snapshot, pipeline["purpose"]) == pipeline["context_digest"]
+        and partition_ready(runtime, snapshot, pipeline)
+    ]
     needed = {
         purpose: fingerprint(snapshot, purpose)
         for purpose in sorted(set(snapshot.spec.reasoning.purposes) & ROLES.keys())
@@ -167,8 +175,14 @@ def proposals(runtime, snapshot) -> tuple[Proposal, ...]:
         and state.get("triggers", {}).get(purpose) != fingerprint(snapshot, purpose)
     }
     return (
-        (Proposal("semantic-plan", "", {"triggers": needed, "prepared_at": runtime.clock()}),)
-        if needed
+        (
+            Proposal(
+                "semantic-plan",
+                "",
+                {"triggers": needed, "advance": advance, "prepared_at": runtime.clock()},
+            ),
+        )
+        if needed or advance
         else ()
     )
 
@@ -244,7 +258,23 @@ def result_schema(purpose: str) -> dict[str, Any]:
 
 
 def perform(runtime, snapshot, action) -> Observation:
-    requests, errors = [], {}
+    requests, errors, pipelines = [], {}, []
+    triggers = dict(action.payload["triggers"])
+    from .campaign_reasoning_partition import advance, create
+
+    for key in action.payload.get("advance", []):
+        pipeline = snapshot.bindings["semantic_jobs"]["pipelines"][key]
+        purpose = pipeline["purpose"]
+        if fingerprint(snapshot, purpose) != pipeline["context_digest"]:
+            continue
+        triggers[purpose] = pipeline["context_digest"]
+        try:
+            children, changed = advance(runtime, snapshot, pipeline)
+            requests.extend(children)
+            pipelines.append(changed)
+        except (CampaignError, OSError, ValueError) as exc:
+            errors[purpose] = str(exc)
+            pipelines.append({**pipeline, "state": "blocked", "error": str(exc)})
     for purpose, expected in action.payload["triggers"].items():
         evidence = context(snapshot, purpose)
         if digest(evidence) != expected:
@@ -273,9 +303,23 @@ def perform(runtime, snapshot, action) -> Observation:
             len(source_bytes) + len(prompt.encode()) + len(json.dumps(schema).encode()) + 2048
             > ceiling
         ):
-            errors[purpose] = (
-                "Canonical context exceeds qualified route input bound; split the campaign or qualify a larger route"
-            )
+            try:
+                children, pipeline = create(
+                    runtime,
+                    snapshot,
+                    action,
+                    purpose,
+                    evidence,
+                    routes,
+                    ceiling=ceiling,
+                    output=output,
+                    final_prompt=prompt,
+                    final_schema=schema,
+                )
+                requests.extend(children)
+                pipelines.append(pipeline)
+            except CampaignError as exc:
+                errors[purpose] = str(exc)
             continue
         import hashlib
 
@@ -320,7 +364,7 @@ def perform(runtime, snapshot, action) -> Observation:
         requests.append(asdict(request))
     return Observation(
         "confirmed",
-        {"requests": requests, "errors": errors, "triggers": action.payload["triggers"]},
+        {"requests": requests, "errors": errors, "triggers": triggers, "pipelines": pipelines},
     )
 
 
@@ -342,6 +386,9 @@ def apply(runtime, snapshot, action, observation) -> None:
             state["triggers"][purpose] = observation.data["triggers"][purpose]
             state["errors"][purpose] = error
             add_event(snapshot, "semantic-job-unavailable", purpose=purpose, reason=error)
+    for pipeline in observation.data.get("pipelines", []):
+        if fingerprint(snapshot, pipeline["purpose"]) == pipeline["context_digest"]:
+            state.setdefault("pipelines", {})[pipeline["id"]] = pipeline
 
 
 def defer_intake(snapshot, *, now: float | None = None) -> bool:

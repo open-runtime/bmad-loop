@@ -8,7 +8,7 @@ from test_campaign_publication import publishable as publishable
 
 from bmad_loop import campaign_queue_publication as publication
 from bmad_loop.campaign_github import GithubError, MutationIntent
-from bmad_loop.campaign_model import OutboxAction
+from bmad_loop.campaign_model import GitHubSpec, OutboxAction
 from bmad_loop.campaign_queue import QueueGroup
 from bmad_loop.campaign_runtime import CampaignRuntime
 from bmad_loop.campaign_runtime_queue import proposals
@@ -43,7 +43,7 @@ def test_final_queue_success_gate_checks_current_authority(publishable, monkeypa
         phase="draining" if change == "draining" else "active",
         units={unit.id: unit},
         spec=SimpleNamespace(
-            github=SimpleNamespace(
+            github=GitHubSpec(
                 hold_labels=("bmad:hold",),
                 required_checks=(),
                 require_independent_review=True,

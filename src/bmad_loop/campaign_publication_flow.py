@@ -194,7 +194,55 @@ def apply_head_worker(runtime, snapshot, unit, receipt):
 def execute_special(runtime, snapshot, action, intent, *, reconcile=False):
     pub = controller(runtime, snapshot)
     current = replace(intent, generation=snapshot.generation, state="sent_unknown")
-    if intent.kind == "review_request":
+    if intent.kind == "native_merge":
+        from . import campaign_hold
+        from .campaign_native_merge import execute
+
+        def fresh_evidence():
+            current_snapshot = runtime.store.load(snapshot.id)
+            unit = current_snapshot.units[action.unit]
+            evidence = runtime._publication_evidence(current_snapshot, unit)
+            return replace(
+                evidence,
+                held=(
+                    evidence.held
+                    or current_snapshot.phase != "active"
+                    or current_snapshot.generation != snapshot.generation
+                    or campaign_hold.active(
+                        campaign_hold.channel(runtime.store.directory(snapshot.id), action.unit),
+                        campaign=snapshot.id,
+                        unit=action.unit,
+                    )
+                ),
+            )
+
+        result = execute(
+            current,
+            runtime.project,
+            runtime.store.directory(snapshot.id) / "native-merge-executions" / intent.action_id,
+            pub,
+            evidence=fresh_evidence(),
+            evidence_provider=fresh_evidence,
+            generation=snapshot.generation,
+            reconcile=reconcile,
+            independent_families=snapshot.spec.github.require_independent_review,
+        )
+        if (
+            result.state == "rejected"
+            and (result.receipt or {}).get("needs_integration")
+            and result.receipt.get("submission") == "not-submitted"
+            and result.receipt.get("definitive") is True
+        ):
+            return Observation(
+                "confirmed",
+                {
+                    "canceled_before_write": True,
+                    "needs_integration": True,
+                    "base": result.receipt["base"],
+                    "retired_native_intent": result.to_dict(),
+                },
+            )
+    elif intent.kind == "review_request":
         result = (
             reconcile_requests(pub, current)
             if reconcile
@@ -204,7 +252,7 @@ def execute_special(runtime, snapshot, action, intent, *, reconcile=False):
         arguments = (
             current,
             runtime.project,
-            runtime.store.directory(snapshot.id) / "project-merge-executions" / action.id,
+            runtime.store.directory(snapshot.id) / "project-merge-executions" / intent.action_id,
             pub,
         )
         if reconcile:

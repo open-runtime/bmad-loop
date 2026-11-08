@@ -72,7 +72,17 @@ def unit_navigation(unit, projection: dict | None = None) -> dict:
         else unit.bindings.get("reflection", {}).get("stage", {})
     )
     names = set()
-    if unit.claim and stage.get("launch_id") == unit.claim.launch_id:
+    bridge = unit.bindings.get("managed_communication") or {}
+    target = bridge.get("target", {})
+    managed = (
+        unit.claim
+        and bridge.get("kind") == "bridge"
+        and (target.get("unit_id"), target.get("launch_id"), target.get("generation"))
+        == (unit.id, unit.claim.launch_id, unit.claim.generation)
+    )
+    if managed and isinstance(bridge.get("name"), str):
+        names.add(bridge["name"])
+    elif unit.claim and stage.get("launch_id") == unit.claim.launch_id:
         for window in stage.get("windows", ()):
             if not unit.claim.quiescent and window.get("state") not in {"active", "launching"}:
                 continue

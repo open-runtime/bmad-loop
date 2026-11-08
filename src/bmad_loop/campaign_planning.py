@@ -36,6 +36,7 @@ def stage_packet(coordinates: StageCoordinates, *, context: dict[str, Any], skil
         "decomposition": "Propose qualified executable units with acceptance criteria, dependencies and explicit ownership scopes.",
         "planning_review": "Independently review the complete proposed plan, coverage, exclusions, overlap evidence and dependency graph.",
         "publication_review": "Review the complete PR diff against the current target, acceptance criteria, private source artifacts and all required feedback. Read every source artifact at its review_path and return its exact source_artifact_digest. Do not modify files.",
+        "landing_repair": "Repair the recorded failed acceptance of the actual merged product, preserving current main and every original obligation. Change only owned scopes; commit the completed repair on this branch. Do not merge, weaken tests, or close the original issue. Return artifacts as an empty list and record a concise repair report.",
         "conflict_repair": "Resolve the merge conflicts using both preserved heads and their intent. Record each conflict disposition and verification covering both sides. Preserve important work from both branches.",
         "closure": "Verify the entire epic is delivered, perform its required retrospective and record the canonical closure artifact.",
         "triage": "Triage the exact incoming GitHub object versions against existing work. Required review findings repair the same PR.",

@@ -43,6 +43,9 @@ def register(subparsers: Any) -> None:
         ("status", "show campaign units, holds and links"),
         ("history", "read bounded campaign events and retained role history"),
         ("jobs", "read bounded reasoning job state and lifecycle receipts"),
+        ("messages", "read durable message delivery and application status"),
+        ("endpoints", "read paged managed communication addresses and delivery state"),
+        ("steer", "queue advisory instructions for the next safe stage boundary"),
         ("handoff", "queue continuation through approved harness candidates"),
         ("migrate-state", "migrate quiescent campaign storage with a preserved backup"),
         ("stop", "close admissions and drain existing bounded stages"),
@@ -128,6 +131,11 @@ def register(subparsers: Any) -> None:
             child.add_argument("--pr", required=True, type=int, metavar="NUMBER")
         if command == "hold":
             child.add_argument("--reason", required=True)
+        if command == "steer":
+            child.add_argument("--unit", default="", metavar="UNIT")
+            child.add_argument("--text", required=True)
+            child.add_argument("--job", default="")
+            child.add_argument("--request-id", default="")
         if command == "authorize-scope":
             child.add_argument("--expected-revision", required=True, type=int)
             child.add_argument("--reason", required=True)
@@ -159,6 +167,15 @@ def register(subparsers: Any) -> None:
             child.add_argument("--after", default="")
             child.add_argument("--limit", type=int, default=100)
             child.add_argument("--details", action="store_true")
+        if command == "messages":
+            child.add_argument("--unit", default="", metavar="UNIT")
+            child.add_argument("--job", default="", metavar="JOB")
+            child.add_argument("--after", type=int, default=0)
+            child.add_argument("--limit", type=int, default=100)
+        if command == "endpoints":
+            child.add_argument("--after", type=int, default=0)
+            child.add_argument("--limit", type=int, default=100)
+            child.add_argument("--state", default="")
         if command == "handoff":
             child.add_argument("--profile", default="")
             child.add_argument("--model", default="")
@@ -213,6 +230,7 @@ def _job_document(row, *, details=False):
         "presentation_status": receipt.get("presentation_status")
         or claim.get("presentation_status"),
     }
+    result["communication"] = claim.get("managed_communication")
     if details:
         receipt = row.get("receipt") or {}
         result["receipt"] = {
@@ -518,7 +536,17 @@ def status_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
         },
         "communication": {
             key: snapshot.bindings.get("communication", {}).get(key)
-            for key in ("mode", "available", "detail", "missing_bindings", "observed_at")
+            for key in (
+                "mode",
+                "available",
+                "detail",
+                "missing_bindings",
+                "observed_at",
+                "counts",
+                "errors",
+                "queued_messages",
+                "endpoints",
+            )
             if key in snapshot.bindings.get("communication", {})
         },
         "outbox": action_counts(snapshot),
@@ -696,6 +724,70 @@ def dispatch(args: argparse.Namespace) -> int:
     snapshot = store.load(campaign_id)
     if command == "status":
         return _emit(args, _result(command, campaign=status_document(snapshot)))
+    if command == "endpoints":
+        from .campaign_managed_communication import ManagedCommunication
+
+        rows = ManagedCommunication(store.directory(campaign_id)).endpoints(
+            after=args.after,
+            limit=args.limit,
+            state=args.state,
+        )
+        return _emit(
+            args,
+            _result(
+                command,
+                endpoints=rows,
+                next_after=rows[-1]["sequence"] if rows else args.after,
+                has_more=len(rows) == args.limit,
+            ),
+        )
+    if command in {"messages", "steer"}:
+        from .campaign_messages import MessageLedger
+
+        ledger = MessageLedger(store.directory(campaign_id))
+        if args.unit and args.unit not in snapshot.units:
+            raise CampaignError(f"unknown campaign unit {args.unit}")
+        if args.job:
+            jobs = store.jobs(campaign_id, job_id=args.job, limit=1)
+            if not jobs or (args.unit and jobs[0]["request"]["unit"] != args.unit):
+                raise CampaignError("unknown reasoning job or different message target")
+        if command == "steer":
+            import uuid
+
+            from .campaign_jobs import TERMINAL
+            from .campaign_model import UnitState
+
+            target_unit = args.unit or (jobs[0]["request"].get("unit", "") if args.job else "")
+            if not target_unit and not args.job:
+                raise CampaignError("steering requires --unit or --job")
+            if (
+                target_unit
+                and snapshot.units[target_unit].state
+                in {
+                    UnitState.DELIVERED,
+                    UnitState.CANCELED,
+                    UnitState.MERGE_REQUESTED,
+                    UnitState.MERGED_PENDING_SYNC,
+                }
+            ) or (args.job and jobs[0]["state"] in TERMINAL):
+                raise CampaignError("target has closed; steering cannot reopen it")
+            accepted = ledger.accept(
+                message_id=args.request_id or uuid.uuid4().hex,
+                unit=target_unit or "@campaign",
+                job=args.job,
+                text=args.text,
+            )
+            return _emit(args, _result(command, message=accepted, state="queued"))
+        rows = ledger.list(unit=args.unit, job=args.job, after=args.after, limit=args.limit)
+        return _emit(
+            args,
+            _result(
+                command,
+                messages=rows,
+                next_after=rows[-1]["sequence"] if rows else args.after,
+                has_more=len(rows) == args.limit,
+            ),
+        )
     if command == "migrate-state":
         migrated = store.migrate_state(campaign_id)
         return _emit(args, _result(command, campaign=status_document(migrated)))

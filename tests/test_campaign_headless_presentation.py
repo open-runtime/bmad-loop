@@ -59,6 +59,14 @@ def test_reasoning_waits_for_workspace_then_freezes_its_native_binding(tmp_path,
     snapshot, runtime, supervisor, _ = case(tmp_path, prepared, count=1)
     snapshot.spec = replace(snapshot.spec, paradev=replace(snapshot.spec.paradev, reflect=True))
     snapshot.config_revision += 1
+    # A configuration revision owns its own frozen launcher envelope.
+    from test_campaign_route_readiness import freeze_routes
+
+    from bmad_loop.adapters.profile import get_profile
+
+    freeze_routes(
+        snapshot, tmp_path / "reflected-configuration", {"campaign:codex": get_profile("codex")}
+    )
     job = snapshot.jobs["job-0"]
     job["request"]["coordinates"]["config_revision"] = snapshot.config_revision
     waiting = runtime.observe_workers(snapshot)

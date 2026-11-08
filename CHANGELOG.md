@@ -13,6 +13,9 @@ breaking changes may land in a minor release.
 - Prepare reusable native-history summaries during active work with bounded background jobs.
 - Bind required acceptance evidence to exact candidates and recruit configured GitHub reviewers.
 - Expose campaign job history, retained terminal history and scoped operator evidence.
+- Add managed hcom bridge addresses, durable advisory steering and paginated delivery receipts.
+- Partition oversized semantic inventories into bounded reasoning jobs before applying complete decisions.
+- Support explicit native administrative publication with actual-landing acceptance and linked repair PRs.
 
 ### Changed
 
@@ -38,6 +41,9 @@ breaking changes may land in a minor release.
 - Enforce native stream limits after process exit and retain telemetry for rejected structured results.
 - Preserve macOS worker identity across clock corrections and refuse uncertain legacy process ownership.
 - Reap owned campaign workers before checking process liveness and refuse duplicate uncertain launches.
+- Honor scoped holds before headless stages and check inherited developer and frozen launcher readiness at admission.
+- Require permission-specific headless qualification independently of handoff configuration.
+- Retain all required duplicate check results and reconcile native merge acknowledgements before replay.
 
 ## [0.14.0] — 2026-11-05
 

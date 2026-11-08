@@ -52,8 +52,11 @@ def write_paths(grants, directory):
     if grants.get("schema_version") != 1 or not grants.get("config_digest"):
         raise CampaignError("Execution sandbox requires frozen versioned grants")
     workspace = _path(grants.get("workspace"))
-    if not workspace.is_dir() or not grants.get("scopes"):
+    readonly_mode = grants.get("permissions") == "read-only-tools"
+    if not workspace.is_dir() or (not readonly_mode and not grants.get("scopes")):
         raise CampaignError("Execution sandbox requires a real workspace and scopes")
+    if readonly_mode and any(grants.get(key) for key in ("scopes", "write_paths", "git_branch")):
+        raise CampaignError("Read-only tools cannot grant product or Git writes")
     product = []
     for item in [*grants["scopes"], *grants.get("write_paths", [])]:
         if any(char in str(item) for char in "*?["):
@@ -63,6 +66,17 @@ def write_paths(grants, directory):
     scratch.mkdir(mode=0o700, exist_ok=True)
     allowed = [*product, scratch.resolve()]
     allowed.extend(_path(item) for item in grants.get("runtime_write_paths", []))
+    if readonly_mode:
+        common = Path(
+            _git(workspace, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        ).resolve()
+        protected = (workspace, common)
+        if any(
+            read == write or read.is_relative_to(write) or write.is_relative_to(read)
+            for read in protected
+            for write in allowed
+        ):
+            raise CampaignError("Read-only runtime grant overlaps product or Git storage")
     if grants.get("git_branch"):
         branch = _git(workspace, "symbolic-ref", "--short", "HEAD")
         if branch != grants["git_branch"] or branch in grants.get(
@@ -77,10 +91,8 @@ def write_paths(grants, directory):
             raise CampaignError("Execution sandbox requires an isolated Git worktree")
         # Objects are shared by every worktree, including protected branches.
         # A writer gets a separate object bank below, never this common store.
-        allowed.append(git_dir)
-        for parent in (common / "refs" / "heads", common / "logs" / "refs" / "heads"):
-            branch_path = _path(branch, root=parent)
-            allowed.extend([branch_path, Path(str(branch_path) + ".lock")])
+        # Native refs and index are private too. Exposing a shared ref before
+        # its new bank objects are sealed breaks concurrent fetch/fsck.
     readonly = [
         _path(row["path"] if isinstance(row, dict) else row)
         for row in grants.get("read_only_paths", [])
@@ -173,7 +185,7 @@ def _object_bank(grants, directory, workspace):
     return bank, objects
 
 
-def macos_profile(paths, *, object_bank=None):
+def macos_profile(paths, *, object_bank=None, native_git=None):
     """Seatbelt applies write confinement to child tools as well as the native CLI."""
     clauses = []
     for path in paths:
@@ -210,6 +222,12 @@ def macos_profile(paths, *, object_bank=None):
             + pattern("^" + temporary + "$")
             + "))\n"
         )
+    if native_git is not None:
+        # git commit --only uses an auxiliary private index named by its PID.
+        index_pattern = "^" + re.escape(str(native_git)) + r"/next-index-[0-9]+(\.lock)?$"
+        profile += (
+            "(allow file-write* (regex #" + json.dumps(index_pattern).replace("\\\\", "\\") + "))\n"
+        )
     return profile
 
 
@@ -225,12 +243,40 @@ def command(grants_path, native, *, platform=None):
     if not sandbox.is_file():
         raise CampaignError("Qualified macOS execution sandbox is unavailable")
     bank, objects = _object_bank(grants, grants_path.parent, workspace)
+    native_git = None
+    if bank is not None:
+        from .campaign_native_git import prepare
+        from .campaign_native_git import write_paths as native_write_paths
+
+        native_git = prepare(bank, objects, workspace, grants_path.parent, grants["git_branch"])
+        allowed = (*allowed, *native_write_paths(native_git))
     profile = grants_path.parent / "execution.sb"
 
-    atomic_write_text(profile, macos_profile(allowed, object_bank=bank), follow_symlinks=False)
+    atomic_write_text(
+        profile,
+        macos_profile(
+            allowed,
+            object_bank=bank,
+            native_git=Path(native_git["git_dir"]) if native_git else None,
+        ),
+        follow_symlinks=False,
+    )
     environment = dict(os.environ)
+    for key in (
+        "GIT_DIR",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_WORK_TREE",
+        "GIT_NAMESPACE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    ):
+        environment.pop(key, None)
     environment.update(TMPDIR=str(scratch), TMP=str(scratch), TEMP=str(scratch))
     if bank is not None:
+        assert native_git is not None
+        environment["GIT_DIR"] = native_git["git_dir"]
+        environment["GIT_WORK_TREE"] = str(workspace)
         environment["GIT_OBJECT_DIRECTORY"] = str(bank)
         environment["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = json.dumps(
             str(objects), ensure_ascii=False

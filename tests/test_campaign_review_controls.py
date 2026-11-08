@@ -1,6 +1,7 @@
 """Real preflight and durable controls exercise their production consumers."""
 
 import json
+import shutil
 import time
 from types import SimpleNamespace
 
@@ -57,7 +58,7 @@ def test_default_teamrouter_observer_admits_unknown_concurrency(project, tmp_pat
         )
 
     monkeypatch.setattr(campaign_capacity, "run_argv", status)
-    monkeypatch.setattr(campaign_preflight.shutil, "which", lambda _: "/qualified/fake-cli")
+    monkeypatch.setattr(shutil, "which", lambda _: "/qualified/fake-cli")
     observed = campaign_preflight.inspect(project.project, selected)
     assert calls and all(command == ("teamrouter", "status", "--json") for command in calls)
     assert observed["capabilities"]["planning"]["ready"]
@@ -136,7 +137,7 @@ def test_preflight_and_scheduler_share_route_eligibility(
         budget_remaining=budget,
         concurrency_known=known,
     )
-    monkeypatch.setattr(campaign_preflight.shutil, "which", lambda _: "/qualified/fake-cli")
+    monkeypatch.setattr(shutil, "which", lambda _: "/qualified/fake-cli")
     result = campaign_preflight.inspect(
         project.project, selected, capacity_observer=lambda *_: route
     )

@@ -161,6 +161,8 @@ def proposals(runtime, snapshot) -> tuple[Proposal, ...]:
             request.role,
             provisional=tuple(selected),
             allowed_candidates=request.candidates,
+            permissions="reasoning",
+            require_headless=True,
         )
         if candidate is None or candidate not in request.candidates:
             continue
@@ -283,7 +285,7 @@ def _superseded(row, action, data=None):
 
 
 def perform(runtime, snapshot, action, *, reconcile: bool = False) -> Observation:
-    from .campaign_headless import capability_for
+    from .campaign_headless import capability_for, readonly_grants
 
     row = _effect_row(runtime, snapshot, action)
     if row["state"] in TERMINAL or _superseded(row, action):
@@ -305,8 +307,55 @@ def perform(runtime, snapshot, action, *, reconcile: bool = False) -> Observatio
             routes = snapshot.config_snapshot.get("reasoning_capabilities", {})
             try:
                 capability = capability_for(
-                    routes, candidate.profile, candidate.model, "no-tools", effort=candidate.effort
+                    routes, candidate.profile, candidate.model, "reasoning", effort=candidate.effort
                 )
+                permission = capability["permissions"]
+                grants = None
+                if permission == "read-only-tools":
+                    workspace = (claim.get("presentation") or {}).get(
+                        "workspace", str(runtime.project)
+                    )
+                    grants = readonly_grants(
+                        workspace, request.coordinates, capability, generation=claim["generation"]
+                    )
+                from .campaign_communication_runtime import prepare as prepare_communication
+                from .campaign_headless import render_input
+                from .campaign_messages import MessageLedger
+
+                managed_binding = prepare_communication(runtime, snapshot, job=row)
+                _, delivery = render_input(request, capability)
+                room = (
+                    min(
+                        request.limits.input_tokens,
+                        capability["input_tokens"],
+                        capability["context_tokens"]
+                        - request.limits.output_tokens
+                        - capability["reserved_tokens"],
+                    )
+                    - delivery["token_upper_bound"]
+                    - 512
+                )
+                mail = MessageLedger(runtime.store.directory(snapshot.id)).freeze(
+                    request.unit or "@campaign",
+                    claim["launch_id"],
+                    job=row["id"],
+                    max_bytes=min(32768, room),
+                )
+                view = claim.get("presentation")
+                if managed_binding and view:
+                    from .campaign_titles import navigation_title, unit_navigation
+
+                    nav = (
+                        unit_navigation(snapshot.units[request.unit])
+                        if request.unit in snapshot.units
+                        else {}
+                    )
+                    view = {
+                        **view,
+                        "navigation_prefix": navigation_title(
+                            **{**nav, "names": (managed_binding["name"],)}
+                        ),
+                    }
                 path = runner.prepare(
                     path.parent,
                     request,
@@ -314,8 +363,12 @@ def perform(runtime, snapshot, action, *, reconcile: bool = False) -> Observatio
                     capability,
                     launch_id=claim["launch_id"],
                     generation=claim["generation"],
+                    permissions=permission,
+                    grants=grants,
                     communication_room=snapshot.spec.communication.room,
-                    presentation=claim.get("presentation"),
+                    presentation=view,
+                    **({"managed_binding": managed_binding} if managed_binding else {}),
+                    **({"steering": mail} if mail else {}),
                 )
             except (CampaignError, OSError, ValueError) as exc:
                 # No launch has been attempted; this is a typed preparation
@@ -344,9 +397,39 @@ def perform(runtime, snapshot, action, *, reconcile: bool = False) -> Observatio
         observed = runner.observe(path)
     else:
         raise CampaignError("unsupported reasoning effect")
+    if path.exists():
+        from .campaign_headless import read_json
+
+        envelope = read_json(path)
+        if envelope.get("managed_binding"):
+            observed["managed_communication"] = envelope["managed_binding"]
+        if (
+            observed["state"] == "finished"
+            and observed.get("receipt", {}).get("outcome") == "completed"
+            and envelope.get("steering")
+        ):
+            from .campaign_messages import MessageLedger
+
+            MessageLedger(runtime.store.directory(snapshot.id)).applied(
+                [message["id"] for message in envelope["steering"]],
+                launch_id=claim["launch_id"],
+                unit=request.unit or "@campaign",
+                job=row["id"],
+            )
     if observed["state"] == "running" and claim.get("presentation"):
         view = presentation(snapshot, request)
         if view is not None:
+            if observed.get("managed_communication"):
+                from .campaign_titles import navigation_title, unit_navigation
+
+                nav = (
+                    unit_navigation(snapshot.units[request.unit])
+                    if request.unit in snapshot.units
+                    else {}
+                )
+                view["navigation_prefix"] = navigation_title(
+                    **{**nav, "names": (observed["managed_communication"]["name"],)}
+                )
             observed["presentation_status"] = runner.refresh_presentation(
                 path, view["navigation_prefix"]
             )
@@ -393,6 +476,8 @@ def apply(runtime, snapshot, action, observation) -> None:
         return
     request = request_from_dict(row["request"])
     data = observation.data
+    if data.get("managed_communication") and row.get("claim"):
+        row["claim"]["managed_communication"] = data["managed_communication"]
     if action.kind == "reasoning-wait":
         if not live(row):
             row["reason"] = WORKSPACE_WAIT

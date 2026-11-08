@@ -605,6 +605,7 @@ def compose_context(snapshot: CampaignSnapshot, unit: CampaignUnit) -> str:
             "ownership": list(peer.spec.scopes),
             "interfaces": list(peer.spec.acceptance),
             "hcom_binding": peer.bindings.get("hcom"),
+            "managed_communication": peer.bindings.get("managed_communication"),
         }
         for peer in relevant[:limit]
     ]

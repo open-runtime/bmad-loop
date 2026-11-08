@@ -63,6 +63,33 @@ worker environments during upgrades. For an exact fork rollout, install its full
 merged Git SHA and run `bmad-loop campaign provenance --expected-commit SHA --json`;
 a matching version string alone is insufficient.
 
+For unattended campaign setup, also read the installed campaign guide and report
+the following independently before recommending activation:
+
+- Exact installed commit, canonical checkout commit and project policy revision.
+- Preflight readiness for the inherited developer and every selected role pool,
+  including model/effort and permission-specific native qualification. A read-only
+  or no-tools capability is not a writer grant. Changed launchers, dependencies or
+  installation paths require the corresponding proof to be renewed.
+- The project's actual publication policy, required checks and reviews. Preserve
+  commit history and use `direct-authorized` only with explicit repository-bound
+  owner authority. Do not restore retired project-specific merge scripts.
+- Configured execution, review, verification, reasoning and shared-session limits;
+  report the effective minimum rather than presenting `max_workers` as throughput.
+- When managed hcom is requested, configure its absolute project room and verify
+  `campaign endpoints`, an external status request and safe-boundary steering.
+  Public bridges identify factual controller replies; they do not impersonate a
+  model or reopen a completed writer. Paradev titles begin with hcom name, epic,
+  issue and PR, retaining pending/unbound labels until real identities exist.
+- Replacement automation responsibilities and a selected delivery reaching merged
+  and reconciled tracking. An installed executable or green preflight alone is
+  not evidence of a successful unattended rollout.
+
+Keep native qualification separate from zero-token repository tests. It sends
+real prompts, so use the owner's existing authorization and the documented bounded
+qualification commands; do not silently probe every model while initializing a
+project. Keep unsupported foreground/background lifecycle behavior explicit.
+
 The orchestrator is what spawns fresh coding CLI sessions through the selected adapter(s) to invoke `bmad-build-auto` (the upstream dev primitive; `bmad-dev-auto` on pre-rename releases) for the dev pass — then re-invokes it on the `done` spec for the follow-up review pass — and `bmad-loop-sweep`, watches their hook signals, and verifies their artifacts. Installing it is therefore part of setup, not an optional extra.
 
 > **Why from Git?** The BMAD installer copies only skill directories into a project — it does not carry sibling files, so the tool can't ride along in the skill folder. This skill installs the open-runtime fork from <https://github.com/open-runtime/bmad-loop>. (The reverse holds, though: the tool's wheel **bundles** the skills, so `bmad-loop init` lays them down into a project's skill trees on its own — see step 3.)

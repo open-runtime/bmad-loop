@@ -42,6 +42,7 @@ class HeadlessAdapter(CodingCLIAdapter):
         self.grants = None
         self.coordinates = None
         self.handoff_packet = None
+        self.managed_binding = None
         self.requests: dict[str, Path] = {}
         self.receipts: dict[str, dict[str, Any]] = {}
         self.baselines: dict[str, str] = {}
@@ -50,7 +51,17 @@ class HeadlessAdapter(CodingCLIAdapter):
     def set_capability(self, capability, grants, coordinates, handoff_packet=None):
         self.capability = copy.deepcopy(capability)
         self.grants = copy.deepcopy(grants)
-        if capability.get("permissions") == "workspace-tools" and self.grants:
+        if capability.get("permissions") == "read-only-tools" and self.grants:
+            from ..campaign_headless import readonly_grants
+
+            self.grants = readonly_grants(
+                self.grants["workspace"],
+                coordinates,
+                capability,
+                generation=self.grants.get("generation", 1),
+                read_only_paths=self.grants.get("read_only_paths", ()),
+            )
+        if capability.get("permissions") in {"workspace-tools", "read-only-tools"} and self.grants:
             from ..campaign_execution_sandbox import _path
 
             workspace = Path(self.grants["workspace"]).resolve()
@@ -67,13 +78,21 @@ class HeadlessAdapter(CodingCLIAdapter):
         self.coordinates = copy.deepcopy(coordinates)
         self.handoff_packet = copy.deepcopy(handoff_packet)
 
+    def set_managed_communication(self, binding):
+        self.managed_binding = copy.deepcopy(binding)
+
     def start_session(self, spec: SessionSpec) -> SessionHandle:
+        from ..campaign_hold import held
+        from .multiplexer import MultiplexerError
+
+        if held():
+            raise MultiplexerError("campaign operator hold suppresses automatic session launch")
         if self.capability is None or self.coordinates is None:
             raise CampaignError(
                 "Headless session requires frozen native capability and coordinates"
             )
         permission = self.capability["permissions"]
-        if permission == "workspace-tools" and (
+        if permission in {"workspace-tools", "read-only-tools"} and (
             not self.grants or Path(self.grants["workspace"]).resolve() != spec.cwd.resolve()
         ):
             raise CampaignError("Headless execution grant belongs to another workspace")
@@ -127,6 +146,7 @@ class HeadlessAdapter(CodingCLIAdapter):
                 key: value for key, value in spec.env.items() if key.startswith("BMAD_LOOP_")
             },
             communication_room=spec.env.get("HCOM_DIR", ""),
+            managed_binding=self.managed_binding,
             presentation=(
                 {
                     "workspace": str(spec.cwd.resolve()),
@@ -142,6 +162,8 @@ class HeadlessAdapter(CodingCLIAdapter):
 
             self.baselines[spec.task_id] = rev_parse_head(spec.cwd)
         launched_ns = time.time_ns()
+        if held():
+            raise MultiplexerError("campaign operator hold suppresses automatic session launch")
         launched = self.runner.launch(path)
         return SessionHandle(
             spec.task_id, launched.get("native_id", identifier), launched_ns=launched_ns
@@ -165,14 +187,25 @@ class HeadlessAdapter(CodingCLIAdapter):
                 )
             time.sleep(0.1)
         if handle.task_id in self.baselines:
+            from ..campaign_native_git import publish
             from ..campaign_object_promotion import promote
-            from ..verify import rev_parse_head
 
             # Native completion precedes all legacy verification/commit reads.
             # Only sealed canonical bytes may enter the child engine's proofs.
-            promote(spec.cwd, rev_parse_head(spec.cwd), self.baselines[handle.task_id])
+            head = publish(
+                spec.cwd, self.baselines[handle.task_id], directory=path.parent, final=True
+            )
+            promote(spec.cwd, head, self.baselines[handle.task_id])
         self.receipts[handle.task_id] = receipt
         outcome = receipt["outcome"]
+        result_json = receipt.get("result")
+        if (
+            outcome == "completed"
+            and (self.capability or {}).get("protocol") == "codex-native-review"
+        ):
+            from ..campaign_codex_review import fold_result
+
+            result_json = fold_result(result_json, receipt.get("native_review"))
         if self.journal is not None and receipt.get("observed_model"):
             self.journal.append(
                 "session-model",
@@ -190,7 +223,7 @@ class HeadlessAdapter(CodingCLIAdapter):
                     else "over_budget" if outcome == "limit" else "crashed"
                 )
             ),
-            result_json=receipt.get("result"),
+            result_json=result_json,
             session_id=receipt.get("session_id"),
             transcript_path=str(path.parent / "stdout.jsonl"),
             usage_limited=receipt.get("reason") if outcome == "quota" else None,

@@ -1,6 +1,7 @@
 """Preflight separates real resource evidence from installation assumptions."""
 
 import json
+import shutil
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -24,9 +25,7 @@ from bmad_loop.campaign_scheduler import CapacityObservation
 
 def inspect(project, tmp_path, monkeypatch, spec, *, which=None, **kwargs):
     git(project.project, "remote", "add", "origin", "https://github.com/example/repo.git")
-    monkeypatch.setattr(
-        campaign_preflight.shutil, "which", which or (lambda binary: "/qualified/fake-cli")
-    )
+    monkeypatch.setattr(shutil, "which", which or (lambda binary: "/qualified/fake-cli"))
     return campaign_preflight.inspect(
         project.project,
         spec,
@@ -53,6 +52,46 @@ def test_default_resource_capabilities_do_not_imply_missing_currency_budget(
     assert result["capabilities"]["planning"]["ready"] is True
     assert result["capabilities"]["execution"]["ready"] is platform_util.HANDLE_ANCHORED_WRITES
     assert result["capabilities"]["publication"]["ready"] is False
+
+
+def test_preflight_checks_inherited_developer_without_execution_override(
+    project, tmp_path, monkeypatch
+):
+    from bmad_loop import policy
+
+    path = project.project / policy.POLICY_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        '[adapter.dev]\nname="codex"\nmodel="astra"\n[adapter.triage]\nname="claude"\nmodel="fable"\n[adapter.review]\nname="claude"\nmodel="fable"\n'
+    )
+    result = inspect(
+        project,
+        tmp_path,
+        monkeypatch,
+        spec(tmp_path),
+        which=lambda binary: None if binary == "codex" else "/qualified/claude",
+    )
+    execution = result["capabilities"]["execution"]
+    assert not execution["ready"]
+    route = execution["observations"]["execution"][0]
+    assert route["profile"] == "codex" and route["model"] == "astra"
+    assert not route["installed"] and not route["eligible"]
+    assert result["capabilities"]["planning"]["ready"]
+
+
+@pytest.mark.parametrize("reasoning", [False, True])
+def test_headless_writer_is_required_without_handoff(project, tmp_path, monkeypatch, reasoning):
+    selected = replace(
+        spec(tmp_path),
+        roles=(("execution", RoleSpec(profile="grok", model="grok-test")),),
+        reasoning=ReasoningSpec(enabled=reasoning, purposes=()),
+    )
+    result = inspect(project, tmp_path, monkeypatch, selected)
+    execution = result["capabilities"]["execution"]
+    assert not execution["ready"]
+    route = execution["observations"]["execution"][0]
+    assert not route["eligible"]
+    assert "workspace-tools" in route["launcher"]["reason"]
 
 
 def test_usd_budget_refuses_without_actual_cost_receipt_accounting(project, tmp_path, monkeypatch):
@@ -175,7 +214,7 @@ def test_cli_preflight_surfaces_lifecycle_and_communication_without_creating_res
     probes = native_probes(monkeypatch, controller=False)
     real_inspect = campaign_preflight.inspect
     git(project.project, "remote", "add", "origin", "https://github.com/example/repo.git")
-    monkeypatch.setattr(campaign_preflight.shutil, "which", lambda binary: "/qualified/fake-cli")
+    monkeypatch.setattr(shutil, "which", lambda binary: "/qualified/fake-cli")
     monkeypatch.setattr(
         campaign_preflight,
         "inspect",

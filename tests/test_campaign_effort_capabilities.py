@@ -78,12 +78,15 @@ def test_original_manifest_forms_remain_usable(prepared, tmp_path, nested):
 
 def test_normal_reasoning_launch_delivers_the_selected_effort_proof(variants, prepared, tmp_path):
     from test_campaign_reasoning_jobs import case
+    from test_campaign_route_readiness import freeze_routes
 
     snapshot, runtime, supervisor, _ = case(tmp_path, prepared, count=0)
     _, routes, candidate, selected_cap, _ = variants
     snapshot.config_snapshot["reasoning_capabilities"] = routes
     snapshot.spec = replace(snapshot.spec, role_pools=(("summary-pool", (candidate,)),))
+    template = runtime.template(snapshot)
     snapshot.config_revision += 1
+    freeze_routes(snapshot, tmp_path / "configuration-v2", template.profiles, template.policy)
     request = replace(
         prepared[2],
         id="variant-job",

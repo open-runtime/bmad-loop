@@ -1,6 +1,6 @@
 # ADR 0002: A deterministic SDLC campaign with GitHub delivery
 
-- **Status:** Implemented and review-ready; project activation remains gated
+- **Status:** Delivery completion in progress; review repairs and activation extension pending
 - **Date:** 2026-11-05
 - **Scope:** An opt-in campaign supervisor, isolated workers, planning, GitHub synchronization and native Paradev reflection
 
@@ -485,8 +485,12 @@ reflection, bundled-backend migration and output history after teardown.
 Optional hcom observation is included; new automatic peer wakeups remain deferred
 until their closing behavior qualifies. GitHub's asynchronous merge API and queue
 candidate semantics are explicit. REM activation must resolve its non-strict
-required checks and administrative merge route before claiming strict unattended
-delivery. No implicit Paradev/hcom release or GitHub ruleset change is authorized.
+required checks through its explicitly authorized native publication mode, without
+claiming strict server-enforced base freshness. Its primary-session decision
+retires the custom merge scripts; actual landing acceptance and bounded repair
+remain required. Managed controller bridges provide addressable sessions and
+safe-boundary steering while mandatory wrapper enrollment uses isolated native
+rooms. No companion hcom release or GitHub ruleset change is required.
 
 ## Alternatives
 

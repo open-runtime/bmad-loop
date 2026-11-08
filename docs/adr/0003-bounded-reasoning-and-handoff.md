@@ -1,6 +1,6 @@
 # ADR 0003: Bounded reasoning jobs and portable session handoff
 
-- **Status:** Implemented and review-ready; project activation remains gated
+- **Status:** Delivery completion in progress; native routes and managed communication pending
 - **Date:** 2026-11-06
 - **Extends:** [ADR 0002](0002-native-sdlc-campaign.md) and its [implementation contract](0002-campaign-implementation.md)
 - **Delivery:** The same campaign implementation PR, before autonomous project activation
@@ -32,6 +32,20 @@ the [G0–G8 traceability matrix](0002-campaign-implementation.md#implementation
 and keep implementation, normal-runtime coverage, native qualification and
 activation separate. The immediate milestone is readiness for the next reviews;
 merge, exact installation and qualified REM delivery remain subsequent gates.
+
+The accepted completion extension in ADR 0002 includes these subsequent gates in
+the current work. Its native route proofs, managed hcom communication, writable
+cross-harness continuation and 32-shared-session qualification are required before
+claiming unattended readiness. Earlier candidate results below remain historical;
+every affected route and final candidate must earn fresh evidence.
+
+Oversized semantic inventories use a durable bounded map/reduce job graph. Maps
+retain source identities and cross-partition dependency/ownership facts. Reducers
+must account for complete input coverage before the final purpose-specific result
+can change authority. Intermediate summaries never mutate priorities or plans;
+stale, incomplete or oversized final decisions remain visible without partial
+application. These jobs share the same capacity and safe-boundary message ledger
+as other reasoning work, with distinct claims and public bridge identities.
 
 Optimize sequencing and useful parallelism through dependencies, ownership and
 token/session capacity. Preserve existing source initiatives/sprints and their
@@ -690,11 +704,11 @@ checks passed. Two independent reviews against that same candidate closed withou
 open findings. The earlier full-suite failures have been repaired and no longer
 block this milestone.
 
-The final-candidate regression, load and independent-review gates are complete;
-the implementation is ready for the next review. Hosted Actions remain disabled,
-and unrun platform gates remain explicit. Merge, exact-commit installation,
-canonical-base update and REM activation remain later gates, unchanged by these
-qualifications.
+Those regression, load and independent-review results qualify the named earlier
+candidate. The delivery completion extension requires fresh final checks and
+reviews after its changes. Hosted Actions remain disabled; unrun platform gates
+remain explicit. Merge, exact-commit installation, canonical-base update and REM
+activation are required completion work, not satisfied by earlier qualification.
 
 ## Capability evidence and limits
 
@@ -754,6 +768,73 @@ would discard virtualenv dependency resolution. No-tools canaries cannot earn
 writer qualification. Earned input coverage, actual output/turn usage and configured
 ceilings remain separate. This finite operation establishes an executable scoped
 writer route, not unrestricted workflow or cross-harness completion qualification.
+
+Read-only tools are a third explicit native permission, distinct from no-tools and
+workspace-tools. The exact outer sandbox permits only scratch and frozen native
+runtime paths, rejecting product/Git write scopes and overlapping runtime roots.
+Its independent fixture requires a private workspace readback, unchanged product
+and Git state, and actual descendant write denial. Normal reasoning may select
+this route only from its frozen reasoning capability; it cannot borrow writer
+evidence or silently widen no-tools authority.
+
+The native Codex read-only backend keeps TeamRouter/hcom admission outside
+Seatbelt: macOS refuses to execute its setuid process-inventory binary under even
+an allow-all Seatbelt profile. It does not bypass or replace ownership checks.
+The exact native read-only sandbox policy confines tools, and a deterministic
+`command/exec` probe through that same policy must demonstrate product/Git/outside
+and descendant write denial before inference. The native RPC response remains in
+the immutable qualification receipt. This backend cannot authorize writers or
+inherit an outer-sandbox proof.
+
+Codex native app-server routes pin the owner wrapper and transport dependencies.
+One ordinary `turn/start` binds native model/session/usage to the selected route.
+A separate `review` capability uses the `codex-native-review` protocol: native
+`review/start` followed by one schema-constrained mapping turn on the same thread.
+Both turns count toward the bounded allowance. Preserve the raw native review and
+all findings independently of the mapping result; unresolved native findings force
+changes requested. Mapping supplies campaign-specific coordinates and acceptance
+proof, and cannot waive the native verdict. Planning/publication/landing review
+selects that explicit slot and fails closed if its proof is invalid. The native
+review recipe requires its own earned qualification, never an edited ordinary
+reasoning capability. No-tools is not claimed for either Codex transport.
+
+The native app-server projects the structured review as rendered prose and does
+not publish the delegate's token usage in its parent stream. Read immutable
+native rollout snapshots using explicit parent-thread, root-turn, child-turn and
+review-item identities. Preserve the native structured `review_output` and child
+`token_count` records, plus the child's actual model/effort context. Add that
+separate delegate usage to the mapping session's native usage. Missing or
+ambiguous lineage fails qualification; requested model names and formatted review
+text are not substitute evidence.
+
+The Codex scoped-writer backend preserves native read-only builtins and exposes
+one dynamic tool, `bmad_shell`. Its disposable client validates thread/turn/tool
+identity before delegating to the exact frozen ownership sandbox and private
+object bank. Durable call identities prevent repeated execution after duplicate
+delivery or uncertain outcomes. The command budget is 32 calls, 60 seconds and
+64 KiB output per call. Native builtin denial and scoped writer commit/history
+proof are independent qualification checks. Quiescence covers the owned session
+and observed descendants; it is not proof against a malicious daemon that detaches
+and disappears between observations. Persistent background services are excluded.
+The Claude scoped MCP route shares this bounded command boundary. Reusing an
+unchanged nested native executable's served-model alias evidence never transfers
+permission qualification to either writer route.
+
+AGY's private no-tools hooks deny general tools and bound model invocations across
+the complete job. Its native schema `finish` is an output operation, narrowly
+allowed only with arguments matching the frozen schema. A model-generated tool
+call cannot establish completion; the owned native terminal lifecycle and result
+remain required. Preserve genuine native attribution and usage on malformed
+structured output, without accepting concatenated JSON or tool parameters as the
+missing terminal result.
+
+The AGY scoped-writer recipe admits only `run_command` and schema-valid `finish`.
+Its documented pre-tool `overwrite` replaces each `CommandLine` with the pinned
+bounded command worker, binding native conversation/step identity to the original
+argv. It denies all other direct file, messaging and MCP operations. The shared
+scoped executor owns write authority and retained call outcomes; native invocation
+limits and terminal completion remain independent checks. This route earns fresh
+writer proof and inherits the foreground-command lifecycle limitation above.
 
 Native Git writes use a private object bank for each launch. Canonical objects and
 earlier banks remain read-only, and banks are never canonical Git alternates:

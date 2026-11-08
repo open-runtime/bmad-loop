@@ -107,6 +107,7 @@ class GitHubSpec:
     recent_days: int = 30
     max_base_refreshes: int = 8
     allow_publication_wait: bool = False
+    allow_admin_merge: bool = False
 
 
 @dataclass(frozen=True)
@@ -440,6 +441,7 @@ def _construct(cls: Any, value: Any, name: str) -> Any:
             "require_independent_review",
             "allow_new_units",
             "allow_publication_wait",
+            "allow_admin_merge",
         }:
             if type(item) is not bool:
                 raise CampaignError(f"{name}.{key} must be a boolean")
@@ -725,10 +727,25 @@ def spec_from_dict(value: Mapping[str, Any]) -> CampaignSpec:
     spec = CampaignSpec(**raw)
     if not spec.sources and not spec.units and not spec.planning.enabled:
         raise CampaignError("campaign requires sources, explicit units or planning")
-    if spec.github.merge_mode not in {"direct-strict", "queue", "project-command"}:
-        raise CampaignError("github.merge_mode must be direct-strict, queue or project-command")
+    if spec.github.merge_mode not in {
+        "direct-strict",
+        "direct-authorized",
+        "queue",
+        "project-command",
+    }:
+        raise CampaignError(
+            "github.merge_mode must be direct-strict, direct-authorized, queue or project-command"
+        )
     if spec.github.merge_mode == "project-command" and not spec.github.merge_command:
         raise CampaignError("project-command requires a configured maintained publication gate")
+    if spec.github.allow_admin_merge and (
+        spec.github.merge_mode != "direct-authorized" or not spec.github.repository
+    ):
+        raise CampaignError(
+            "allow_admin_merge requires an explicit repository and direct-authorized mode"
+        )
+    if spec.github.merge_mode == "direct-authorized" and not spec.github.allow_admin_merge:
+        raise CampaignError("direct-authorized requires explicit allow_admin_merge authorization")
     if spec.github.merge_executor and spec.github.merge_mode != "project-command":
         raise CampaignError("github.merge_executor requires project-command mode")
     if set(spec.reasoning.purposes) - set(ReasoningSpec().purposes):
@@ -741,10 +758,12 @@ def spec_from_dict(value: Mapping[str, Any]) -> CampaignSpec:
         )
     if spec.paradev.group_by not in {"story", "epic"}:
         raise CampaignError("paradev.group_by must be story or epic")
-    if spec.communication.mode not in {"off", "observe"}:
-        raise CampaignError(
-            "communication mode requires off or observe; automatic delivery is not qualified"
-        )
+    if spec.communication.mode not in {"off", "observe", "managed"}:
+        raise CampaignError("communication mode requires off, observe or managed")
+    if spec.communication.mode == "managed" and (
+        not spec.communication.room or not Path(spec.communication.room).is_absolute()
+    ):
+        raise CampaignError("managed communication requires an explicit absolute room")
     if spec.decisions.mode not in {"off", "evidence-first"}:
         raise CampaignError("decisions.mode must be off or evidence-first")
     if spec.resolution.mode not in {"off", "diagnose", "bounded-auto"}:

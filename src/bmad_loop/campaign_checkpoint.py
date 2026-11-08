@@ -253,7 +253,9 @@ class ProgressMonitor:
         now = self.clock()
         identity = {key: self.request[key] for key in IDENTITY}
         try:
-            head = verify.rev_parse_head(self.workspace)
+            from .campaign_native_git import publish
+
+            head = publish(self.workspace, self.base, run_id=self.request.get("run_id", ""))
             from .campaign_object_promotion import promote
 
             if head not in self.path_cache:

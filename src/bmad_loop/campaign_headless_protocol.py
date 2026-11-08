@@ -27,6 +27,94 @@ _ERRORS = {
 }
 
 
+def _agy_envelopes(frames, *, partial=False):
+    """Normalize AGY's cumulative native receipt, not assistant-authored JSON.
+
+    Stream init carries the native model configuration; the final result carries
+    cumulative usage and turns. Step usage must not be added to those totals.
+    A bare JSON result without native model attribution still fails admission.
+    """
+    session = model = ""
+    terminal = None
+    initialized = False
+    for frame in frames:
+        event = frame.get("event")
+        if terminal is not None:
+            raise CampaignError("AGY native stream continues after its terminal receipt")
+        if event == "init":
+            if initialized or not isinstance(frame.get("init"), dict):
+                raise CampaignError("AGY native stream has ambiguous initialization")
+            initialized = True
+            session = frame.get("conversation_id", "")
+            model = frame["init"].get("model", "")
+            if not isinstance(session, str) or not session or not isinstance(model, str):
+                raise CampaignError("AGY native initialization lacks session identity")
+        elif event == "step_update":
+            step = frame.get("step_update")
+            if not isinstance(step, dict) or not session or step.get("conversation_id") != session:
+                raise CampaignError("AGY native step belongs to another session")
+        elif event == "result" or (event is None and "status" in frame):
+            value = frame.get("result") if event else frame
+            if not isinstance(value, dict):
+                raise CampaignError("AGY native result is not an object")
+            identifier = value.get("conversation_id", "")
+            if not isinstance(identifier, str) or (session and identifier != session):
+                raise CampaignError("AGY native output mixes session identities")
+            session = identifier
+            selected = value.get("model", "")
+            if not isinstance(selected, str) or (selected and model and selected != model):
+                raise CampaignError("AGY native output mixes model identities")
+            model = selected or model
+            terminal = value
+        else:
+            raise CampaignError("AGY native stream contains an unknown event")
+    if terminal is None:
+        if partial:
+            return [{"type": "system", "session_id": session, "model": model}]
+        raise CampaignError("AGY native terminal receipt is missing")
+    status = terminal.get("status")
+    if status not in {"SUCCESS", "ERROR", "CANCELED", "INTERRUPTED", "INVALID"}:
+        raise CampaignError("AGY native receipt is not a recognized terminal state")
+    turns = terminal.get("num_turns")
+    if type(turns) is not int or turns < (1 if status == "SUCCESS" else 0):
+        raise CampaignError("AGY native turn count is missing")
+    usage = terminal.get("usage")
+    if not isinstance(usage, dict):
+        raise CampaignError("AGY native usage is missing")
+    totals = {}
+    for source, target in (
+        ("input_tokens", "input_tokens"),
+        ("output_tokens", "output_tokens"),
+        ("thinking_tokens", "reasoning_tokens"),
+        ("cache_read_tokens", "cache_read_tokens"),
+    ):
+        if source not in usage:
+            continue
+        value = usage[source]
+        if type(value) is not int or value < 0:
+            raise CampaignError("AGY native usage has an invalid counter")
+        totals[target] = value
+    error = terminal.get("error")
+    # A native free-text error is retained but never guessed into a quota code.
+    # Only a machine-classified error object may select automatic quota recovery.
+    return [
+        {"type": "system", "model": model, "session_id": session},
+        {
+            "type": "result",
+            "session_id": session,
+            "model": model,
+            "structured_output": terminal.get("structured_output"),
+            "result": terminal.get("response", ""),
+            "usage": totals,
+            "num_turns": turns,
+            "is_error": status != "SUCCESS",
+            "error": error if isinstance(error, dict) else {},
+            "native_error": error if isinstance(error, str) else "",
+            "native_canceled": status in {"CANCELED", "INTERRUPTED"},
+        },
+    ]
+
+
 def _muse_envelopes(frames, *, partial=False):
     """Decode MSP v1 native telemetry, never model-authored output deltas."""
     session = run = ""
@@ -124,8 +212,33 @@ def parse_output(
                 raise CampaignError("Native headless output is not framed JSON") from exc
     if (not frames and not partial) or any(not isinstance(row, dict) for row in frames):
         raise CampaignError("Native headless output has no object frames")
+    native_confinement = None
+    if protocol in {"codex-app-server", "codex-native-review"}:
+        commands = [
+            frame["result"] for frame in frames if frame.get("id") == 5 and "result" in frame
+        ]
+        if len(commands) > 1:
+            raise CampaignError("Native containment command is ambiguous")
+        native_confinement = commands[0] if commands else None
     if protocol == "muse-json" and any("payload_type" in row for row in frames):
         frames = _muse_envelopes(frames, partial=partial)
+    if protocol == "agy-json":
+        frames = _agy_envelopes(frames, partial=partial)
+    if protocol == "codex-app-server":
+        from .campaign_codex_appserver import envelopes
+
+        frames = envelopes(frames, partial=partial)
+    if protocol == "codex-native-review":
+        from .campaign_codex_review import envelopes as review_envelopes
+
+        frames = review_envelopes(frames, partial=partial)
+    native_review = next(
+        (frame["native_review"] for frame in frames if "native_review" in frame), None
+    )
+    native_review_evidence = next(
+        (frame["native_review_evidence"] for frame in frames if "native_review_evidence" in frame),
+        None,
+    )
     result = None
     models: list[str] = []
     session_id = ""
@@ -216,13 +329,22 @@ def parse_output(
             if code or outcome == "completed":
                 outcome = _ERRORS.get(str(code), "failed")
                 reason = f"native {kind}: {code or 'unclassified failure'}"
+        if protocol in {"agy-json", "codex-app-server", "codex-native-review"} and frame.get(
+            "native_canceled"
+        ):
+            outcome, reason = "canceled", "Native run was canceled or interrupted"
+        elif protocol == "agy-json" and frame.get("is_error") and frame.get("native_error"):
+            reason = "AGY native failure: " + frame["native_error"][:512]
         if (
             frame.get("finish_reason") in {"length", "max_tokens"}
             or frame.get("stop_reason") == "max_tokens"
         ):
             outcome, reason, truncated = "limit", "Native output was truncated", True
         if kind in {"result", "turn.completed", "response"}:
-            turns += 1
+            if protocol in {"agy-json", "codex-native-review"}:
+                turns = frame.get("num_turns", 1)
+            else:
+                turns += 1
             raw_usage = frame.get("usage") or {}
             for name, target in (
                 ("input_tokens", "input_tokens"),
@@ -275,11 +397,21 @@ def parse_output(
         and (not observed or observed not in {selected_model, *served_model_aliases})
     ):
         raise CampaignError("Native primary model is missing or differs from selected route")
-    if not partial and outcome == "completed" and (not session_id or result is None):
+    if not partial and outcome == "completed" and not session_id:
         raise CampaignError("Native session identity or structured result is missing")
+    if not partial and outcome == "completed" and result is None:
+        outcome, failure_kind = "failed", "schema"
+        reason = "Native structured result is missing or malformed"
     if not partial and failure_kind == "schema" and not session_id:
         raise CampaignError("Native schema rejection lacks session identity")
     return {
+        **({"native_confinement": native_confinement} if native_confinement is not None else {}),
+        **({"native_review": native_review} if native_review is not None else {}),
+        **(
+            {"native_review_evidence": native_review_evidence}
+            if native_review_evidence is not None
+            else {}
+        ),
         "outcome": "failed" if partial else outcome,
         "reason": "Partial native telemetry; no completion evidence" if partial else reason,
         "result": None if partial else result,

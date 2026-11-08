@@ -28,6 +28,9 @@ def observe(runtime, snapshot, action):
         return {**result, "reasons": ["Remote wait has no bound candidate; inspect prior receipt"]}
     candidate = Candidate(**raw)
     requirements = PublicationRequirements.from_spec(snapshot.spec.github)
+    administrative = (
+        requirements.allow_admin_merge and requirements.repository == candidate.repository
+    )
     controller = PublicationController(
         runtime.gateway(snapshot), requirements=requirements, clock=runtime.clock
     )
@@ -58,7 +61,13 @@ def observe(runtime, snapshot, action):
         reasons.append("Remote defect revision was already attempted")
     if not changed_defect:
         for check in requirements.checks(observed.rules.checks):
-            reason = _check_reason(check, observed.checks, observed.statuses, candidate.head)
+            reason = _check_reason(
+                check,
+                observed.checks,
+                observed.statuses,
+                candidate.head,
+                require_success=administrative,
+            )
             if reason:
                 reasons.append(reason)
         if observed.requested_reviewers or observed.requested_teams:
@@ -75,10 +84,11 @@ def observe(runtime, snapshot, action):
             and row.get("state") == "APPROVED"
             and row.get("commit_id") == candidate.head
         }
-        if len(approvers) < observed.rules.required_reviews:
+        if not administrative and len(approvers) < observed.rules.required_reviews:
             reasons.append("Required current-head GitHub approvals are missing")
         if (
-            observed.rules.required_reviews or observed.rules.last_push_approval
+            not administrative
+            and (observed.rules.required_reviews or observed.rules.last_push_approval)
         ) and observed.review_decision != "APPROVED":
             reasons.append("Eligible GitHub approval is pending")
         if any(row.get("state") == "CHANGES_REQUESTED" for row in latest.values()):

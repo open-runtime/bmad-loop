@@ -76,11 +76,11 @@ def _validate(capability, candidate) -> None:
     receipt = report.get("receipt", {})
     expected = envelope["probe"].get("expected")
     writer = envelope["permissions"] == "workspace-tools"
-    if writer:
-        expected = {
-            "nonce": envelope["probe"]["nonce"],
-            "markers": envelope["probe"]["markers"],
-        }
+    readonly = envelope["permissions"] == "read-only-tools"
+    if writer or readonly:
+        from .campaign_execution_qualification import expected_result
+
+        expected = expected_result(envelope["probe"])
         checks = {
             "native_completed",
             "nonce",
@@ -104,6 +104,50 @@ def _validate(capability, candidate) -> None:
             "packed_object_shadow",
             "bank_shadow_readback",
         }
+        if readonly:
+            checks -= {
+                "object_unlink",
+                "object_hardlink",
+                "packed_object_shadow",
+                "bank_shadow_readback",
+            }
+            checks |= {"owned", "new_product", "worker_ref", "git_index", "readable", "descendant"}
+        if envelope["capability"]["protocol"] == "codex-native-review":
+            from .campaign_codex_review import validate_review
+
+            validate_review(receipt.get("native_review"))
+            if envelope["capability"].get("confinement") == "codex-native-read-only-v1":
+                from .campaign_codex_review_evidence import evidence as review_evidence
+
+                observed = review_evidence(receipt.get("native_review_evidence"))
+                if (
+                    observed["review"] != receipt["native_review"]
+                    or observed["model"] != candidate.model
+                    or observed["effort"] != candidate.effort
+                ):
+                    raise CampaignError("Native review capability differs from delegate evidence")
+            checks.add("native_review")
+            if receipt.get("turns") != 2:
+                raise CampaignError("Native review evidence lacks both bounded turns")
+        confinement = envelope["capability"].get("confinement")
+        if confinement in {"codex-native-read-only-v1", "codex-scoped-tools-v1"}:
+            from .campaign_readonly_qualification import native_checks
+
+            native_checks(receipt.get("native_confinement"))
+        if confinement == "codex-scoped-tools-v1":
+            from .campaign_execution_qualification import scoped_tool_checks
+
+            earned = scoped_tool_checks(envelope)
+            if not all(earned.values()):
+                raise CampaignError("Native scoped writer lacks completed tool evidence")
+            checks |= {*earned, "native_builtin_confinement"}
+        if confinement == "agy-scoped-command-v1":
+            from .campaign_execution_qualification import scoped_tool_checks
+
+            earned = scoped_tool_checks(envelope)
+            if not all(earned.values()):
+                raise CampaignError("Native AGY writer lacks completed scoped tool evidence")
+            checks |= set(earned)
         if any(report.get("checks", {}).get(key) is not True for key in checks):
             raise CampaignError("Native writer qualification lacks verified containment")
         covered_input = report.get("input_tokens")
@@ -145,7 +189,7 @@ def _validate(capability, candidate) -> None:
         raise CampaignError("Native qualification lacks matching completed lifecycle evidence")
     required = {
         "full_input",
-        "scoped_tools" if writer else "no_tools",
+        "scoped_tools" if writer else "read_only_tools" if readonly else "no_tools",
         "window_completion",
         "quiescence",
         "model_attribution",

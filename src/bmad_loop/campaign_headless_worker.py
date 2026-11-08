@@ -93,6 +93,23 @@ def child_main(path: Path) -> int:
             raise CampaignError("Headless execution grants changed")
         if digest(envelope.get("environment", {})) != envelope["environment_digest"]:
             raise CampaignError("Headless environment changed")
+        if "steering" in envelope and digest(envelope["steering"]) != envelope.get(
+            "steering_digest"
+        ):
+            raise CampaignError("Headless steering context changed")
+        managed = envelope.get("managed_binding")
+        if managed is not None:
+            if (
+                not isinstance(managed, dict)
+                or digest(managed) != envelope.get("managed_binding_digest")
+                or managed.get("kind") != "bridge"
+                or not isinstance(managed.get("name"), str)
+                or not managed["name"]
+                or managed.get("room") != envelope.get("communication_room")
+                or not isinstance(managed.get("target"), dict)
+                or not managed["target"].get("launch_id")
+            ):
+                raise CampaignError("Headless managed communication binding changed")
         communication_room = envelope.get("communication_room", "")
         if ("communication_room" in envelope or "communication_room_digest" in envelope) and (
             not isinstance(communication_room, str)
@@ -143,6 +160,22 @@ def child_main(path: Path) -> int:
             communication=CommunicationSpec(room=communication_room),
         )
         environment.update(envelope.get("environment", {}))
+        if managed is not None or (
+            envelope.get("probe") and candidate.profile in {"claude", "codex"}
+        ):
+            from .platform_util import is_link_like
+
+            private_room = directory / "sandbox-runtime" / "hcom"
+            if is_link_like(private_room.parent) or is_link_like(private_room):
+                raise CampaignError("Native messaging room is redirected")
+            private_room.mkdir(parents=True, exist_ok=True, mode=0o700)
+            # Owner wrappers retain their required native enrollment and routing.
+            # That enrollment is private; only the controller's public bridge
+            # accepts campaign mail, so native hooks cannot bypass safe boundaries.
+            environment["HCOM_DIR"] = str(private_room)
+            if managed is not None:
+                receipt["managed_communication"] = managed
+            receipt["native_communication_room"] = str(private_room)
         from .campaign_headless_context import restore
 
         environment, native_context = restore(environment, os.environ, envelope.get("presentation"))

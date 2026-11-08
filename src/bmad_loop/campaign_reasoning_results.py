@@ -187,6 +187,15 @@ def apply_result(runtime, snapshot, row: dict[str, Any]) -> None:
 
         apply_audit(runtime, snapshot, row)
         return
+    partition = request.coordinates.get("semantic_partition")
+    if partition:
+        from .campaign_reasoning_partition import validate as validate_partition
+
+        if not validate_partition(runtime, snapshot, row):
+            add_event(
+                snapshot, "semantic-partition-applied", job_id=request.id, purpose=request.purpose
+            )
+            return
     from .campaign_reasoning_plan import context, fingerprint
 
     evidence = context(snapshot, request.purpose)
@@ -296,6 +305,8 @@ def apply_result(runtime, snapshot, row: dict[str, Any]) -> None:
     snapshot.bindings.setdefault("semantic_jobs", {"triggers": {}, "errors": {}})["triggers"][
         request.purpose
     ] = fingerprint(snapshot, request.purpose)
+    if partition:
+        snapshot.bindings["semantic_jobs"]["pipelines"][partition["pipeline"]]["state"] = "applied"
     add_event(snapshot, "semantic-result-applied", job_id=request.id, purpose=request.purpose)
 
 

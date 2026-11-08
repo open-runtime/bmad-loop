@@ -9,7 +9,7 @@ import pytest
 from test_campaign_headless import ChildMux
 from test_campaign_headless import prepared as prepared
 
-from bmad_loop import campaign_execution_sandbox
+from bmad_loop import campaign_execution_sandbox, campaign_native_git, campaign_object_promotion
 from bmad_loop.campaign_execution_qualification import launcher_text, qualify, validate_proposal
 from bmad_loop.campaign_headless import HeadlessRunner, file_digest, read_json, validate_capability
 from bmad_loop.campaign_model import CampaignError
@@ -140,6 +140,13 @@ print(json.dumps({'type':'result','structured_output':{'nonce':nonce,'markers':m
                 "path": str(Path(sys.executable).resolve()),
                 "sha256": file_digest(Path(sys.executable).resolve()),
             },
+            *(
+                {
+                    "path": str(Path(module.__file__).resolve()),
+                    "sha256": file_digest(Path(module.__file__).resolve()),
+                }
+                for module in (campaign_native_git, campaign_object_promotion)
+            ),
         ],
         "argv": [
             binary,
@@ -155,6 +162,16 @@ print(json.dumps({'type':'result','structured_output':{'nonce':nonce,'markers':m
     proposal = tmp_path / "proposal.json"
     proposal.write_text(json.dumps(capability))
     return proposal, candidate, capability
+
+
+@pytest.mark.parametrize("module", [campaign_native_git, campaign_object_promotion])
+def test_old_writer_proofs_require_current_private_git_dependency_binding(writer, module):
+    _, candidate, cap = writer
+    cap["dependencies"] = [
+        row for row in cap["dependencies"] if row["path"] != str(Path(module.__file__).resolve())
+    ]
+    with pytest.raises(CampaignError, match="private Git publication.*requalification"):
+        validate_proposal(cap, candidate)
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="macOS OS sandbox is required")

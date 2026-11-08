@@ -11,6 +11,7 @@ from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
 from conftest import git
 from test_campaign_headless import fixture_capability
 from test_campaign_headless import prepared as prepared
@@ -53,14 +54,18 @@ def scaled_sources(case, count=24):
     return tuple(sources), tuple(ownership)
 
 
-def reporting_route(tmp_path, prepared):
+def reporting_route(tmp_path, prepared, *, native=False):
     runner, _, _, candidate, original = prepared
     script = tmp_path / "scripted-reporter.py"
-    script.write_text("""import json,sys
+    script.write_text("""import json,re,sys
 payload=sys.stdin.buffer.read().decode()
-source=next(json.loads(line) for line in payload.splitlines() if line.startswith('{"source_id":'))
-context=json.loads(source['content']);unit=context['units'][0]
-result={'schema_version':1,'context_digest':source['source_id'].removeprefix('context:'),'citations':[unit['source_id']],'summary':'Canonical scripted campaign observation','claims':[{'unit':unit['id'],**{key:unit[key] for key in ('state','head','base','source_id')}}]}
+nonce=re.search(r'QUALIFICATION NONCE ([a-f0-9]+)',payload)
+if nonce:
+ result={'nonce':nonce[1],'markers':re.findall(r'CANARY [0-9]+: ([a-f0-9]+)',payload)}
+else:
+ source=next(json.loads(line) for line in payload.splitlines() if line.startswith('{"source_id":'))
+ context=json.loads(source['content']);unit=context['units'][0]
+ result={'schema_version':1,'context_digest':source['source_id'].removeprefix('context:'),'citations':[unit['source_id']],'summary':'Canonical scripted campaign observation','claims':[{'unit':unit['id'],**{key:unit[key] for key in ('state','head','base','source_id')}}]}
 print(json.dumps({'type':'system','model':'gpt-test','session_id':'scale-report'}))
 print(json.dumps({'type':'result','structured_output':result,'usage':{'input_tokens':10,'output_tokens':10}}))
 """)
@@ -69,7 +74,26 @@ print(json.dumps({'type':'result','structured_output':result,'usage':{'input_tok
         "argv": [str(Path(sys.executable).resolve()), str(script)],
         "dependencies": [{"path": str(script), "sha256": file_digest(script)}],
     }
-    cap = fixture_capability(tmp_path, cap)
+    if native:
+        from bmad_loop.campaign_headless import read_json
+        from bmad_loop.campaign_qualification import qualify
+
+        proposal = tmp_path / "reporting-proposal.json"
+        proposal.write_text(
+            json.dumps({key: value for key, value in cap.items() if key != "qualification"})
+        )
+        report = qualify(
+            proposal,
+            tmp_path / "reporting-qualification",
+            input_bytes=90000,
+            output_tokens=4096,
+            timeout_s=30,
+            runner=runner,
+        )
+        assert report["ok"], report
+        cap = read_json(Path(report["capability_path"]))
+    else:
+        cap = fixture_capability(tmp_path, cap)
     path = tmp_path / "scale-capabilities.json"
     path.write_text(
         json.dumps(
@@ -87,12 +111,25 @@ def recorded_job_states(store, campaign_id):
     return states
 
 
+@pytest.mark.parametrize("native", [False, True], ids=["legacy", "qualified-managed"])
 def test_48_stories_24_epics_verify8_and_reasoning_drain_resume(
-    production_case, prepared, tmp_path, monkeypatch
+    production_case, prepared, tmp_path, monkeypatch, native
 ):
+    if native and sys.platform != "darwin":
+        pytest.skip("Qualified scoped scripted native transport uses the macOS sandbox")
     case = production_case
     sources, ownership = scaled_sources(case)
-    runner, candidate, capabilities = reporting_route(tmp_path, prepared)
+    runner, candidate, capabilities = reporting_route(tmp_path, prepared, native=native)
+    fake = None
+    if native:
+        from campaign_scripted_native import qualify_case
+        from test_campaign_managed_runtime import managed_runtime
+
+        qualified = qualify_case(case, prepared, tmp_path)
+        document = json.loads(qualified.read_text())
+        document["routes"].update(json.loads(capabilities.read_text())["routes"])
+        capabilities.write_text(json.dumps(document))
+        fake = managed_runtime(case.runtime, case.snapshot, tmp_path, monkeypatch)
     server = QueuedServer(case.service, stacked=True)
     monkeypatch.setattr(case.service, "request", server.request)
     verifier = tmp_path / "qualified-combined-verifier.py"
@@ -120,7 +157,7 @@ def test_48_stories_24_epics_verify8_and_reasoning_drain_resume(
         max_active_epics=24,
         max_in_flight_units=48,
         max_review_sessions=8,
-        resources=ResourceSpec(verify_slots=8, max_sessions=56),
+        resources=ResourceSpec(verify_slots=8, max_sessions=32),
         roles=roles,
         role_pools=(*case.snapshot.spec.role_pools, ("scale-reporting", (candidate,))),
         reasoning=ReasoningSpec(
@@ -149,7 +186,9 @@ def test_48_stories_24_epics_verify8_and_reasoning_drain_resume(
         "epics": 24,
         "verify_slots": 8,
         "publication": "queue",
+        "transport": "qualified-managed" if native else "legacy-scripted",
         "max_live": 0,
+        "max_shared_sessions": 0,
         "max_execution": 0,
         "max_verify": 0,
         "max_review": 0,
@@ -160,12 +199,30 @@ def test_48_stories_24_epics_verify8_and_reasoning_drain_resume(
         "first_launch_epics": [],
     }
     observed_launches = set()
+    sent_mail = set()
     sampled_at = started
 
     def proposals(snapshot):
         nonlocal sampled_at
         live = [unit for unit in snapshot.units.values() if unit.claim and not unit.claim.quiescent]
         metrics["max_live"] = max(metrics["max_live"], len(live))
+        if fake is not None:
+            from test_campaign_managed_communication import send
+
+            manager = case.runtime.communication_manager(case.store.directory(snapshot.id))
+            for endpoint in manager.endpoints(state="accepting", limit=100):
+                selected = endpoint["target"]
+                if selected["job_id"] or selected["unit_id"] in sent_mail:
+                    continue
+                unit = snapshot.units[selected["unit_id"]]
+                if unit.claim and unit.claim.role == "execution" and unit.claim.status == "running":
+                    send(
+                        fake,
+                        endpoint,
+                        "Preserve each accepted criterion and report its evidence.",
+                        intent="inform",
+                    )
+                    sent_mail.add(selected["unit_id"])
         for resource in ("execution", "verify", "review"):
             metrics["max_" + resource] = max(
                 metrics["max_" + resource], sum(unit.claim.resource == resource for unit in live)
@@ -177,6 +234,12 @@ def test_48_stories_24_epics_verify8_and_reasoning_drain_resume(
                 for row in snapshot.jobs.values()
             ),
         )
+        shared = sum(unit.claim.resource != "verify" for unit in live) + sum(
+            bool(row.get("claim") and not row["claim"]["quiescent"])
+            for row in snapshot.jobs.values()
+        )
+        metrics["max_shared_sessions"] = max(metrics["max_shared_sessions"], shared)
+        assert shared <= 32
         metrics["max_active_epics"] = max(
             metrics["max_active_epics"], len({unit.spec.epic for unit in live})
         )
@@ -256,3 +319,13 @@ def test_48_stories_24_epics_verify8_and_reasoning_drain_resume(
     assert len(case.service.closed_units) >= 48
     assert len(server.group_numbers) == 48
     assert all(unit.evidence.get("queue", {}).get("verification") for unit in result.units.values())
+    if native:
+        manager = case.runtime.communication_manager(case.store.directory(result.id))
+        assert not manager.has_open() and sent_mail
+        messages = manager.ledger.list(limit=500)
+        assert messages and all(row["state"] in {"applied", "closed"} for row in messages)
+        assert any(row["state"] == "applied" for row in messages)
+        assert fake.count("start") == fake.count("stop")
+        metrics["managed_messages"] = len(messages)
+        metrics["managed_endpoints"] = fake.count("start")
+        (tmp_path / "scale-metrics.json").write_text(json.dumps(metrics, indent=2))

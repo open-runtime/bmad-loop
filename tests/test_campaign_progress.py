@@ -64,9 +64,20 @@ def test_launch_claim_persists_epic_fairness(tmp_path):
 
 @pytest.mark.parametrize("provider_timestamp", [None, 10])
 def test_cached_capacity_expires_before_runtime_admission(tmp_path, provider_timestamp):
+    import sys
+
+    from test_campaign_route_readiness import freeze_routes
+
+    from bmad_loop.adapters.profile import get_profile
+
     snapshot = make_snapshot()
     snapshot.spec = replace(
         snapshot.spec, roles=(("planning", RoleSpec(profile="codex", model="gpt-astra")),)
+    )
+    freeze_routes(
+        snapshot,
+        tmp_path / "configuration",
+        {"campaign:codex": replace(get_profile("codex"), binary=sys.executable)},
     )
     snapshot.bindings["capacity"] = {
         "observed_at": 10,

@@ -340,7 +340,7 @@ class GithubGateway:
         return MutationIntent(action_id, kind, "POST", path, payload, marker, generation=generation)
 
     def execute(self, intent: MutationIntent, *, generation: int) -> MutationIntent:
-        if intent.kind == "project_merge":
+        if intent.kind in {"project_merge", "native_merge"}:
             raise GithubError("Project merge executor intents cannot use native GitHub submission")
         if generation != intent.generation:
             raise GithubError("Stale coordinator generation cannot mutate GitHub")

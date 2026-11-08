@@ -268,7 +268,7 @@ def reusable(runtime, snapshot, unit, sources):
         route_key = digest(dataclasses.asdict(candidate))
         if route_key not in route_cache:
             try:
-                cap = _cap(snapshot, candidate, "no-tools")
+                cap = _cap(snapshot, candidate, "reasoning")
                 validate_fidelity_qualification(cap, candidate=candidate, purpose="handoff_map")
                 route_cache[route_key] = _budget(candidate, cap).route
             except CampaignError:

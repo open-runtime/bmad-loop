@@ -38,7 +38,7 @@ ROLES = (
 
 def resolve_roles(spec: CampaignSpec, policy) -> CampaignSpec:
     roles = dict(spec.roles)
-    required = set(ROLES) | set(roles)
+    required = set(ROLES) | set(roles) | {"execution"}
     if "execution_review" in roles:
         required.add("execution")
     if spec.reasoning.enabled:
@@ -52,7 +52,9 @@ def resolve_roles(spec: CampaignSpec, policy) -> CampaignSpec:
         if any(purpose.startswith("handoff_") for purpose in spec.reasoning.purposes):
             required.update(("execution", "summarization", "handoff_audit"))
     for role in sorted(required):
-        selected = roles.get(role, RoleSpec())
+        selected = roles.get(
+            role, RoleSpec(max_sessions=spec.max_workers) if role == "execution" else RoleSpec()
+        )
         if selected.pool:
             continue
         inherited = policy.adapter.resolved(
@@ -171,6 +173,21 @@ def inspect(
         ),
         "historical_queue_views_retained": True,
     }
+    from .campaign_headless import load_capabilities
+    from .campaign_route_readiness import inspect as inspect_route
+    from .campaign_route_readiness import permissions_for
+
+    routes = {}
+    manifest_problem = ""
+    if spec.reasoning.capabilities:
+        path = Path(spec.reasoning.capabilities).expanduser()
+        try:
+            routes = load_capabilities(path if path.is_absolute() else project / path)
+        except (CampaignError, OSError, ValueError) as exc:
+            manifest_problem = str(exc)
+            problem(
+                "execution", "Qualified launcher manifest could not be loaded: " + manifest_problem
+            )
     for role in sorted(set(ROLES) | set(dict(spec.roles))):
         if role in {"planning", "planning_review"} and not spec.planning.enabled:
             continue
@@ -188,16 +205,27 @@ def inspect(
             try:
                 profile = get_profile(profile_name, project)
                 route = capacity_observer(resolved, project)
-                installed = bool(shutil.which(profile.binary) or Path(profile.binary).is_file())
+                readiness = inspect_route(profile, resolved, routes, permissions_for(role))
+                if (
+                    spec.communication.mode == "managed"
+                    and readiness["transport"] != "bounded-headless"
+                ):
+                    readiness.update(
+                        ready=False,
+                        reason="Managed messaging requires a qualified headless route with isolated native enrollment",
+                    )
+                if manifest_problem and profile.adapter == "bounded-headless":
+                    readiness.update(ready=False, reason=manifest_problem)
                 choices.append(
                     {
                         "profile": profile_name,
                         "model": resolved.model,
                         "effort": resolved.effort,
-                        "binary": profile.binary,
-                        "installed": installed,
+                        "binary": readiness["binary"],
+                        "installed": readiness["installed"],
+                        "launcher": readiness,
                         "capacity": dataclasses.asdict(route),
-                        "eligible": installed and not route_unavailable(route),
+                        "eligible": readiness["ready"] and not route_unavailable(route),
                     }
                 )
             except (ValueError, OSError) as exc:
@@ -207,24 +235,24 @@ def inspect(
         if not any(choice["eligible"] for choice in choices):
             problem(area, f"{role}: no available authorized model route")
     if spec.reasoning.enabled:
-        from .campaign_headless import capability_for, load_capabilities, validate_capability
+        from .campaign_headless import capability_for, validate_capability
         from .campaign_reasoning_plan import ROLES as semantic_roles
 
         try:
             if not spec.reasoning.capabilities:
                 raise CampaignError("reasoning requires a qualified capabilities manifest")
-            path = Path(spec.reasoning.capabilities).expanduser()
-            routes = load_capabilities(path if path.is_absolute() else project / path)
+            if manifest_problem:
+                raise CampaignError(manifest_problem)
             modes = {
-                (semantic_roles[purpose], "no-tools")
+                (semantic_roles[purpose], "reasoning")
                 for purpose in spec.reasoning.purposes
                 if purpose in semantic_roles
             }
             if any(purpose.startswith("handoff_") for purpose in spec.reasoning.purposes):
                 modes.update(
                     {
-                        ("summarization", "no-tools"),
-                        ("handoff_audit", "no-tools"),
+                        ("summarization", "reasoning"),
+                        ("handoff_audit", "reasoning"),
                         ("execution", "workspace-tools"),
                     }
                 )
@@ -241,7 +269,15 @@ def inspect(
                             mode,
                             effort=candidate.effort,
                         )
-                        validate_capability(cap, candidate, permissions=mode)
+                        validate_capability(cap, candidate, permissions=cap["permissions"])
+                        readiness = inspect_route(
+                            get_profile(candidate.profile, project), candidate, routes, mode
+                        )
+                        if not readiness["ready"]:
+                            raise CampaignError(readiness["reason"])
+                        capacity = capacity_observer(candidate, project)
+                        if reason := route_unavailable(capacity):
+                            raise CampaignError(reason)
                         qualified.append(candidate.profile + ":" + candidate.model)
                     except (CampaignError, OSError, ValueError) as exc:
                         reasons.append(str(exc))
@@ -275,8 +311,16 @@ def inspect(
                 problem("publication", "effective target rules could not be read completely")
             if not rules.merge_commits_allowed:
                 problem("publication", "target rules forbid history-preserving merge commits")
-            if spec.github.merge_mode in {"direct-strict", "project-command"}:
-                if not rules.strict or not rules.checks:
+            project_admin = (
+                spec.github.allow_admin_merge
+                and spec.github.merge_mode == "direct-authorized"
+                and spec.github.repository == repository
+            )
+            capabilities["publication"]["observations"]["allow_admin_merge"] = project_admin
+            if spec.github.merge_mode == "direct-authorized" and not shutil.which("gh"):
+                problem("publication", "direct-authorized requires the native GitHub CLI")
+            if spec.github.merge_mode in {"direct-strict", "project-command", "direct-authorized"}:
+                if not project_admin and (not rules.strict or not rules.checks):
                     problem(
                         "publication",
                         "direct-strict requires server-enforced up-to-date required checks",
@@ -358,7 +402,7 @@ def inspect(
                 problem("reflection", lifecycle["detail"])
         except Exception as exc:
             problem("reflection", f"Paradev capability read failed: {type(exc).__name__}: {exc}")
-    if spec.communication.mode == "observe":
+    if spec.communication.mode in {"observe", "managed"}:
         from .campaign_communication import HcomObserver
 
         try:
@@ -376,6 +420,18 @@ def inspect(
                 "detail": "hcom observation unavailable: " + str(exc),
             }
         capabilities["reflection"]["observations"]["communication"] = communication
+        if spec.communication.mode == "managed":
+            communication.update(
+                mode="managed",
+                sends=True,
+                automatic_peer_delivery=False,
+                public_delivery="controller-bridge",
+                native_room="isolated-per-job",
+                steering="safe-boundary",
+                acknowledgement="durable-receipt",
+            )
+            if not communication["available"]:
+                problem("execution", "Managed messaging requires the configured hcom transport")
     if spec.paradev.project_id:
         try:
             from .campaign_native_inventory import NativeServiceObserver

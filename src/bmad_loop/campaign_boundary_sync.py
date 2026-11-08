@@ -405,7 +405,8 @@ def after_effect(runtime, snapshot, action):
     changed = (
         before["graph_revision"] != snapshot.graph_revision
         or before["config_revision"] != snapshot.config_revision
-        or verify.rev_parse_head(Path(unit.bindings["workspace"])) != debt["receipt"]["head"]
+        or verify.rev_parse_head(Path(debt["request"].get("workspace", unit.bindings["workspace"])))
+        != debt["receipt"]["head"]
         or semantic(snapshot, unit, before, allowed_heads=allowed)
         != semantic(snapshot, unit, inputs, allowed_heads=allowed)
     )
@@ -458,7 +459,8 @@ def after_apply(runtime, snapshot, action, data):
     changed = (
         before["graph_revision"] != snapshot.graph_revision
         or before["config_revision"] != snapshot.config_revision
-        or verify.rev_parse_head(Path(unit.bindings["workspace"])) != debt["receipt"]["head"]
+        or verify.rev_parse_head(Path(debt["request"].get("workspace", unit.bindings["workspace"])))
+        != debt["receipt"]["head"]
         or semantic(snapshot, unit, before, allowed_heads=allowed)
         != semantic(snapshot, unit, data["inputs"], allowed_heads=allowed)
     )
@@ -472,6 +474,12 @@ def after_apply(runtime, snapshot, action, data):
 
         finalize_stage_usage(snapshot, unit, data["receipt"], administrative=True)
         invalidate(runtime, snapshot, unit, debt, inputs=data["inputs"])
+    elif data["receipt"].get("outcome") == "invalid_stage_result" and data["receipt"].get(
+        "landing"
+    ):
+        from .campaign_landing_acceptance import apply_worker
+
+        apply_worker(runtime, snapshot, unit, data["receipt"])
     elif data["receipt"].get("outcome") == "invalid_stage_result":
         from .campaign_usage import finalize_stage_usage
 

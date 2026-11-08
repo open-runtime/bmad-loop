@@ -60,6 +60,11 @@ def _no_tools(capability: dict[str, Any]) -> None:
         return any(left == flag and right == value for left, right in zip(argv, argv[1:]))
 
     protocol = capability["protocol"]
+    if protocol == "agy-json":
+        from .campaign_agy_launcher import validate_recipe
+
+        validate_recipe(capability)
+        return
     supported = (
         protocol == "bmad-test-v1"
         or (
@@ -140,12 +145,17 @@ def build_probe(directory, selection, capability, *, input_bytes, output_tokens,
         ),
         probe_prompt(count),
         probe_schema(count),
-        JobLimits(capability["input_tokens"], output_tokens, 1, timeout_s),
+        JobLimits(
+            capability["input_tokens"],
+            output_tokens,
+            2 if capability["protocol"] == "agy-json" else 1,
+            timeout_s,
+        ),
         candidates=(selection,),
         required=False,
     )
     probe = {
-        "schema_version": 3,
+        "schema_version": 4 if capability["protocol"] == "agy-json" else 3,
         "nonce": nonce,
         "request_digest": digest(asdict(request)),
         "expected": {"nonce": nonce, "markers": values},
@@ -157,13 +167,13 @@ def build_probe(directory, selection, capability, *, input_bytes, output_tokens,
 
 
 def validate_probe_request(request: JobRequest, probe: dict[str, Any]) -> None:
-    if probe.get("kind") == "workspace-tools-v1":
+    if probe.get("kind") in {"workspace-tools-v1", "read-only-tools-v1"}:
         from .campaign_execution_qualification import validate_request
 
         validate_request(request, probe)
         return
     if (
-        probe.get("schema_version") not in {1, 2, 3}
+        probe.get("schema_version") not in {1, 2, 3, 4}
         or request.id != "qualification-" + str(probe.get("nonce", ""))
         or request.prompt
         != (
@@ -185,7 +195,7 @@ def validate_probe_request(request: JobRequest, probe: dict[str, Any]) -> None:
         or len(request.candidates) != 1
         or len(request.inputs) != 1
         or request.inputs[0]["source_id"] != "fixed-canary"
-        or request.limits.max_turns != 1
+        or request.limits.max_turns != (2 if probe.get("schema_version") == 4 else 1)
         or digest(asdict(request)) != probe.get("request_digest")
         or request.inputs[0]["sha256"] != probe.get("source_sha256")
     ):
@@ -194,7 +204,9 @@ def validate_probe_request(request: JobRequest, probe: dict[str, Any]) -> None:
     if (
         expected.get("nonce") != probe["nonce"]
         or not isinstance(expected.get("markers"), list)
-        or not 8 <= len(expected["markers"]) <= (1024 if probe.get("schema_version") == 3 else 256)
+        or not 8
+        <= len(expected["markers"])
+        <= (1024 if probe.get("schema_version") in {3, 4} else 256)
     ):
         raise CampaignError("Qualification probe expected receipt is invalid")
     path = Path(request.inputs[0]["path"])
@@ -217,7 +229,10 @@ def validate_probe_request(request: JobRequest, probe: dict[str, Any]) -> None:
 
 def validate_probe_envelope(envelope) -> None:
     probe = envelope.get("probe")
-    if isinstance(probe, dict) and probe.get("kind") == "workspace-tools-v1":
+    if isinstance(probe, dict) and probe.get("kind") in {
+        "workspace-tools-v1",
+        "read-only-tools-v1",
+    }:
         from .campaign_execution_qualification import validate_envelope
 
         validate_envelope(envelope)
@@ -231,6 +246,8 @@ def validate_probe_envelope(envelope) -> None:
     ):
         raise CampaignError("Qualification envelope cannot grant arbitrary work or permissions")
     _no_tools(envelope["capability"])
+    if (probe.get("schema_version") == 4) != (envelope["capability"]["protocol"] == "agy-json"):
+        raise CampaignError("Qualification invocation budget belongs to another native protocol")
     validate_probe_request(request_from_dict(envelope["request"]), probe)
 
 
@@ -248,9 +265,10 @@ def validate_alias_evidence(capability) -> None:
     original = envelope["capability"]
     if any(
         original.get(key) != capability.get(key)
-        for key in ("profile", "model", "binary_sha256", "cli_version", "protocol")
+        for key in ("profile", "model", "cli_version", "protocol")
     ):
         raise CampaignError("Native alias evidence belongs to a different route")
+    validate_alias_executable(original, capability)
     receipt = read_json(path.parent / "receipt.json")
     if (
         receipt.get("processes_quiescent") is not True
@@ -275,6 +293,34 @@ def validate_alias_evidence(capability) -> None:
         or decoded["observed_model"] not in capability["served_model_aliases"]
     ):
         raise CampaignError("Native alias canary did not establish exact selected/served binding")
+
+
+def validate_alias_executable(original, capability):
+    """Permit only the same native binary beneath the exact scoped wrapper.
+
+    This carries selected/served model identity, never permission qualification.
+    The new writer still earns its own canary and immutable capability receipt.
+    """
+    from . import campaign_execution_sandbox
+    from .campaign_execution_qualification import launcher_text
+    from .campaign_headless import file_digest
+
+    if original.get("binary_sha256") == capability.get("binary_sha256"):
+        return
+    native = Path(original["binary"])
+    launcher = Path(capability["binary"])
+    wrapper = Path(campaign_execution_sandbox.__file__).resolve()
+    dependencies = {row["path"]: row["sha256"] for row in capability.get("dependencies", [])}
+    if (
+        capability.get("permissions") not in {"workspace-tools", "read-only-tools"}
+        or capability.get("argv", [])[:5]
+        != [str(launcher), "--grants", "{grants_path}", "--", str(native)]
+        or launcher.read_text(encoding="utf-8") != launcher_text()
+        or file_digest(native) != original["binary_sha256"]
+        or dependencies.get(str(native)) != original["binary_sha256"]
+        or dependencies.get(str(wrapper)) != file_digest(wrapper)
+    ):
+        raise CampaignError("Native alias evidence does not bind the exact nested executable")
 
 
 def result(request_path: Path, observation: dict[str, Any]) -> dict[str, Any]:
@@ -386,7 +432,7 @@ def qualify(
             "efforts": [selection.effort],
             "input_tokens": report["coverage"]["input_tokens"],
             "output_tokens": report["coverage"]["configured_output_tokens"],
-            "max_turns": 1,
+            "max_turns": read_json(request_path)["request"]["limits"]["max_turns"],
             "qualification": {
                 "status": "passed",
                 "path": str(evidence_path),

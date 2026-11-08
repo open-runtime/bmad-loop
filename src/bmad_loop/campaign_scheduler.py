@@ -92,10 +92,13 @@ def delegates_tracking_slot(snapshot: CampaignSnapshot, original: CampaignUnit) 
     """A merged original hands its active slot to its actual source repair child."""
     return original.state == UnitState.MERGED_PENDING_SYNC and any(
         key in snapshot.units
-        and snapshot.units[key].spec.kind == "tracking"
+        and snapshot.units[key].spec.kind in {"tracking", "landing_repair"}
         and snapshot.units[key].spec.parent == original.id
         and snapshot.units[key].state not in (UnitState.DELIVERED, UnitState.CANCELED)
-        for key in original.bindings.get("tracking_units", ())
+        for key in (
+            *original.bindings.get("tracking_units", ()),
+            original.evidence.get("landing_acceptance", {}).get("repair_unit", ""),
+        )
     )
 
 

@@ -61,7 +61,9 @@ def _banks(parent: Path, workspace: Path) -> tuple[Path, ...]:
     return tuple(result)
 
 
-def promote(workspace: Path, head: str, baseline: str) -> dict[str, str]:
+def promote(
+    workspace: Path, head: str, baseline: str, *, roots: tuple[str, ...] = ()
+) -> dict[str, str]:
     """Return only after the exact head's new graph is independent of live banks.
 
     Legacy workers with no registered banks retain their existing Git path. A
@@ -81,7 +83,7 @@ def promote(workspace: Path, head: str, baseline: str) -> dict[str, str]:
     reject_legacy_bank_alternates(common)
     if not all(
         isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", value)
-        for value in (head, baseline)
+        for value in (head, baseline, *roots)
     ):
         raise CampaignError("Git object promotion requires exact head and baseline object IDs")
     objects = common / "objects"
@@ -107,7 +109,7 @@ def promote(workspace: Path, head: str, baseline: str) -> dict[str, str]:
                 raise CampaignError(
                     "Git object promotion baseline is not sealed in canonical storage"
                 )
-            complete = ("rev-list", "--objects", "--missing=error", head, "^" + baseline)
+            complete = ("rev-list", "--objects", "--missing=error", head, *roots, "^" + baseline)
             if not _git(workspace, *complete, env=canonical_env, check=False).returncode:
                 return {"state": "sealed", "head": head, "baseline": baseline}
             source_env = _environment(view)
@@ -123,7 +125,7 @@ def promote(workspace: Path, head: str, baseline: str) -> dict[str, str]:
                     "--no-reuse-delta",
                     str(directory / "pack"),
                     env=source_env,
-                    input_data=(head + "\n^" + baseline + "\n").encode("ascii"),
+                    input_data=("\n".join((head, *roots, "^" + baseline)) + "\n").encode("ascii"),
                 )
                 .stdout.decode("ascii")
                 .strip()

@@ -50,6 +50,17 @@ def case(
     snapshot.config_snapshot["reasoning_capabilities"] = {
         candidate.profile + ":" + candidate.model: cap
     }
+    from test_campaign_route_readiness import freeze_routes
+
+    from bmad_loop.adapters.profile import get_profile
+
+    freeze_routes(
+        snapshot,
+        tmp_path / "configuration",
+        {
+            "campaign:" + candidate.profile: get_profile(candidate.profile),
+        },
+    )
     snapshot.bindings["capacity"] = {
         "observed_at": 100,
         "observations": [

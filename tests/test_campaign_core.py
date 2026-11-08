@@ -149,7 +149,7 @@ def test_spec_snapshot_roundtrip_freezes_roles_and_settings():
         ({"unknown": 2}, "unknown fields"),
         ({"max_workers": True}, "positive integer"),
         ({"max_workers": 0}, "positive integer"),
-        ({"communication": {"mode": "automatic"}}, "not qualified"),
+        ({"communication": {"mode": "automatic"}}, "off, observe or managed"),
         ({"roles": {"planning": {"pool": "missing"}}}, "unknown pool"),
         ({"roles": {"planning": {"pool": "x", "profile": "codex"}}}, "choose pool"),
         ({"verify_commands": ["echo hi"]}, "array"),

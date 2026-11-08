@@ -79,7 +79,7 @@ def _cap(snapshot, candidate, mode="workspace-tools"):
         mode,
         effort=candidate.effort,
     )
-    validate_capability(cap, candidate, permissions=mode)
+    validate_capability(cap, candidate, permissions=cap["permissions"])
     return cap
 
 
@@ -784,7 +784,7 @@ def _summary_route(
         ):
             continue
         try:
-            cap = _cap(snapshot, candidate, "no-tools")
+            cap = _cap(snapshot, candidate, "reasoning")
             validate_fidelity_qualification(
                 cap, candidate=candidate, purpose=purpose, contract=contract
             )
@@ -805,7 +805,7 @@ def _summary_route(
             + role
             + (": " + "; ".join(dict.fromkeys(failures)) if failures else "")
         )
-    return selected, _cap(snapshot, selected, "no-tools")
+    return selected, _cap(snapshot, selected, "reasoning")
 
 
 def _budget(candidate, cap):

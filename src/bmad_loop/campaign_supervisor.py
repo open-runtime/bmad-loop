@@ -403,6 +403,9 @@ class CampaignSupervisor:
                                 job.get("claim") and not job["claim"]["quiescent"]
                                 for job in snapshot.jobs.values()
                             )
+                            and getattr(self.driver, "communication_settled", lambda _: True)(
+                                snapshot
+                            )
                         ):
                             # Leave durable API debt for resume. Retrying it
                             # before checking drain completion can keep an
@@ -473,7 +476,14 @@ class CampaignSupervisor:
                             snapshot.phase = "delivered"
                             add_event(snapshot, "campaign-delivered")
                             snapshot = self._save(snapshot)
-                        elif snapshot.phase == "draining" and not live and not self._active:
+                        elif (
+                            snapshot.phase == "draining"
+                            and not live
+                            and not self._active
+                            and getattr(self.driver, "communication_settled", lambda _: True)(
+                                snapshot
+                            )
+                        ):
                             snapshot.phase = "stopped"
                             add_event(snapshot, "campaign-drained")
                             snapshot = self._save(snapshot)

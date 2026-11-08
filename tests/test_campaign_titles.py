@@ -83,6 +83,22 @@ def test_group_aggregates_actual_members_without_merging_other_initiatives():
     assert navigation_title(**nav) == "@nava/@tina · E:epic · I:#42/#43 · PR:#18/#19"
 
 
+def test_managed_bridge_precedes_private_native_actor_and_is_generation_bound():
+    work = unit()
+    work.bindings["managed_communication"] = {
+        "kind": "bridge",
+        "name": "nava",
+        "target": {
+            "unit_id": work.id,
+            "launch_id": work.claim.launch_id,
+            "generation": work.claim.generation,
+        },
+    }
+    assert navigation_title(**unit_navigation(work)) == "@nava · E:epic · I:#42 · PR:#18"
+    work.claim = dataclasses.replace(work.claim, generation=2, launch_id="replacement")
+    assert unit_navigation(work)["names"] == ()
+
+
 def test_aggregate_overflow_reports_omitted_members_in_each_field():
     title = navigation_title(
         names=("nava", "tina", "luna"),

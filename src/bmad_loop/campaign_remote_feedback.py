@@ -60,6 +60,8 @@ def collect(
         "startup_failure",
         "stale",
     }
+    if requirements.allow_admin_merge and requirements.repository == candidate.repository:
+        failed_conclusions |= {"neutral", "skipped"}
     for required in requirements.checks(observation.rules.checks):
         checks = [
             row
@@ -68,8 +70,12 @@ def collect(
             and row.get("head_sha") == candidate.head
             and (required.app_id is None or (row.get("app") or {}).get("id") == required.app_id)
         ]
-        if checks:
-            newest = max(checks, key=lambda row: int(row.get("id", 0)))
+        suites = {}
+        for row in checks:
+            suite = (row.get("check_suite") or {}).get("id", "legacy")
+            if suite not in suites or int(row.get("id", 0)) > int(suites[suite].get("id", 0)):
+                suites[suite] = row
+        for newest in suites.values():
             if (
                 newest.get("id")
                 and newest.get("status") == "completed"
@@ -109,29 +115,28 @@ def collect(
                             "description": newest.get("description", ""),
                         }
                     )
-    if observation.rules.required_reviews:
-        latest: dict[str, dict[str, Any]] = {}
-        for review in sorted(observation.reviews, key=lambda row: int(row.get("id", 0))):
-            actor = (review.get("user") or {}).get("login")
-            if actor:
-                latest[actor] = review
-        for actor, review in latest.items():
-            if (
-                review.get("id")
-                and review.get("state") == "CHANGES_REQUESTED"
-                and review.get("commit_id") == candidate.head
-            ):
-                defects.append(
-                    {
-                        "kind": "changes_requested",
-                        "id": str(review["id"]),
-                        "author": actor,
-                        "head": candidate.head,
-                        "revision": review.get("submitted_at") or str(review["id"]),
-                        "body": review.get("body", ""),
-                        "url": review.get("html_url", ""),
-                    }
-                )
+    latest: dict[str, dict[str, Any]] = {}
+    for review in sorted(observation.reviews, key=lambda row: int(row.get("id", 0))):
+        actor = (review.get("user") or {}).get("login")
+        if actor:
+            latest[actor] = review
+    for actor, review in latest.items():
+        if (
+            review.get("id")
+            and review.get("state") == "CHANGES_REQUESTED"
+            and review.get("commit_id") == candidate.head
+        ):
+            defects.append(
+                {
+                    "kind": "changes_requested",
+                    "id": str(review["id"]),
+                    "author": actor,
+                    "head": candidate.head,
+                    "revision": review.get("submitted_at") or str(review["id"]),
+                    "body": review.get("body", ""),
+                    "url": review.get("html_url", ""),
+                }
+            )
     if observation.rules.conversation_resolution:
         for thread in observation.threads:
             if (

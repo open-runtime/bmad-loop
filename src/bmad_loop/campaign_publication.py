@@ -26,10 +26,17 @@ class PublicationRequirements:
 
     hold_labels: tuple[str, ...] = ("bmad:hold",)
     required_checks: tuple[str, ...] = ()
+    allow_admin_merge: bool = False
+    repository: str = ""
 
     @classmethod
     def from_spec(cls, spec: GitHubSpec) -> PublicationRequirements:
-        return cls(tuple(spec.hold_labels), tuple(spec.required_checks))
+        return cls(
+            tuple(spec.hold_labels),
+            tuple(spec.required_checks),
+            spec.allow_admin_merge,
+            spec.repository,
+        )
 
     def checks(self, server: tuple[RequiredCheck, ...]) -> tuple[RequiredCheck, ...]:
         """Add campaign contexts without weakening any server App identity."""
@@ -294,6 +301,15 @@ class PublicationController:
         canonical_merge: MergeReceipt | None = None,
     ) -> GateResult:
         reasons: list[str] = []
+        project_admin = (
+            self.requirements.allow_admin_merge
+            and merge_mode == "direct-authorized"
+            and self.requirements.repository == candidate.repository
+        )
+        if merge_mode == "direct-authorized" and not project_admin:
+            reasons.append(
+                "Native administrative publication lacks repository-scoped authorization"
+            )
         if candidate != evidence.candidate:
             reasons.append("Acceptance evidence belongs to a different candidate")
         if (
@@ -363,6 +379,7 @@ class PublicationController:
                 "clean",
                 "unstable",
                 "has_hooks",
+                *({"blocked"} if project_admin else set()),
             }
         ):
             reasons.append("GitHub mergeability is not confirmed")
@@ -374,8 +391,8 @@ class PublicationController:
             reasons.append("Effective rules are incomplete")
         if not rules.merge_commits_allowed:
             reasons.append("Target policy forbids history-preserving merge commits")
-        if merge_mode in {"direct-strict", "project-command"}:
-            if not rules.strict or not rules.checks:
+        if merge_mode in {"direct-strict", "project-command", "direct-authorized"}:
+            if not project_admin and (not rules.strict or not rules.checks):
                 reasons.append("Server-enforced up-to-date required checks are missing")
             if rules.queue:
                 reasons.append("Target requires merge queue; direct publication is not allowed")
@@ -392,7 +409,11 @@ class PublicationController:
             reasons.append("Unsupported merge mode")
         for check in self.requirements.checks(rules.checks):
             check_reason = _check_reason(
-                check, observation.checks, observation.statuses, candidate.head
+                check,
+                observation.checks,
+                observation.statuses,
+                candidate.head,
+                require_success=project_admin,
             )
             if check_reason:
                 reasons.append(check_reason)
@@ -412,10 +433,10 @@ class PublicationController:
             and row.get("state") == "APPROVED"
             and row.get("commit_id") == candidate.head
         }
-        if len(approvers) < rules.required_reviews:
+        if not project_admin and len(approvers) < rules.required_reviews:
             reasons.append("Required current-head GitHub approvals are missing")
         if (
-            rules.required_reviews or rules.last_push_approval
+            not project_admin and (rules.required_reviews or rules.last_push_approval)
         ) and observation.review_decision != "APPROVED":
             reasons.append("GitHub has not confirmed eligible approval under current review rules")
         if observation.requested_reviewers or observation.requested_teams:
@@ -641,6 +662,8 @@ def _check_reason(
     checks: tuple[JsonObject, ...],
     statuses: tuple[JsonObject, ...],
     head: str,
+    *,
+    require_success: bool = False,
 ) -> str:
     matching_checks = [
         row
@@ -658,12 +681,18 @@ def _check_reason(
     if not matching_checks and not matching_statuses:
         return f"Required check missing: {required.context} (app {required.app_id})"
     if matching_checks:
-        newest = max(matching_checks, key=lambda row: row.get("id", 0))
-        if newest.get("status") != "completed" or newest.get("conclusion") not in {
-            "success",
-            "neutral",
-            "skipped",
-        }:
+        # Independent workflows can publish the same required context. A
+        # newer green run in one suite cannot hide a failure in another.
+        suites: dict[object, JsonObject] = {}
+        for row in matching_checks:
+            suite = (row.get("check_suite") or {}).get("id", "legacy")
+            if suite not in suites or row.get("id", 0) > suites[suite].get("id", 0):
+                suites[suite] = row
+        accepted = {"success"} if require_success else {"success", "neutral", "skipped"}
+        if any(
+            row.get("status") != "completed" or row.get("conclusion") not in accepted
+            for row in suites.values()
+        ):
             return f"Required check pending/failed: {required.context}"
     if matching_statuses:
         newest = max(matching_statuses, key=lambda row: row.get("id", 0))

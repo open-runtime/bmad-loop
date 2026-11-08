@@ -143,8 +143,10 @@ def test_git_failure_produces_visible_unavailable_receipt(case, monkeypatch):
 def test_head_move_during_observation_is_not_coherent_progress(case, monkeypatch):
     repo, _, _, _, monitor = case
     old = verify.rev_parse_head(repo)
-    heads = iter([old, "f" * 40])
-    monkeypatch.setattr(verify, "rev_parse_head", lambda _: next(heads))
+    from bmad_loop import campaign_native_git
+
+    monkeypatch.setattr(campaign_native_git, "publish", lambda *args, **kwargs: old)
+    monkeypatch.setattr(verify, "rev_parse_head", lambda _: "f" * 40)
     row = monitor.observe()
     assert row["state"] == "unavailable"
     assert "changed during observation" in row["error"]

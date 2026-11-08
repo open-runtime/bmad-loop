@@ -229,15 +229,15 @@ def test_complete_input_arrives_on_stdin_and_completion_requires_quiescence(prep
     assert len(runner.mux.processes) == 1
 
 
-@pytest.mark.parametrize("configured", [False, True])
+@pytest.mark.parametrize("configured,managed", [(False, False), (True, False), (True, True)])
 def test_headless_room_is_explicit_and_inherited_actor_identity_is_removed(
-    prepared, tmp_path, monkeypatch, configured
+    prepared, tmp_path, monkeypatch, configured, managed
 ):
     runner, _, request, candidate, cap = prepared
     script = tmp_path / "native-environment.py"
     script.write_text("""import hashlib,json,os,sys
 payload=sys.stdin.buffer.read()
-keys=('HCOM_DIR','HCOM_INSTANCE_NAME','HCOM_PROCESS_ID','HCOM_NAME','HCOM_LAUNCHED','SUPERSET_TERMINAL_ID','BMAD_LOOP_TASK_ID')
+keys=('HCOM_DIR','HCOM_INSTANCE_NAME','HCOM_PROCESS_ID','HCOM_NAME','HCOM_LAUNCHED','HCOM_NOTES','SUPERSET_TERMINAL_ID','BMAD_LOOP_TASK_ID')
 print(json.dumps({'type':'system','model':'gpt-test','session_id':'room-native'}))
 print(json.dumps({'type':'result','structured_output':{'digest':hashlib.sha256(payload).hexdigest(),'bytes':len(payload),'environment':{key:os.environ[key] for key in keys if key in os.environ}},'usage':{'input_tokens':12,'output_tokens':8}}))
 """)
@@ -250,7 +250,14 @@ print(json.dumps({'type':'result','structured_output':{'digest':hashlib.sha256(p
         },
     )
     room = str(tmp_path / "campaign-room") if configured else ""
-    for key in ("HCOM_DIR", "HCOM_INSTANCE_NAME", "HCOM_PROCESS_ID", "HCOM_NAME", "HCOM_LAUNCHED"):
+    for key in (
+        "HCOM_DIR",
+        "HCOM_INSTANCE_NAME",
+        "HCOM_PROCESS_ID",
+        "HCOM_NAME",
+        "HCOM_LAUNCHED",
+        "HCOM_NOTES",
+    ):
         monkeypatch.setenv(key, "inherited-parent")
     monkeypatch.setenv("SUPERSET_TERMINAL_ID", "parent-terminal")
     path = runner.prepare(
@@ -261,6 +268,16 @@ print(json.dumps({'type':'result','structured_output':{'digest':hashlib.sha256(p
         launch_id="room-launch",
         generation=1,
         communication_room=room,
+        managed_binding=(
+            {
+                "kind": "bridge",
+                "name": "nava",
+                "room": room,
+                "target": {"launch_id": "parent-claim"},
+            }
+            if managed
+            else None
+        ),
         environment={"BMAD_LOOP_TASK_ID": "owned-task"},
     )
     runner.launch(path)
@@ -268,10 +285,53 @@ print(json.dumps({'type':'result','structured_output':{'digest':hashlib.sha256(p
     assert receipt["outcome"] == "completed", receipt
     assert receipt["result"]["environment"] == {
         "BMAD_LOOP_TASK_ID": "owned-task",
-        **({"HCOM_DIR": str(Path(room).resolve())} if configured else {}),
+        **(
+            {
+                "HCOM_DIR": (
+                    str(path.parent / "sandbox-runtime" / "hcom")
+                    if managed
+                    else str(Path(room).resolve())
+                )
+            }
+            if configured
+            else {}
+        ),
     }
     # Empty rooms retain the preexisting wire shape and do not infer a parent room.
     assert ("communication_room" in read_json(path)) is configured
+    if managed:
+        assert receipt["managed_communication"]["name"] == "nava"
+        assert receipt["native_communication_room"] != room
+
+
+def test_managed_identity_and_steering_are_sealed_before_native_launch(prepared, tmp_path):
+    runner, _, request, candidate, cap = prepared
+    room = str(tmp_path / "public-room")
+    path = runner.prepare(
+        tmp_path / "sealed-managed",
+        request,
+        candidate,
+        cap,
+        launch_id="managed-launch",
+        generation=1,
+        communication_room=room,
+        managed_binding={
+            "kind": "bridge",
+            "name": "nava",
+            "room": room,
+            "target": {"launch_id": "parent-claim"},
+        },
+        steering=[{"id": "owner", "text": "Preserve acceptance", "authority": "advisory"}],
+    )
+    raw = read_json(path)
+    assert b"Preserve acceptance" in (path.parent / "input.txt").read_bytes()
+    raw["managed_binding"]["name"] = "other"
+    write_json(path, raw)
+    runner.launch(path)
+    receipt = finish(runner, path)
+    assert receipt["outcome"] == "failed"
+    assert "managed communication binding changed" in receipt["reason"]
+    assert not (path.parent / "stdout.jsonl").exists()
 
 
 @pytest.mark.parametrize("tamper", ["replace", "remove"])
@@ -620,6 +680,94 @@ def test_execution_capability_must_consume_scope_grants(prepared):
         validate_capability(cap, candidate, permissions="workspace-tools")
 
 
+def test_headless_hold_prevents_preparation_and_release_allows_one_launch(prepared, tmp_path):
+    from bmad_loop import campaign_hold
+    from bmad_loop.adapters.base import SessionSpec
+    from bmad_loop.adapters.headless import HeadlessAdapter
+    from bmad_loop.adapters.multiplexer import MultiplexerError
+    from bmad_loop.adapters.profile import get_profile
+    from bmad_loop.policy import Policy
+
+    runner, _, request, candidate, cap = prepared
+    adapter = HeadlessAdapter(
+        run_dir=tmp_path / "held-adapter",
+        profile=get_profile("codex"),
+        policy=Policy(),
+        mux=runner.mux,
+    )
+    adapter.set_capability(cap, None, request.coordinates)
+    spec = SessionSpec(
+        "held-stage",
+        "planning",
+        "Return a JSON result",
+        tmp_path,
+        model=candidate.model,
+        effort=candidate.effort,
+        timeout_s=15,
+    )
+    held = [True]
+    token = campaign_hold.install(lambda: held[0])
+    try:
+        with pytest.raises(MultiplexerError, match="campaign operator hold"):
+            adapter.start_session(spec)
+        assert not adapter.run_dir.exists()
+        assert not runner.mux.processes
+        held[0] = False
+        handle = adapter.start_session(spec)
+        held[0] = True  # A running session keeps its normal completion path.
+        result = adapter.wait_for_completion(handle, spec)
+        assert result.status == "completed"
+        assert len(runner.mux.processes) == 1
+    finally:
+        campaign_hold.reset(token)
+
+
+def test_hold_arriving_during_headless_preparation_prevents_native_launch(prepared, tmp_path):
+    from bmad_loop import campaign_hold
+    from bmad_loop.adapters.base import SessionSpec
+    from bmad_loop.adapters.headless import HeadlessAdapter
+    from bmad_loop.adapters.multiplexer import MultiplexerError
+    from bmad_loop.adapters.profile import get_profile
+    from bmad_loop.policy import Policy
+
+    runner, _, request, candidate, cap = prepared
+    adapter = HeadlessAdapter(
+        run_dir=tmp_path / "held-late",
+        profile=get_profile("codex"),
+        policy=Policy(),
+        mux=runner.mux,
+    )
+    adapter.set_capability(cap, None, request.coordinates)
+    spec = SessionSpec(
+        "late-stage",
+        "planning",
+        "Return a JSON result",
+        tmp_path,
+        model=candidate.model,
+        effort=candidate.effort,
+        timeout_s=15,
+    )
+    held = [False]
+    prepare = adapter.runner.prepare
+
+    def prepare_then_hold(*args, **kwargs):
+        path = prepare(*args, **kwargs)
+        held[0] = True
+        return path
+
+    adapter.runner.prepare = prepare_then_hold
+    token = campaign_hold.install(lambda: held[0])
+    try:
+        with pytest.raises(MultiplexerError, match="campaign operator hold"):
+            adapter.start_session(spec)
+        path = adapter.requests[spec.task_id]
+        assert path.is_file()
+        assert not (path.parent / "launch-intent.json").exists()
+        assert not runner.mux.processes
+    finally:
+        campaign_hold.reset(token)
+
+
 def test_headless_profiles_are_explicitly_qualified():
     from bmad_loop.adapters.profile import get_profile
     from bmad_loop.adapters.registry import get_adapter_kind
@@ -628,6 +776,100 @@ def test_headless_profiles_are_explicitly_qualified():
         profile = get_profile(name)
         assert profile.adapter == "bounded-headless"
         assert get_adapter_kind(profile.adapter).load().plain.__name__ == "HeadlessAdapter"
+
+
+def test_child_stage_hold_after_startup_is_receipted_and_release_completes(
+    prepared, project, tmp_path, monkeypatch
+):
+    from test_campaign_workers import envelope, worker_request
+
+    from bmad_loop import campaign_hold, campaign_workers, runsetup
+    from bmad_loop.adapters.headless import HeadlessAdapter
+    from bmad_loop.adapters.profile import get_profile
+
+    runner, _, job, candidate, original = prepared
+    script = tmp_path / "completed-stage.py"
+    script.write_text(
+        "import json,sys\n"
+        "sys.stdin.buffer.read()\n"
+        "print(json.dumps({'type':'system','model':'gpt-test','session_id':'released-stage'}))\n"
+        "print(json.dumps({'type':'result','structured_output':{'status':'done'},"
+        "'usage':{'input_tokens':12,'output_tokens':8}}))\n"
+    )
+    cap = fixture_capability(
+        tmp_path,
+        {
+            **original,
+            "argv": [original["binary"], str(script)],
+            "dependencies": [{"path": str(script), "sha256": file_digest(script)}],
+        },
+        candidate,
+    )
+    channel = tmp_path / "operator-hold.json"
+    hold_during_construction = True
+    contexts = []
+
+    def make_adapters(workspace, run_dir, policy, *, profiles, **kwargs):
+        context = contexts[-1]
+        assert (context.directory / "startup.json").exists()
+        if hold_during_construction:
+            campaign_hold.write(
+                channel, campaign=context.campaign_id, unit=context.unit_id, hold="operator"
+            )
+        return {
+            "triage": HeadlessAdapter(
+                run_dir=run_dir, profile=profiles["triage"], policy=policy, mux=runner.mux
+            )
+        }
+
+    monkeypatch.setattr(runsetup, "make_adapters", make_adapters)
+    for attempt, outcome in ((1, "operator_held"), (2, "stage_complete")):
+        context = replace(
+            envelope(project.project, tmp_path / f"stage-attempt-{attempt}"), attempt=attempt
+        )
+        context = replace(
+            context, profiles={**context.profiles, "selected": get_profile(candidate.profile)}
+        )
+        contexts.append(context)
+        path = campaign_workers.prepare_launch(
+            context,
+            worker_request(
+                project.project,
+                context,
+                launch_id=f"stage-launch-{attempt}",
+                kind="stage",
+                role="planning_review",
+                candidate={
+                    "profile": candidate.profile,
+                    "model": candidate.model,
+                    "effort": candidate.effort,
+                },
+                profile_key="selected",
+                prompt="Review the current planning artifact.",
+                read_only=True,
+                timeout_s=15,
+                hold_channel=str(channel),
+                headless_capabilities={
+                    candidate.profile + ":" + candidate.model: {"reasoning": cap}
+                },
+                headless_coordinates=job.coordinates,
+            ),
+        )
+        code = campaign_workers.child_main(path)
+        receipt = read_json(context.directory / "receipt.json")
+        assert receipt["outcome"] == outcome, receipt
+        assert code == (1 if attempt == 1 else 0)
+        if attempt == 1:
+            assert not runner.mux.processes
+            assert not receipt["accounting"]["session_observed"]
+            campaign_hold.write(
+                channel, campaign=context.campaign_id, unit=context.unit_id, hold=""
+            )
+            hold_during_construction = False
+        else:
+            assert len(runner.mux.processes) == 1
+            assert receipt["accounting"]["session_observed"]
+            assert receipt["observed_model"] == candidate.model
 
 
 def test_native_interruptions_survive_without_model_result():

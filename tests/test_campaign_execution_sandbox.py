@@ -109,12 +109,13 @@ assert result.returncode!=0, 'sandbox allowed target ref mutation'
     argv, cwd, environment = command(path, [str(Path(sys.executable).resolve()), "-c", source])
     result = subprocess.run(argv, cwd=cwd, env=environment, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
-    from bmad_loop.campaign_object_promotion import promote
+    from bmad_loop.campaign_native_git import publish
 
-    promote(
+    publish(
         workspace,
-        git(workspace, "rev-parse", "HEAD").strip(),
         git(project.project, "rev-parse", "main").strip(),
+        directory=path.parent,
+        final=True,
     )
     assert git(workspace, "log", "-1", "--format=%s").strip() == "accepted owned work"
     assert git(workspace, "rev-parse", "HEAD") != git(project.project, "rev-parse", "main")
@@ -205,13 +206,23 @@ for action in [lambda: obj.write_bytes(b'corrupt'),lambda: obj.unlink(),lambda: 
  else: raise AssertionError('existing bank object was mutable')
 """
     _, environment = _native(path, code)
-    head = git(workspace, "rev-parse", "HEAD").strip()
+    head = subprocess.check_output(
+        ["git", "-C", str(workspace), "rev-parse", "HEAD"], env=environment, text=True
+    ).strip()
     bank = Path(environment["GIT_OBJECT_DIRECTORY"])
     object_path = bank / head[:2] / head[2:]
     assert object_path.is_file()
-    from bmad_loop.campaign_object_promotion import promote
+    from bmad_loop.campaign_native_git import publish
 
-    promote(workspace, head, git(project.project, "rev-parse", "main").strip())
+    assert (
+        publish(
+            workspace,
+            git(project.project, "rev-parse", "main").strip(),
+            directory=path.parent,
+            final=True,
+        )
+        == head
+    )
     assert git(project.project, "show", head + ":src/owned.txt") == "accepted"
 
     # A later launch can read the older bank through canonical alternates, but

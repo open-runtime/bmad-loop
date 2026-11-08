@@ -1,6 +1,6 @@
 # ADR 0002 implementation contract
 
-- **Status:** Implemented and review-ready; project activation remains gated
+- **Status:** Delivery completion in progress; review repairs and activation extension pending
 - **Date:** 2026-11-05
 - **Parent:** [Native SDLC campaign](0002-native-sdlc-campaign.md)
 - **Delivery:** One bmad-loop PR, including code, tests, documentation and local deployment tooling
@@ -15,10 +15,87 @@ extends this work without weakening its acceptance or publication gates.
 
 ## Implementation goals and traceability
 
-The implementation is ready for the next review of PR 18. Ultimate delivery additionally requires
+The prior review-ready candidate established the G0–G8 foundation below. The
+accepted delivery extension additionally requires the following concrete work.
+The owner's administrative-publication decision supersedes this ADR's strict-only
+REM activation requirement; strict and queue modes retain their existing contracts.
+
+| Delivery goal                                | Implementation and acceptance                                                                                                                                                                                              | Status                                                      |
+| -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
+| D1 — Hold and route admission                | Headless hold before preparation/launch; inherited developer; shared frozen launcher/permission readiness; standalone writer capabilities; no attempt charge while unavailable; old snapshot compatibility                 | Implemented; focused regressions and ablations passed       |
+| D2 — Owner-authorized publication            | Repository-bound opt-in; ordinary exact-head GitHub merge with authorized administrative fallback; no independent GitHub approver requirement; durable uncertain execution and landing verification/repair before tracking | In progress                                                 |
+| D3 — Native routes and writable continuation | Qualify enabled Claude/Codex/Grok/AGY/Muse model/effort/permission recipes; real writable Claude↔Codex continuation; installation-bound proofs                                                                             | In progress                                                 |
+| D4 — Managed communication                   | Own actor per unit/job; factual bridge status; durable safe-boundary steering; accepting/closing/closed generations; no identity borrowing or reopened writers; Paradev bindings                                           | In progress                                                 |
+| D5 — Final candidate qualification           | Full suite, type/lint/package checks, 48 stories/24 epics/eight verification slots with managed communication, two independent candidate-bound reviews                                                                     | In progress; native load exposed shared Git publication gap |
+| D6 — Deployment and REM delivery             | History-preserving PR merge, exact fork installation and canonical base, refreshed fork setup skill, controlled two-epic real delivery, verified automation responsibility and concurrency configuration                   | Pending qualification                                       |
+
+The completion contract includes
 accepted reviews, synchronization with main, history-preserving merge, exact-commit
 installation, canonical-base update and qualified REM activation. Do not mark the
 ultimate objective complete at the review-ready boundary.
+
+### Accepted completion extension — 2026-11-08
+
+Reconcile every earlier requirement against its ordinary CLI/runtime path, tests,
+native capability and deployment evidence. Earlier candidate results are historical
+evidence, not qualification of later changes. Keep coherent commits in this PR and
+preserve their ancestry through merge.
+
+REM's current primary-session publication decision retires both custom merge
+scripts. Do not finish or restore the obsolete REM-specific executor or case-file
+integration. Use ordinary GitHub publication with an exact-head condition and an
+explicit repository-bound administrative authorization. Preserve generic trusted
+project-command support for other repositories. An uncertain merge is reconciled
+before replay. Holds, selected reviews, applicable acceptance and mandatory checks
+remain required; no additional coordinator approval or ruleset change is added.
+
+Post-merge acceptance must make progress: verify/review the actual landing when
+its tree and ancestry are not already covered, then accept it or create one linked
+repair unit. The repair depends on the confirmed merge event rather than original
+delivery. Keep original completion and parent tracking pending until repair and
+acceptance succeed. Do not chase unrelated later main revisions indefinitely.
+
+Managed communication supplies a distinct addressable binding for every coding
+session and reasoning job. Native delivery requires qualified closing behavior;
+otherwise a controller bridge gives factual status and durable safe-boundary
+steering. Acknowledgement distinguishes transport submission, BMAD acceptance,
+model delivery and application. Never reopen a writer for late mail. An hcom PR
+is not a prerequisite for this design. TeamRouter is required where the selected
+route supports it; other routes explicitly report their native routing backend.
+
+Qualify actual native review invocation separately from prompted model review.
+REM's selected base comparison and complementary native review retain exact
+candidate/base and complete findings. Complete writable Claude-to-Codex and
+Codex-to-Claude continuation through the normal runtime, with predecessor
+quiescence, current constraints, preserved dirty work and same-PR delivery.
+
+Bulk reasoning must partition oversized inventories with bounded source-addressable
+reduction rather than requiring operators to split campaigns. Final scale proof
+uses 48 stories, 24 execution workers/active epics, eight review slots, eight
+verification slots, four reasoning jobs and **32 shared sessions**. Exercise
+managed messages, recovery and eventual tracking closure under this exact budget.
+
+After final checks and independent reviews, merge, install the exact merged fork,
+update the canonical base and revalidate installation-bound routes. Demonstrate
+two unclaimed disjoint REM stories from different epics and configuration-driven
+onboarding in a non-REM repository. Retain active owners and unrelated automations;
+never revive retired factory infrastructure. The initial native writer deployment
+is qualified on macOS; unrun host/platform capabilities remain explicit.
+
+The initial 32-session legacy load run reached delivery, and the qualified
+headless three-story campaign reached delivery with all managed endpoints closed.
+Real hcom qualification covers an outside peer's status request, durable steering
+delivered through a normal reasoning child, and closed-generation late mail.
+The larger qualified-native load exposed a separate Git visibility defect: a
+shared branch ref could advance before its quarantined objects were promoted.
+Private writer refs/index and seal-before-CAS publication must resolve that defect
+before the native load gate can pass. Neither the smaller native run nor the
+legacy load result substitutes for this gate.
+
+Scoped command lifecycle evidence covers owned sessions and observed descendants.
+An actual detached-and-reparented child can evade periodic observation. Keep that
+limitation explicit: filesystem confinement is not universal daemon containment,
+and no qualification may turn a finite foreground check into such a claim.
 
 The matrix identifies implementation responsibilities, production entry points
 and acceptance evidence. Paths identify the implemented runtime integration seams.
@@ -1171,6 +1248,26 @@ The test gate covers both hook orderings and in-flight/late delivery, not just
 an unread counter. No hcom actor is allowed to create a second executor or mark
 another unit complete. This limitation does not prevent concurrent BMAD units.
 
+The accepted `communication.mode = "managed"` extension provides public
+controller-owned bridge addresses without enabling native automatic inbox
+delivery. Each launch generation has its own address, registered before the
+native session starts. Claude/Codex wrappers retain TeamRouter and mandatory hcom
+enrollment in private per-job rooms. The public room exposes only bridge actors;
+their replies identify factual controller status, never a purported model reply.
+An outside agent can request status or submit a versioned, exactly addressed
+steering envelope. BMAD persists advisory mail before acknowledging it, freezes
+it at the next eligible stage boundary and records application only after owned
+stage completion. Unit mail targets coding stages; explicit job mail targets that
+reasoning job. A queued message cannot grant scope, bypass a hold or reopen work.
+
+The endpoint ledger, bounded shared-room poller and durable message ledger survive
+coordinator restart. They preserve uncertain replies, detect database replacement,
+close only owned bridge registrations and return explicit closed-target receipts
+for late mail. Unknown/live prior owners cannot be adopted. Completion and drain
+wait for bridge closure. CLI `endpoints`, `messages` and `steer` expose address,
+acceptance and application separately. Titles put the public hcom name, epic,
+issue and PR first; private native enrollment is a separate identity.
+
 ## REM activation and delivery of this PR
 
 Ship the entire framework in PR 18; each implementation stage is a commit/check,
@@ -1179,35 +1276,29 @@ compare them against this contract and retain only compatible implementation.
 Keep REM-specific logic out of portable orchestration; support trusted project
 policy/evidence and merge-command adapters with exact-head receipts.
 
-REM still mandates its maintained merge_pr.py route and risk-proportionate
-evidence, signed commits, cross-family review for high-risk work, explicit owner
-holds, and project-wide verification locks. A project merge-command adapter may
-call that route synchronously and then independently reconcile GitHub. It must
-not hand publication to a scheduled merge waiter and report delivery early.
-Disabling automations does not imply removing required project tooling.
-Strict mode also requires the command to honor the server's current-base gate;
-an administrative fallback that bypasses it is incompatible. The current REM
-route includes administrative exceptions, so activation must resolve that
-contract explicitly rather than merely invoking the old command unchanged.
+REM's 2026-11-07 primary-session decision retired its custom merge scripts and
+authorizes ordinary GitHub publication with administrative fallback. Use the
+repository-bound `direct-authorized` mode under that decision. Retain signed
+commits, applicable verification, explicit owner holds, selected native reviews,
+high-risk cross-family review and shared project verification locks. Do not
+restore a retired executor or add approval by a separate coordinator.
 
-REM's working agreement also forbids changing GitHub rulesets. Implement BMAD's
-executor contract, rejection fixtures and actionable preflight in this PR;
-changing REM policy/tooling or enabling a different publication guarantee requires
-its separate explicit activation decision. The generic integration cannot be
-called REM-qualified merely because it invokes that script.
+The repository's non-product workflow emits its applicable required check names;
+mixed changes can produce more than one result for a name. Every applicable
+matching result must pass. Never collapse a failed duplicate behind a green one
+or substitute a successful local command for missing hosted evidence.
 
-Live rules inspected on 2026-11-05 expose required checks with
-strict_required_status_checks_policy=false and no merge_queue rule. Classic
-protection reports absent while enterprise/organization/repository rulesets
-still apply. Consequently strict unattended publication is not currently ready
-on REM. The new preflight must report this accurately. Installing bmad-loop
-cannot repair it, and this PR must not change organization settings implicitly.
+Strict/queue contracts remain available for other repositories. Native authorized
+publication deliberately has a different freshness guarantee: GitHub accepts an
+exact-head condition but offers no atomic base comparison. Integrate and review
+against current main before submission, reconcile ambiguous writes, then validate
+the actual landed commit. Failed landing acceptance opens a bounded repair unit
+depending on the confirmed merge rather than the original unit's delivery; the
+original unit and its parents remain tracking-pending until repair succeeds.
 
-Resolve that activation prerequisite through an explicitly authorized repository
-policy change or a reviewed change to the requested guarantee. Preserve the
-current strict contract meanwhile: allow planning/execution to proceed when
-explicitly selected, retain ready PRs, and hold automatic merge. No code can
-atomically compare the base through GitHub's head-only merge precondition.
+Do not change GitHub rulesets. Fresh preflight must inspect the actual actor,
+rules, holds and chosen merge mode before activation. Installation alone supplies
+no publication authorization and proves no target-repository readiness.
 
 REM's Studio configuration permits up to 24 active epics, 32 build/test threads
 per command and eight nextest suite slots. These are separate limits; they do

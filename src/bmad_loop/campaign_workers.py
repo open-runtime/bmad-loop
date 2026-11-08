@@ -301,7 +301,7 @@ def observe(directory: Path, *, expected: dict[str, Any]) -> dict[str, Any]:
     workspace = Path(startup["workspace"])
     request_path = directory / "request.json"
     request = json.loads(request_path.read_text(encoding="utf-8")) if request_path.exists() else {}
-    if request.get("kind") == "queue_verify":
+    if request.get("kind") == "queue_verify" or request.get("landing_group"):
         from .campaign_queue import QueueGroup, assert_checkout
 
         if (
@@ -310,7 +310,9 @@ def observe(directory: Path, *, expected: dict[str, Any]) -> dict[str, Any]:
         ):
             raise CampaignError("queue verification startup workspace binding changed")
         assert_checkout(
-            workspace, Path(startup["common_dir"]), QueueGroup(**request["queue_group"])
+            workspace,
+            Path(startup["common_dir"]),
+            QueueGroup(**(request.get("landing_group") or request["queue_group"])),
         )
     else:
         assert_workspace(workspace, Path(startup["common_dir"]), startup["branch"])
@@ -543,29 +545,30 @@ def _adapters(
 ):
     from .adapters.headless import HeadlessAdapter
     from .campaign_headless import capability_for
+    from .campaign_model import RoleCandidate
+    from .campaign_route_readiness import permissions_for, selected_capability
 
-    permission = "no-tools" if request.get("read_only") else "workspace-tools"
+    permission = permissions_for(
+        request.get("role", "execution"),
+        stage=request.get("stage", ""),
+        read_only=bool(request.get("read_only")),
+    )
     routes = request.get("headless_capabilities", {})
     profiles = dict(kwargs.get("profiles") or envelope.profiles)
     selected_caps = {}
     for role in ("dev", "review", "triage", "retro"):
+        if request.get("kind") == "stage" and role != "triage":
+            continue
         selected = policy.adapter.resolved(role)
-        key = selected.name + ":" + selected.model
-        if key not in routes:
-            continue
-        modes = routes[key]
-        if "by_effort" in modes:
-            # Inspect permissions only within the selected effort. A reasoning
-            # proof must not replace an otherwise valid legacy coding adapter.
-            modes = modes["by_effort"].get(selected.effort, {})
-        mode = "reasoning" if permission == "no-tools" else "execution"
-        if ("reasoning" in modes or "execution" in modes) and mode not in modes:
-            continue
-        if "permissions" in modes and modes["permissions"] != permission:
-            continue
-        selected_caps[role] = capability_for(
-            routes, selected.name, selected.model, permission, effort=selected.effort
+        cap = selected_capability(
+            profiles[role],
+            RoleCandidate(selected.name, selected.model, selected.effort),
+            routes,
+            permission,
         )
+        if cap is None:
+            continue
+        selected_caps[role] = cap
         profiles[role] = dataclasses.replace(profiles[role], adapter="bounded-headless")
     handoff_role = (
         "triage"
@@ -579,7 +582,11 @@ def _adapters(
     kwargs["profiles"] = profiles
     adapters = runsetup.make_adapters(project, run_dir, policy, **kwargs)
     for role, adapter in adapters.items():
+        if request.get("kind") == "stage" and role != "triage":
+            continue
         if not isinstance(adapter, HeadlessAdapter):
+            if request.get("managed_communication"):
+                raise CampaignError("Managed communication requires a qualified headless adapter")
             continue
         selected = policy.adapter.resolved(role)
         cap = selected_caps.get(role) or capability_for(
@@ -591,6 +598,8 @@ def _adapters(
             request.get("headless_coordinates"),
             request.get("handoff_packet"),
         )
+        if request.get("managed_communication"):
+            adapter.set_managed_communication(request["managed_communication"])
     if request.get("claim"):
         from .campaign_model import WorkerClaim
         from .campaign_reflection_flow import observe_adapter
@@ -1025,11 +1034,13 @@ def child_main(request_path: Path) -> int:
     if request_path.parent.resolve() != envelope.directory.resolve():
         raise CampaignExecutionError("child request is outside its execution directory")
     workspace = Path(request["workspace"])
-    if request["kind"] == "queue_verify":
+    if request["kind"] == "queue_verify" or request.get("landing_group"):
         from .campaign_queue import QueueGroup, assert_checkout
 
         assert_checkout(
-            workspace, Path(request["common_dir"]), QueueGroup(**request["queue_group"])
+            workspace,
+            Path(request["common_dir"]),
+            QueueGroup(**(request.get("landing_group") or request["queue_group"])),
         )
     else:
         assert_workspace(workspace, Path(request["common_dir"]), request["branch"])
@@ -1119,6 +1130,7 @@ def child_main(request_path: Path) -> int:
         "finished_at": time.time(),
         "stage": request.get("stage", ""),
         "result_contract": request.get("result_contract", ""),
+        "landing": bool(request.get("landing")),
     }
     atomic_write_text(envelope.directory / "receipt.json", json.dumps(receipt, default=str))
     return (

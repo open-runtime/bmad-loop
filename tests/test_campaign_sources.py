@@ -34,6 +34,40 @@ def spec(source):
     return CampaignSpec("sources", sources=(source,))
 
 
+def test_worker_story_grants_only_its_resolved_lifecycle_file(project):
+    from bmad_loop.campaign_sources import worker_story_write_paths
+
+    setup_stories(project, [{"id": "first", "title": "First", "description": "First"}])
+    folder = project.project / SPEC_FOLDER / "stories"
+    folder.mkdir(exist_ok=True)
+    leaf = folder / "first-story.md"
+    leaf.write_text("---\nstatus: ready-for-dev\n---\n")
+    source = SourceSelector("stories", id="spec", path=SPEC_FOLDER)
+    unit = UnitSpec("first", source.id, "epic", "First", "first", scopes=("src",))
+    assert worker_story_write_paths(project.project, source, unit) == (leaf.resolve(),)
+    assert (
+        worker_story_write_paths(project.project, source, replace(unit, selector="missing")) == ()
+    )
+    (folder / "first-other.md").write_text(leaf.read_text())
+    with pytest.raises(CampaignError, match="ambiguous"):
+        worker_story_write_paths(project.project, source, unit)
+
+
+def test_worker_story_grant_refuses_redirected_source(project, tmp_path):
+    from bmad_loop.campaign_sources import worker_story_write_paths
+
+    setup_stories(project, [{"id": "first", "title": "First", "description": "First"}])
+    folder = project.project / SPEC_FOLDER / "stories"
+    folder.mkdir(exist_ok=True)
+    outside = tmp_path / "outside.md"
+    outside.write_text("---\nstatus: ready-for-dev\n---\n")
+    (folder / "first-story.md").symlink_to(outside)
+    source = SourceSelector("stories", id="spec", path=SPEC_FOLDER)
+    unit = UnitSpec("first", source.id, "epic", "First", "first")
+    with pytest.raises(CampaignError, match="redirects"):
+        worker_story_write_paths(project.project, source, unit)
+
+
 def test_sprint_import_keeps_selected_order_and_does_not_depend_on_unselected_rows(project):
     write_sprint(
         project,

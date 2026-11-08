@@ -187,9 +187,33 @@ def execution(request, session):
     stop_requested = False
     deadline = time.monotonic() + 180
 
+    def assert_deadline():
+        if time.monotonic() < deadline:
+            return
+        from campaign_runtime_watchdog import failure_details
+
+        current = case.store.load(snapshot.id)
+        details = diagnose(current)
+        details.update(failure_details(case, current, supervisor._active))
+        details["capacity"] = current.bindings.get("capacity", {})
+        raise AssertionError(
+            "Warmup/handoff did not complete within 180s: " + json.dumps(details, indent=2)
+        )
+
     def observe_progress():
         nonlocal prefix_jobs, original_launch, original_pr, stop_requested
         current = case.store.load(snapshot.id)
+        # Qualification fixtures bind real source bytes. Concurrent edits must
+        # fail visibly instead of looking like a warmup or capacity deadlock.
+        invalid_launchers = [
+            {"profile": row["profile"], "model": row["model"], **launcher}
+            for row in current.bindings.get("capacity", {}).get("observations", [])
+            for launcher in row.get("launchers", [])
+            if launcher.get("reason") == "Qualified wrapper/native dependency changed"
+        ]
+        assert (
+            not invalid_launchers
+        ), "Qualification fixture changed during execution: " + json.dumps(invalid_launchers)
         unit = current.units[UNIT]
         if not prefix_jobs:
             applied = [
@@ -219,12 +243,24 @@ def execution(request, session):
         ):
             case.store.enqueue(snapshot.id, "stop")
             stop_requested = True
-        assert time.monotonic() < deadline, json.dumps(diagnose(current), indent=2)
+        assert_deadline()
         return case.runtime.clock()
 
-    result = CampaignSupervisor(
+    supervisor = CampaignSupervisor(
         case.store, case.runtime, clock=observe_progress, progress=lambda _: None
-    ).run(snapshot.id)
+    )
+    original_wait = supervisor._wake.wait
+
+    def bounded_wait(timeout=None):
+        # Reconciliation/idle waits do not always invoke the supplied clock.
+        # Keep their wall-time guard independent of progress callbacks too.
+        assert_deadline()
+        result = original_wait(min(timeout or 0.05, max(0, deadline - time.monotonic())))
+        assert_deadline()
+        return result
+
+    monkeypatch.setattr(supervisor._wake, "wait", bounded_wait)
+    result = supervisor.run(snapshot.id)
     unit = result.units[UNIT]
     handoff = unit.evidence["handoff"]
     assert prefix_jobs
