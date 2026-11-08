@@ -569,40 +569,16 @@ class CampaignRuntime:
     def prepare_resume(self, snapshot: CampaignSnapshot) -> bool:
         from .campaign_attribution import restore
         from .campaign_native_review_flow import current, required
+        from .campaign_review_freshness import invalidate, stale
 
         changed = restore(snapshot)
-        # A lost merge acknowledgement leaves READY_TO_PUBLISH behind. Retain
-        # the submitted evidence until the durable write intent is reconciled.
-        pending_merges = {
-            action.unit
-            for action in snapshot.outbox
-            if action.kind == "github"
-            and action.payload.get("purpose") == "merge"
-            and action.state in {"prepared", "sent_unknown"}
-        }
         for unit in snapshot.units.values():
-            if (
-                unit.id not in pending_merges
-                and unit.state
-                not in {
-                    UnitState.MERGE_REQUESTED,
-                    UnitState.MERGED_PENDING_SYNC,
-                    UnitState.DELIVERED,
-                    UnitState.CANCELED,
-                }
-                and required(snapshot)
-                and (
-                    unit.evidence.get("native_review_pair")
-                    or unit.state == UnitState.READY_TO_PUBLISH
-                )
+            if stale(snapshot, unit) or (
+                required(snapshot)
+                and unit.state == UnitState.READY_TO_PUBLISH
                 and not current(snapshot, unit)
             ):
-                for key in ("native_review_pair", "review"):
-                    unit.evidence.pop(key, None)
-                if unit.state == UnitState.READY_TO_PUBLISH:
-                    transition(snapshot, unit.id, UnitState.SYNCING)
-                add_event(snapshot, "native-review-pair-invalidated", unit=unit.id)
-                changed = True
+                changed = invalidate(snapshot, unit) or changed
             hold = unit.hold
             if (
                 hold
@@ -3862,6 +3838,7 @@ class CampaignRuntime:
     def _publication_evidence(self, snapshot, unit) -> PublicationEvidence:
         from .campaign_acceptance import evaluate as acceptance_evaluate
         from .campaign_native_review_flow import accepted as pair_accepted
+        from .campaign_review_freshness import current as review_current
 
         candidate = self._candidate(snapshot, unit)
         verification = unit.evidence.get("verification", {})
@@ -3871,6 +3848,7 @@ class CampaignRuntime:
             verification.get("outcome") == "verified"
             and acceptance_evaluate(unit, candidate)["complete"],
             review.get("validated", {}).get("verdict") == "approved"
+            and review_current(snapshot, unit)
             and pair_accepted(snapshot, unit),
             bool(unit.claim and unit.claim.quiescent),
             verify.worktree_clean(Path(unit.bindings["workspace"]))
@@ -3892,7 +3870,10 @@ class CampaignRuntime:
     def _perform_prepare_ready(self, snapshot, action) -> Observation:
         unit = snapshot.units[action.unit]
         from .campaign_native_review_flow import require as require_pair
+        from .campaign_review_freshness import stale
 
+        if stale(snapshot, unit):
+            return Observation("confirmed", {"acceptance_stale": True})
         require_pair(snapshot, unit)
         pr = self.gateway(snapshot).pull(unit.bindings["pr"]["number"])
         intent = self.gateway(snapshot).prepare_ready(
@@ -3982,6 +3963,11 @@ class CampaignRuntime:
             return Observation(
                 "confirmed", {"needs_integration": True, "base": observation.base_head}
             )
+        from .campaign_native_review_flow import accepted as pair_accepted
+        from .campaign_review_freshness import current as review_current
+
+        if not review_current(snapshot, unit) or not pair_accepted(snapshot, unit):
+            return Observation("confirmed", {"acceptance_stale": True})
         evidence = self._publication_evidence(snapshot, unit)
         gate = controller.evaluate(
             candidate,
@@ -4516,6 +4502,11 @@ class CampaignRuntime:
         data = observation.data
         unit = snapshot.units.get(action.unit)
         kind = action.kind
+        if kind in {"prepare-ready", "prepare-merge"} and data.get("acceptance_stale"):
+            from .campaign_review_freshness import invalidate
+
+            invalidate(snapshot, unit)
+            return
         if data.get("operator_suppressed"):
             from .campaign_queue_publication import release_suppressed
 
@@ -4888,7 +4879,9 @@ class CampaignRuntime:
                     action=action.id,
                     reason="required scope changed before parent closure",
                 )
-                if data.get("needs_integration") and unit.state == UnitState.READY_TO_PUBLISH:
+                if (
+                    data.get("needs_integration") or data.get("acceptance_stale")
+                ) and unit.state == UnitState.READY_TO_PUBLISH:
                     from .campaign_publication_retry import invalidate
 
                     held = invalidate(snapshot, unit.id, action.id, data.get("base", ""))

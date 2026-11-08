@@ -26,6 +26,8 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Refresh obsolete publication reviews after live intake changes the execution graph, retaining uncertain merge receipts.
+- Split output-limited handoff reducers at whole-child boundaries without discarding completed summaries or retry debt.
 - Permit Git's private AUTO_MERGE cleanup transaction after scoped commits.
 - Persist handoff retry cooldowns and bound reduced artifacts separately from native reasoning output.
 - Preserve BMAD stage result fields through Codex's closed native output schema.

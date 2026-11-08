@@ -723,8 +723,10 @@ and single native-review recipes. These exercise roughly 128 KiB of input, actua
 scoped edits/commits, protected paths, native identity, usage and lifecycle. Input
 bytes are not tokens; the results do not qualify every model, effort, permission
 mode or full-history continuation path. Changed transport dependencies require
-fresh proof. Writable continuation and the actual main/custom native review pair
-remain separate gates, followed by installation-bound revalidation.
+fresh proof. The actual main/custom native review pair has since earned separate
+proof: both native reviews precede a third schema-mapping turn, with retained
+delegate artifacts and exact candidate/base identity. Writable continuation remains
+a separate gate, followed by installation-bound revalidation.
 The frozen code candidate `276daa62` passed the integrated regression suite with
 20,391 passes and 261 skips in 664.86 seconds; the dedicated scale case is run
 separately. Pyright, Trunk, package build, isolated wheel installation and release
@@ -958,6 +960,16 @@ quiescent lifecycle can consume the remaining model-result correction budget.
 The original receipt remains a limit failure; concurrent wall, wire, turn,
 provider or incomplete-result failures are ineligible. Final stream sizes and
 the whole-job deadline are checked again after owned descendants drain.
+
+Campaign recovery can split a quiescent multi-child reducer after a typed native
+output-token limit. Splits retain whole child summaries and their source coverage,
+reuse applied or pending siblings, and preserve the original extraction frontier.
+Attempt debt stays attached to the original children through both splitting and
+subsequent combination. Splits consume the existing eight-round reduction bound;
+an unknown worker claim prevents replacement. Other limit kinds retry the current
+reducer without re-extracting the complete conversation. Scripted regression
+coverage follows failed receipt, persisted cooldown, restart, splitting, successful
+combination, auditing and successor assembly through the normal proposal path.
 
 Explicit trial reuse follows only retained bindings and revalidates each source,
 native receipt and earned route qualification. Map and reducer routes may use

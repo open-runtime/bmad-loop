@@ -29,7 +29,7 @@ def dispatch(module, runtime, snapshot, kind):
     return action
 
 
-def finish(runtime, snapshot, action, outcome, result=None):
+def finish(runtime, snapshot, action, outcome, result=None, **telemetry):
     row = snapshot.jobs[action.payload["job_id"]]
     receipt = {
         "job_id": row["id"],
@@ -42,6 +42,7 @@ def finish(runtime, snapshot, action, outcome, result=None):
         "result": result,
         "provider_family": "anthropic" if row["selection"]["profile"] == "claude" else "openai",
         "usage": {"output_tokens": 10, "cost_usd": 0},
+        **telemetry,
     }
     observed = Observation("confirmed", {"state": "finished", "receipt": receipt})
     reasoning.apply(runtime, snapshot, action, observed)

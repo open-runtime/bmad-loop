@@ -935,6 +935,11 @@ expansion must fit the same checked artifact limit. Oversized results retain the
 sources and fail with explicit observed/bound sizes, without dropping owner
 obligations. Retry cooldowns are persisted per failed attempt, so polling and
 restart do not continually postpone the only available route.
+When a stopped reducer exceeds its native output-token allowance, recovery can
+split its input at whole-child summary boundaries. Completed sibling summaries,
+source coverage and retry counts survive; the pipeline does not restart all
+history extraction. Unknown worker state blocks replacement, and the existing
+eight-round reduction ceiling still applies.
 
 Completed job receipts and validated results allow the same command to resume;
 changed sources, route or limits require a new trial directory. Failure stops new

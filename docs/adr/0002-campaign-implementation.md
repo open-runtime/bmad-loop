@@ -20,14 +20,14 @@ accepted delivery extension additionally requires the following concrete work.
 The owner's administrative-publication decision supersedes this ADR's strict-only
 REM activation requirement; strict and queue modes retain their existing contracts.
 
-| Delivery goal                                | Implementation and acceptance                                                                                                                                                                                              | Status                                                                                              |
-| -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
-| D1 — Hold and route admission                | Headless hold before preparation/launch; inherited developer; shared frozen launcher/permission readiness; standalone writer capabilities; no attempt charge while unavailable; old snapshot compatibility                 | Implemented; focused regressions and ablations passed                                               |
-| D2 — Owner-authorized publication            | Repository-bound opt-in; ordinary exact-head GitHub merge with authorized administrative fallback; no independent GitHub approver requirement; durable uncertain execution and landing verification/repair before tracking | Implemented and regression tested; real target delivery pending                                     |
-| D3 — Native routes and writable continuation | Qualify enabled Claude/Codex/Grok/AGY/Muse model/effort/permission recipes; real writable Claude↔Codex continuation; installation-bound proofs                                                                             | Five exact writer recipes earned evidence; continuation and paired review qualification in progress |
-| D4 — Managed communication                   | Own actor per unit/job; factual bridge status; durable safe-boundary steering; accepting/closing/closed generations; no identity borrowing or reopened writers; Paradev bindings                                           | Implemented; actual isolated hcom and scripted managed-load qualification passed                    |
-| D5 — Final candidate qualification           | Full suite, type/lint/package checks, 48 stories/24 epics/eight verification slots with managed communication, two independent candidate-bound reviews                                                                     | Managed load passed; final source freeze, full checks and independent reviews pending               |
-| D6 — Deployment and REM delivery             | History-preserving PR merge, exact fork installation and canonical base, refreshed fork setup skill, controlled two-epic real delivery, verified automation responsibility and concurrency configuration                   | Pending qualification                                                                               |
+| Delivery goal                                | Implementation and acceptance                                                                                                                                                                                              | Status                                                                                     |
+| -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| D1 — Hold and route admission                | Headless hold before preparation/launch; inherited developer; shared frozen launcher/permission readiness; standalone writer capabilities; no attempt charge while unavailable; old snapshot compatibility                 | Implemented; focused regressions and ablations passed                                      |
+| D2 — Owner-authorized publication            | Repository-bound opt-in; ordinary exact-head GitHub merge with authorized administrative fallback; no independent GitHub approver requirement; durable uncertain execution and landing verification/repair before tracking | Implemented and regression tested; real target delivery pending                            |
+| D3 — Native routes and writable continuation | Qualify enabled Claude/Codex/Grok/AGY/Muse model/effort/permission recipes; real writable Claude↔Codex continuation; installation-bound proofs                                                                             | Five writer recipes and actual native review pair qualified; writable continuation pending |
+| D4 — Managed communication                   | Own actor per unit/job; factual bridge status; durable safe-boundary steering; accepting/closing/closed generations; no identity borrowing or reopened writers; Paradev bindings                                           | Implemented; actual isolated hcom and scripted managed-load qualification passed           |
+| D5 — Final candidate qualification           | Full suite, type/lint/package checks, 48 stories/24 epics/eight verification slots with managed communication, two independent candidate-bound reviews                                                                     | Managed load passed; final source freeze, full checks and independent reviews pending      |
+| D6 — Deployment and REM delivery             | History-preserving PR merge, exact fork installation and canonical base, refreshed fork setup skill, controlled two-epic real delivery, verified automation responsibility and concurrency configuration                   | Pending qualification                                                                      |
 
 The completion contract includes
 accepted reviews, synchronization with main, history-preserving merge, exact-commit
@@ -77,6 +77,15 @@ review after mixed-family authorship. Omitted roles retain legacy behavior and
 configuration identities. Complete writable Claude-to-Codex and
 Codex-to-Claude continuation through the normal runtime, with predecessor
 quiescence, current constraints, preserved dirty work and same-PR delivery.
+
+Ordinary publication reviews and native review pairs share freshness checks for
+candidate, integrated base, graph, source and frozen configuration. Live intake can
+invalidate an approved review even when its candidate commit has not changed.
+Before submission, that condition returns the unit to verification and review;
+it cannot become a permanent remote wait. Already submitted or uncertain merge
+writes retain their receipts until reconciliation, and delivered history remains
+intact. Regression coverage injects a new issue through the running coordinator
+after approval and requires fresh review followed by merge and tracking closure.
 
 Bulk reasoning must partition oversized inventories with bounded source-addressable
 reduction rather than requiring operators to split campaigns. Final scale proof

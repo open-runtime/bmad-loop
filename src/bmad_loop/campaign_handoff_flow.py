@@ -367,6 +367,12 @@ def _requires_replan(row):
 
 def _failure_keys(raw):
     coordinates = raw["coordinates"]
+    if raw["purpose"] == "handoff_reduce" and coordinates.get("reduction_failure_keys"):
+        return list(
+            dict.fromkeys(
+                key for keys in coordinates["reduction_failure_keys"].values() for key in keys
+            )
+        )
     summary = coordinates.get("summary_spec") or {}
     identities = summary.get("primary_ids") or [source["sha256"] for source in raw["inputs"]]
     return [digest([raw["purpose"], coordinates.get("contract", ""), key]) for key in identities]
@@ -1019,6 +1025,7 @@ def _reduce(runtime, snapshot, unit, value):
             **_coordinates(snapshot, unit, value),
             "summary_spec": dataclasses.asdict(spec),
             "history_snapshots": value["capture"]["sources"],
+            "reduction_failure_keys": _reduction_failure_keys(runtime, snapshot, spec),
         }
         jobs.append(
             dataclasses.asdict(
@@ -1051,6 +1058,126 @@ def _reduce(runtime, snapshot, unit, value):
             )
         )
     return {"requests": jobs, "reduction": True}
+
+
+def _reduction_failure_keys(runtime, snapshot, spec):
+    """Keep attempt debt attached to original children through splits and combines."""
+    result = {}
+    for key in spec.primary_ids:
+        child = _job(runtime, snapshot, key)["request"]
+        result[key] = (
+            _failure_keys(child)
+            if child["purpose"] == "handoff_reduce"
+            else [digest(["handoff_reduce", "", key])]
+        )
+    return result
+
+
+def _summary_replan(runtime, snapshot, unit, value):
+    """Retry the current reduction frontier, never discard it to re-extract maps."""
+    from .campaign_summary import (
+        SummaryJobSpec,
+        load_input,
+        split_reduction_input,
+        summary_prompt,
+        summary_schema,
+    )
+
+    rows = [_job(runtime, snapshot, key) for key in value["jobs"]]
+    if not any(row["request"]["purpose"] == "handoff_reduce" for row in rows):
+        return _maps(runtime, snapshot, unit, value)
+    if any(row["request"]["purpose"] != "handoff_reduce" for row in rows):
+        raise CampaignError("Continuation reduction frontier mixes maps and reducers")
+    reuse, requests, split_jobs = [], [], []
+    for row in rows:
+        if not _requires_replan(row):
+            reuse.append(row["id"])
+            continue
+        claim, receipt = row.get("claim") or {}, row.get("receipt") or {}
+        if claim and not claim.get("quiescent"):
+            raise CampaignError("Cannot replace a reducer with unknown native quiescence")
+        old = SummaryJobSpec(**row["request"]["coordinates"]["summary_spec"])
+        split = (
+            row["state"] == "failed"
+            and claim.get("quiescent") is True
+            and receipt.get("quiescent") is True
+            and receipt.get("outcome") == "limit"
+            and receipt.get("limit_kind") == "native-output-tokens"
+            and not old.correction_of
+            and len(load_input(old).get("children", [])) > 1
+        )
+        if split and value.get("reduction_level", 0) >= 8:
+            raise CampaignError(
+                "History reduction failed to converge within eight qualified rounds"
+            )
+        specs = (
+            split_reduction_input(old, _root(runtime, snapshot, value) / "reductions")
+            if split
+            else (old,)
+        )
+        if split:
+            split_jobs.append(row["id"])
+        for planned in specs:
+            candidate, cap = _summary_route(
+                runtime,
+                snapshot,
+                "summarization",
+                value,
+                min_payload=planned.input_tokens,
+                purpose="handoff_reduce",
+            )
+            spec = dataclasses.replace(
+                planned,
+                id=digest([value["id"], planned.id, value["plan_epoch"], snapshot.config_revision]),
+                route=_budget(candidate, cap).route,
+                output_tokens=min(planned.output_tokens, cap["output_tokens"]),
+            )
+            coordinates = {
+                **_coordinates(snapshot, unit, value),
+                "summary_spec": dataclasses.asdict(spec),
+                "history_snapshots": value["capture"]["sources"],
+                "reduction_failure_keys": _reduction_failure_keys(runtime, snapshot, spec),
+            }
+            requests.append(
+                dataclasses.asdict(
+                    JobRequest(
+                        spec.id,
+                        "handoff_reduce",
+                        "summarization",
+                        coordinates,
+                        (
+                            {
+                                "source_id": spec.id,
+                                "path": spec.input_path,
+                                "sha256": spec.input_sha256,
+                                "tokens": spec.input_tokens,
+                            },
+                        ),
+                        summary_prompt(spec),
+                        summary_schema(spec),
+                        JobLimits(
+                            cap["input_tokens"],
+                            spec.output_tokens,
+                            1,
+                            min(
+                                row["request"]["limits"]["timeout_s"],
+                                snapshot.spec.reasoning.timeout_s,
+                            ),
+                        ),
+                        unit=unit.id,
+                        dependencies=spec.dependencies,
+                        candidates=(candidate,),
+                        created_at=runtime.clock(),
+                    )
+                )
+            )
+    return {
+        "requests": requests,
+        "reuse_jobs": reuse,
+        "reduction_replan": True,
+        "reduction": bool(split_jobs),
+        "split_jobs": split_jobs,
+    }
 
 
 def validate_fidelity_qualification(cap, *, candidate=None, purpose="", contract=""):
@@ -1804,7 +1931,7 @@ def _perform(runtime, snapshot, action, *, reconcile=False):
         prior_epoch = value.get("plan_epoch", 0)
         value = _retry_context(runtime, value, rows)
         planner = {
-            "handoff-replan": _maps,
+            "handoff-replan": _summary_replan,
             "handoff-audit-replan": _audit_plan,
             "handoff-contract-replan": _contract_replan,
         }[action.kind]
@@ -2110,6 +2237,8 @@ def apply(runtime, snapshot, action, observation):
             value["plan_epoch"] = data["plan_epoch"]
             value["route_cooldowns"] = data.get("route_cooldowns", {})
             for key in value["jobs" if action.kind == "handoff-replan" else "audits"]:
+                if key in ids:
+                    continue
                 row = snapshot.jobs.get(key)
                 if row is None:
                     continue
@@ -2126,7 +2255,7 @@ def apply(runtime, snapshot, action, observation):
             if action.kind in {"handoff-plan", "handoff-replan"} or data.get("reduction")
             else ("audits", "audit")
         )
-        if action.kind in {"handoff-plan", "handoff-replan"}:
+        if action.kind in {"handoff-plan", "handoff-replan"} and not data.get("reduction_replan"):
             value["map_jobs"] = ids
         if field == "jobs":
             value["all_jobs"] = list(dict.fromkeys([*value.get("all_jobs", []), *ids]))
