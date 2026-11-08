@@ -33,9 +33,8 @@ def assert_target(workspace, value):
     value = target(value)
     if verify.rev_parse_head(workspace) != value["head"] or not verify.worktree_clean(workspace):
         raise CampaignError("Native review pair candidate changed or has uncommitted work")
-    result = verify._run_git(
-        ["git", "-C", str(workspace), "merge-base", "--is-ancestor", value["base"], value["head"]],
-        workspace,
+    result = verify.git_bytes(
+        workspace, "merge-base", "--is-ancestor", value["base"], value["head"]
     )
     if result.returncode:
         raise CampaignError("Native review pair base is not integrated into the candidate")
