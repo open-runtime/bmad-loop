@@ -535,7 +535,10 @@ def invalidate(runtime, snapshot, unit, debt, *, inputs=None):
         )["github"]
         unit.evidence["github_input_revision"] = digest(unit.evidence["github_boundary_inputs"])
     flow = unit.evidence.get("planning_flow")
-    if flow and (stage in snapshot.spec.planning.stages or stage == "publication_review"):
+    if flow and (
+        stage in snapshot.spec.planning.stages
+        or stage in {"publication_review", "native_review_pair"}
+    ):
         for row in flow["history"]:
             if row["state"] in {"prepared", "completed"} and (
                 row["launch_id"] == receipt["launch_id"] or row["stage"] in flow["stages"]

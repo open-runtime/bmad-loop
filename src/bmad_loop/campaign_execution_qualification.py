@@ -188,6 +188,8 @@ def build(
         "runtime_write_paths": capability.get("runtime_write_paths", []),
     }
     grants.update({"permissions": "read-only-tools"} if readonly else {"git_branch": BRANCH})
+    if "--review-pair" in capability.get("argv", ()):
+        grants["native_review_target"] = {"head": baseline, "base": baseline}
     probe = {
         "kind": kind,
         "nonce": nonce,
@@ -294,6 +296,11 @@ def validate_request(request, probe):
         }
     ):
         raise CampaignError("Native read-only containment probe differs from the fixture")
+    if "native_review_target" in probe["grants"] and probe["grants"]["native_review_target"] != {
+        "head": probe["baseline"],
+        "base": probe["baseline"],
+    }:
+        raise CampaignError("Native review pair target differs from its fixed fixture")
 
 
 def validate_envelope(envelope):
@@ -503,10 +510,10 @@ def result(path, observation):
             envelope["capability"]["protocol"] == "codex-native-review"
             and checks["native_completed"]
         ):
-            from .campaign_codex_review import validate_review
+            from .campaign_codex_review_pair import validate_receipt
 
-            validate_review(receipt.get("native_review"))
-            checks["native_review"] = receipt.get("turns") == 2
+            validate_receipt(receipt, envelope["capability"], envelope["request"]["coordinates"])
+            checks["native_review"] = True
         if all(checks.values()):
             confinement = envelope["capability"].get("confinement")
             if confinement in {"codex-native-read-only-v1", "codex-scoped-tools-v1"}:

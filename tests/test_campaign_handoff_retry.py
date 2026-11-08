@@ -239,3 +239,41 @@ def test_persisted_summary_without_artifact_field_keeps_native_request_identity(
     reasoning.apply(runtime, snapshot, action, Observation("confirmed", {}))
     assert row["state"] == "applied", row.get("reason")
     assert row["request_digest"] == original_digest
+
+
+def test_summary_purpose_selects_exact_qualified_effort(campaign):
+    from bmad_loop.campaign_headless import file_digest, read_json, write_json
+    from bmad_loop.campaign_jobs import digest
+
+    runtime, snapshot, _, _ = campaign
+    base = snapshot.spec.candidates("summarization")[0]
+    high = dataclasses.replace(base, effort="xhigh")
+    medium = dataclasses.replace(base, effort="medium")
+    variants = {}
+    for candidate, purpose in [(high, "handoff_map"), (medium, "handoff_reduce")]:
+        cap = runtime.fixture_cap(candidate)
+        path = Path(cap["semantic_qualification"]["path"])
+        evidence = read_json(path)
+        bindings = [row for row in evidence["route_bindings"] if row["purpose"] == purpose]
+        evidence["route_bindings"] = bindings
+        receipt_path = Path(evidence["independent_review"]["native_receipt_path"])
+        receipt = read_json(receipt_path)
+        receipt["result"]["route_bindings_digest"] = digest(bindings)
+        write_json(receipt_path, receipt)
+        evidence["independent_review"]["sha256"] = file_digest(receipt_path)
+        write_json(path, evidence)
+        cap["semantic_qualification"]["sha256"] = file_digest(path)
+        variants[candidate.effort] = {"reasoning": cap}
+    snapshot.config_snapshot["reasoning_capabilities"][base.profile + ":" + base.model] = {
+        "by_effort": variants
+    }
+    snapshot.spec = dataclasses.replace(
+        snapshot.spec,
+        role_pools=tuple(
+            (name, (high, medium) if name == "map" else pool)
+            for name, pool in snapshot.spec.role_pools
+        ),
+    )
+    for purpose, expected in [("handoff_map", high), ("handoff_reduce", medium)]:
+        selected, cap = handoff._summary_route(runtime, snapshot, "summarization", purpose=purpose)
+        assert selected == expected and cap["efforts"] == [expected.effort]

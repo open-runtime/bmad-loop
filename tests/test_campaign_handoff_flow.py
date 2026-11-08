@@ -40,6 +40,7 @@ def campaign(prepared, project, tmp_path):
             **basecap,
             "profile": candidate.profile,
             "model": candidate.model,
+            "efforts": [candidate.effort],
             "permissions": "workspace-tools" if execution else "no-tools",
         }
         if execution:

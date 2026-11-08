@@ -9,6 +9,7 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- Require optional native main/custom review pairs separately from independent publication review.
 - Deliver explicitly selected native tickets without closing their ongoing parent epics or milestones.
 - Add durable reasoning jobs, qualified headless adapters and portable transcript handoff contracts.
 - Prepare reusable native-history summaries during active work with bounded background jobs.

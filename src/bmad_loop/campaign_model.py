@@ -687,6 +687,7 @@ def spec_from_dict(value: Mapping[str, Any]) -> CampaignSpec:
         "decision_review",
         "conflict_repair",
         "publication_review",
+        "native_review_pair",
         "execution",
         "execution_review",
         "reasoning",

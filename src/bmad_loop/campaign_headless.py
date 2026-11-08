@@ -303,7 +303,7 @@ def load_capabilities(path: Path) -> dict[str, Any]:
                 }.get(mode, cap.get("permissions", "no-tools"))
                 if mode == "reasoning" and permission not in {"no-tools", "read-only-tools"}:
                     raise CampaignError("Reasoning routes cannot grant product writes")
-                if (mode == "review") != (cap.get("protocol") == "codex-native-review"):
+                if mode != "review" and cap.get("protocol") == "codex-native-review":
                     raise CampaignError(
                         "Native review requires its separate review capability slot"
                     )

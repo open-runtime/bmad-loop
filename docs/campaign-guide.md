@@ -309,6 +309,26 @@ the full PR diff. Changed heads invalidate affected evidence. Draft-to-ready
 transition permits selected remote checks and reviewers to run. Model review
 and an eligible GitHub approval are separate obligations.
 
+For repositories requiring two actual native Codex reviews, configure the optional
+role below with an earned paired-review capability in that route's `review` slot:
+
+```toml
+[roles.native_review_pair]
+profile = "codex"
+model = "gpt-6-astra"
+effort = "high"
+max_sessions = 2
+```
+
+The pair reviews the exact integrated base and then the complementary acceptance
+and risk requirements. It runs before the separate `publication_review` stage and
+shares the review and total-session limits. Both native findings sets are retained;
+the third turn only maps them into the campaign result. Changed candidate or base
+invalidates the pair. Findings enter same-PR repair, and publication waits for a
+fresh approved pair plus independent review. A single-review or ordinary reasoning
+capability cannot satisfy this role. Leave the role absent for repositories whose
+policy does not require the pair.
+
 `github.required_checks` adds checks on the exact PR head to the server's required
 checks, retaining any server App restrictions. Missing or pending checks wait;
 failed checks enter bounded repair after confirmed queue removal when enqueued.
@@ -801,6 +821,13 @@ Put that independently qualified capability in a `review` slot beside `reasoning
 and `execution`; planning, publication and landing review prefer the explicit
 review slot. A failed selected review proof blocks admission. Routes without this
 slot retain their existing review behavior. Neither Codex route claims no-tools.
+
+Other harnesses can place their independently qualified `read-only-tools`
+capability in `review` while retaining a no-tools capability in `reasoning`.
+For example, a Grok code reviewer can inspect the checkout without replacing the
+larger no-tools route and semantic proofs used by history reducers. A prompted
+code review is distinct from a native Codex review; it cannot satisfy
+`native_review_pair`. Writer capabilities are not accepted in the review slot.
 
 The separate `codex-scoped-tools-v1` writer recipe keeps native tools read-only
 and registers `bmad_shell` through the native dynamic-tool interface. Only that

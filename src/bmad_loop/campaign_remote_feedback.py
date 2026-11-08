@@ -209,7 +209,7 @@ def _apply(
     seen = unit.evidence.setdefault("remote_feedback_attempted", [])
     if feedback.digest in seen:
         if expected_state == UnitState.MERGE_REQUESTED:
-            for name in ("integrated", "pushed", "verification", "review"):
+            for name in ("integrated", "pushed", "verification", "review", "native_review_pair"):
                 unit.evidence.pop(name, None)
             unit.resume_state = UnitState.SYNCING
             transition(snapshot, unit.id, UnitState.SYNCING)
@@ -238,7 +238,7 @@ def _apply(
     unit.evidence["required_findings"] = [
         row for row in feedback.defects if row["kind"] in {"changes_requested", "review_thread"}
     ]
-    for name in ("integrated", "pushed", "verification", "review"):
+    for name in ("integrated", "pushed", "verification", "review", "native_review_pair"):
         unit.evidence.pop(name, None)
     unit.resume_state = UnitState.SYNCING
     transition(snapshot, unit.id, UnitState.SYNCING)

@@ -363,6 +363,9 @@ def test_reduction_native_reasoning_budget_is_separate_from_artifact_bytes(tmp_p
     assert "16384 tokens, including any reasoning" in prompt
     assert "4164 bytes" in prompt and "2082 UTF-8 bytes" in prompt
     assert "every distinct current owner obligation" in prompt
+    assert "retained child job IDs" in prompt
+    assert "Retain unresolved uncertainty" in prompt
+    assert "Never fabricate a resolution" in prompt
     value = result(reducer, events)
     compact = validate_summary(reducer, value, events, observed_output_tokens=6940)
     assert len(encoded(compact)) <= 4164

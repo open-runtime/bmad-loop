@@ -362,7 +362,9 @@ def apply(
         "complete": all(stream["usage_complete"] for stream in streams),
         "legacy_counters_unknown": any(stream.get("legacy_counters_unknown") for stream in streams),
     }
-    if role == "publication_review" and sample.get("session_observed", True):
+    if role in {"publication_review", "native_review_pair"} and sample.get(
+        "session_observed", True
+    ):
         if receipt.get("outcome") == "stage_complete" and "validated" not in receipt:
             row.setdefault("publication_validation", "pending")
         else:
@@ -416,7 +418,7 @@ def finalize_stage_usage(
     sample = receipt.get("accounting") or {}
     key = sample.get("stream_id") or ("stage:" + str(receipt.get("launch_id", "")))
     row = ledger["streams"].get(key)
-    if row is None or row.get("role") != "publication_review":
+    if row is None or row.get("role") not in {"publication_review", "native_review_pair"}:
         return
     if row["unit"] != unit.id:
         raise CampaignError("publication accounting stream belongs to another unit")
@@ -478,7 +480,7 @@ def admission_reason(
                 return "campaign lifetime child review attempt budget exhausted"
         elif dev <= 0:
             return "campaign lifetime development attempt budget exhausted"
-    if payload.get("role") == "publication_review":
+    if payload.get("role") in {"publication_review", "native_review_pair"}:
         limit = int(
             snapshot.config_snapshot.get("policy", {}).get("limits", {}).get("max_review_cycles", 3)
         )

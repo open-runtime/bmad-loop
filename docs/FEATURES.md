@@ -29,6 +29,7 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - Bounded reasoning jobs propose routing, triage, priorities, graph changes and reports; validated proposals retain existing ownership and delivery gates.
   - Transactional campaign storage keeps an append-only event journal and paginated job history, with explicit migration for legacy snapshots.
   - Qualified headless routes and immutable transcript packets support fenced continuation while preserving acceptance and contributor identity.
+  - An optional native main/custom review pair retains both reviews before independent publication review, with candidate drift and findings entering the normal repair path.
 - **Config:** `bmad-loop campaign --help`; versioned campaign TOML; optional `[paradev] reflect`
 - **Tested by:** `tests/test_campaign_core.py`, `tests/test_campaign_cli.py`, `tests/test_campaign_decisions.py`, `tests/test_campaign_resolution.py`, `tests/test_campaign_publication.py`, `tests/test_campaign_paradev.py`
 - **Docs:** [Campaign guide](campaign-guide.md), [CLI reference: campaign](reference/cli.md#campaign)

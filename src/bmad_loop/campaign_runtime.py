@@ -327,6 +327,7 @@ class CampaignRuntime:
             in {
                 "planning_review",
                 "publication_review",
+                "native_review_pair",
                 "admission_review",
                 "triage",
                 "decision_review",
@@ -567,9 +568,41 @@ class CampaignRuntime:
 
     def prepare_resume(self, snapshot: CampaignSnapshot) -> bool:
         from .campaign_attribution import restore
+        from .campaign_native_review_flow import current, required
 
         changed = restore(snapshot)
+        # A lost merge acknowledgement leaves READY_TO_PUBLISH behind. Retain
+        # the submitted evidence until the durable write intent is reconciled.
+        pending_merges = {
+            action.unit
+            for action in snapshot.outbox
+            if action.kind == "github"
+            and action.payload.get("purpose") == "merge"
+            and action.state in {"prepared", "sent_unknown"}
+        }
         for unit in snapshot.units.values():
+            if (
+                unit.id not in pending_merges
+                and unit.state
+                not in {
+                    UnitState.MERGE_REQUESTED,
+                    UnitState.MERGED_PENDING_SYNC,
+                    UnitState.DELIVERED,
+                    UnitState.CANCELED,
+                }
+                and required(snapshot)
+                and (
+                    unit.evidence.get("native_review_pair")
+                    or unit.state == UnitState.READY_TO_PUBLISH
+                )
+                and not current(snapshot, unit)
+            ):
+                for key in ("native_review_pair", "review"):
+                    unit.evidence.pop(key, None)
+                if unit.state == UnitState.READY_TO_PUBLISH:
+                    transition(snapshot, unit.id, UnitState.SYNCING)
+                add_event(snapshot, "native-review-pair-invalidated", unit=unit.id)
+                changed = True
             hold = unit.hold
             if (
                 hold
@@ -841,7 +874,7 @@ class CampaignRuntime:
                 resource = (
                     "execution" if continuation.payload["kind"] == "execution" else "planning"
                 )
-                if continuation.payload.get("role") == "publication_review":
+                if continuation.payload.get("role") in {"publication_review", "native_review_pair"}:
                     resource = "review"
                 if reserve(resource):
                     proposals.append(continuation)
@@ -1005,10 +1038,17 @@ class CampaignRuntime:
             elif unit.state == UnitState.SYNCING and not unit.evidence.get("integrated"):
                 if reserve("execution"):
                     proposals.append(Proposal("launch", key, {"kind": "integrate"}))
-            elif unit.state == UnitState.REVIEWING and not unit.evidence.get("review"):
+            elif unit.state == UnitState.REVIEWING:
+                from .campaign_native_review_flow import accepted as pair_accepted
+
+                role = (
+                    "publication_review" if pair_accepted(snapshot, unit) else "native_review_pair"
+                )
+                if role == "publication_review" and unit.evidence.get("review"):
+                    continue
                 candidate = self._role(
                     snapshot,
-                    "publication_review",
+                    role,
                     developer_family=unit.evidence.get("developer_family", ""),
                     developer_families=tuple(unit.evidence.get("developer_families", [])),
                 )
@@ -1019,9 +1059,9 @@ class CampaignRuntime:
                             key,
                             {
                                 "kind": "stage",
-                                "role": "publication_review",
+                                "role": role,
                                 "candidate": dataclasses.asdict(candidate),
-                                "stage": "publication_review",
+                                "stage": role,
                             },
                         )
                     )
@@ -1129,10 +1169,14 @@ class CampaignRuntime:
                     role,
                     permissions=(
                         (
-                            "review"
-                            if proposal.payload.get("stage", role)
-                            in {"publication_review", "landing_review", "planning_review"}
-                            else "reasoning"
+                            "native-review-pair"
+                            if proposal.payload.get("stage", role) == "native_review_pair"
+                            else (
+                                "review"
+                                if proposal.payload.get("stage", role)
+                                in {"publication_review", "landing_review", "planning_review"}
+                                else "reasoning"
+                            )
                         )
                         if proposal.payload.get("read_only") is True
                         else (
@@ -1283,6 +1327,7 @@ class CampaignRuntime:
                     launch.payload.get("stage")
                     in {
                         "publication_review",
+                        "native_review_pair",
                         "planning_review",
                         "decision_review",
                         "escalation",
@@ -1489,7 +1534,7 @@ class CampaignRuntime:
                     if payload["kind"] in {"verify", "queue_verify"}
                     else (
                         "review"
-                        if payload.get("role") == "publication_review"
+                        if payload.get("role") in {"publication_review", "native_review_pair"}
                         else (
                             "resolution"
                             if payload.get("result_contract")
@@ -3472,7 +3517,7 @@ class CampaignRuntime:
                     base64.b64encode(preimage).decode("ascii") if preimage is not None else None
                 )
                 context.update(closure_context(request["closure_manifest"]))
-            if stage == "publication_review":
+            if stage in {"publication_review", "native_review_pair"}:
                 from .campaign_acceptance import context as acceptance_context
 
                 context["acceptance_ledger"] = acceptance_context(unit)
@@ -3486,11 +3531,15 @@ class CampaignRuntime:
                     snapshot, unit.id
                 )
             request["coordinates"] = dataclasses.asdict(coordinates)
+            # Landing and publication review use their exact stage candidate,
+            # which can differ from the unit's earlier development head/base.
+            request["headless_coordinates"].update(dataclasses.asdict(coordinates))
             request["read_only"] = request.get(
                 "read_only",
                 stage
                 in {
                     "publication_review",
+                    "native_review_pair",
                     "planning_review",
                     "escalation",
                     "decision_review",
@@ -3764,6 +3813,21 @@ class CampaignRuntime:
                 inventory = CoverageReceipt(**inventory_data)
                 validate_overlap(disposition, inventory, owned_pr=unit.bindings["pr"]["number"])
                 receipt["validated_admission"] = raw
+            if coordinates.stage == "native_review_pair":
+                from .campaign_codex_review_pair import stage_evidence
+                from .campaign_headless import capability_for
+
+                selection = request["candidate"]
+                cap = capability_for(
+                    request["headless_capabilities"],
+                    selection["profile"],
+                    selection["model"],
+                    "review",
+                    effort=selection.get("effort", ""),
+                )
+                receipt["validated_native_review_pair"] = stage_evidence(
+                    receipt, cap, dataclasses.asdict(coordinates), launch=request
+                )
             if coordinates.stage == "publication_review":
                 from .campaign_acceptance import evaluate as evaluate_acceptance
 
@@ -3772,6 +3836,9 @@ class CampaignRuntime:
 
                     receipt["validated_acceptance"] = landing_acceptance(unit, receipt)
                 else:
+                    from .campaign_native_review_flow import require as require_pair
+
+                    require_pair(snapshot, unit)
                     receipt["validated_acceptance"] = evaluate_acceptance(
                         unit, self._candidate(snapshot, unit), review=receipt
                     )
@@ -3794,6 +3861,7 @@ class CampaignRuntime:
 
     def _publication_evidence(self, snapshot, unit) -> PublicationEvidence:
         from .campaign_acceptance import evaluate as acceptance_evaluate
+        from .campaign_native_review_flow import accepted as pair_accepted
 
         candidate = self._candidate(snapshot, unit)
         verification = unit.evidence.get("verification", {})
@@ -3802,7 +3870,8 @@ class CampaignRuntime:
             candidate,
             verification.get("outcome") == "verified"
             and acceptance_evaluate(unit, candidate)["complete"],
-            review.get("validated", {}).get("verdict") == "approved",
+            review.get("validated", {}).get("verdict") == "approved"
+            and pair_accepted(snapshot, unit),
             bool(unit.claim and unit.claim.quiescent),
             verify.worktree_clean(Path(unit.bindings["workspace"]))
             and verify.rev_parse_head(Path(unit.bindings["workspace"])) == candidate.head,
@@ -3822,6 +3891,9 @@ class CampaignRuntime:
 
     def _perform_prepare_ready(self, snapshot, action) -> Observation:
         unit = snapshot.units[action.unit]
+        from .campaign_native_review_flow import require as require_pair
+
+        require_pair(snapshot, unit)
         pr = self.gateway(snapshot).pull(unit.bindings["pr"]["number"])
         intent = self.gateway(snapshot).prepare_ready(
             pr["node_id"],
@@ -5304,7 +5376,7 @@ class CampaignRuntime:
                 )
         elif outcome == "integrated":
             unit.evidence["integrated"] = receipt
-            for key in ("verification", "review"):
+            for key in ("verification", "review", "native_review_pair"):
                 unit.evidence.pop(key, None)
             if unit.evidence.get("pushed") != receipt["head"]:
                 unit.evidence.pop("pushed", None)
@@ -5435,9 +5507,27 @@ class CampaignRuntime:
                 from .campaign_publication_flow import record_stage_writer
 
                 record_stage_writer(unit, receipt)
+        elif stage == "native_review_pair":
+            if not receipt.get("validated_native_review_pair"):
+                raise CampaignError("Native review pair lacks validated native evidence")
+            unit.evidence["native_review_pair"] = receipt
+            unit.evidence.pop("review", None)
+            if receipt["validated"]["verdict"] != "approved":
+                unit.evidence["required_findings"] = receipt["artifact"].get("findings", [])
+                unit.resume_state = UnitState.SYNCING
+                self._set_hold(
+                    unit,
+                    Hold(
+                        "review_findings",
+                        "required native review findings need same-PR repair",
+                        id=claim.launch_id,
+                    ),
+                )
         elif stage == "publication_review":
             from .campaign_acceptance import record as record_acceptance
+            from .campaign_native_review_flow import require as require_pair
 
+            require_pair(snapshot, unit)
             unit.evidence["review"] = receipt
             acceptance = record_acceptance(unit, self._candidate(snapshot, unit), review=receipt)
             if receipt["validated"]["verdict"] == "approved" and acceptance["complete"]:

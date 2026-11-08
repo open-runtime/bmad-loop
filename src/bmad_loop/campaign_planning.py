@@ -36,6 +36,7 @@ def stage_packet(coordinates: StageCoordinates, *, context: dict[str, Any], skil
         "decomposition": "Propose qualified executable units with acceptance criteria, dependencies and explicit ownership scopes.",
         "planning_review": "Independently review the complete proposed plan, coverage, exclusions, overlap evidence and dependency graph.",
         "publication_review": "Review the complete PR diff against the current target, acceptance criteria, private source artifacts and all required feedback. Read every source artifact at its review_path and return its exact source_artifact_digest. Do not modify files.",
+        "native_review_pair": "Run the actual native main/base review and actual native custom review of the entire PR candidate. The base and head are the exact supplied SHAs. Preserve every finding from both reviews and their worst verdict. Include private source artifacts and return their exact source_artifact_digest. Do not modify files. Independent publication review and acceptance mapping follow this separate stage.",
         "landing_repair": "Repair the recorded failed acceptance of the actual merged product, preserving current main and every original obligation. Change only owned scopes; commit the completed repair on this branch. Do not merge, weaken tests, or close the original issue. Return artifacts as an empty list and record a concise repair report.",
         "conflict_repair": "Resolve the merge conflicts using both preserved heads and their intent. Record each conflict disposition and verification covering both sides. Preserve important work from both branches.",
         "closure": "Verify the entire epic is delivered, perform its required retrospective and record the canonical closure artifact.",
@@ -123,7 +124,7 @@ def validate_result(
         receipts.append({"path": relative, "sha256": hashlib.sha256(data).hexdigest()})
     if coordinates.stage in {"requirements", "architecture", "decomposition"} and not receipts:
         raise CampaignError("planning stage requires durable product artifacts")
-    if coordinates.stage in {"planning_review", "publication_review"}:
+    if coordinates.stage in {"planning_review", "publication_review", "native_review_pair"}:
         if raw.get("verdict") not in {"approved", "changes_requested", "hold"}:
             raise CampaignError("review verdict missing")
         findings = raw.get("findings")
@@ -134,7 +135,7 @@ def validate_result(
         ):
             raise CampaignError("approved review still has unresolved required findings")
         if (
-            coordinates.stage == "publication_review"
+            coordinates.stage in {"publication_review", "native_review_pair"}
             and coordinates.source_revision
             and raw.get("source_artifact_digest") != coordinates.source_revision
         ):

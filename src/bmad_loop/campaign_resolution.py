@@ -437,7 +437,15 @@ def apply_resolution(
             raise CampaignError("repair resume state cannot bypass candidate acceptance")
         if unit.state != resume_state:
             transition(snapshot, unit_id, resume_state)
-        for key in ("integrated", "pushed", "verification", "review", "publication", "checks"):
+        for key in (
+            "integrated",
+            "pushed",
+            "verification",
+            "review",
+            "native_review_pair",
+            "publication",
+            "checks",
+        ):
             unit.evidence.pop(key, None)
         unit.bindings["head"] = result.head
         unit.hold = None

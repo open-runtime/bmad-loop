@@ -436,7 +436,7 @@ def invalidate(snapshot: Any, unit: Any, changed: list[dict[str, str]]) -> None:
             }
         ],
     )
-    for key in ("integrated", "verification", "review", "pushed"):
+    for key in ("integrated", "verification", "review", "native_review_pair", "pushed"):
         unit.evidence.pop(key, None)
     transition(snapshot, unit.id, UnitState.READY)
     add_event(snapshot, "planning-evidence-invalidated", unit=unit.id, changed=changed)

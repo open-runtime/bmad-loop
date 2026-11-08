@@ -12,7 +12,7 @@ from .campaign_store import add_event, transition
 def invalidate(snapshot: CampaignSnapshot, unit_id: str, action_id: str, base: str) -> Hold | None:
     unit = snapshot.units[unit_id]
     previous = unit.evidence.get("integrated", {}).get("base", "")
-    for key in ("integrated", "verification", "review", "pushed"):
+    for key in ("integrated", "verification", "review", "native_review_pair", "pushed"):
         unit.evidence.pop(key, None)
     if unit.state != UnitState.SYNCING:
         transition(snapshot, unit_id, UnitState.SYNCING)

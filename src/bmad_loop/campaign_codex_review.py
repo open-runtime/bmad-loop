@@ -67,6 +67,10 @@ def validate_review(raw):
 def envelopes(frames, *, partial=False):
     from .campaign_codex_appserver import envelopes as one_turn
 
+    if any(frame.get("method") == "bmad/nativeReviewPair" for frame in frames):
+        from .campaign_codex_review_pair import envelopes as pair_envelopes
+
+        return pair_envelopes(frames, partial=partial)
     boundary = next(
         (index for index, frame in enumerate(frames) if frame.get("id") == 4 and "result" in frame),
         None,
@@ -83,6 +87,29 @@ def envelopes(frames, *, partial=False):
         if partial:
             return normalized[:1]
         raise CampaignError("Native Codex review mapping turn is missing")
+    review, binding, delegate = review_segment(first, normalized)
+    second = [frame for frame in first if frame.get("id") == 2 and "result" in frame]
+    second += [{**frame, "id": 3} if frame.get("id") == 4 else frame for frame in frames[boundary:]]
+    result = one_turn(second, partial=partial)
+    if len(result) > 1:
+        totals = result[-1].get("usage", {})
+        if any(totals.get(key, -1) < value for key, value in normalized[-1]["usage"].items()):
+            raise CampaignError("Native Codex review mapping usage decreased")
+        result[-1]["num_turns"] = 2
+        result[-1]["native_review"] = review
+        if delegate:
+            # Native review is a separate child session; parent token totals do
+            # not contain its spend. Preserve and add the two real counters.
+            result[-1]["usage"] = {
+                key: totals.get(key, 0) + delegate["usage"].get(key, 0)
+                for key in set(totals) | set(delegate["usage"])
+            }
+            result[-1]["native_review_evidence"] = binding
+    return result
+
+
+def review_segment(first, normalized):
+    """Read exactly one completed native review and its observed delegate."""
     artifacts = []
     for frame in first:
         params = frame.get("params", {})
@@ -105,6 +132,7 @@ def envelopes(frames, *, partial=False):
         frame["params"] for frame in first if frame.get("method") == "bmad/nativeReviewEvidence"
     ]
     delegate = None
+    binding = None
     if bindings:
         from .campaign_codex_review_evidence import evidence
 
@@ -136,24 +164,7 @@ def envelopes(frames, *, partial=False):
         review = delegate["review"]
     else:
         review = validate_review(next(iter(distinct.values())))
-    second = [frame for frame in first if frame.get("id") == 2 and "result" in frame]
-    second += [{**frame, "id": 3} if frame.get("id") == 4 else frame for frame in frames[boundary:]]
-    result = one_turn(second, partial=partial)
-    if len(result) > 1:
-        totals = result[-1].get("usage", {})
-        if any(totals.get(key, -1) < value for key, value in normalized[-1]["usage"].items()):
-            raise CampaignError("Native Codex review mapping usage decreased")
-        result[-1]["num_turns"] = 2
-        result[-1]["native_review"] = review
-        if delegate:
-            # Native review is a separate child session; parent token totals do
-            # not contain its spend. Preserve and add the two real counters.
-            result[-1]["usage"] = {
-                key: totals.get(key, 0) + delegate["usage"].get(key, 0)
-                for key in set(totals) | set(delegate["usage"])
-            }
-            result[-1]["native_review_evidence"] = binding
-    return result
+    return review, binding, delegate
 
 
 def fold_result(result, review):

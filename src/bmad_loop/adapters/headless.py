@@ -78,6 +78,12 @@ class HeadlessAdapter(CodingCLIAdapter):
                     dict.fromkeys([*self.grants.get("runtime_write_paths", []), *approved])
                 )
         self.coordinates = copy.deepcopy(coordinates)
+        if "--review-pair" in capability.get("argv", ()):
+            from ..campaign_codex_review_pair import selected, target
+
+            if not selected(capability) or not self.grants:
+                raise CampaignError("Native review pair requires frozen read-only grants")
+            self.grants["native_review_target"] = target(coordinates)
         self.handoff_packet = copy.deepcopy(handoff_packet)
 
     def set_managed_communication(self, binding):
@@ -243,7 +249,10 @@ class HeadlessAdapter(CodingCLIAdapter):
             and (self.capability or {}).get("protocol") == "codex-native-review"
         ):
             from ..campaign_codex_review import fold_result
+            from ..campaign_codex_review_pair import selected, validate_receipt
 
+            if selected(self.capability):
+                validate_receipt(receipt, self.capability, self.coordinates)
             result_json = fold_result(result_json, receipt.get("native_review"))
         if self.journal is not None and receipt.get("observed_model"):
             self.journal.append(

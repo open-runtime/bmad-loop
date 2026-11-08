@@ -15,6 +15,10 @@ from .campaign_model import CampaignError
 
 
 def permissions_for(role: str, *, stage: str = "", read_only: bool | None = None) -> str:
+    if (stage or role) == "native_review_pair":
+        if read_only is False:
+            raise CampaignError("Native review pair must be read-only")
+        return "native-review-pair"
     if read_only is not False and (stage or role) in {
         "publication_review",
         "landing_review",
@@ -45,6 +49,16 @@ def permissions_for(role: str, *, stage: str = "", read_only: bool | None = None
 
 def selected_capability(profile, candidate, routes, permissions):
     """Mirror worker transport selection, retaining unmatched legacy adapters."""
+    if permissions == "native-review-pair":
+        from .campaign_codex_review_pair import selected
+
+        cap = capability_for(
+            routes, candidate.profile, candidate.model, "review", effort=candidate.effort
+        )
+        validate_capability(cap, candidate, permissions="read-only-tools")
+        if not selected(cap):
+            raise CampaignError("Native review pair requires an explicitly qualified pair route")
+        return cap
     value = routes.get(candidate.profile + ":" + candidate.model, {})
     if isinstance(value, dict) and "by_effort" in value:
         value = value["by_effort"].get(candidate.effort, {})

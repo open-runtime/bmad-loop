@@ -446,6 +446,7 @@ def apply_effect(runtime, snapshot, unit, action, data) -> None:
         unit.evidence.pop("pushed", None)
         unit.evidence.pop("verification", None)
         unit.evidence.pop("review", None)
+        unit.evidence.pop("native_review_pair", None)
         transition(snapshot, unit.id, UnitState.SYNCING)
         unit.resume_state = UnitState.SYNCING
         if state.get("restart_acceptance") and not failure:

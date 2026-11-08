@@ -83,6 +83,18 @@ def _cap(snapshot, candidate, mode="workspace-tools"):
     return cap
 
 
+def _target_cap(snapshot, candidate, role):
+    """A native pair continues only through another earned read-only pair route."""
+    if role != "native_review_pair":
+        return _cap(snapshot, candidate)
+    from .campaign_codex_review_pair import selected
+
+    cap = _cap(snapshot, candidate, "review")
+    if cap["permissions"] != "read-only-tools" or not selected(cap):
+        raise CampaignError("Native review pair handoff requires a qualified pair route")
+    return cap
+
+
 def _fallback(snapshot, role, previous, requested=None):
     candidates = snapshot.spec.candidates(role)
     if requested is not None:
@@ -101,13 +113,13 @@ def _fallback(snapshot, role, previous, requested=None):
                 "Handoff target is ambiguous; specify the exact approved profile/model/effort"
             )
         candidate = matching[0]
-        _cap(snapshot, candidate)
+        _target_cap(snapshot, candidate, role)
         return candidate
     for candidate in candidates:
         if (candidate.profile, candidate.model) == previous:
             continue
         try:
-            _cap(snapshot, candidate)
+            _target_cap(snapshot, candidate, role)
         except CampaignError:
             continue
         return candidate
@@ -133,7 +145,7 @@ def _available_alternative(runtime, snapshot, value):
         ):
             continue
         try:
-            _cap(snapshot, candidate)
+            _target_cap(snapshot, candidate, role)
         except CampaignError:
             continue
         allowed.append(candidate)
@@ -971,7 +983,7 @@ def _reduce(runtime, snapshot, unit, value):
         for key in value["jobs"]
     )
     target = _candidate(value["candidate"])
-    target_cap = _cap(snapshot, target)
+    target_cap = _target_cap(snapshot, target, value.get("route_role", value["role"]))
     ceiling = min(
         snapshot.spec.reasoning.packet_token_limit, _budget(target, target_cap).payload_tokens
     )
@@ -1362,7 +1374,9 @@ def _constraint_plan(runtime, snapshot, unit, value):
     target = _candidate(value["candidate"])
     ceiling = min(
         snapshot.spec.reasoning.packet_token_limit,
-        _budget(target, _cap(snapshot, target)).payload_tokens,
+        _budget(
+            target, _target_cap(snapshot, target, value.get("route_role", value["role"]))
+        ).payload_tokens,
     )
     output = min(cap["output_tokens"], max(512, ceiling // 16))
     jobs = []
@@ -1616,7 +1630,7 @@ def _assemble(runtime, snapshot, unit, value):
             "Current constraints require completed independent audits before packet release"
         )
     target = _candidate(value["candidate"])
-    cap = _cap(snapshot, target)
+    cap = _target_cap(snapshot, target, value.get("route_role", value["role"]))
     summaries = tuple(_applied(_job(runtime, snapshot, key)) for key in value["jobs"])
     packet = assemble_packet(
         tuple(HistorySnapshot(**row) for row in value["capture"]["sources"]),
@@ -1694,7 +1708,7 @@ def _assemble(runtime, snapshot, unit, value):
             "sha256": hashlib.sha256(tree).hexdigest(),
         }
         payload["constraint_audit_receipts"] = value["constraint_audits"]
-    payload["read_only"] = False
+    payload["read_only"] = value["role"] == "native_review_pair"
     payload["history_omissions_resolved_by"] = value["audits"]
     # Audits have established the current constraints. Do not duplicate the
     # same historical owner quotations and complete summaries in the initial
@@ -1732,7 +1746,7 @@ def _assemble(runtime, snapshot, unit, value):
             "path": str(path),
             "sha256": hashlib.sha256(data).hexdigest(),
             "tokens": len(data),
-            "read_only": False,
+            "read_only": payload["read_only"],
         },
         "audits": value["audits"],
     }
@@ -1753,7 +1767,7 @@ def _perform(runtime, snapshot, action, *, reconcile=False):
         return Observation("confirmed", {"superseded": True})
     if action.kind == "handoff-route":
         candidate = _candidate(action.payload["candidate"])
-        cap = _cap(snapshot, candidate)
+        cap = _target_cap(snapshot, candidate, value.get("route_role", value["role"]))
         if candidate not in snapshot.spec.candidates(value.get("route_role", value["role"])):
             raise CampaignError("Refreshed handoff route left its approved role pool")
         packet = value.get("packet")
@@ -1859,7 +1873,9 @@ def _perform(runtime, snapshot, action, *, reconcile=False):
             != value["capture"]["current"]["fingerprint"]
         ):
             raise CampaignError("Working state changed after handoff capture")
-        _cap(snapshot, _candidate(value["candidate"]))
+        _target_cap(
+            snapshot, _candidate(value["candidate"]), value.get("route_role", value["role"])
+        )
         data = {"ready": True}
         if value.get("recovery", {}).get("ready"):
             from .campaign_handoff_recovery import collect

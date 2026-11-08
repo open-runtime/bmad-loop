@@ -616,8 +616,13 @@ headroom. The actual normalized byte count remains the hard check. Oversize
 results report both observed and permitted sizes, retain immutable sources and
 consume the existing bounded failure budget. Coverage, owner-obligation audits,
 final packet limits and the eight-round convergence bound remain mandatory.
-This reducer prompt is `history-reduce-v3` and requires fresh reducer semantic
+This reducer prompt is `history-reduce-v4` and requires fresh reducer semantic
 qualification; unchanged extraction, audit and finite-contract proofs remain valid.
+The working brief retains current obligations and uncertainty while a cited index
+points to historical technical details in the complete retained children. Known
+historical limitations remain qualified facts; `gaps` identifies missing supplied
+coverage or ambiguity that prevents faithful continuation. Neither index entries
+nor gap classification may fabricate resolution or waive unfinished acceptance.
 
 Semantic qualification uses schema-2 proofs for exact operation, effort and
 earned transport-evidence hash. A capability may reference several independent
@@ -820,6 +825,18 @@ proof, and cannot waive the native verdict. Planning/publication/landing review
 selects that explicit slot and fails closed if its proof is invalid. The native
 review recipe requires its own earned qualification, never an edited ordinary
 reasoning capability. No-tools is not claimed for either Codex transport.
+
+Repositories that require both a native base comparison and a complementary
+native review configure a separate `native_review_pair` stage. Its qualified
+launcher includes `--review-pair`: two actual `review/start` calls compare the
+candidate with its immutable accepted base and inspect the supplied complementary
+requirements, followed by one schema-mapping turn. Preserve both native delegate
+lineages, findings and usage. Verify the clean candidate and integrated base before
+and after the pair. Its durable receipt and the separate independent publication
+review must both be current; neither a mapping turn nor a contributing writer's
+review supplies the independent-family requirement. The stage uses normal claims,
+review capacity, stop/recovery and repair handling. Existing single-review recipes
+remain available and cannot silently satisfy the configured pair.
 
 The native app-server projects the structured review as rendered prose and does
 not publish the delegate's token usage in its parent stream. Read immutable

@@ -113,22 +113,10 @@ def _validate(capability, candidate) -> None:
             }
             checks |= {"owned", "new_product", "worker_ref", "git_index", "readable", "descendant"}
         if envelope["capability"]["protocol"] == "codex-native-review":
-            from .campaign_codex_review import validate_review
+            from .campaign_codex_review_pair import validate_receipt
 
-            validate_review(receipt.get("native_review"))
-            if envelope["capability"].get("confinement") == "codex-native-read-only-v1":
-                from .campaign_codex_review_evidence import evidence as review_evidence
-
-                observed = review_evidence(receipt.get("native_review_evidence"))
-                if (
-                    observed["review"] != receipt["native_review"]
-                    or observed["model"] != candidate.model
-                    or observed["effort"] != candidate.effort
-                ):
-                    raise CampaignError("Native review capability differs from delegate evidence")
+            validate_receipt(receipt, envelope["capability"], envelope["request"]["coordinates"])
             checks.add("native_review")
-            if receipt.get("turns") != 2:
-                raise CampaignError("Native review evidence lacks both bounded turns")
         confinement = envelope["capability"].get("confinement")
         if confinement in {"codex-native-read-only-v1", "codex-scoped-tools-v1"}:
             from .campaign_readonly_qualification import native_checks

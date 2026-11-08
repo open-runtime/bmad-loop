@@ -74,6 +74,11 @@ the following independently before recommending activation:
 - The project's actual publication policy, required checks and reviews. Preserve
   commit history and use `direct-authorized` only with explicit repository-bound
   owner authority. Do not restore retired project-specific merge scripts.
+- When repository policy requires a native base comparison plus a complementary
+  native review, configure `roles.native_review_pair` with an exact paired-review
+  capability. Keep independent `publication_review` separately configured. A
+  schema-mapping turn does not count as a native review, and a contributing
+  writer's review cannot satisfy independence.
 - Configured execution, review, verification, reasoning and shared-session limits;
   report the effective minimum rather than presenting `max_workers` as throughput.
 - When managed hcom is requested, configure its absolute project room and verify

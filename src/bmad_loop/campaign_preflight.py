@@ -59,7 +59,7 @@ def resolve_roles(spec: CampaignSpec, policy) -> CampaignSpec:
             continue
         inherited = policy.adapter.resolved(
             "review"
-            if role in {"publication_review", "execution_review"}
+            if role in {"publication_review", "native_review_pair", "execution_review"}
             else "dev" if role == "execution" else "triage"
         )
         profile = selected.profile or inherited.name
@@ -115,7 +115,7 @@ def inspect(
         if configured.budget_usd is not None:
             area = (
                 "publication"
-                if role == "publication_review"
+                if role in {"publication_review", "native_review_pair"}
                 else "execution" if role in {"conflict_repair", "escalation"} else "planning"
             )
             problem(
@@ -230,7 +230,11 @@ def inspect(
                 )
             except (ValueError, OSError) as exc:
                 choices.append({"profile": profile_name, "eligible": False, "reason": str(exc)})
-        area = "execution" if role in {"execution", "execution_review"} else "planning"
+        area = (
+            "publication"
+            if role == "native_review_pair"
+            else "execution" if role in {"execution", "execution_review"} else "planning"
+        )
         capabilities[area]["observations"][role] = choices
         if not any(choice["eligible"] for choice in choices):
             problem(area, f"{role}: no available authorized model route")

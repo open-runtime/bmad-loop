@@ -65,7 +65,16 @@ route supports it; other routes explicitly report their native routing backend.
 
 Qualify actual native review invocation separately from prompted model review.
 REM's selected base comparison and complementary native review retain exact
-candidate/base and complete findings. Complete writable Claude-to-Codex and
+candidate/base and complete findings. Configure the optional `native_review_pair`
+role to make these two actual native reviews a required durable stage before
+independent publication review. The schema-mapping turn is a third turn, never a
+substitute for either review. Retain both delegate artifacts and their combined
+findings. The pair consumes ordinary review/shared capacity, binds the exact
+candidate, base, graph and configuration, and is invalidated with candidate drift.
+Missing or single-review capabilities cannot satisfy the pair. Pair findings
+enter the existing same-PR repair path; its receipt cannot waive independent
+review after mixed-family authorship. Omitted roles retain legacy behavior and
+configuration identities. Complete writable Claude-to-Codex and
 Codex-to-Claude continuation through the normal runtime, with predecessor
 quiescence, current constraints, preserved dirty work and same-PR delivery.
 

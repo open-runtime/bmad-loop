@@ -175,8 +175,9 @@ def validate_recipe(capability):
         "{schema_path}",
     ]
     review = capability["protocol"] == "codex-native-review"
+    paired = "--review-pair" in recipe
     variants = (
-        [expected + ["--review"]]
+        [expected + ["--review"], expected + ["--review", "--review-pair"]]
         if review and readonly
         else [expected + ["--read-only"]] if readonly else [expected]
     )
@@ -192,8 +193,9 @@ def validate_recipe(capability):
         or not native.is_absolute()
         or launcher.read_text(encoding="utf-8") != launcher_text()
         or capability["input_mode"] != "prompt-file"
-        or capability["max_turns"] != (2 if review else 1)
+        or capability["max_turns"] != (3 if paired else 2 if review else 1)
         or (review and not readonly)
+        or (paired and not (review and native_sandbox))
         or (native_sandbox and (not readonly or capability.get("runtime_write_paths")))
         or (scoped_tools and (readonly or review or capability.get("runtime_write_paths")))
     ):
@@ -214,6 +216,10 @@ def validate_recipe(capability):
         native,
         Path(sys.executable).resolve(),
     ]
+    if paired:
+        from . import campaign_codex_review_pair
+
+        paths.append(Path(campaign_codex_review_pair.__file__).resolve())
     if scoped_tools:
         from . import campaign_execution_sandbox, campaign_scoped_tools
 
@@ -237,6 +243,7 @@ def run(
     prompt,
     schema,
     review=False,
+    review_pair=False,
     read_only=False,
     native_sandbox=False,
     scoped_tools=False,
@@ -276,6 +283,13 @@ def run(
             )
         ):
             raise CampaignError("Native read-only grants cannot authorize writes")
+    pair_target = None
+    if review_pair:
+        from .campaign_codex_review_pair import assert_target
+
+        if not review or not native_sandbox:
+            raise CampaignError("Native review pair requires its qualified native read-only route")
+        pair_target = assert_target(workspace, grants.get("native_review_target"))
     process = subprocess.Popen(
         [str(native), "app-server", "--listen", "stdio://"],
         cwd=workspace,
@@ -310,7 +324,7 @@ def run(
             completed = True
             terminal = frame.get("params", {}).get("turn", {})
         params = frame.get("params", {})
-        if frame.get("id") in {3, 4} and isinstance(frame.get("result"), dict):
+        if frame.get("id") in {3, 4, 6} and isinstance(frame.get("result"), dict):
             active_turn = frame["result"].get("turn", {}).get("id", "")
         if review and frame.get("method") == "turn/started":
             started = params.get("turn", {})
@@ -434,13 +448,23 @@ def run(
                 )
             )
         if review:
+            if pair_target:
+                assert_target(workspace, pair_target)
+                print(
+                    json.dumps({"method": "bmad/nativeReviewPair", "params": pair_target}),
+                    flush=True,
+                )
             rpc(
                 3,
                 "review/start",
                 {
                     "threadId": thread,
                     "delivery": "inline",
-                    "target": {"type": "custom", "instructions": prompt},
+                    "target": (
+                        {"type": "baseBranch", "branch": pair_target["base"]}
+                        if pair_target
+                        else {"type": "custom", "instructions": prompt}
+                    ),
                 },
             )
         else:
@@ -456,7 +480,8 @@ def run(
             )
         while not completed:
             receive()
-        if review and terminal.get("status") == "completed":
+
+        def retain_review(label):
             from .campaign_codex_review import validate_review
 
             if len(review_items) != 1:
@@ -467,7 +492,7 @@ def run(
                 assert grants_path is not None
                 binding = snapshot(
                     configured["thread"]["path"],
-                    grants_path.parent / "codex-review-evidence",
+                    grants_path.parent / ("codex-review-" + label),
                     thread=thread,
                     root_turn=active_turn,
                     child_turn=review_child_turn,
@@ -482,6 +507,43 @@ def run(
                 )
             else:
                 validate_review(next(iter(review_items.values())))
+
+        if review and terminal.get("status") == "completed":
+            retain_review("main" if pair_target else "evidence")
+            if pair_target:
+                assert_target(workspace, pair_target)
+                completed = False
+                terminal = {}
+                review_items = {}
+                review_child_turn = ""
+                rpc(
+                    6,
+                    "review/start",
+                    {
+                        "threadId": thread,
+                        "delivery": "inline",
+                        "target": {
+                            "type": "custom",
+                            "instructions": (
+                                "Perform the complementary native review after the completed main comparison. "
+                                f"The exact candidate is {pair_target['head']} and accepted main base is {pair_target['base']}. "
+                                "The driver owns both native review calls; do not launch another harness, session or nested review. "
+                                "Inspect acceptance, runtime wiring, failure recovery, ownership and hidden regressions; "
+                                "retain actionable findings from either review. Original campaign context:\n"
+                                + prompt
+                            ),
+                        },
+                    },
+                )
+                while not completed:
+                    receive()
+                if terminal.get("status") == "completed":
+                    retain_review("custom")
+                    assert_target(workspace, pair_target)
+            if terminal.get("status") != "completed":
+                assert process.stdin is not None
+                process.stdin.close()
+                return 0
             completed = False
             rpc(
                 4,
@@ -504,6 +566,8 @@ def run(
             )
             while not completed:
                 receive()
+            if pair_target:
+                assert_target(workspace, pair_target)
         assert process.stdin is not None
         process.stdin.close()
         try:
@@ -523,6 +587,7 @@ def main(argv=None):
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--schema", type=Path, required=True)
     parser.add_argument("--review", action="store_true")
+    parser.add_argument("--review-pair", action="store_true")
     parser.add_argument("--read-only", action="store_true")
     parser.add_argument("--native-sandbox", action="store_true")
     parser.add_argument("--scoped-tools", action="store_true")
@@ -536,6 +601,7 @@ def main(argv=None):
         prompt=args.input.read_text(encoding="utf-8"),
         schema=json.loads(args.schema.read_text(encoding="utf-8")),
         review=args.review,
+        review_pair=args.review_pair,
         read_only=args.read_only,
         native_sandbox=args.native_sandbox,
         scoped_tools=args.scoped_tools,

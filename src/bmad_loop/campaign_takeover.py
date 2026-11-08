@@ -114,7 +114,11 @@ def apply(runtime, snapshot, action, data) -> None:
         UnitState.MERGED_PENDING_SYNC,
         UnitState.DELIVERED,
     }
-    for key in (() if landed else ("review", "verification", "integrated", "pushed", "admission")):
+    for key in (
+        ()
+        if landed
+        else ("review", "native_review_pair", "verification", "integrated", "pushed", "admission")
+    ):
         if key in unit.evidence:
             invalidated[key] = unit.evidence.pop(key)
     unit.evidence.setdefault("operator_release_history", []).append(
