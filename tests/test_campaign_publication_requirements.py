@@ -205,7 +205,23 @@ def test_runtime_prepare_uses_frozen_campaign_requirements(
     driver = CampaignRuntime(
         project.project, CampaignStore(tmp_path / "authority"), gateway=old.gateway
     )
-    monkeypatch.setattr(driver, "_candidate", lambda *args: candidate)
+    unit.bindings["source_revision"] = candidate.source_revision
+    unit.evidence["integrated"] = {"head": candidate.head, "base": candidate.base}
+    unit.evidence["review"] = {
+        "head": candidate.head,
+        "validated": {
+            "verdict": "approved",
+            "coordinates": {
+                "head": candidate.head,
+                "base": candidate.base,
+                "source_revision": unit.bindings["source_revision"],
+                "graph_revision": snapshot.graph_revision,
+                "config_revision": snapshot.config_revision,
+            },
+        },
+    }
+    candidate = driver._candidate(snapshot, unit)
+    evidence = replace(evidence, candidate=candidate)
     monkeypatch.setattr(driver, "_publication_evidence", lambda *args: evidence)
     monkeypatch.setattr(campaign_ownership, "canonical_unchanged", lambda *args: None)
     monkeypatch.setattr(PublicationController, "inspect", lambda *args: observed)
@@ -217,6 +233,20 @@ def test_runtime_prepare_uses_frozen_campaign_requirements(
     else:
         assert result.state == "waiting" and not result.data["gate"]["ready"]
     assert "intent" not in result.data and old.gateway.transport.calls == []
+
+    # Removing only the remote condition reaches real merge preparation with
+    # the same current local review, instead of bypassing freshness.
+    observed = replace(
+        publishable[3],
+        observed_at=time.time(),
+        checks=publishable[3].checks + (security(candidate),),
+    )
+    ready = driver._perform_prepare_merge(
+        snapshot, OutboxAction("ready", "prepare-merge", unit.id, {}, 0)
+    )
+    assert ready.state == "confirmed" and ready.data["purpose"] == "merge"
+    assert ready.data["intent"]["payload"]["sha"] == candidate.head
+    assert old.gateway.transport.calls == []
 
 
 @pytest.mark.parametrize("defect", ["hold", "missing-check", "review-request"])

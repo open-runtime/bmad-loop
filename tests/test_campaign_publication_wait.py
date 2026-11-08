@@ -120,7 +120,23 @@ def test_waiting_campaign_retains_ready_pr_until_real_strict_gate_passes(
     driver = CampaignRuntime(
         project.project, CampaignStore(tmp_path / "authority"), gateway=controller.gateway
     )
-    monkeypatch.setattr(driver, "_candidate", lambda *args: candidate)
+    unit.bindings["source_revision"] = candidate.source_revision
+    unit.evidence["integrated"] = {"head": candidate.head, "base": candidate.base}
+    unit.evidence["review"] = {
+        "head": candidate.head,
+        "validated": {
+            "verdict": "approved",
+            "coordinates": {
+                "head": candidate.head,
+                "base": candidate.base,
+                "source_revision": unit.bindings["source_revision"],
+                "graph_revision": state.graph_revision,
+                "config_revision": state.config_revision,
+            },
+        },
+    }
+    candidate = driver._candidate(state, unit)
+    evidence = replace(evidence, candidate=candidate)
     monkeypatch.setattr(driver, "_publication_evidence", lambda *args: evidence)
     monkeypatch.setattr(campaign_ownership, "canonical_unchanged", lambda *args: None)
     monkeypatch.setattr(campaign_remote_feedback, "collect", lambda *args, **kwargs: None)
@@ -132,6 +148,14 @@ def test_waiting_campaign_retains_ready_pr_until_real_strict_gate_passes(
     assert "up-to-date" in result.reason
     assert unit.state == UnitState.READY_TO_PUBLISH and unit.bindings["pr"]["number"] == 1
     assert "intent" not in result.data and "merge" not in unit.evidence
+    assert controller.gateway.transport.calls == []
+
+    unavailable = replace(observation, observed_at=time.time())
+    ready = driver._perform_prepare_merge(
+        state, OutboxAction("ready", "prepare-merge", unit.id, {}, 0)
+    )
+    assert ready.state == "confirmed" and ready.data["purpose"] == "merge"
+    assert ready.data["intent"]["payload"]["sha"] == candidate.head
     assert controller.gateway.transport.calls == []
 
 
