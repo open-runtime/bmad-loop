@@ -1,6 +1,6 @@
 # ADR 0003: Bounded reasoning jobs and portable session handoff
 
-- **Status:** Delivery completion in progress; full-history qualification, final checks and activation pending
+- **Status:** Source qualification complete; installation and target-project activation required
 - **Date:** 2026-11-06
 - **Extends:** [ADR 0002](0002-native-sdlc-campaign.md) and its [implementation contract](0002-campaign-implementation.md)
 - **Delivery:** The same campaign implementation PR, before autonomous project activation
@@ -855,6 +855,34 @@ The delivery completion extension requires fresh final checks and
 reviews after its changes. Hosted Actions remain disabled; unrun platform gates
 remain explicit. Merge, exact-commit installation, canonical-base update and REM
 activation are required completion work, not satisfied by earlier qualification.
+
+The final source candidate `8a7b4a9e` passed the complete regression and both load
+cases recorded in ADR 0002. All eight native routes and both writable continuation
+directions passed fresh renewal; every recorded native/startup identity is dead.
+These native stage proofs remain separate from actual provider quota exhaustion,
+full native supervisor execution and target-project GitHub delivery.
+
+The complete sealed-history trial processed 191,223,107 bytes from 28 sources,
+covering all 53,494 unique normalized event-text ranges. It retained 766 maps and
+82 reducers across five shrinking rounds. One map exceeded its output bound;
+the failed receipt remains failed, and its first ordinary bounded correction
+succeeded. No limits or successful historical receipts were rewritten. The final
+summary is 77,647 bytes with four historical uncertainties explicit. An independent
+Muse audit compared it with all 37 designated owner messages and 178 exact spans,
+finding no missing critical obligations, invented authority or unresolved conflicts.
+Actual Codex command execution then retrieved omitted final/intermediate/leaf
+summaries and original source/owner records; exact readback and unchanged sources
+were verified. All recorded owned processes are quiescent.
+
+This proves complete source processing, independently audited critical owner
+coverage and exact retained-source retrieval. It does not prove lossless compression
+of every noncritical detail or delivery of the development work described in the
+history. The immutable originals and whole contributing tree remain available.
+At 64 concurrent trial jobs, the in-process operator progress scan suffered GIL
+contention; an independent external watcher checked the unchanged source and
+existing operational thresholds. That is a trial-monitoring limitation, not a
+claim that 64 is an optimum production concurrency. The normal coordinator's
+32-session managed load has its separate stop/resume and delivery evidence.
 
 ## Capability evidence and limits
 
