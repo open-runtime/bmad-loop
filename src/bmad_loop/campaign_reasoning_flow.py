@@ -121,16 +121,17 @@ def defer_never_submitted(runtime, snapshot, action):
     return True
 
 
-def presentation(snapshot, request):
+def presentation(snapshot, request=None):
     """Bind read-only jobs to an existing owned workspace, never the coordinator's cwd."""
     if not snapshot.spec.paradev.reflect:
         return None
     from .campaign_reflection_flow import workspace_binding
     from .campaign_titles import navigation_title, unit_navigation
 
+    unit_id = request.unit if request is not None else ""
     units = (
-        [snapshot.units[request.unit]]
-        if request.unit in snapshot.units
+        [snapshot.units[unit_id]]
+        if unit_id in snapshot.units
         else sorted(
             snapshot.units.values(), key=lambda unit: (unit.spec.kind != "planning", unit.id)
         )
@@ -140,7 +141,7 @@ def presentation(snapshot, request):
             binding = workspace_binding(unit)
             navigation = (
                 {**unit_navigation(unit), "names": ()}
-                if request.unit in snapshot.units
+                if unit_id in snapshot.units
                 else {"epics": ("unbound",), "issues": ("none",), "prs": ("none",)}
             )
             return {

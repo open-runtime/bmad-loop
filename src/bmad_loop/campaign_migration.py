@@ -141,6 +141,103 @@ def _read_json(path: Path, *, bound: int) -> tuple[dict[str, Any], str]:
     return data, hashlib.sha256(raw).hexdigest()
 
 
+def _native_items(
+    directory: Path, common: Path, *, max_bytes: int, max_items: int
+) -> list[MigrationItem]:
+    """Read complete bounded ownership without recursively importing inventory."""
+    from .campaign_jobs import STATES, TERMINAL
+
+    if directory.is_symlink():
+        raise MigrationError("native snapshot directory is symlinked")
+    data, _ = _read_json(directory / "snapshot.json", bound=max_bytes)
+    if data in (MARKER, LEGACY_MARKER):
+        data = CampaignDatabase(directory).read_inventory(
+            max_bytes=max_bytes, max_items=max_items, minimum_schema=data["schema_version"]
+        )
+    snapshot = snapshot_from_dict(data)
+    if snapshot.id != directory.name:
+        raise MigrationError("native campaign snapshot ID differs from directory")
+    if Path(snapshot.common_dir).resolve() != common:
+        raise MigrationError("native campaign belongs to another common directory")
+    items = []
+    for unit in snapshot.units.values():
+        if unit.claim and unit.claim.unit != unit.id:
+            raise MigrationError("native worker claim belongs to another unit")
+        details = {
+            "campaign_id": snapshot.id,
+            "unit_id": unit.id,
+            "hold": asdict(unit.hold) if unit.hold else None,
+            "claim": asdict(unit.claim) if unit.claim else None,
+            "workspace": unit.bindings.get("workspace"),
+            "pr": unit.bindings.get("pr"),
+            "admissions_open": snapshot.phase == "active",
+        }
+        items.append(
+            MigrationItem(
+                f"native-unit:{snapshot.id}:{unit.id}",
+                "native-unit",
+                _digest(details),
+                str(directory),
+                str(unit.state),
+                "unknown",
+                "owned" if unit.claim else "unknown",
+                (unit.id,),
+                details,
+            )
+        )
+    if not isinstance(snapshot.jobs, dict):
+        raise MigrationError("native campaign jobs must be an object")
+    for identity, job in snapshot.jobs.items():
+        if not isinstance(job, dict):
+            raise MigrationError("native reasoning job must be an object")
+        claim = job.get("claim")
+        if claim is None:
+            continue
+        request = job.get("request")
+        state = job.get("state")
+        if (
+            not isinstance(request, dict)
+            or identity != job.get("id")
+            or identity != request.get("id")
+            or not isinstance(state, str)
+            or state not in STATES
+            or not isinstance(claim, dict)
+            or not isinstance(claim.get("launch_id"), str)
+            or not claim["launch_id"]
+            or type(claim.get("generation")) is not int
+            or type(claim.get("quiescent")) is not bool
+            or not isinstance(request.get("unit"), str)
+            or (request["unit"] and request["unit"] not in snapshot.units)
+        ):
+            raise MigrationError("native reasoning claim has invalid ownership")
+        # Even a terminal job must remain visible if quiescence is unconfirmed.
+        if state in TERMINAL and claim["quiescent"]:
+            continue
+        details = {
+            "campaign_id": snapshot.id,
+            "job_id": identity,
+            "unit_id": request["unit"],
+            "claim": claim,
+            "admissions_open": snapshot.phase == "active",
+        }
+        items.append(
+            MigrationItem(
+                f"native-job:{snapshot.id}:{identity}",
+                "native-job",
+                _digest(details),
+                str(directory),
+                state,
+                "unknown",
+                "owned",
+                (request["unit"],) if request["unit"] else (),
+                details,
+            )
+        )
+    if len(items) > max_items:
+        raise MigrationError("campaign ownership projection exceeds item bound")
+    return items
+
+
 def inventory(
     project: Path,
     *,
@@ -282,49 +379,26 @@ def inventory(
     if campaign_root is not None:
         root = campaign_root.resolve()
         try:
-            for directory in sorted(root.iterdir()) if root.exists() else ():
+            directories = sorted(root.iterdir()) if root.exists() else ()
+        except OSError as exc:
+            unavailable.append(f"native-campaigns:{type(exc).__name__}")
+            directories = ()
+        for directory in directories:
+            try:
                 if not (directory / "snapshot.json").exists():
                     continue
                 if len(items) >= max_items:
                     truncated.append("native-campaigns")
                     break
-                if directory.is_symlink():
-                    raise MigrationError("native snapshot directory is symlinked")
-                data, _ = _read_json(directory / "snapshot.json", bound=max_bytes)
-                if data in (MARKER, LEGACY_MARKER):
-                    data, _ = CampaignDatabase(directory).read(
-                        max_bytes=max_bytes, minimum_schema=data["schema_version"]
+                items.extend(
+                    _native_items(
+                        directory, common, max_bytes=max_bytes, max_items=max_items - len(items)
                     )
-                snapshot = snapshot_from_dict(data)
-                if snapshot.id != directory.name:
-                    raise MigrationError("native campaign snapshot ID differs from directory")
-                if Path(snapshot.common_dir).resolve() != common:
-                    raise MigrationError("native campaign belongs to another common directory")
-                for unit in snapshot.units.values():
-                    details = {
-                        "campaign_id": snapshot.id,
-                        "unit_id": unit.id,
-                        "hold": asdict(unit.hold) if unit.hold else None,
-                        "claim": asdict(unit.claim) if unit.claim else None,
-                        "workspace": unit.bindings.get("workspace"),
-                        "pr": unit.bindings.get("pr"),
-                        "admissions_open": snapshot.phase == "active",
-                    }
-                    items.append(
-                        MigrationItem(
-                            f"native-unit:{snapshot.id}:{unit.id}",
-                            "native-unit",
-                            _digest(details),
-                            str(directory),
-                            str(unit.state),
-                            "unknown",
-                            "owned" if unit.claim else "unknown",
-                            (unit.id,),
-                            details,
-                        )
-                    )
-        except (OSError, ValueError, CampaignError) as exc:
-            unavailable.append(f"native-campaigns:{type(exc).__name__}")
+                )
+            except (OSError, ValueError, KeyError, TypeError, CampaignError) as exc:
+                unavailable.append(
+                    f"native-campaigns:{directory.name}:{type(exc).__name__}:{str(exc)[:240]}"
+                )
     if gateway is None:
         unavailable.append("github:observer-not-configured")
     else:

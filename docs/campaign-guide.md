@@ -590,6 +590,7 @@ bmad-loop campaign steer CAMPAIGN_ID --job JOB_ID --text "Consider the new owner
 bmad-loop campaign history CAMPAIGN_ID --unit QUALIFIED_UNIT --role review --after 0 --limit 100 --json
 bmad-loop campaign handoff CAMPAIGN_ID --unit QUALIFIED_UNIT --profile codex --reason "capacity wait" --json
 bmad-loop campaign migrate-state CAMPAIGN_ID --json
+bmad-loop campaign requalify CAMPAIGN_ID --capabilities /path/to/earned-capabilities.json --expected-revision REVISION --reason "Renew installed routes before first worker" --json
 bmad-loop campaign hold CAMPAIGN_ID --unit QUALIFIED_UNIT --reason "Inspect this change" --json
 bmad-loop campaign release CAMPAIGN_ID --unit QUALIFIED_UNIT --json
 bmad-loop campaign stop CAMPAIGN_ID --json
@@ -598,6 +599,20 @@ bmad-loop campaign reconcile CAMPAIGN_ID --json
 bmad-loop campaign resume CAMPAIGN_ID --json
 bmad-loop campaign attach CAMPAIGN_ID --unit QUALIFIED_UNIT --role execution
 ```
+
+`status --json` includes `discovery.state`, the last observation time, whether a
+refresh is pending, and unavailable or truncated sources. Pending units show a
+discovery wait when no more specific admission reason applies. A partial inventory
+does not authorize new work. Optional portfolio reasoning waits for an owned
+workspace when reflection is enabled; refreshing unchanged inventory does not
+create a new analysis merely because its observation time changed.
+
+If startup stopped before any worker launched, `requalify` can renew the frozen
+native route proofs after an installation update. Supply freshly qualified routes
+with the same contracts and the current campaign revision. It preserves prior
+proofs and configuration templates, leaves the campaign stopped, and does not
+reload project policy. Campaigns with launched workers or publication history
+require their original qualified installation; this command refuses those cases.
 
 When reasoning and `handoff_map` are enabled with a qualified summarization route,
 live sessions with exact hook-backed transcripts prepare optional prefix summaries.

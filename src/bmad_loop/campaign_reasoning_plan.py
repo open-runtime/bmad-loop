@@ -45,7 +45,7 @@ def _stable(value):
                 "duration_s",
             }
         }
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple)):
         return [_stable(item) for item in value]
     return value
 
@@ -92,7 +92,16 @@ def context(snapshot, purpose: str) -> dict[str, Any]:
         }
         for version in pending
     ]
-    inventory = _stable(snapshot.bindings.get("inventory", {}))
+    # The coverage receipt digest includes its observation time. Semantic advice
+    # follows the observed facts, not that receipt identity: otherwise each poll
+    # invalidates an unchanged, possibly partitioned graph review.
+    inventory = _stable(
+        {
+            key: value
+            for key, value in snapshot.bindings.get("inventory", {}).items()
+            if key != "digest"
+        }
+    )
     result = {
         "schema_version": 1,
         "campaign": snapshot.id,
@@ -146,13 +155,20 @@ def _eligible(snapshot, purpose: str) -> bool:
         return bool(context(snapshot, purpose)["observations"]) and bool(
             snapshot.bindings.get("inventory", {}).get("complete")
         )
-    if purpose == "semantic_sync":
+    if purpose in {"semantic_sync", "graph_review"}:
         return bool(snapshot.bindings.get("inventory", {}).get("complete"))
     return bool(snapshot.units)
 
 
 def proposals(runtime, snapshot) -> tuple[Proposal, ...]:
     if not snapshot.spec.reasoning.enabled or snapshot.phase != "active":
+        return ()
+    from .campaign_reasoning_flow import presentation
+
+    # These are optional portfolio jobs. Unit allocation supplies their owned
+    # terminal; materializing large pipelines before that point only accumulates
+    # workspace waits while discovery is still preventing unit admission.
+    if snapshot.spec.paradev.reflect and presentation(snapshot) is None:
         return ()
     if any(
         action.kind == "semantic-plan" and action.state in {"prepared", "sent_unknown"}
@@ -165,7 +181,8 @@ def proposals(runtime, snapshot) -> tuple[Proposal, ...]:
     advance = [
         key
         for key, pipeline in state.get("pipelines", {}).items()
-        if fingerprint(snapshot, pipeline["purpose"]) == pipeline["context_digest"]
+        if _eligible(snapshot, pipeline["purpose"])
+        and fingerprint(snapshot, pipeline["purpose"]) == pipeline["context_digest"]
         and partition_ready(runtime, snapshot, pipeline)
     ]
     needed = {

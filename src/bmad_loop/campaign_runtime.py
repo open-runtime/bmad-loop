@@ -4616,12 +4616,13 @@ class CampaignRuntime:
                         "process",
                         "legacy-run",
                         "native-unit",
+                        "native-job",
                         "automation",
                         "scheduler",
                         "publisher",
                     }
                     and not (
-                        item["kind"] == "native-unit"
+                        item["kind"] in {"native-unit", "native-job"}
                         and (item.get("details") or {}).get("campaign_id") == snapshot.id
                     )
                 ]

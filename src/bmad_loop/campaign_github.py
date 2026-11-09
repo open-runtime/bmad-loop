@@ -14,7 +14,7 @@ import subprocess
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass, replace
 from typing import Any, Literal, Protocol
-from urllib.parse import urlencode
+from urllib.parse import parse_qsl, urlencode, urlsplit
 
 API_VERSION = "2026-03-10"
 JsonObject = dict[str, Any]
@@ -173,6 +173,7 @@ class GithubGateway:
         self.repository = repository
         self.root = f"repos/{repository}"
         self.max_pages = max_pages
+        self._repository_id: int | None = None
 
     def get(self, path: str) -> Any:
         response = self.transport.request("GET", path)
@@ -183,11 +184,14 @@ class GithubGateway:
     def iter_pages(self, path: str, *, collection: str | None = None) -> Iterator[list[JsonObject]]:
         """Complete pages, bounded by a visible limit; callers may stop at a scope boundary."""
         current = path + ("&" if "?" in path else "?") + "per_page=100"
-        seen: set[str] = set()
+        endpoint = urlsplit(current).path
+        scope = dict(parse_qsl(urlsplit(current).query, keep_blank_values=True))
+        seen: set[tuple[str, tuple[tuple[str, str], ...]]] = set()
         while current:
-            if current in seen or len(seen) >= self.max_pages:
+            key = (urlsplit(current).path, tuple(sorted(parse_qsl(urlsplit(current).query))))
+            if key in seen or len(seen) >= self.max_pages:
                 raise GithubError("GitHub pagination incomplete or cyclic")
-            seen.add(current)
+            seen.add(key)
             response = self.transport.request("GET", current)
             if response.status != 200:
                 raise GithubError(f"GitHub page failed: HTTP {response.status}")
@@ -199,12 +203,66 @@ class GithubGateway:
                 raise GithubError("Unexpected GitHub list schema")
             yield data
             links = response.headers.get("link", "")
-            next_page = re.search(r'<([^>]+)>;\s*rel="next"', links)
-            current = next_page.group(1) if next_page else ""
-            if current.startswith("https://api.github.com/"):
-                current = current.removeprefix("https://api.github.com/")
-            if current and not current.startswith(self.root + "/"):
+            next_pages = []
+            for link in re.split(r",\s*(?=<)", links) if links else ():
+                match = re.fullmatch(r'\s*<([^<>]+)>;\s*rel="([^"]+)"\s*', link)
+                if match is None:
+                    raise GithubError("Malformed GitHub pagination Link header")
+                if "next" in match[2].split():
+                    next_pages.append(match[1])
+            if len(next_pages) > 1:
+                raise GithubError("Ambiguous GitHub pagination next page")
+            current = self._page_path(next_pages[0], endpoint, scope) if next_pages else ""
+
+    def _page_path(self, link: str, endpoint: str, scope: dict[str, str]) -> str:
+        """Bind GitHub's numeric repository aliases to the selected repository."""
+        try:
+            parsed = urlsplit(link)
+            query = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=True)
+        except ValueError as exc:
+            raise GithubError("Malformed GitHub pagination URL") from exc
+        if (
+            any(ord(char) <= 32 for char in link)
+            or (parsed.scheme or parsed.netloc)
+            and (parsed.scheme != "https" or parsed.netloc != "api.github.com")
+            or parsed.fragment
+            or parsed.path.startswith("//")
+        ):
+            raise GithubError("Pagination escaped the selected repository")
+        page_path = parsed.path.removeprefix("/")
+        alias = re.fullmatch(r"repositories/([1-9][0-9]*)(/.*)", page_path)
+        if alias:
+            if self._repository_id is None:
+                repository = self.get(self.root)
+                if (
+                    not isinstance(repository, dict)
+                    or type(repository.get("id")) is not int
+                    or repository["id"] <= 0
+                    or not isinstance(repository.get("full_name"), str)
+                    or repository["full_name"].casefold() != self.repository.casefold()
+                ):
+                    raise GithubError("Cannot bind GitHub pagination repository identity")
+                self._repository_id = repository["id"]
+            if alias[1] != str(self._repository_id):
                 raise GithubError("Pagination escaped the selected repository")
+            page_path = self.root + alias[2]
+        if page_path != endpoint or not page_path.startswith(self.root + "/"):
+            raise GithubError("Pagination escaped the selected repository or endpoint")
+        params = dict(query)
+        if (
+            len(params) != len(query)
+            or {
+                key: value
+                for key, value in params.items()
+                if key not in {"page", "after", "before"}
+            }
+            != {
+                key: value for key, value in scope.items() if key not in {"page", "after", "before"}
+            }
+            or ("page" in params and re.fullmatch(r"[1-9][0-9]*", params["page"]) is None)
+        ):
+            raise GithubError("Pagination escaped the selected query scope")
+        return page_path + ("?" + parsed.query if parsed.query else "")
 
     def pages(self, path: str, *, collection: str | None = None) -> list[JsonObject]:
         return [row for page in self.iter_pages(path, collection=collection) for row in page]

@@ -47,6 +47,18 @@ stale, incomplete or oversized final decisions remain visible without partial
 application. These jobs share the same capacity and safe-boundary message ledger
 as other reasoning work, with distinct claims and public bridge identities.
 
+Optional portfolio jobs wait for an existing owned workspace when Paradev
+reflection is enabled. Graph review and semantic synchronization also require a
+complete discovery observation, including before advancing partitioned analysis.
+These prerequisites must not prevent ordinary unit allocation or observation of
+already admitted jobs. Semantic context identity excludes observation clocks and
+the top-level time-dependent coverage receipt digest; factual inventory changes,
+nested evidence hashes and graph/config revisions still invalidate stale advice.
+Qualify startup through incomplete discovery, recovery, capacity observation,
+workspace allocation and worker launch using the normal coordinator path, rather
+than injecting a workspace into every fixture. This regression is separate from
+actual native delivery and live-worker stop/resume qualification.
+
 Optimize sequencing and useful parallelism through dependencies, ownership and
 token/session capacity. Preserve existing source initiatives/sprints and their
 GitHub mapping; introduce no calendar, dates, velocity or sprint-capacity model.

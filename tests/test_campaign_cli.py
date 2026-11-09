@@ -131,6 +131,51 @@ def test_invalid_spec_is_a_complete_failing_verdict(campaign_spec, capsys):
     assert output.err == ""
 
 
+def test_requalify_passes_explicit_revision_and_does_not_resume(
+    runtime, tmp_path, monkeypatch, capsys
+):
+    from bmad_loop import campaign_requalification
+
+    store, snapshot, calls = runtime
+    manifest = tmp_path / "qualified.json"
+    received = []
+
+    def renew(saved_store, campaign_id, capabilities, *, expected_revision, reason):
+        received.append((saved_store, campaign_id, capabilities, expected_revision, reason))
+        snapshot.phase = "stopped"
+        snapshot.config_revision += 1
+        return snapshot
+
+    monkeypatch.setattr(campaign_requalification, "requalify", renew)
+    assert (
+        cli.main(
+            [
+                "campaign",
+                "requalify",
+                snapshot.id,
+                "--capabilities",
+                str(manifest),
+                "--expected-revision",
+                str(snapshot.revision),
+                "--reason",
+                "installed route renewal",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    output = capsys.readouterr()
+    result = json.loads(output.out)
+    assert result["command"] == "campaign.requalify"
+    assert result["campaign"]["phase"] == "stopped"
+    assert result["campaign"]["config_revision"] == 2
+    assert received == [
+        (store, snapshot.id, manifest, snapshot.revision, "installed route renewal")
+    ]
+    assert output.err == ""
+    assert calls == []
+
+
 def test_preflight_has_separate_capabilities_and_does_not_create_campaign(
     campaign_spec, runtime, capsys, monkeypatch
 ):
@@ -465,3 +510,33 @@ def test_projection_preserves_actual_hold_and_delivery_distinctions(runtime):
     assert view["counts"] == {"merged_pending_sync": 1}
     assert view["units"][0]["hold"]["kind"] == "tracking"
     assert view["units"][0]["state"] != "delivered"
+
+
+def test_projection_explains_discovery_wait_and_clears_it_when_complete(runtime, capsys):
+    from bmad_loop.campaign_cli import _emit
+
+    _, snapshot, _ = runtime
+    view = status_document(snapshot)
+    assert view["discovery"]["state"] == "pending"
+    assert view["units"][0]["admission_wait"] == "repository discovery has not completed"
+    snapshot.bindings["inventory"] = {
+        "complete": False,
+        "observed_at": 100,
+        "unavailable": ["github:pagination unavailable"],
+        "truncated": ["git:branch detail"],
+    }
+    view = status_document(snapshot)
+    assert view["discovery"]["state"] == "incomplete"
+    assert view["discovery"]["unavailable"] == ["github:pagination unavailable"]
+    assert view["discovery"]["truncated"] == ["git:branch detail"]
+    assert view["units"][0]["admission_wait"] == "repository discovery is incomplete"
+    _emit(types.SimpleNamespace(json=False), {"ok": True, "campaign": view})
+    output = capsys.readouterr().out
+    assert "discovery: incomplete" in output
+    assert "github:pagination unavailable" in output
+    assert "repository discovery is incomplete" in output
+    snapshot.bindings["inventory"] = {"complete": True, "observed_at": 200}
+    view = status_document(snapshot)
+    assert view["discovery"]["state"] == "ready"
+    assert view["discovery"]["unavailable"] == []
+    assert view["units"][0]["admission_wait"] == ""

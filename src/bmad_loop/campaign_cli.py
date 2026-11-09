@@ -48,6 +48,10 @@ def register(subparsers: Any) -> None:
         ("steer", "queue advisory instructions for the next safe stage boundary"),
         ("handoff", "queue continuation through approved harness candidates"),
         ("migrate-state", "migrate quiescent campaign storage with a preserved backup"),
+        (
+            "requalify",
+            "renew installed route proofs for a stopped campaign before its first worker",
+        ),
         ("stop", "close admissions and drain existing bounded stages"),
         ("hold", "hold one unit at a safe stage boundary"),
         ("release", "release an explicit operator hold"),
@@ -137,6 +141,10 @@ def register(subparsers: Any) -> None:
             child.add_argument("--job", default="")
             child.add_argument("--request-id", default="")
         if command == "authorize-scope":
+            child.add_argument("--expected-revision", required=True, type=int)
+            child.add_argument("--reason", required=True)
+        if command == "requalify":
+            child.add_argument("--capabilities", required=True, metavar="FILE")
             child.add_argument("--expected-revision", required=True, type=int)
             child.add_argument("--reason", required=True)
         if command == "stop":
@@ -328,10 +336,20 @@ def status_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
     from .campaign_metrics import document as timing_document
     from .campaign_operator import diagnostics
     from .campaign_scheduler import admit
-    from .sanitize import scrub_json
+    from .sanitize import scrub_json, scrub_text
 
     units = []
     admission = admit(snapshot)
+    inventory = snapshot.bindings.get("inventory", {})
+    discovery_wait = (
+        (
+            "repository discovery is incomplete"
+            if inventory
+            else "repository discovery has not completed"
+        )
+        if not inventory.get("complete")
+        else ""
+    )
     public_bindings = {
         "workspace",
         "workspace_id",
@@ -392,7 +410,8 @@ def status_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
                         ],
                     }
                 ),
-                "admission_wait": admission.waits.get(key, ""),
+                "admission_wait": admission.waits.get(key, "")
+                or (discovery_wait if unit.state in {"pending", "ready"} else ""),
                 "handoff": scrub_json(
                     {
                         name: unit.evidence.get("handoff", {}).get(name)
@@ -481,6 +500,18 @@ def status_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
             ),
         ),
         "counts": counts,
+        "discovery": {
+            "state": (
+                "ready" if inventory.get("complete") else "incomplete" if inventory else "pending"
+            ),
+            "observed_at": inventory.get("observed_at"),
+            "refresh_pending": any(
+                action.kind == "inventory" and action.state in {"prepared", "sent_unknown"}
+                for action in snapshot.outbox
+            ),
+            "unavailable": [scrub_text(reason) for reason in inventory.get("unavailable", [])],
+            "truncated": [scrub_text(reason) for reason in inventory.get("truncated", [])],
+        },
         "tracking": {
             "source_completion_scopes": {
                 source.id: source.completion_scope for source in snapshot.spec.sources
@@ -576,8 +607,14 @@ def _emit(args: argparse.Namespace, result: dict[str, Any]) -> int:
             print(
                 f"{campaign['id']}: {campaign['phase']} ({campaign['repository']} -> {campaign['target']})"
             )
+            discovery = campaign.get("discovery", {})
+            if discovery.get("state") in {"pending", "incomplete"}:
+                print(f"  discovery: {discovery['state']}")
+                for reason in (*discovery.get("unavailable", ()), *discovery.get("truncated", ())):
+                    print(f"    {reason}")
             for unit in campaign["units"]:
-                suffix = f" — {unit['hold']['reason']}" if unit["hold"] else ""
+                reason = unit["hold"]["reason"] if unit["hold"] else unit.get("admission_wait", "")
+                suffix = f" — {reason}" if reason else ""
                 print(f"  {unit['id']}: {unit['state']}{suffix}")
         elif "campaigns" in result:
             for campaign in result["campaigns"]:
@@ -805,6 +842,17 @@ def dispatch(args: argparse.Namespace) -> int:
     if command == "migrate-state":
         migrated = store.migrate_state(campaign_id)
         return _emit(args, _result(command, campaign=status_document(migrated)))
+    if command == "requalify":
+        from .campaign_requalification import requalify
+
+        renewed = requalify(
+            store,
+            campaign_id,
+            Path(args.capabilities).expanduser(),
+            expected_revision=args.expected_revision,
+            reason=args.reason,
+        )
+        return _emit(args, _result(command, campaign=status_document(renewed)))
     if command == "jobs":
         if not 1 <= args.limit <= 1000:
             raise CampaignError("job page limit must be between 1 and 1000")

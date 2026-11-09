@@ -49,6 +49,7 @@ bmad-loop campaign messages ID [--unit UNIT] [--job JOB] [--after SEQUENCE] [--l
 bmad-loop campaign steer ID [--unit UNIT] [--job JOB] --text TEXT [--request-id ID] [--json]
 bmad-loop campaign handoff ID --unit UNIT [--profile PROFILE] [--model MODEL] [--effort EFFORT] [--reason TEXT] [--json]
 bmad-loop campaign migrate-state ID [--json]
+bmad-loop campaign requalify ID --capabilities FILE --expected-revision REVISION --reason TEXT [--json]
 bmad-loop campaign resume ID [--json]
 bmad-loop campaign stop ID [--terminate-workers] [--json]
 bmad-loop campaign hold ID --unit UNIT --reason TEXT [--json]
@@ -78,6 +79,16 @@ route; it does not move a live native session. Uncertain predecessor ownership,
 missing route qualification or incomplete constraint recovery remains visible.
 Storage migration requires drained workers and reconciled effects, preserves
 the exact old snapshot and makes the new authority unreadable to older binaries.
+
+Requalification renews installed route proofs for a stopped campaign that has not
+launched a worker or published work. It validates the supplied earned capabilities,
+preserves the frozen policy and profiles, and records a new configuration revision
+and immutable template. The campaign remains stopped; resume is a separate action.
+It refuses stale revisions, uncertain effects or actors, changed route contracts,
+and campaigns that already began delivery. This is not a general mid-delivery
+installation migration or permission to rewrite qualification receipts.
+Renewed semantic proof coordinates must preserve every declared current purpose
+and contract and pass full fidelity validation against the replacement route.
 
 Migration inventory caches an immutable external receipt and returns an owner
 manifest template. Qualification compares fresh authenticated service/object

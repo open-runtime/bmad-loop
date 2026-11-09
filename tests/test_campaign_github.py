@@ -119,9 +119,13 @@ def test_paginated_list_and_pr_filtering():
     ] = ApiResponse(
         200,
         [{"id": 1}, {"id": 2, "pull_request": {}}],
-        {"link": '<https://api.github.com/repos/a/b/issues?page=2>; rel="next"'},
+        {
+            "link": '<https://api.github.com/repos/a/b/issues?state=open&sort=updated&direction=asc&per_page=100&page=2>; rel="next"'
+        },
     )
-    transport.responses["GET", "repos/a/b/issues?page=2"] = ApiResponse(200, [{"id": 3}], {})
+    transport.responses[
+        "GET", "repos/a/b/issues?state=open&sort=updated&direction=asc&per_page=100&page=2"
+    ] = ApiResponse(200, [{"id": 3}], {})
     assert [row["id"] for row in GithubGateway(transport, "a/b").issues()] == [1, 3]
 
 
@@ -133,7 +137,9 @@ def test_pagination_escape_and_limit_are_not_partial_success():
     with pytest.raises(GithubError, match="escaped"):
         GithubGateway(transport, "a/b").pages("repos/a/b/issues")
     transport.responses["GET", "repos/a/b/issues?per_page=100"] = ApiResponse(
-        200, [], {"link": '<https://api.github.com/repos/a/b/issues?page=2>; rel="next"'}
+        200,
+        [],
+        {"link": '<https://api.github.com/repos/a/b/issues?per_page=100&page=2>; rel="next"'},
     )
     with pytest.raises(GithubError, match="incomplete"):
         GithubGateway(transport, "a/b", max_pages=1).pages("repos/a/b/issues")

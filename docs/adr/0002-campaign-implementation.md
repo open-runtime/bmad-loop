@@ -800,6 +800,42 @@ audit for every worker. A required inventory failure holds the affected planning
 or admission decision. Explicitly report optional missing context; never label
 a partial inventory as proof that no competing work exists.
 
+Preserved ref aliases must not exhaust a fixed branch-count allowance. Retain all
+observed ref identities, share evidence only for identical immutable heads, and
+scope patch/history expansion to declared paths before applying detail bounds.
+Inspect every best merge base in criss-cross histories and both endpoints of
+selected renames. Empty or repository-wide planning scopes retain full inspection;
+genuinely oversized relevant evidence remains explicitly incomplete. GitHub may
+paginate through numeric repository URLs: bind that ID to the selected repository
+metadata and preserve the original endpoint and query scope on every page.
+Bound commit-ID retrieval with an overflow sentinel and measure immutable object
+sizes before loading formatted history. A limit on retained JSON alone does not
+bound Git's captured output; oversized histories or individual commits must remain
+explicitly incomplete.
+
+Native campaign discovery reads an ownership projection in one SQLite transaction,
+independently of growing cached inventories, job inputs and event history. Keep
+unit/workspace bindings and every claimed reasoning job whose quiescence is not
+established, including terminal jobs with uncertain owners. Bound the projection
+itself; a corrupt, foreign or oversized ownership record remains unavailable.
+Legacy JSON remains bounded. Exclude this campaign's own unit and reasoning claims
+from external ownership while retaining other campaigns' claims. Expose discovery
+waits and their causes through the ordinary status contract.
+
+An installed coordinator upgrade cannot silently reinterpret frozen native route
+proofs against new worker modules. Permit explicit route requalification only for
+a stopped campaign before its first unit worker, publication or earned acceptance.
+Under the repository coordinator lock, compare the expected revision, reject
+unsettled effects/actors, validate freshly earned equivalent route contracts and
+persist a new configuration revision/template without reloading policy or profiles.
+Retain old proofs and invalidate never-launched optional advice. Resume remains a
+separate action. This limited startup recovery does not claim general migration
+of campaigns already in delivery.
+Semantic renewal compares the declared purposes and contracts in hash-bound proof
+metadata, then validates the complete replacement proof for every purpose. Proof
+coordinates may change; lost corpus or review evidence must not silently narrow
+authority. Superseded contract alternatives remain historical evidence.
+
 Planning writes an overlap disposition for each proposed unit: already delivered,
 covered by active work, continue existing work, reuse partial work, new work, or
 unresolved overlap. Cite exact source/PR/commit identities and acceptance coverage,

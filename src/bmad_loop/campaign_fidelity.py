@@ -87,22 +87,8 @@ def semantic_contract(purpose, audit_schema, contract=""):
     return result
 
 
-def validate(cap, audit_schema, *, candidate=None, purpose="handoff_audit", contract=""):
-    from .campaign_headless import file_digest, provider_family, read_json
-
-    binding = cap.get("semantic_qualification") or {}
-    if not binding:
-        raise CampaignError("Semantic handoff fidelity qualification is missing")
-    if binding.get("schema_version") != 2:
-        raise CampaignError(
-            "Semantic handoff fidelity requires purpose-bound schema-2 qualification"
-        )
-    proofs = binding.get("proofs")
-    if proofs is None:
-        proofs = [{key: binding.get(key) for key in ("path", "sha256")}]
-    if not isinstance(proofs, list) or not 1 <= len(proofs) <= 32:
-        raise CampaignError("Semantic handoff fidelity proof list is invalid")
-    target = route_binding(cap, purpose, candidate)
+def contract_header(purpose, audit_schema, contract=""):
+    """Identify current contract declarations before checking their proof closure."""
     actual_contract = semantic_contract(purpose, audit_schema, contract)
     expected = {
         "schema_version": 2,
@@ -126,6 +112,26 @@ def validate(cap, audit_schema, *, candidate=None, purpose="handoff_audit", cont
                 audit_schema_digest=actual_contract["audit_schema_digest"],
                 audit_prompt_version=HISTORY_AUDIT_PROMPT_VERSION,
             )
+    return actual_contract, expected
+
+
+def validate(cap, audit_schema, *, candidate=None, purpose="handoff_audit", contract=""):
+    from .campaign_headless import file_digest, provider_family, read_json
+
+    binding = cap.get("semantic_qualification") or {}
+    if not binding:
+        raise CampaignError("Semantic handoff fidelity qualification is missing")
+    if binding.get("schema_version") != 2:
+        raise CampaignError(
+            "Semantic handoff fidelity requires purpose-bound schema-2 qualification"
+        )
+    proofs = binding.get("proofs")
+    if proofs is None:
+        proofs = [{key: binding.get(key) for key in ("path", "sha256")}]
+    if not isinstance(proofs, list) or not 1 <= len(proofs) <= 32:
+        raise CampaignError("Semantic handoff fidelity proof list is invalid")
+    target = route_binding(cap, purpose, candidate)
+    actual_contract, expected = contract_header(purpose, audit_schema, contract)
 
     failures = []
     for proof in proofs:
