@@ -874,7 +874,7 @@ or a campaign containing only coordination units still requires broader discover
 
 An installed coordinator upgrade cannot silently reinterpret frozen native route
 proofs against new worker modules. Permit explicit route requalification only for
-a stopped campaign before its first unit worker, publication or earned acceptance.
+a stopped campaign before its first unit worker, PR publication or earned acceptance.
 Under the repository coordinator lock, compare the expected revision, reject
 unsettled effects/actors, validate freshly earned equivalent route contracts and
 persist a new configuration revision/template without reloading policy or profiles.
@@ -887,8 +887,14 @@ renewal may retain a draft unit with an exact confirmed preparation receipt,
 unchanged clean bootstrap commit and matching workspace/Git identity. Preserve
 its source bindings, never-started intake control and confirmed reflection of the
 same draft workspace before any session. Refuse unknown allocations,
-publication, worker or reasoning attempts, unrelated bindings and earned stage
+PR publication, worker or reasoning attempts, unrelated bindings and earned stage
 evidence; renewing proofs never adopts arbitrary work or rewrites its branch.
+Confirmed bootstrap hierarchy observations and milestone/issue creations can also
+survive this renewal when their exact intents, receipts and native bindings agree.
+Preserve the creations and unfinished hierarchy work without replaying them.
+Unknown or rejected writes, unrelated GitHub mutations and PR history remain
+outside this pre-first-worker recovery contract. Ordinary hierarchy reconciliation
+still checks current remote state before admitting work after resume.
 Semantic renewal compares the declared purposes and contracts in hash-bound proof
 metadata, then validates the complete replacement proof for every purpose. Proof
 coordinates may change; lost corpus or review evidence must not silently narrow

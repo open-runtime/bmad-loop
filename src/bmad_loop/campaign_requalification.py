@@ -14,6 +14,7 @@ import dataclasses
 import hashlib
 import json
 from pathlib import Path
+from typing import NoReturn
 
 from .campaign_database import EventJournal
 from .campaign_execution import CampaignExecution
@@ -118,7 +119,180 @@ def _surface(value, *, validate_semantics=True):
     }
 
 
-def _prepared_unit(snapshot: CampaignSnapshot, unit: CampaignUnit, directory: Path) -> None:
+def _bootstrap_tracking(snapshot: CampaignSnapshot) -> set[str]:
+    """Prove untouched tracking bootstrap from its ordered durable journal.
+
+    Confirmed creates remain owned remote objects, including receipts not yet
+    projected into shared bindings. This does not replay or refresh any effect;
+    ordinary hierarchy reconciliation still observes remote changes on resume.
+    """
+    from .campaign_action_history import actions
+    from .campaign_github import managed_marker
+    from .campaign_tracking import HierarchyCoordinator
+    from .campaign_tracking_delta import merge
+
+    def refuse() -> NoReturn:
+        raise CampaignError("startup renewal cannot prove bootstrap tracking history")
+
+    def native_binding(value, kind, *, native=False):
+        if not isinstance(value, dict):
+            refuse()
+        number, identity = value.get("number"), value.get("id" if native else "database_id")
+        path = "milestone" if kind == "milestone" else "issues"
+        if (
+            type(number) is not int
+            or number < 1
+            or type(identity) is not int
+            or identity < 1
+            or value.get("state") != "open"
+            or value.get("html_url" if native else "url")
+            != f"https://github.com/{snapshot.repository}/{path}/{number}"
+            or (not native and value.get("kind") != kind)
+            or (native and "pull_request" in value)
+        ):
+            refuse()
+        return number, identity
+
+    hierarchy: dict[str, dict] = {}
+    proposals = {}
+    confirmed = {}
+    units = set()
+    for action in actions(snapshot, kinds=("hierarchy", "github")):
+        unit = snapshot.units.get(action.unit)
+        if unit is None or action.state != "confirmed" or action.error:
+            refuse()
+        if action.kind == "hierarchy":
+            data = action.receipt
+            if (
+                action.payload
+                or set(data)
+                != {
+                    "projection_version",
+                    "graph_revision",
+                    "binding_changes",
+                    "unit_changes",
+                    "read_fence",
+                    "action_key",
+                    "intent",
+                    "complete",
+                    "reason",
+                }
+                or type(data["projection_version"]) is not int
+                or data["projection_version"] != 1
+                or data["graph_revision"] != snapshot.graph_revision
+                or data["complete"] is not False
+                or data["unit_changes"] != {}
+                or data["reason"]
+                or not isinstance(data["binding_changes"], dict)
+                or not isinstance(data["read_fence"], dict)
+            ):
+                refuse()
+            for key, change in data["binding_changes"].items():
+                if not isinstance(change, dict) or set(change) != {"before", "after"}:
+                    refuse()
+                kind = "milestone" if key.startswith("initiative:") else "issue"
+                native_binding(change["after"], kind)
+            try:
+                projected = merge(hierarchy, data["binding_changes"])
+            except CampaignError:
+                refuse()
+            if projected is None or any(
+                not isinstance(fence, dict)
+                or any(projected.get(key, {}).get(name) != value for name, value in fence.items())
+                for key, fence in data["read_fence"].items()
+            ):
+                refuse()
+            hierarchy = projected
+            units.add(unit.id)
+            intent = data["intent"]
+            if intent is None:
+                continue
+            namespace = unit.spec.source + ":" + (unit.spec.initiative or snapshot.spec.name)
+            keys = {
+                "initiative:" + namespace: "milestone",
+                "epic:" + namespace + ":" + unit.spec.epic: "issue",
+            }
+            member = unit
+            seen = set()
+            while member is not None:
+                if member.id in seen:
+                    refuse()
+                seen.add(member.id)
+                keys["story:" + member.id] = "issue"
+                member = snapshot.units.get(member.spec.parent) if member.spec.parent else None
+            matching = [
+                key
+                for key in keys
+                if HierarchyCoordinator._action(snapshot, key, "create") == data["action_key"]
+            ]
+            if len(matching) != 1 or not isinstance(intent, dict):
+                refuse()
+            key = matching[0]
+            kind = keys[key]
+            if (
+                intent.get("action_id") != data["action_key"]
+                or intent.get("kind") != kind
+                or intent.get("method") != "POST"
+                or intent.get("path")
+                != f"repos/{snapshot.repository}/{'milestones' if kind == 'milestone' else 'issues'}"
+                or intent.get("marker") != managed_marker(snapshot.id, key, kind)
+                or intent.get("state") != "prepared"
+                or intent.get("receipt") is not None
+                or intent.get("coordinates") is not None
+                or intent.get("error")
+                or intent.get("generation") != action.generation
+            ):
+                refuse()
+            prior = proposals.get(data["action_key"])
+            value = (action.unit, key, intent)
+            if prior is not None and prior != value:
+                refuse()
+            proposals[data["action_key"]] = value
+        else:
+            proposed = proposals.get(action.id)
+            if proposed is None:
+                refuse()
+            owner, key, intent = proposed
+            if (
+                action.unit != owner
+                or action.generation != intent["generation"]
+                or action.payload
+                != {
+                    "intent": intent,
+                    "purpose": "hierarchy",
+                    "tracking_key": action.id,
+                    "scope_revision": snapshot.graph_revision,
+                }
+                or set(action.receipt) != {"intent"}
+            ):
+                refuse()
+            result = action.receipt["intent"]
+            if not isinstance(result, dict):
+                refuse()
+            native = result.get("receipt")
+            if result != {**intent, "state": "confirmed", "receipt": native} or native is None:
+                refuse()
+            kind = intent["kind"]
+            coords = native_binding(native, kind, native=True)
+            text = native.get("description" if kind == "milestone" else "body", "")
+            if not isinstance(text, str) or intent["marker"] not in text:
+                refuse()
+            confirmed[action.id] = (key, coords)
+    if set(proposals) != set(confirmed):
+        refuse()
+    if hierarchy != snapshot.bindings.get("github_hierarchy", {}):
+        refuse()
+    for key, coords in confirmed.values():
+        if key in hierarchy and coords != native_binding(hierarchy[key], hierarchy[key]["kind"]):
+            refuse()
+    if any(snapshot.units[key].bindings.get("hierarchy_ready") is not False for key in units):
+        refuse()
+    return units
+
+
+def _prepared_unit(
+    snapshot: CampaignSnapshot, unit: CampaignUnit, directory: Path, *, tracking=False
+) -> None:
     """Recognize only the deterministic, unpublished prepare-unit result.
 
     Historical action receipts remain authority after SQLite archival. A current
@@ -134,15 +308,18 @@ def _prepared_unit(snapshot: CampaignSnapshot, unit: CampaignUnit, directory: Pa
     action = rows[0]
     if any(
         row.kind
-        not in {
-            "prepare-unit",
-            "source-observation",
-            "reflection",
-            "communication",
-            "semantic-plan",
-            "reasoning-wait",
-            "reasoning-stale",
-        }
+        not in (
+            {
+                "prepare-unit",
+                "source-observation",
+                "reflection",
+                "communication",
+                "semantic-plan",
+                "reasoning-wait",
+                "reasoning-stale",
+            }
+            | ({"hierarchy", "github"} if tracking else set())
+        )
         for row in actions(snapshot, unit=unit.id)
     ):
         raise CampaignError(
@@ -168,7 +345,8 @@ def _prepared_unit(snapshot: CampaignSnapshot, unit: CampaignUnit, directory: Pa
     retained = {
         key: value
         for key, value in unit.bindings.items()
-        if key not in {"intake_control", "reflection"}
+        if key
+        not in ({"intake_control", "reflection"} | ({"hierarchy_ready"} if tracking else set()))
     }
     if set(receipt) != fields or retained != receipt:
         raise CampaignError("prepared workspace bindings differ from the confirmed receipt")
@@ -295,6 +473,11 @@ def _startup_only(snapshot: CampaignSnapshot, directory: Path) -> bool:
     prepared = False
     if any(action.state not in {"confirmed", "rejected"} for action in snapshot.outbox):
         raise CampaignError("capability requalification requires settled outbound effects")
+    tracking = (
+        _bootstrap_tracking(snapshot)
+        if any(unit.state == UnitState.DRAFT for unit in snapshot.units.values())
+        else set()
+    )
     for unit in snapshot.units.values():
         expected = CampaignUnit(unit.spec)
         ensure(expected)
@@ -311,7 +494,7 @@ def _startup_only(snapshot: CampaignSnapshot, directory: Path) -> bool:
         ):
             raise CampaignError("capability requalification requires units with no prior work")
         if unit.state == UnitState.DRAFT:
-            _prepared_unit(snapshot, unit, directory)
+            _prepared_unit(snapshot, unit, directory, tracking=unit.id in tracking)
             prepared = True
         elif unit.bindings:
             raise CampaignError("capability requalification requires units with no prior work")

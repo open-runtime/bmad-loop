@@ -15,6 +15,8 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Reuse current semantic context within a partition batch while rechecking freshness on each application.
+- Preserve confirmed bootstrap hierarchy records when renewing routes before the first worker.
 - Fit Paradev sidebar navigation and ownership markers within native tag limits.
 - Normalize managed terminal titles before comparing their native readback.
 - Reuse exact legacy ticket-mirror issues and existing parents before creating campaign hierarchy.

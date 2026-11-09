@@ -386,11 +386,22 @@ def perform(runtime, snapshot, action) -> Observation:
 
 
 def apply(runtime, snapshot, action, observation) -> None:
+    # Preparing jobs changes only jobs/events/semantic bookkeeping, none of the
+    # context facts. Hash each purpose once in this synchronous application;
+    # partition count must not multiply copying/hashing the whole inventory.
+    # Keep this cache local: the next application must recheck current evidence.
+    fingerprints: dict[str, str] = {}
+
+    def current(purpose: str) -> str:
+        if purpose not in fingerprints:
+            fingerprints[purpose] = fingerprint(snapshot, purpose)
+        return fingerprints[purpose]
+
     state = snapshot.bindings.setdefault("semantic_jobs", {"triggers": {}, "errors": {}})
     for raw in observation.data.get("requests", []):
         request = request_from_dict(raw)
         if (
-            fingerprint(snapshot, request.purpose) != request.coordinates["context_digest"]
+            current(request.purpose) != request.coordinates["context_digest"]
             or request.coordinates["graph_revision"] != snapshot.graph_revision
         ):
             continue
@@ -399,12 +410,12 @@ def apply(runtime, snapshot, action, observation) -> None:
         state["errors"].pop(request.purpose, None)
         add_event(snapshot, "semantic-job-created", job_id=request.id, purpose=request.purpose)
     for purpose, error in observation.data.get("errors", {}).items():
-        if fingerprint(snapshot, purpose) == observation.data["triggers"][purpose]:
+        if current(purpose) == observation.data["triggers"][purpose]:
             state["triggers"][purpose] = observation.data["triggers"][purpose]
             state["errors"][purpose] = error
             add_event(snapshot, "semantic-job-unavailable", purpose=purpose, reason=error)
     for pipeline in observation.data.get("pipelines", []):
-        if fingerprint(snapshot, pipeline["purpose"]) == pipeline["context_digest"]:
+        if current(pipeline["purpose"]) == pipeline["context_digest"]:
             state.setdefault("pipelines", {})[pipeline["id"]] = pipeline
 
 
@@ -452,6 +463,6 @@ def defer_intake(snapshot, *, now: float | None = None) -> bool:
             and now - row["request"]["created_at"] > 30
         ):
             continue
-        if row["request"]["coordinates"].get("context_digest") == fingerprint(snapshot, "triage"):
+        if row["request"]["coordinates"].get("context_digest") == trigger:
             return True
     return False
