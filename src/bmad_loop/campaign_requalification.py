@@ -23,12 +23,68 @@ from .campaign_store import CampaignStore, RevisionConflict, add_event
 from .platform_util import atomic_write_text, is_link_like
 
 
-def _surface(value):
+def _semantic_surface(capability, *, validate_proofs=True):
+    """Keep declared authority independent of mutable proof-closure availability.
+
+    Hash-bound outer proofs identify current contracts for the exact frozen
+    route. Old contracts remain history, but corrupt corpus/review files cannot
+    silently drop a declared purpose. Renewed routes must deeply validate every
+    such purpose through the normal admission validator.
+    """
+    from .campaign_fidelity import PURPOSES, contract_header, route_binding, validate
+    from .campaign_handoff_flow import AUDIT_SCHEMA
+    from .campaign_headless import file_digest, read_json
+
+    binding = capability.get("semantic_qualification")
+    if not binding:
+        return {}
+    if not isinstance(binding, dict) or binding.get("schema_version") != 2:
+        raise CampaignError("semantic qualification must be a purpose-bound mapping")
+    proofs = binding.get("proofs")
+    if proofs is None:
+        proofs = [{key: binding.get(key) for key in ("path", "sha256")}]
+    if not isinstance(proofs, list) or not 1 <= len(proofs) <= 32:
+        raise CampaignError("semantic qualification proof list is invalid")
+    declarations = []
+    for proof in proofs:
+        name = proof.get("path") if isinstance(proof, dict) else None
+        if not isinstance(name, str):
+            raise CampaignError("semantic qualification proof reference is invalid")
+        path = Path(name)
+        if file_digest(path) != proof.get("sha256"):
+            raise CampaignError("semantic qualification declaration changed")
+        declarations.append(read_json(path))
+    coverage = {}
+    for purpose in sorted(PURPOSES):
+        contract = (
+            "constraints-v1"
+            if purpose.startswith("constraint_")
+            else "recovery-v1" if purpose.startswith("recovery_") else ""
+        )
+        semantic, expected = contract_header(purpose, AUDIT_SCHEMA, contract)
+        target = route_binding(capability, purpose)
+        declared = any(
+            isinstance(evidence.get("route_bindings"), list)
+            and target in evidence["route_bindings"]
+            and all(evidence.get(key) == value for key, value in expected.items())
+            for evidence in declarations
+        )
+        if not declared:
+            continue
+        if validate_proofs:
+            validate(capability, AUDIT_SCHEMA, purpose=purpose, contract=contract)
+        coverage[purpose] = semantic
+    if not coverage:
+        raise CampaignError("semantic qualification has no valid supported purpose declaration")
+    return coverage
+
+
+def _surface(value, *, validate_semantics=True):
     """Keep the prior route's authority while permitting freshly earned pins."""
     if not isinstance(value, dict):
         raise CampaignError("frozen capability route is malformed")
     if "protocol" in value:
-        return {
+        surface = {
             key: value.get(key)
             for key in (
                 "profile",
@@ -49,10 +105,15 @@ def _surface(value):
                 "output_tokens",
                 "reserved_tokens",
                 "max_turns",
-                "semantic_qualification",
             )
         }
-    return {key: _surface(child) for key, child in value.items()}
+        surface["semantic_qualification"] = _semantic_surface(
+            value, validate_proofs=validate_semantics
+        )
+        return surface
+    return {
+        key: _surface(child, validate_semantics=validate_semantics) for key, child in value.items()
+    }
 
 
 def _startup_only(snapshot: CampaignSnapshot) -> None:
@@ -153,7 +214,7 @@ def requalify(
             raise CampaignError("requalification requires an immutable loaded installation")
         routes = load_capabilities(capabilities)
         previous_routes = snapshot.config_snapshot.get("reasoning_capabilities", {})
-        if not routes or _surface(routes) != _surface(previous_routes):
+        if not routes or _surface(routes) != _surface(previous_routes, validate_semantics=False):
             raise CampaignError("requalification cannot change frozen route authority or limits")
         binding = snapshot.bindings.get("execution_template") or {}
         template = CampaignExecution.load(Path(binding.get("path", "")), binding.get("digest", ""))

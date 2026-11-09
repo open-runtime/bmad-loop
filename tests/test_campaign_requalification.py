@@ -6,6 +6,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from test_campaign_fidelity import proof as proof
 from test_campaign_headless import fixture_capability
 from test_campaign_headless import prepared as prepared
 
@@ -25,6 +26,80 @@ from bmad_loop.campaign_model import (
     WorkerClaim,
 )
 from bmad_loop.campaign_store import CampaignStore, RevisionConflict, add_action
+
+
+def semantic_proof(directory, capability, proof, purposes):
+    """Bind the zero-token semantic fixture through the real fidelity validator."""
+    from bmad_loop.campaign_fidelity import route_binding, semantic_contract
+    from bmad_loop.campaign_handoff_flow import AUDIT_SCHEMA
+    from bmad_loop.campaign_headless import file_digest, read_json, write_json
+
+    _, original = proof
+    evidence = read_json(original)
+    receipt = read_json(Path(evidence["independent_review"]["native_receipt_path"]))
+    directory.mkdir()
+    for index, source in enumerate(evidence["corpus"]):
+        copied = directory / f"corpus-{index}.txt"
+        copied.write_bytes(Path(source["source_path"]).read_bytes())
+        source["source_path"] = str(copied)
+    receipt["result"]["corpus_digest"] = digest(evidence["corpus"])
+    bindings = [route_binding(capability, purpose) for purpose in purposes]
+    evidence["route_bindings"] = bindings
+    receipt["result"]["route_bindings_digest"] = digest(bindings)
+    receipt["result"]["semantic_contract_digests"] = {}
+    receipt["result"]["contract_schema_digests"] = {}
+    for purpose in purposes:
+        contract = (
+            "constraints-v1"
+            if purpose.startswith("constraint_")
+            else "recovery-v1" if purpose.startswith("recovery_") else ""
+        )
+        semantic = semantic_contract(purpose, AUDIT_SCHEMA, contract)
+        if contract:
+            field = (
+                "constraint_schemas_digest"
+                if contract == "constraints-v1"
+                else "recovery_schemas_digest"
+            )
+            evidence[field] = semantic["schemas_digest"]
+            receipt["result"]["contract_schema_digests"][contract] = semantic["schemas_digest"]
+        else:
+            receipt["result"]["semantic_contract_digests"][purpose] = digest(semantic)
+            if purpose == "handoff_audit":
+                evidence["audit_prompt_version"] = semantic["prompt_version"]
+                receipt["result"]["audit_prompt_version"] = semantic["prompt_version"]
+    native = directory / "independent.json"
+    write_json(native, receipt)
+    evidence["independent_review"] = {
+        "native_receipt_path": str(native),
+        "sha256": file_digest(native),
+    }
+    path = directory / "fidelity.json"
+    write_json(path, evidence)
+    return {"schema_version": 2, "proofs": [{"path": str(path), "sha256": file_digest(path)}]}
+
+
+def semantic_campaign(case, old_binding, new_binding, *, retain_transport=False):
+    store, snapshot, template, manifest = case
+    old = next(iter(snapshot.config_snapshot["reasoning_capabilities"].values()))
+    old["semantic_qualification"] = old_binding
+    snapshot.config_revision += 1
+    snapshot.config_snapshot["configuration_revision"] = snapshot.config_revision
+    template = replace(
+        template,
+        config_revision=snapshot.config_revision,
+        directory=template.directory.with_name("semantic-configuration"),
+    )
+    path, sha = template.save()
+    snapshot.bindings["execution_template"] = {"path": str(path), "digest": sha}
+    snapshot = store.save(snapshot, snapshot.revision)
+    content = json.loads(manifest.read_text())
+    key = next(iter(content["routes"]))
+    if retain_transport:
+        content["routes"][key] = copy.deepcopy(old)
+    content["routes"][key]["semantic_qualification"] = new_binding
+    manifest.write_text(json.dumps(content))
+    return store, snapshot, template, manifest
 
 
 @pytest.fixture
@@ -283,3 +358,150 @@ def test_coordinator_lock_refuses_concurrent_requalification(campaign):
         with pytest.raises(OSError):
             apply(campaign)
     assert store.load(before.id).revision == before.revision
+
+
+@pytest.mark.parametrize(
+    "purposes",
+    [
+        ("handoff_map", "handoff_reduce", "handoff_audit"),
+        ("constraint_reduce", "constraint_audit"),
+        ("recovery_extract", "recovery_audit"),
+    ],
+)
+def test_renewed_transport_accepts_fresh_proofs_for_same_semantic_contracts(
+    campaign, proof, tmp_path, purposes
+):
+    old = next(iter(campaign[1].config_snapshot["reasoning_capabilities"].values()))
+    new = next(iter(json.loads(campaign[3].read_text())["routes"].values()))
+    assert old["qualification"]["sha256"] != new["qualification"]["sha256"]
+    old_binding = semantic_proof(tmp_path / "old-semantics", old, proof, purposes)
+    new_binding = semantic_proof(tmp_path / "new-semantics", new, proof, purposes)
+    case = semantic_campaign(campaign, old_binding, new_binding)
+    after = apply(case)
+    assert after.phase == "stopped" and after.config_revision == case[1].config_revision + 1
+    record = after.bindings["capability_requalifications"][0]
+    previous = json.loads(Path(record["previous_capabilities_path"]).read_text())["routes"]
+    renewed = json.loads(Path(record["capabilities_path"]).read_text())["routes"]
+    assert next(iter(previous.values()))["semantic_qualification"] == old_binding
+    assert next(iter(renewed.values()))["semantic_qualification"] == new_binding
+
+
+@pytest.mark.parametrize("superseded", ["route", "contract"])
+def test_unchanged_transport_retains_valid_semantics_among_superseded_proofs(
+    campaign, proof, tmp_path, superseded
+):
+    from bmad_loop.campaign_headless import file_digest
+
+    old = next(iter(campaign[1].config_snapshot["reasoning_capabilities"].values()))
+    valid = semantic_proof(tmp_path / "valid", old, proof, ("handoff_map",))
+    historical = semantic_proof(
+        tmp_path / "historical",
+        {**old, "cli_version": "superseded"} if superseded == "route" else old,
+        proof,
+        ("handoff_reduce",),
+    )
+    if superseded == "contract":
+        path = Path(historical["proofs"][0]["path"])
+        evidence = json.loads(path.read_text())
+        evidence.pop("summary_job_schema_digest")
+        path.write_text(json.dumps(evidence))
+        historical["proofs"][0]["sha256"] = file_digest(path)
+    binding = {"schema_version": 2, "proofs": historical["proofs"] + valid["proofs"]}
+    case = semantic_campaign(campaign, binding, binding, retain_transport=True)
+    assert apply(case).phase == "stopped"
+
+
+@pytest.mark.parametrize("changed", ["transport", "corpus", "independent-review", "schema"])
+def test_invalid_semantics_refuse_renewal_before_any_new_configuration(
+    campaign, proof, tmp_path, changed
+):
+    old = next(iter(campaign[1].config_snapshot["reasoning_capabilities"].values()))
+    binding = semantic_proof(tmp_path / "semantic", old, proof, ("handoff_map",))
+    case = semantic_campaign(campaign, binding, binding, retain_transport=changed != "transport")
+    if changed in {"corpus", "independent-review"}:
+        evidence = json.loads(Path(binding["proofs"][0]["path"]).read_text())
+        target = (
+            evidence["corpus"][0]["source_path"]
+            if changed == "corpus"
+            else evidence["independent_review"]["native_receipt_path"]
+        )
+        Path(target).write_text("changed evidence", encoding="utf-8")
+    elif changed == "schema":
+        content = json.loads(case[3].read_text())
+        next(iter(content["routes"].values()))["semantic_qualification"]["schema_version"] = 1
+        case[3].write_text(json.dumps(content))
+    with pytest.raises(CampaignError, match="[Ss]emantic|fidelity"):
+        apply(case)
+    assert case[0].load(case[1].id).revision == case[1].revision
+    assert not (case[0].directory(case[1].id) / "configuration-revisions").exists()
+
+
+@pytest.mark.parametrize("changed", ["expanded", "narrowed"])
+def test_valid_new_semantics_cannot_change_frozen_purpose_authority(
+    campaign, proof, tmp_path, changed
+):
+    old = next(iter(campaign[1].config_snapshot["reasoning_capabilities"].values()))
+    new = next(iter(json.loads(campaign[3].read_text())["routes"].values()))
+    original, replacement = ("handoff_map",), ("handoff_map", "handoff_reduce")
+    if changed == "narrowed":
+        original, replacement = replacement, original
+    case = semantic_campaign(
+        campaign,
+        semantic_proof(tmp_path / "old", old, proof, original),
+        semantic_proof(tmp_path / "new", new, proof, replacement),
+    )
+    with pytest.raises(CampaignError, match="frozen route authority or limits"):
+        apply(case)
+    assert case[0].load(case[1].id).revision == case[1].revision
+
+
+@pytest.mark.parametrize("changed", ["corpus", "independent-review"])
+def test_shared_corruption_cannot_silently_drop_one_frozen_semantic_purpose(
+    campaign, proof, tmp_path, changed
+):
+    old = next(iter(campaign[1].config_snapshot["reasoning_capabilities"].values()))
+    mapping = semantic_proof(tmp_path / "mapping", old, proof, ("handoff_map",))
+    reduction = semantic_proof(tmp_path / "reduction", old, proof, ("handoff_reduce",))
+    binding = {"schema_version": 2, "proofs": mapping["proofs"] + reduction["proofs"]}
+    case = semantic_campaign(campaign, binding, binding, retain_transport=True)
+    evidence = json.loads(Path(reduction["proofs"][0]["path"]).read_text())
+    target = (
+        evidence["corpus"][0]["source_path"]
+        if changed == "corpus"
+        else evidence["independent_review"]["native_receipt_path"]
+    )
+    Path(target).write_text("changed only the reduction proof", encoding="utf-8")
+    with pytest.raises(CampaignError, match="[Ss]emantic|fidelity"):
+        apply(case)
+    assert case[0].load(case[1].id).revision == case[1].revision
+    assert not (case[0].directory(case[1].id) / "configuration-revisions").exists()
+
+
+def test_fresh_proof_can_replace_unavailable_old_closure_without_losing_authority(
+    campaign, proof, tmp_path
+):
+    old = next(iter(campaign[1].config_snapshot["reasoning_capabilities"].values()))
+    new = next(iter(json.loads(campaign[3].read_text())["routes"].values()))
+    purposes = ("handoff_map", "handoff_reduce")
+    original = semantic_proof(tmp_path / "old", old, proof, purposes)
+    fresh = semantic_proof(tmp_path / "new", new, proof, purposes)
+    case = semantic_campaign(campaign, original, fresh)
+    evidence = json.loads(Path(original["proofs"][0]["path"]).read_text())
+    Path(evidence["corpus"][0]["source_path"]).unlink()
+    Path(evidence["independent_review"]["native_receipt_path"]).unlink()
+    assert apply(case).config_revision == case[1].config_revision + 1
+
+
+def test_changed_old_declaration_cannot_authorize_narrowed_replacement(campaign, proof, tmp_path):
+    old = next(iter(campaign[1].config_snapshot["reasoning_capabilities"].values()))
+    new = next(iter(json.loads(campaign[3].read_text())["routes"].values()))
+    original = semantic_proof(tmp_path / "old", old, proof, ("handoff_map", "handoff_reduce"))
+    fresh = semantic_proof(tmp_path / "new", new, proof, ("handoff_map",))
+    case = semantic_campaign(campaign, original, fresh)
+    path = Path(original["proofs"][0]["path"])
+    evidence = json.loads(path.read_text())
+    evidence["route_bindings"] = evidence["route_bindings"][:1]
+    path.write_text(json.dumps(evidence))
+    with pytest.raises(CampaignError, match="declaration changed"):
+        apply(case)
+    assert case[0].load(case[1].id).revision == case[1].revision

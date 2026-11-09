@@ -831,6 +831,10 @@ persist a new configuration revision/template without reloading policy or profil
 Retain old proofs and invalidate never-launched optional advice. Resume remains a
 separate action. This limited startup recovery does not claim general migration
 of campaigns already in delivery.
+Semantic renewal compares the declared purposes and contracts in hash-bound proof
+metadata, then validates the complete replacement proof for every purpose. Proof
+coordinates may change; lost corpus or review evidence must not silently narrow
+authority. Superseded contract alternatives remain historical evidence.
 
 Planning writes an overlap disposition for each proposed unit: already delivered,
 covered by active work, continue existing work, reuse partial work, new work, or

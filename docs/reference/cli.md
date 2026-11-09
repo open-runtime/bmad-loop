@@ -87,6 +87,8 @@ and immutable template. The campaign remains stopped; resume is a separate actio
 It refuses stale revisions, uncertain effects or actors, changed route contracts,
 and campaigns that already began delivery. This is not a general mid-delivery
 installation migration or permission to rewrite qualification receipts.
+Renewed semantic proof coordinates must preserve every declared current purpose
+and contract and pass full fidelity validation against the replacement route.
 
 Migration inventory caches an immutable external receipt and returns an owner
 manifest template. Qualification compares fresh authenticated service/object
