@@ -51,6 +51,12 @@ def observe(runtime, snapshot, unit, *, pr=None):
     if unit.claim and unit.claim.quiescent and local != unit.bindings.get("head"):
         raise CampaignError("quiescent local candidate differs from its observed worker head")
     anchor = unit.bindings.get("remote_head_anchor") or unit.bindings.get("last_pushed_head")
+    restored = {}
+    if not anchor and unit.bindings.get("adoption", {}).get("state") == "owned":
+        from .campaign_adoption import owned_checkpoint_anchor
+
+        anchor = owned_checkpoint_anchor(snapshot, unit, pusher, local)
+        restored["recovered_remote_head_anchor"] = anchor
     if not anchor or not pusher._ancestor(anchor, remote):
         raise CampaignError("remote branch lost its authenticated owned checkpoint ancestry")
     prior = unit.evidence.get("remote_head_sync")
@@ -59,6 +65,7 @@ def observe(runtime, snapshot, unit, *, pr=None):
     incorporated = pusher._ancestor(remote, local)
     if incorporated and not prior and remote == anchor:
         return {
+            **restored,
             "remote_head_current": remote,
             "local_head": local,
             "remote_recovery_fence": pusher.fenced(),
@@ -88,7 +95,7 @@ def observe(runtime, snapshot, unit, *, pr=None):
     value["id"] = hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
     if prior and prior["head"] == remote:
         value["id"] = prior["id"]
-    return {"remote_head_sync": value, "remote_recovery_fence": pusher.fenced()}
+    return {**restored, "remote_head_sync": value, "remote_recovery_fence": pusher.fenced()}
 
 
 def checked(runtime, snapshot, unit, *, pr=None):
@@ -115,6 +122,8 @@ def invalidate(snapshot, unit):
 
 def apply(runtime, snapshot, unit, data):
     unit.evidence.pop("remote_head_check_needed", None)
+    if data.get("recovered_remote_head_anchor"):
+        unit.bindings.setdefault("remote_head_anchor", data["recovered_remote_head_anchor"])
     if unit.state == UnitState.MERGE_REQUESTED and snapshot.spec.github.merge_mode == "queue":
         unit.evidence.setdefault("queue", {})["remote_head_pending"] = data
         return

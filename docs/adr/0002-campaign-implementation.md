@@ -1,9 +1,9 @@
 # ADR 0002 implementation contract
 
-- **Status:** Source qualification complete; installation and target-project activation required
+- **Status:** Implemented; release-specific qualification and target-project delivery remain gated
 - **Date:** 2026-11-05
 - **Parent:** [Native SDLC campaign](0002-native-sdlc-campaign.md)
-- **Delivery:** One bmad-loop PR, including code, tests, documentation and local deployment tooling
+- **Delivery:** Initial campaign PR and reviewed follow-up releases preserve the same delivery contract
 
 This contract resolves implementation choices in ADR 0002. The experimental
 campaign implements these boundaries above the existing serial engines; integrated
@@ -15,24 +15,29 @@ extends this work without weakening its acceptance or publication gates.
 
 ## Implementation goals and traceability
 
-The prior review-ready candidate established the historical G0–G8 foundation below. The
-accepted delivery extension additionally requires the following concrete work.
+The initial implementation and released follow-ups established the historical
+G0–G8 foundation below. The delivery goals distinguish established qualification
+from checks that each changed release and target-project pilot must still satisfy.
 The owner's administrative-publication decision supersedes this ADR's strict-only
 REM activation requirement; strict and queue modes retain their existing contracts.
 
-| Delivery goal                                | Implementation and acceptance                                                                                                                                                                                              | Status                                                                                               |
-| -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| D1 — Hold and route admission                | Headless hold before preparation/launch; inherited developer; shared frozen launcher/permission readiness; standalone writer capabilities; no attempt charge while unavailable; old snapshot compatibility                 | Implemented; focused regressions and ablations passed                                                |
-| D2 — Owner-authorized publication            | Repository-bound opt-in; ordinary exact-head GitHub merge with authorized administrative fallback; no independent GitHub approver requirement; durable uncertain execution and landing verification/repair before tracking | Implemented and regression tested; real target delivery pending                                      |
-| D3 — Native routes and writable continuation | Qualify enabled Claude/Codex/Grok/AGY/Muse model/effort/permission recipes; real writable Claude↔Codex continuation; installation-bound proofs                                                                             | Eight route recipes and both native writable continuation stages qualified; installed proofs pending |
-| D4 — Managed communication                   | Own actor per unit/job; factual bridge status; durable safe-boundary steering; accepting/closing/closed generations; no identity borrowing or reopened writers; Paradev bindings                                           | Implemented; actual isolated hcom and scripted managed-load qualification passed                     |
-| D5 — Final candidate qualification           | Full suite, type/lint/package checks, 48 stories/24 epics/eight verification slots with managed communication, two independent candidate-bound reviews                                                                     | Frozen managed load, package and scoped reviews passed; final regression fixture repairs pending     |
-| D6 — Deployment and REM delivery             | History-preserving PR merge, exact fork installation and canonical base, refreshed fork setup skill, controlled two-epic real delivery, verified automation responsibility and concurrency configuration                   | Pending qualification                                                                                |
+| Delivery goal                                | Implementation and acceptance                                                                                                                                                                                              | Status                                                                                                                                                                      |
+| -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| D1 — Hold and route admission                | Headless hold before preparation/launch; inherited developer; shared frozen launcher/permission readiness; standalone writer capabilities; no attempt charge while unavailable; old snapshot compatibility                 | Implemented; focused regressions and ablations passed                                                                                                                       |
+| D2 — Owner-authorized publication            | Repository-bound opt-in; ordinary exact-head GitHub merge with authorized administrative fallback; no independent GitHub approver requirement; durable uncertain execution and landing verification/repair before tracking | Implemented and regression tested; real target delivery requires separate activation evidence                                                                               |
+| D3 — Native routes and writable continuation | Qualify enabled Claude/Codex/Grok/AGY/Muse model/effort/permission recipes; real writable Claude↔Codex continuation; installation-bound proofs                                                                             | Nine installed tool grants and retained no-tools semantic routes qualified; both native writable directions demonstrated; changed installation-bound grants require renewal |
+| D4 — Managed communication                   | Own actor per unit/job; factual bridge status; durable safe-boundary steering; accepting/closing/closed generations; no identity borrowing or reopened writers; Paradev bindings                                           | Implemented; actual isolated hcom and scripted managed-load qualification passed                                                                                            |
+| D5 — Final candidate qualification           | Full suite, type/lint/package checks, 48 stories/24 epics/eight verification slots with managed communication, two independent candidate-bound reviews                                                                     | Prior suite, load, package and review checkpoints passed; every follow-up candidate requires applicable affected checks and independent review                              |
+| D6 — Deployment and REM delivery             | History-preserving PR merge, exact fork installation and canonical base, refreshed fork setup skill, controlled two-epic real delivery, verified automation responsibility and concurrency configuration                   | Merged installation and generic onboarding demonstrated; each release and target require applicable renewal and selected delivery evidence                                  |
 
 The completion contract includes
 accepted reviews, synchronization with main, history-preserving merge, exact-commit
 installation, canonical-base update and qualified REM activation. Do not mark the
 ultimate objective complete at the review-ready boundary.
+Renew only proofs invalidated by an installed path, dependency or contract change;
+validate unchanged retained semantic evidence without repeating its inference.
+Installed startup readiness does not establish actual parallel target delivery,
+identity reflection, outside-peer communication or live-worker drain/resume.
 
 ### Accepted completion extension — 2026-11-08
 

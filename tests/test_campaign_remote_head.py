@@ -94,6 +94,52 @@ def test_remote_refresh_budget_requires_positive_integer(value):
 
 
 @pytest.mark.parametrize(
+    "fault",
+    ["missing", "uncertain", "wrong_action", "foreign_pr", "local_ancestry", "present_conflict"],
+)
+def test_legacy_adoption_anchor_requires_exact_confirmed_preparation(case, monkeypatch, fault):
+    from bmad_loop import campaign_adoption as adoption
+
+    unit = case.unit
+    unit.bindings.pop("last_pushed_head")
+    unit.bindings["adoption"] = {"state": "owned"}
+    manifest = SimpleNamespace(head="a" * 40, branch="owned", pr_number=1, pr_node_id="PR1")
+    monkeypatch.setattr(adoption, "transaction", lambda *args: (manifest, None, None))
+    action = OutboxAction(
+        "prepare",
+        "prepare-unit",
+        unit.id,
+        {"adoption": True},
+        1,
+        state="confirmed",
+        receipt={
+            "head": "a" * 40,
+            "branch": "owned",
+            "workspace": unit.bindings["workspace"],
+            "pr": {"number": 1, "node_id": "PR1"},
+        },
+    )
+    case.snapshot.outbox.append(action)
+    pushed = PushObservation("prepare-initial", "a" * 40, "confirmed", "a" * 40)
+    if fault == "uncertain":
+        pushed = replace(pushed, state="sent_unknown")
+    elif fault == "wrong_action":
+        pushed = replace(pushed, action_id="unrelated-initial")
+    elif fault == "foreign_pr":
+        action.receipt["pr"]["node_id"] = "OTHER"
+    elif fault == "local_ancestry":
+        unit.bindings["head"] = "d" * 40
+    elif fault == "present_conflict":
+        unit.bindings["remote_head_anchor"] = "e" * 40
+    case.pusher.observations = lambda: () if fault == "missing" else (pushed,)
+    with pytest.raises(CampaignError):
+        remote.observe(case.runtime, case.snapshot, unit)
+    assert unit.bindings.get("remote_head_anchor") == (
+        "e" * 40 if fault == "present_conflict" else None
+    )
+
+
+@pytest.mark.parametrize(
     "field", ["node", "branch", "repository", "target", "merged", "unowned", "anchor", "remote_url"]
 )
 def test_observation_refuses_foreign_or_rewritten_authority(case, field):

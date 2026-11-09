@@ -1,9 +1,9 @@
 # ADR 0003: Bounded reasoning jobs and portable session handoff
 
-- **Status:** Source qualification complete; installation and target-project activation required
+- **Status:** Implemented; release-specific qualification and target-project delivery remain gated
 - **Date:** 2026-11-06
 - **Extends:** [ADR 0002](0002-native-sdlc-campaign.md) and its [implementation contract](0002-campaign-implementation.md)
-- **Delivery:** The same campaign implementation PR, before autonomous project activation
+- **Delivery:** Initial campaign PR and reviewed follow-up releases, before qualified target-project activation
 
 ## Problem and decision
 
@@ -27,17 +27,22 @@ replaces the accepted contract, actual repository state or publication receipts.
 This decision extends the original campaign work; it does not defer its unresolved
 correctness, GitHub, Paradev or activation requirements.
 
-Implement this extension in PR 18 alongside the original audit repairs. Follow
+The initial extension landed in PR 18 alongside the original audit repairs. Follow
 the [G0–G8 traceability matrix](0002-campaign-implementation.md#implementation-goals-and-traceability)
 and keep implementation, normal-runtime coverage, native qualification and
-activation separate. The immediate milestone is readiness for the next reviews;
-merge, exact installation and qualified REM delivery remain subsequent gates.
+activation separate. Native qualification, both writable continuation directions,
+full-history semantic evidence, merged installation and generic onboarding have
+been demonstrated. Each follow-up candidate requires applicable affected checks and
+independent reviews; real selected REM delivery is a separate acceptance gate.
 
 The accepted completion extension in ADR 0002 includes these subsequent gates in
 the current work. Its native route proofs, managed hcom communication, writable
 cross-harness continuation and 32-shared-session qualification are required before
-claiming unattended readiness. Earlier candidate results below remain historical;
-every affected route and final candidate must earn fresh evidence.
+claiming unattended readiness. Earlier candidate results below remain historical.
+Every changed candidate requires applicable qualification, and installation-bound
+routes require renewal when their paths or dependencies change. Unchanged semantic
+proofs may be retained after validation. Real target delivery and live operator checks
+remain separate from scripted load, canary and onboarding proofs.
 
 Oversized semantic inventories use a durable bounded map/reduce job graph. Maps
 retain source identities and cross-partition dependency/ownership facts. Reducers

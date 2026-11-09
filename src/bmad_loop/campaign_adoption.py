@@ -937,7 +937,7 @@ def prepare(runtime, snapshot, action) -> dict[str, Any]:
                 raise AdoptionUncertain(
                     "adoption initial push is still awaiting exact remote acknowledgement"
                 )
-            return result
+            return {**result, "last_pushed_head": pushed.head, "remote_head_anchor": pushed.head}
     observation_ref = f"refs/bmad-campaign/{snapshot.id}/adoption/{action.id}"
     _git(
         runtime.project,
@@ -1125,7 +1125,46 @@ def prepare(runtime, snapshot, action) -> dict[str, Any]:
         raise AdoptionUncertain(
             "adoption initial push is uncertain; retain the existing checkpoint for reconciliation"
         )
-    return result
+    return {**result, "last_pushed_head": pushed.head, "remote_head_anchor": pushed.head}
+
+
+def owned_checkpoint_anchor(snapshot, unit, pusher, local_head: str) -> str:
+    """Recover a legacy adoption anchor only from its confirmed initial push.
+
+    Old preparation receipts predate the anchor field. Their exact native PR,
+    branch, immutable action and branch-scoped push journal remain authority;
+    neither the current remote nor an arbitrary local candidate supplies it.
+    """
+    from .campaign_action_history import actions
+
+    if unit.bindings.get("adoption", {}).get("state") != "owned":
+        raise AdoptionError("missing owned adoption checkpoint authority")
+    manifest, _, _ = transaction(snapshot, unit.id)
+    pushes = {row.action_id: row for row in pusher.observations()}
+    for action in actions(snapshot, kinds=("prepare-unit",), unit=unit.id, reverse=True):
+        receipt = action.receipt
+        if (
+            action.state != "confirmed"
+            or action.payload.get("adoption") is not True
+            or receipt.get("branch") != manifest.branch
+            or receipt.get("branch") != unit.bindings.get("branch")
+            or receipt.get("workspace") != unit.bindings.get("workspace")
+            or receipt.get("pr", {}).get("number") != manifest.pr_number
+            or receipt.get("pr", {}).get("node_id") != manifest.pr_node_id
+            or unit.bindings.get("pr", {}).get("number") != manifest.pr_number
+            or unit.bindings.get("pr", {}).get("node_id") != manifest.pr_node_id
+        ):
+            continue
+        pushed = pushes.get(action.id + "-initial")
+        if (
+            pushed is not None
+            and pushed.state == "confirmed"
+            and pushed.head == receipt.get("head")
+            and pusher._ancestor(manifest.head, pushed.head)
+            and pusher._ancestor(pushed.head, local_head)
+        ):
+            return pushed.head
+    raise AdoptionError("owned adoption lacks its confirmed initial checkpoint receipt")
 
 
 def guard_owned(runtime, snapshot, unit_id: str, *, remote_head_sync=None) -> None:
