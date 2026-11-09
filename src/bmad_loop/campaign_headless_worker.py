@@ -21,10 +21,30 @@ from .campaign_headless import (
     write_json,
 )
 from .campaign_headless_protocol import parse_output
-from .campaign_jobs import digest, request_from_dict
+from .campaign_jobs import JobLimits, digest, request_from_dict
 from .campaign_model import CampaignError, CommunicationSpec, RoleCandidate
 from .childrun import kill_tree
 from .process_host import get_process_host
+
+
+def _wire_output_limit(protocol: str, permissions: str, input_bytes: int, limits: JobLimits) -> int:
+    """Bound transport bytes separately from native model output and turn usage."""
+    wire_limit = limits.output_tokens * 16 + 65536
+    if protocol == "muse-json":
+        # MSP echoes input and emits a separate native envelope per output delta.
+        wire_limit = input_bytes * 3 + limits.output_tokens * 128 + 65536
+    elif protocol == "grok-json" and permissions in {"read-only-tools", "workspace-tools"}:
+        # Native tool results include JSON escaping and byte-array output.
+        # Pool a finite transport allowance per authorized turn; this is
+        # not a native per-call limit or extra model output/turn authority.
+        wire_limit += limits.max_turns * 512 * 1024
+    elif protocol in {"codex-app-server", "codex-native-review"}:
+        # Native RPC echoes input and emits one framed event per text delta.
+        # Scoped command results can be echoed and JSON-escaped; reserve
+        # the finite32-call *64KiB tool ceiling independently of model
+        # tokens. Neither transport overhead nor tool text buys tokens.
+        wire_limit = input_bytes * 6 + limits.output_tokens * 512 + 32 * 65536 * 12 + 65536
+    return wire_limit
 
 
 def child_main(path: Path) -> int:
@@ -200,30 +220,12 @@ def child_main(path: Path) -> int:
             # The launcher can otherwise replace the pinned native executable
             # after qualification and before exec. Account routing is unchanged.
             environment["MUSE_NO_AUTO_UPDATE"] = "1"
-        # MSP emits input echoes and a separate native envelope for every output
-        # delta. Bound those wire bytes separately from model output tokens.
-        wire_limit = request.limits.output_tokens * 16 + 65536
-        if capability["protocol"] == "muse-json":
-            wire_limit = envelope["input"]["bytes"] * 3 + request.limits.output_tokens * 128 + 65536
-        elif capability["protocol"] == "grok-json" and envelope["permissions"] in {
-            "read-only-tools",
-            "workspace-tools",
-        }:
-            # Native tool results include JSON escaping and byte-array output.
-            # Pool a finite transport allowance per authorized turn; this is
-            # not a native per-call limit or extra model output/turn authority.
-            wire_limit += request.limits.max_turns * 512 * 1024
-        elif capability["protocol"] in {"codex-app-server", "codex-native-review"}:
-            # Native RPC echoes input and emits one framed event per text delta.
-            # Scoped command results can be echoed and JSON-escaped; reserve
-            # the finite32-call *64KiB tool ceiling independently of model
-            # tokens. Neither transport overhead nor tool text buys tokens.
-            wire_limit = (
-                envelope["input"]["bytes"] * 6
-                + request.limits.output_tokens * 512
-                + 32 * 65536 * 12
-                + 65536
-            )
+        wire_limit = _wire_output_limit(
+            capability["protocol"],
+            envelope["permissions"],
+            envelope["input"]["bytes"],
+            request.limits,
+        )
         receipt["wire_output_limit_bytes"] = wire_limit
         with (
             (directory / "input.txt").open("rb") as source,

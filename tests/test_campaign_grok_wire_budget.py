@@ -89,6 +89,42 @@ def script_text(rows, *, hold_overflow=False):
     return "import json\nfor row in " + repr(rows) + ":\n print(json.dumps(row), flush=True)\n"
 
 
+@pytest.mark.parametrize(
+    "permissions", ["read-only-tools", "workspace-tools", "no-tools", "review"]
+)
+def test_portable_grok_tool_stream_fits_only_tool_permissions(permissions):
+    limits = JobLimits(131072, 16384, max_turns=8)
+    wire_bytes = len("\n".join(json.dumps(row) for row in messages("normal")).encode())
+    ceiling = worker._wire_output_limit("grok-json", permissions, 109338, limits)
+    assert (wire_bytes < ceiling) is (permissions in {"read-only-tools", "workspace-tools"})
+    assert ceiling < 5 * 1024 * 1024
+
+
+@pytest.mark.parametrize("permissions", ["read-only-tools", "workspace-tools", "no-tools"])
+@pytest.mark.parametrize(
+    "protocol,expected",
+    [
+        ("claude-stream", 66560),
+        ("agy-json", 66560),
+        ("bmad-test-v1", 66560),
+        ("codex-jsonl", 66560),
+        ("muse-json", 86016),
+        ("codex-app-server", 25288704),
+        ("codex-native-review", 25288704),
+    ],
+)
+def test_portable_other_protocol_transport_budgets_unchanged(protocol, expected, permissions):
+    limits = JobLimits(4096, 64, max_turns=3)
+    assert worker._wire_output_limit(protocol, permissions, 4096, limits) == expected
+
+
+@pytest.mark.parametrize("turns,expected", [(1, 851968), (8, 4521984), (16, 8716288)])
+def test_portable_grok_allowance_scales_with_authorized_turns_and_stays_finite(turns, expected):
+    limits = JobLimits(131072, 16384, max_turns=turns)
+    assert worker._wire_output_limit("grok-json", "read-only-tools", 109338, limits) == expected
+    assert worker._wire_output_limit("grok-json", "no-tools", 109338, limits) == 327680
+
+
 @pytest.mark.skipif(sys.platform != "darwin", reason="actual qualified read-only sandbox")
 @pytest.mark.parametrize("kind", ["normal", "wire", "output", "turns"])
 @pytest.mark.parametrize(
