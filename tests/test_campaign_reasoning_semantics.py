@@ -267,15 +267,82 @@ def test_unqualified_configuration_is_visible_and_does_not_repeat_each_tick(tmp_
 
 
 def test_inventory_poll_clocks_do_not_trigger_duplicate_reasoning(tmp_path, prepared):
+    from bmad_loop.campaign_discovery import CoverageReceipt
+    from bmad_loop.campaign_jobs import current, request_from_dict
+
     snapshot, runtime, _ = case(tmp_path, prepared, ["semantic_sync"])
-    snapshot.bindings["inventory"]["observed_at"] = 100
-    snapshot.bindings["inventory"]["pulls"] = [{"id": 1, "head": "head", "observed_at": 100}]
+    receipt = CoverageReceipt(
+        1,
+        "a/b",
+        str(tmp_path),
+        100,
+        (),
+        True,
+        (),
+        (),
+        (),
+        ({"id": 1, "head": "head", "observed_at": 100},),
+        (),
+        (),
+        (),
+    )
+    snapshot.bindings["inventory"] = {**receipt.to_dict(), "digest": receipt.digest}
     prepare_jobs(snapshot, runtime)
-    snapshot.bindings["inventory"]["observed_at"] = 200
-    snapshot.bindings["inventory"]["pulls"][0]["observed_at"] = 200
+    request = request_from_dict(next(iter(snapshot.jobs.values()))["request"])
+    refreshed = replace(
+        receipt, observed_at=200, pulls=({"id": 1, "head": "head", "observed_at": 200},)
+    )
+    assert refreshed.digest != receipt.digest
+    snapshot.bindings["inventory"] = {**refreshed.to_dict(), "digest": refreshed.digest}
     assert plan.proposals(runtime, snapshot) == ()
+    assert current(snapshot, request)
     snapshot.bindings["inventory"]["pulls"][0]["head"] = "new-head"
     assert plan.proposals(runtime, snapshot)[0].kind == "semantic-plan"
+    assert not current(snapshot, request)
+
+
+@pytest.mark.parametrize(
+    "inventory", [None, {"complete": False, "unavailable": ["github:offline"]}]
+)
+def test_graph_review_waits_for_complete_inventory_then_resumes(tmp_path, prepared, inventory):
+    snapshot, runtime, _ = case(tmp_path, prepared, ["graph_review"])
+    snapshot.bindings.pop("inventory")
+    if inventory is not None:
+        snapshot.bindings["inventory"] = inventory
+    assert plan.proposals(runtime, snapshot) == ()
+    snapshot.bindings["inventory"] = {"complete": True, "pulls": []}
+    prepare_jobs(snapshot, runtime)
+    assert [row["request"]["purpose"] for row in snapshot.jobs.values()] == ["graph_review"]
+
+
+def test_portfolio_jobs_wait_for_owned_workspace_then_materialize_once(tmp_path, prepared):
+    from dataclasses import asdict
+
+    from bmad_loop.campaign_paradev import WorkspaceBinding
+
+    purposes = ["graph_review", "priority", "routing", "report"]
+    snapshot, runtime, _ = case(tmp_path, prepared, purposes)
+    snapshot.spec = replace(snapshot.spec, paradev=replace(snapshot.spec.paradev, reflect=True))
+    for now in (100, 130, 160):
+        runtime.clock = lambda: now
+        assert not [p for p in runtime.observe_workers(snapshot) if p.kind == "semantic-plan"]
+    assert not snapshot.jobs
+    unit = next(iter(snapshot.units.values()))
+    binding = WorkspaceBinding(
+        unit.id,
+        "allocation",
+        "workspace",
+        "project",
+        str(tmp_path / "owned"),
+        "campaign/unit",
+        str(tmp_path / "common"),
+        str(tmp_path / "git"),
+        "story",
+    )
+    unit.bindings.update(native=asdict(binding), workspace=binding.path, branch=binding.branch)
+    prepare_jobs(snapshot, runtime)
+    assert sorted(row["request"]["purpose"] for row in snapshot.jobs.values()) == sorted(purposes)
+    assert plan.proposals(runtime, snapshot) == ()
 
 
 def test_graph_revision_change_replans_jobs_even_with_same_visible_units(tmp_path, prepared):

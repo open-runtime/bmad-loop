@@ -194,6 +194,74 @@ class CampaignDatabase:
             }
             return state, count
 
+    def read_inventory(
+        self, *, max_bytes: int, max_items: int, minimum_schema: int = 2
+    ) -> dict[str, Any]:
+        """Bound an ownership projection, not unrelated cached observations.
+
+        This is an observation only, never a replacement authority document.
+        Keep complete unit records (including source, hold, claim and workspace
+        bindings), plus all nonterminal or unconfirmed reasoning claims. Omit
+        their prompts/results and campaign caches, action payloads and history.
+        SQLite applies the byte bound before transferring each JSON value to
+        Python; one read transaction binds both authority and job observations.
+        """
+        if max_bytes < 1 or max_items < 1:
+            raise CampaignError("campaign inventory bounds must be positive")
+        with self.connect() as connection:
+            connection.execute("BEGIN")
+            if connection.execute("PRAGMA user_version").fetchone()[0] < minimum_schema:
+                raise CampaignError("campaign marker requires a newer database schema")
+            row = connection.execute(
+                "WITH projection(value) AS (SELECT json_remove(payload, "
+                "'$.bindings','$.outbox','$.events','$.config_snapshot',"
+                "'$.processed_commands','$.jobs') FROM authority WHERE id=1) "
+                "SELECT length(CAST(value AS BLOB)), "
+                "CASE WHEN length(CAST(value AS BLOB))<=? THEN value END FROM projection",
+                (max_bytes,),
+            ).fetchone()
+            if row is None:
+                raise CampaignError("campaign database has no authority")
+            if row[0] > max_bytes:
+                raise CampaignError("campaign ownership projection exceeds byte bound")
+            state = json.loads(row[1])
+            if not isinstance(state, dict):
+                raise CampaignError("campaign ownership authority must be an object")
+            remaining = max_bytes - row[0]
+            units = state.get("units", {})
+            if not isinstance(units, dict):
+                raise CampaignError("campaign ownership units must be an object")
+            if len(units) > max_items:
+                raise CampaignError("campaign ownership projection exceeds item bound")
+            jobs = {}
+            cursor = connection.execute(
+                "WITH projection(id,value) AS (SELECT id,json_object("
+                "'id',json_extract(payload,'$.id'),"
+                "'state',json_extract(payload,'$.state'),"
+                "'claim',json_extract(payload,'$.claim'),"
+                "'request',json_object('id',json_extract(payload,'$.request.id'),"
+                "'unit',json_extract(payload,'$.request.unit'))) FROM jobs "
+                "WHERE json_type(payload,'$.claim') IS NOT NULL "
+                "AND json_type(payload,'$.claim')!='null' "
+                "AND (state NOT IN ('applied','stale','canceled') "
+                "OR json_type(payload,'$.claim.quiescent') IS NOT 'true')) "
+                "SELECT id,length(CAST(value AS BLOB)), "
+                "CASE WHEN length(CAST(value AS BLOB))<=? THEN value END "
+                "FROM projection ORDER BY id LIMIT ?",
+                (remaining, max_items - len(units) + 1),
+            )
+            for identity, size, payload in cursor:
+                if len(units) + len(jobs) >= max_items:
+                    raise CampaignError("campaign ownership projection exceeds item bound")
+                if size > remaining:
+                    raise CampaignError("campaign ownership projection exceeds byte bound")
+                jobs[identity] = json.loads(payload)
+                remaining -= size
+            state["jobs"] = jobs
+            if len(encode(state).encode()) > max_bytes:
+                raise CampaignError("campaign ownership projection exceeds byte bound")
+            return state
+
     def commit(
         self,
         state: dict[str, Any],

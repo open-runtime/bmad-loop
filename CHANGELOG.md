@@ -7,11 +7,19 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Added
+
+- Renew installed native route proofs explicitly for stopped campaigns before their first worker.
+
 ### Fixed
 
 - Give Grok tool telemetry a finite wire allowance separate from model output limits.
 - Admit explicitly enabled TeamRouter credit routes using exact-model account evidence.
 - Observe native Grok and Muse allowance without inference; preserve unknown provider concurrency.
+- Follow verified GitHub numeric repository pagination without widening query scope.
+- Discover preserved branch aliases with scoped immutable evidence, including multiple merge bases and rename endpoints.
+- Read bounded campaign ownership independently of cached inventory, including live reasoning claims.
+- Wait for discovery and owned workspaces before optional portfolio reasoning; expose discovery waits in status.
 
 ## [0.15.8] — 2026-11-08
 

@@ -267,16 +267,31 @@ class RepositoryDiscovery:
         except GithubError as exc:
             unavailable.append("branch_base:" + str(exc))
             return
-        expanded: set[str] = set()
+        # A preserved checkpoint namespace can contain thousands of aliases. Walk
+        # target ancestry once for locally referenced objects, and inspect each
+        # distinct immutable head once. Ref names remain in the receipt.
+        try:
+            merged = set(
+                self._git(
+                    ["for-each-ref", "--merged=" + base, "--format=%(objectname)"]
+                ).splitlines()
+            )
+        except (GitError, GithubError) as exc:
+            unavailable.append("branch_ancestry:" + str(exc))
+            return
+        observed: dict[str, JsonObject] = {}
         detail_bytes = 0
-        candidates = 0
         for row in (*remote_refs, *local_refs):
-            if not row["ref"].startswith("refs/heads/") or row["ref"] == target_ref:
+            if not row["ref"].startswith("refs/heads/"):
                 continue
-            candidates += 1
-            if candidates > 128:
-                truncated.append("git:branch_candidate_limit")
-                break
+            if row["sha"] == base or row["sha"] in merged:
+                row["inspection"] = "already_in_target"
+                continue
+            if previous := observed.get(row["sha"]):
+                row["inspection"] = "same_immutable_head"
+                row["branch_evidence_ref"] = f"ref:{previous['ref']}@{previous['sha']}"
+                continue
+            observed[row["sha"]] = row
             try:
                 head = self._observe_ref(remote, row["ref"], row["sha"])
                 ancestry = git_bytes(self.repo, "merge-base", "--is-ancestor", head, base)
@@ -285,55 +300,27 @@ class RepositoryDiscovery:
                     continue
                 if ancestry.returncode != 1:
                     raise GithubError("Branch ancestry observation unavailable")
-                names = self._cached(
-                    "branch-paths",
-                    (base, head),
-                    lambda: [
-                        item
-                        for item in self._git(
-                            [
-                                "diff",
-                                "--name-only",
-                                # A rename away also touches its original scope.
-                                "--no-renames",
-                                "-z",
-                                "--no-ext-diff",
-                                "--no-textconv",
-                                base + "..." + head,
-                                "--",
-                            ]
-                        ).split("\0")
-                        if item
-                    ],
-                )
-                if len(json.dumps(names).encode()) > self.max_detail_bytes:
-                    truncated.append("ref:" + row["ref"] + ":changed_paths")
-                    continue
-                if paths and not any(
-                    path in {"*", "."}
-                    or name == path.rstrip("/")
-                    or name.startswith(path.rstrip("/") + "/")
-                    for name in names
-                    for path in paths
-                ):
-                    row["inspection"] = "outside_declared_paths"
-                    row["changed_paths"] = names
-                    continue
-                expanded.add(head)
-                if len(expanded) > 32:
-                    truncated.append("git:relevant_branch_detail_limit")
-                    break
                 detail = self._cached(
-                    "branch-detail", (base, head), lambda: self.inspect_branch(base, head)
+                    "scoped-branch-detail",
+                    (base, head, str(self.max_detail_bytes), *paths),
+                    lambda: self.inspect_branch(base, head, relevant_paths=paths),
                 )
-                if head not in {
-                    item.get("branch_evidence", {}).get("head")
-                    for item in (*remote_refs, *local_refs)
-                }:
-                    detail_bytes += len(json.dumps(detail).encode())
+                if not detail["changed_paths"] and paths and not detail["truncated"]:
+                    row["inspection"] = "outside_declared_paths"
+                    # These are *scoped* changes, not an assertion that the
+                    # branch has no changes elsewhere in the repository.
+                    row["changed_paths"] = []
+                    row["changed_paths_scope"] = list(paths)
+                    row["merge_base"] = detail["merge_base"]
+                    row["merge_bases"] = detail["merge_bases"]
+                    continue
+                detail_bytes += len(json.dumps(detail).encode())
                 if detail_bytes > self.max_detail_bytes * 4:
                     truncated.append("git:branch_detail_byte_limit")
-                    break
+                    row["inspection"] = "detail_byte_limit"
+                    # Continue classifying every remaining ref; a byte budget
+                    # must not conceal whether later refs overlap this scope.
+                    continue
                 row["branch_evidence"] = detail
                 if detail["truncated"] or detail.get("commits_truncated"):
                     truncated.append("ref:" + row["ref"] + ":detail")
@@ -561,8 +548,15 @@ class RepositoryDiscovery:
             tuple(archives),
         )
 
-    def inspect_branch(self, base: str, head: str) -> JsonObject:
-        """Targeted diff evidence; references resolve to immutable commits first."""
+    def inspect_branch(
+        self, base: str, head: str, *, relevant_paths: tuple[str, ...] = ()
+    ) -> JsonObject:
+        """Observe branch-authored changes, scoped before loading patch/history.
+
+        Target-only changes are not unfinished branch work. Merge-base diffs
+        establish that distinction even when an old preserved branch is far
+        behind main. Empty/broad scopes retain repository-wide inspection.
+        """
         resolved: list[str] = []
         for ref in (base, head):
             if not ref or ref.startswith("-"):
@@ -571,28 +565,149 @@ class RepositoryDiscovery:
                 self._git(["rev-parse", "--verify", "--end-of-options", ref + "^{commit}"]).strip()
             )
         before, after = resolved
-        merge_base = self._git(["merge-base", before, after]).strip()
-        diff = self._git(["diff", "--no-ext-diff", "--no-textconv", f"{before}...{after}", "--"])
-        encoded = diff.encode()
-        raw_commits = self._git(
-            ["log", "--max-count=33", "--format=%H%x00%P%x00%s%x00", before + ".." + after, "--"]
+        merge_bases = sorted(self._git(["merge-base", "--all", before, after]).splitlines())
+        if not merge_bases:
+            raise GithubError("Branch has no merge base; overlap requires explicit review")
+        paths = (
+            tuple(sorted({path.rstrip("/") for path in relevant_paths}))
+            if not any(path in {"*", "."} for path in relevant_paths)
+            else ()
         )
+        # Criss-cross histories have several equally valid best bases. Inspect
+        # each rather than choose one silently. Identical deltas share evidence.
+        deltas: list[JsonObject] = []
+        expanded: set[str] = set()
+        diff_bytes = 0
+        for merge_base in merge_bases:
+            changed, diff = self._branch_delta(merge_base, after, paths)
+            expanded.update(changed)
+            encoded = diff.encode()
+            digest = hashlib.sha256(encoded).hexdigest()
+            duplicate = next((item for item in deltas if item["sha256"] == digest), None)
+            if duplicate is not None:
+                duplicate["merge_bases"].append(merge_base)
+                continue
+            remaining = max(0, self.max_detail_bytes - diff_bytes)
+            deltas.append(
+                {
+                    "merge_bases": [merge_base],
+                    "changed_paths": changed,
+                    "diff": encoded[:remaining].decode("utf-8", errors="replace"),
+                    "sha256": digest,
+                    "truncated": len(encoded) > remaining,
+                }
+            )
+            diff_bytes += len(encoded)
+        primary = deltas[0]
+        shared = {
+            "base": before,
+            "head": after,
+            "merge_base": merge_bases[0],
+            "merge_bases": merge_bases,
+            "selected_paths": list(paths),
+            "changed_paths": sorted(expanded),
+            "diff": primary["diff"],
+            "sha256": primary["sha256"],
+            "equivalent_merge_bases": primary["merge_bases"],
+            "alternate_diffs": deltas[1:],
+            "truncated": any(item["truncated"] for item in deltas),
+        }
+        if paths and not expanded:
+            return {**shared, "commits": [], "commits_truncated": False}
+        pathspec = [":(literal)" + path for path in sorted(expanded)] if paths else []
+        raw_commits = self._git(
+            ["log", "--format=%H%x00%P%x00%s%x00", before + ".." + after, "--", *pathspec]
+        )
+        # A native checkpoint can be empty on selected paths; retain the exact
+        # observed tip in addition to every selected-path commit, for lineage.
+        if paths:
+            raw_commits = (
+                self._git(["show", "-s", "--format=%H%x00%P%x00%s%x00", after, "--"]) + raw_commits
+            )
         fields = raw_commits.split("\0")
-        commits = [
-            {
-                "sha": fields[index].strip(),
+        commits: list[JsonObject] = []
+        seen: set[str] = set()
+        commit_bytes = 0
+        commits_truncated = False
+        for index in range(0, len(fields) - 2, 3):
+            sha = fields[index].strip()
+            if sha in seen:
+                continue
+            seen.add(sha)
+            commit = {
+                "sha": sha,
                 "parents": fields[index + 1].split(),
                 "subject": fields[index + 2][:2000],
             }
-            for index in range(0, len(fields) - 2, 3)
+            commit_bytes += len(json.dumps(commit).encode())
+            if commit_bytes > self.max_detail_bytes:
+                commits_truncated = True
+                break
+            commits.append(commit)
+        return {**shared, "commits": commits, "commits_truncated": commits_truncated}
+
+    def _branch_delta(
+        self, merge_base: str, after: str, paths: tuple[str, ...]
+    ) -> tuple[list[str], str]:
+        """Read a selected delta and both endpoints of any selected rename."""
+        pathspec = [":(literal)" + path for path in paths]
+        names = [
+            name
+            for name in self._git(
+                [
+                    "diff",
+                    "--name-only",
+                    "--no-renames",
+                    "-z",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    merge_base,
+                    after,
+                    "--",
+                    *pathspec,
+                ]
+            ).split("\0")
+            if name
         ]
-        return {
-            "base": before,
-            "head": after,
-            "merge_base": merge_base,
-            "diff": encoded[: self.max_detail_bytes].decode("utf-8", errors="replace"),
-            "truncated": len(encoded) > self.max_detail_bytes,
-            "sha256": hashlib.sha256(encoded).hexdigest(),
-            "commits": commits[:32],
-            "commits_truncated": len(commits) > 32,
-        }
+        if paths and not names:
+            return [], ""
+        # Expand a selected rename to both endpoints. A scoped diff alone would
+        # show a deletion/addition and lose the other path's ownership evidence.
+        expanded = set(names)
+        if paths:
+            fields = self._git(
+                [
+                    "diff",
+                    "--name-status",
+                    "--find-renames",
+                    "-z",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    merge_base,
+                    after,
+                    "--",
+                ]
+            ).split("\0")
+            index = 0
+            while index < len(fields) - 1:
+                status, first = fields[index : index + 2]
+                index += 2
+                if status.startswith(("R", "C")):
+                    second = fields[index]
+                    index += 1
+                    if first in expanded or second in expanded:
+                        expanded.update((first, second))
+            pathspec = [":(literal)" + path for path in sorted(expanded)]
+        diff = self._git(
+            [
+                "diff",
+                "--find-renames",
+                "--no-ext-diff",
+                "--no-textconv",
+                merge_base,
+                after,
+                "--",
+                *pathspec,
+            ]
+        )
+        return sorted(expanded), diff
