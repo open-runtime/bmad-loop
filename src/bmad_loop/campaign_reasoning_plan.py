@@ -95,13 +95,32 @@ def context(snapshot, purpose: str) -> dict[str, Any]:
     # The coverage receipt digest includes its observation time. Semantic advice
     # follows the observed facts, not that receipt identity: otherwise each poll
     # invalidates an unchanged, possibly partitioned graph review.
-    inventory = _stable(
-        {
-            key: value
-            for key, value in snapshot.bindings.get("inventory", {}).items()
-            if key != "digest"
-        }
-    )
+    inventory = {
+        key: value
+        for key, value in snapshot.bindings.get("inventory", {}).items()
+        if key != "digest"
+    }
+    coverage = inventory.get("github_coverage")
+    if isinstance(coverage, dict) and isinstance(coverage.get("identity_observations"), list):
+        # A successful clock-only refresh is an observation diagnostic, not a
+        # changed fact. Keep all failures and the fresh PR metadata themselves.
+        coverage = dict(coverage)
+        changes = [
+            row
+            for row in coverage["identity_observations"]
+            if not (
+                isinstance(row, dict)
+                and row.get("phase") == "before_detail"
+                and row.get("fields") == ["updated_at"]
+                and row.get("refreshed") is True
+            )
+        ]
+        if changes:
+            coverage["identity_observations"] = changes
+        else:
+            coverage.pop("identity_observations")
+        inventory["github_coverage"] = coverage
+    inventory = _stable(inventory)
     result = {
         "schema_version": 1,
         "campaign": snapshot.id,
@@ -386,11 +405,22 @@ def perform(runtime, snapshot, action) -> Observation:
 
 
 def apply(runtime, snapshot, action, observation) -> None:
+    # Preparing jobs changes only jobs/events/semantic bookkeeping, none of the
+    # context facts. Hash each purpose once in this synchronous application;
+    # partition count must not multiply copying/hashing the whole inventory.
+    # Keep this cache local: the next application must recheck current evidence.
+    fingerprints: dict[str, str] = {}
+
+    def current(purpose: str) -> str:
+        if purpose not in fingerprints:
+            fingerprints[purpose] = fingerprint(snapshot, purpose)
+        return fingerprints[purpose]
+
     state = snapshot.bindings.setdefault("semantic_jobs", {"triggers": {}, "errors": {}})
     for raw in observation.data.get("requests", []):
         request = request_from_dict(raw)
         if (
-            fingerprint(snapshot, request.purpose) != request.coordinates["context_digest"]
+            current(request.purpose) != request.coordinates["context_digest"]
             or request.coordinates["graph_revision"] != snapshot.graph_revision
         ):
             continue
@@ -399,12 +429,12 @@ def apply(runtime, snapshot, action, observation) -> None:
         state["errors"].pop(request.purpose, None)
         add_event(snapshot, "semantic-job-created", job_id=request.id, purpose=request.purpose)
     for purpose, error in observation.data.get("errors", {}).items():
-        if fingerprint(snapshot, purpose) == observation.data["triggers"][purpose]:
+        if current(purpose) == observation.data["triggers"][purpose]:
             state["triggers"][purpose] = observation.data["triggers"][purpose]
             state["errors"][purpose] = error
             add_event(snapshot, "semantic-job-unavailable", purpose=purpose, reason=error)
     for pipeline in observation.data.get("pipelines", []):
-        if fingerprint(snapshot, pipeline["purpose"]) == pipeline["context_digest"]:
+        if current(pipeline["purpose"]) == pipeline["context_digest"]:
             state.setdefault("pipelines", {})[pipeline["id"]] = pipeline
 
 
@@ -452,6 +482,6 @@ def defer_intake(snapshot, *, now: float | None = None) -> bool:
             and now - row["request"]["created_at"] > 30
         ):
             continue
-        if row["request"]["coordinates"].get("context_digest") == fingerprint(snapshot, "triage"):
+        if row["request"]["coordinates"].get("context_digest") == trigger:
             return True
     return False

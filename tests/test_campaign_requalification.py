@@ -181,6 +181,288 @@ def test_prepared_reflection_requires_exact_confirmed_unstarted_projection(
         assert after.config_revision == before.config_revision + 1
 
 
+@pytest.fixture
+def bootstrap_tracking(allocated_campaign):
+    """Run real hierarchy production, queueing and fake remote create receipts."""
+    from test_campaign_tracking import HierarchyTransport
+
+    from bmad_loop.campaign_github import GithubGateway, MutationIntent
+    from bmad_loop.campaign_runtime import CampaignRuntime
+    from bmad_loop.campaign_supervisor import Observation
+
+    case, key, _, _ = allocated_campaign
+    store, state, template, manifest = case
+
+    class Transport(HierarchyTransport):
+        def request(self, method, path, payload=None):
+            result = super().request(
+                method, path.replace("repos/owner/repo/", "repos/a/b/"), payload
+            )
+            for row in (*self.issues.values(), *self.milestones.values()):
+                row["html_url"] = row["html_url"].replace(
+                    "github.com/a/b/", "github.com/owner/repo/"
+                )
+            return result
+
+    transport = Transport()
+    gateway = GithubGateway(transport, state.repository)
+    runtime = CampaignRuntime(Path(state.root), store, gateway=gateway)
+    # Milestone creation, its read-only projection, then epic creation. The
+    # second confirmed receipt is intentionally not yet projected into bindings.
+    for _ in range(3):
+        action = add_action(state, "hierarchy", key, {})
+        result = runtime._perform_hierarchy(state, action)
+        runtime.apply(state, action, result)
+        action.state, action.receipt = result.state, copy.deepcopy(result.data)
+        if result.data["intent"]:
+            effect = next(row for row in state.outbox if row.id == result.data["action_key"])
+            intent = MutationIntent.from_dict(effect.payload["intent"])
+            confirmed = gateway.execute(
+                replace(intent, state="sent_unknown"), generation=state.generation
+            )
+            observed = Observation("confirmed", {"intent": confirmed.to_dict()})
+            runtime.apply(state, effect, observed)
+            effect.state, effect.receipt = observed.state, copy.deepcopy(observed.data)
+    state = store.save(state, state.revision)
+    assert len(transport.effects) == 2
+    assert state.units[key].bindings["hierarchy_ready"] is False
+    return (store, state, template, manifest), key, runtime, transport
+
+
+def test_bootstrap_tracking_renewal_preserves_confirmed_and_unapplied_creates(bootstrap_tracking):
+    from bmad_loop.campaign_action_history import actions
+
+    case, key, _, transport = bootstrap_tracking
+    store, before, _, _ = case
+    original = copy.deepcopy(before.units[key])
+    hierarchy = copy.deepcopy(before.bindings["github_hierarchy"])
+    history = [asdict(row) for row in actions(before, kinds=("hierarchy", "github"))]
+    calls = copy.deepcopy(transport.effects)
+    after = apply(case)
+    assert after.phase == "stopped" and after.units[key] == original
+    assert after.bindings["github_hierarchy"] == hierarchy
+    assert [asdict(row) for row in actions(after, kinds=("hierarchy", "github"))] == history
+    assert transport.effects == calls
+    assert after.config_revision == before.config_revision + 1
+    assert store.load(after.id).units == after.units
+
+
+@pytest.fixture
+def shared_bootstrap_tracking(allocated_campaign, request):
+    """Two real prepared units concurrently propose shared native creates."""
+    from test_campaign_tracking import HierarchyTransport
+
+    from bmad_loop.campaign_action_history import actions
+    from bmad_loop.campaign_github import GithubGateway, MutationIntent
+    from bmad_loop.campaign_model import UnitState
+    from bmad_loop.campaign_runtime import CampaignRuntime
+    from bmad_loop.campaign_supervisor import Observation
+
+    case, first, _, _ = allocated_campaign
+    store, state, template, manifest = case
+
+    class Transport(HierarchyTransport):
+        def request(self, method, path, payload=None):
+            result = super().request(
+                method, path.replace("repos/owner/repo/", "repos/a/b/"), payload
+            )
+            for row in (*self.issues.values(), *self.milestones.values()):
+                row["html_url"] = row["html_url"].replace(
+                    "github.com/a/b/", "github.com/owner/repo/"
+                )
+            return result
+
+    transport = Transport()
+    gateway = GithubGateway(transport, state.repository)
+    runtime = CampaignRuntime(Path(state.root), store, gateway=gateway)
+    peers = []
+    for suffix in ("concurrent", "unrelated"):
+        spec = replace(state.units[first].spec, id=first + "-" + suffix)
+        state.units[spec.id] = CampaignUnit(spec, state=UnitState.PLANNING)
+        state.spec = replace(state.spec, units=(*state.spec.units, spec))
+        action = add_action(state, "prepare-unit", spec.id, {})
+        result = runtime._perform_prepare_unit(state, action)
+        runtime.apply(state, action, result)
+        action.state, action.receipt = result.state, copy.deepcopy(result.data)
+        peers.append(spec.id)
+    second, unrelated = peers
+    state.graph_revision += 1
+    state.config_revision += 1
+    state.config_snapshot["configuration_revision"] = state.config_revision
+    template = replace(
+        template,
+        config_revision=state.config_revision,
+        directory=template.directory.with_name("shared-config"),
+    )
+    path, sha = template.save()
+    state.bindings["execution_template"] = {"path": str(path), "digest": sha}
+    for cycle in range(3):
+        pending = []
+        # Observe both on the same before-image, as independently executing
+        # supervisor futures do. Apply then uses the real first-writer dedup.
+        for key in (first, second):
+            action = add_action(state, "hierarchy", key, {})
+            pending.append((action, runtime._perform_hierarchy(state, action)))
+        completing = list(reversed(pending)) if getattr(request, "param", False) else pending
+        for action, result in completing:
+            runtime.apply(state, action, result)
+            action.state, action.receipt = result.state, copy.deepcopy(result.data)
+        if cycle != 1:
+            assert pending[0][1].data["intent"] == pending[1][1].data["intent"]
+            action_id = pending[0][1].data["action_key"]
+            matching = [row for row in actions(state, kinds=("github",)) if row.id == action_id]
+            assert len(matching) == 1 and matching[0].unit == completing[0][0].unit
+            effect = matching[0]
+            intent = MutationIntent.from_dict(effect.payload["intent"])
+            confirmed = gateway.execute(
+                replace(intent, state="sent_unknown"), generation=state.generation
+            )
+            observation = Observation("confirmed", {"intent": confirmed.to_dict()})
+            runtime.apply(state, effect, observation)
+            effect.state, effect.receipt = observation.state, copy.deepcopy(observation.data)
+    # A third unit only observes the already-created shared epic. It is eligible
+    # for tracking renewal, but did not propose either create and cannot own it.
+    action = add_action(state, "hierarchy", unrelated, {})
+    result = runtime._perform_hierarchy(state, action)
+    assert result.data["intent"] is None and result.data["complete"] is False
+    runtime.apply(state, action, result)
+    action.state, action.receipt = result.state, copy.deepcopy(result.data)
+    state = store.save(state, state.revision)
+    assert len(transport.effects) == 2
+    return (store, state, template, manifest), first, second, unrelated, transport
+
+
+@pytest.mark.parametrize("shared_bootstrap_tracking", [False, True], indirect=True)
+def test_renewal_preserves_deduplicated_shared_creates_from_concurrent_units(
+    shared_bootstrap_tracking,
+):
+    from bmad_loop.campaign_action_history import actions
+
+    case, first, second, _, transport = shared_bootstrap_tracking
+    _, before, _, _ = case
+    original_units = copy.deepcopy(before.units)
+    history = [asdict(row) for row in actions(before, kinds=("hierarchy", "github"))]
+    assert len([row for row in history if row["kind"] == "github"]) == 2
+    assert all(before.units[key].bindings["hierarchy_ready"] is False for key in (first, second))
+    after = apply(case)
+    assert after.units == original_units and after.phase == "stopped"
+    assert after.bindings["github_hierarchy"] == before.bindings["github_hierarchy"]
+    assert [asdict(row) for row in actions(after, kinds=("hierarchy", "github"))] == history
+    assert len(transport.effects) == 2
+
+
+@pytest.mark.parametrize("fault", ["different-request", "different-generation", "unrelated-owner"])
+def test_shared_create_renewal_requires_exact_intent_and_proposing_owner(
+    shared_bootstrap_tracking, fault
+):
+    from bmad_loop.campaign_action_history import actions
+
+    case, _, second, unrelated, _ = shared_bootstrap_tracking
+    store, state, _, _ = case
+    history = actions(state, kinds=("hierarchy", "github"))
+    for row in history:
+        if not any(hot.id == row.id for hot in state.outbox):
+            state.outbox.append(row)
+    if fault in {"different-request", "different-generation"}:
+        second_proposal = next(
+            row
+            for row in history
+            if row.kind == "hierarchy" and row.unit == second and row.receipt["intent"]
+        )
+        if fault == "different-request":
+            second_proposal.receipt["intent"]["payload"]["title"] = "Different shared title"
+        else:
+            second_proposal.generation += 1
+            second_proposal.receipt["intent"]["generation"] = second_proposal.generation
+    else:
+        next(row for row in history if row.kind == "github").unit = unrelated
+    with pytest.raises(CampaignError, match="bootstrap tracking"):
+        renewal._startup_only(state, store.directory(state.id))
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "unknown",
+        "rejected",
+        "unlinked",
+        "payload",
+        "method",
+        "pr",
+        "generation",
+        "native-id",
+        "foreign",
+        "marker",
+        "projection-version",
+        "graph",
+        "complete",
+        "unit-changes",
+        "read-fence",
+        "unproved-binding",
+        "ready",
+        "missing-receipt",
+    ],
+)
+def test_bootstrap_tracking_renewal_refuses_unproved_effects(bootstrap_tracking, fault):
+    from bmad_loop.campaign_action_history import actions
+
+    case, key, _, _ = bootstrap_tracking
+    store, state, template, manifest = case
+    history = actions(state, kinds=("hierarchy", "github"))
+    # Update detached archived rows through the hot overlay, preserving the real
+    # SQLite archival reader used by the positive case.
+    for row in history:
+        if not any(hot.id == row.id for hot in state.outbox):
+            state.outbox.append(row)
+    effects = [row for row in history if row.kind == "github"]
+    projected = [row for row in history if row.kind == "hierarchy"]
+    effect = effects[0]
+    if fault in {"unknown", "rejected"}:
+        effect.state = "sent_unknown" if fault == "unknown" else "rejected"
+    elif fault == "unlinked":
+        projected[0].receipt["intent"] = None
+    elif fault == "payload":
+        effect.payload["intent"]["payload"]["title"] = "different request"
+    elif fault in {"method", "pr", "generation"}:
+        name, value = {
+            "method": ("method", "PATCH"),
+            "pr": ("kind", "pr"),
+            "generation": ("generation", 999),
+        }[fault]
+        for intent in (
+            projected[0].receipt["intent"],
+            effect.payload["intent"],
+            effect.receipt["intent"],
+        ):
+            intent[name] = value
+    elif fault in {"native-id", "foreign", "marker"}:
+        native = effect.receipt["intent"]["receipt"]
+        if fault == "native-id":
+            native["id"] += 1
+        elif fault == "foreign":
+            native["html_url"] = "https://github.com/foreign/repo/milestone/1"
+        else:
+            native["description"] = "missing ownership marker"
+    elif fault in {"projection-version", "graph", "complete", "unit-changes", "read-fence"}:
+        name, value = {
+            "projection-version": ("projection_version", 2),
+            "graph": ("graph_revision", 999),
+            "complete": ("complete", True),
+            "unit-changes": ("unit_changes", {"issue": {"before": None, "after": 1}}),
+            "read-fence": ("read_fence", {"unobserved": {"number": 99}}),
+        }[fault]
+        projected[-1].receipt[name] = value
+    elif fault == "unproved-binding":
+        state.bindings["github_hierarchy"]["initiative:unproved"] = {"number": 99}
+    elif fault == "ready":
+        state.units[key].bindings["hierarchy_ready"] = True
+    else:
+        effects[-1].receipt = {}
+    with pytest.raises(CampaignError, match="bootstrap tracking|settled"):
+        renewal._startup_only(state, store.directory(state.id))
+    assert store.load(state.id).revision == state.revision
+
+
 @pytest.mark.parametrize(
     "fault",
     [

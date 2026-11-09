@@ -281,6 +281,11 @@ ownership. These immutable ref IDs guide overlap inspection, without checking
 out or running branch code. Canonical target heads are reported separately and
 still pass the ordinary fresh-main integration and publication gates.
 
+Discovery refreshes detailed PR metadata when only its update timestamp has
+changed since path and link classification. Commit, body or lifecycle changes
+still invalidate that classification. Reviews and checks are collected afresh,
+and any identity change during their observation still makes discovery incomplete.
+
 Execution drafts include concrete acceptance criteria and, when available, the
 exact selected native plan or story text with its source hash. An unplanned
 ticket includes only its native product entry; an unplanned sprint story can use
@@ -658,13 +663,18 @@ If startup stopped before any worker launched, `requalify` can renew the frozen
 native route proofs after an installation update. Supply freshly qualified routes
 with the same contracts and the current campaign revision. It preserves prior
 proofs and configuration templates, leaves the campaign stopped, and does not
-reload project policy. Campaigns with launched workers or publication history
+reload project policy. Campaigns with launched workers or PR publication history
 require their original qualified installation; this command refuses those cases.
+
 An allocated draft can also renew after `reconcile` settles its workspace
 preparation under the upgraded installation. Its recorded bootstrap commit must
 remain clean and unchanged, with the same native workspace and Git identity.
 The command preserves those bindings and their confirmed pre-worker reflection,
-and refuses unresolved allocation effects or other prior work.
+plus exactly recorded bootstrap hierarchy observations and confirmed milestone
+or issue creations. It preserves their native IDs and receipts without recreating
+them. Unresolved allocation, unknown or rejected writes, unrelated GitHub
+mutations and other prior work still prevent renewal. Resume rechecks remote
+hierarchy state through the normal reconciliation path.
 
 When reasoning and `handoff_map` are enabled with a qualified summarization route,
 live sessions with exact hook-backed transcripts prepare optional prefix summaries.

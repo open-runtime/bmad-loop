@@ -1,6 +1,7 @@
 """Semantic jobs connect canonical evidence to real campaign execution paths."""
 
-from dataclasses import replace
+from collections import Counter
+from dataclasses import asdict, replace
 
 import pytest
 from test_campaign_core import make_snapshot
@@ -11,7 +12,7 @@ from bmad_loop import campaign_intake_flow as intake
 from bmad_loop import campaign_reasoning_plan as plan
 from bmad_loop import campaign_reasoning_results as results
 from bmad_loop.campaign_intake import IntakeBatch
-from bmad_loop.campaign_jobs import validate_result
+from bmad_loop.campaign_jobs import JobLimits, JobRequest, validate_result
 from bmad_loop.campaign_model import (
     CampaignError,
     Hold,
@@ -23,6 +24,7 @@ from bmad_loop.campaign_model import (
 from bmad_loop.campaign_planning_flow import activate, next_stage
 from bmad_loop.campaign_runtime import CampaignRuntime
 from bmad_loop.campaign_store import CampaignStore, add_action
+from bmad_loop.campaign_supervisor import Observation
 
 
 def case(tmp_path, prepared, purposes):
@@ -301,6 +303,49 @@ def test_inventory_poll_clocks_do_not_trigger_duplicate_reasoning(tmp_path, prep
     assert not current(snapshot, request)
 
 
+@pytest.mark.parametrize("purpose", ["graph_review", "semantic_sync", "triage"])
+def test_successful_pr_clock_diagnostic_does_not_change_semantic_facts(purpose):
+    import copy
+
+    snapshot = make_snapshot()
+    inventory = {
+        "complete": True,
+        "pulls": [{"number": 2, "head": {"sha": "head"}, "labels": ["hold"]}],
+        "github_coverage": {"details": {"complete": True}},
+    }
+    snapshot.bindings["inventory"] = copy.deepcopy(inventory)
+    baseline = plan.fingerprint(snapshot, purpose)
+    refreshed = {
+        "number": 2,
+        "phase": "before_detail",
+        "fields": ["updated_at"],
+        "refreshed": True,
+    }
+    snapshot.bindings["inventory"]["github_coverage"]["identity_observations"] = [refreshed]
+    raw = copy.deepcopy(snapshot.bindings["inventory"])
+    assert plan.fingerprint(snapshot, purpose) == baseline
+    assert snapshot.bindings["inventory"] == raw  # Evidence and diagnostics remain immutable.
+    for failed in (
+        {**refreshed, "fields": ["body"]},
+        {**refreshed, "phase": "during_detail", "refreshed": False},
+        {**refreshed, "refreshed": False},
+    ):
+        snapshot.bindings["inventory"]["github_coverage"]["identity_observations"] = [
+            refreshed,
+            failed,
+        ]
+        assert plan.fingerprint(snapshot, purpose) != baseline
+        assert plan.context(snapshot, purpose)["inventory"]["github_coverage"][
+            "identity_observations"
+        ] == [failed]
+    snapshot.bindings["inventory"] = copy.deepcopy(raw)
+    snapshot.bindings["inventory"]["pulls"][0]["labels"] = ["ready"]
+    assert plan.fingerprint(snapshot, purpose) != baseline
+    snapshot.bindings["inventory"] = copy.deepcopy(raw)
+    snapshot.bindings["inventory"]["pulls"][0]["identity_observations"] = [refreshed]
+    assert plan.fingerprint(snapshot, purpose) != baseline  # No generic remote-key stripping.
+
+
 @pytest.mark.parametrize(
     "inventory", [None, {"complete": False, "unavailable": ["github:offline"]}]
 )
@@ -493,3 +538,140 @@ def test_replayed_semantic_trigger_preserves_request_despite_later_clock(tmp_pat
     plan.apply(runtime, snapshot, action, first)
     plan.apply(runtime, snapshot, action, second)
     assert len(snapshot.jobs) == 1
+
+
+def _application_batch(snapshot, purpose, count, prefix):
+    expected = plan.fingerprint(snapshot, purpose)
+    requests = [
+        asdict(
+            JobRequest(
+                id=f"{prefix}-map-0-{index}",
+                purpose=purpose,
+                role=plan.ROLES[purpose],
+                coordinates={
+                    "graph_revision": snapshot.graph_revision,
+                    "config_revision": snapshot.config_revision,
+                    "head": "",
+                    "base": "",
+                    "context_digest": expected,
+                    "semantic_partition": {"pipeline": prefix, "stage": "map", "level": 0},
+                },
+                inputs=(
+                    {
+                        "source_id": f"partition:{prefix}:{index}",
+                        "path": f"/unused/{prefix}-{index}.json",
+                        "sha256": "a" * 64,
+                        "tokens": 1,
+                    },
+                ),
+                prompt="Summarize this immutable partition without changing campaign authority.",
+                output_schema=plan.result_schema(purpose),
+                limits=JobLimits(1024, 1024),
+                required=False,
+            )
+        )
+        for index in range(count)
+    ]
+    return {
+        "requests": requests,
+        "triggers": {purpose: expected},
+        "errors": {},
+        "pipelines": [{"id": prefix, "purpose": purpose, "context_digest": expected}],
+    }
+
+
+def test_semantic_apply_hashes_full_evidence_once_per_purpose(monkeypatch):
+    """Partition count must not multiply whole-inventory hashing on the coordinator."""
+    snapshot = make_snapshot()
+    purposes = ("graph_review", "semantic_sync", "triage", "report")
+    snapshot.spec = replace(snapshot.spec, reasoning=ReasoningSpec(enabled=True, purposes=purposes))
+    snapshot.bindings["inventory"] = {"complete": True, "issues": [{"number": 1, "body": "facts"}]}
+    data = {"requests": [], "triggers": {}, "errors": {}, "pipelines": []}
+    for purpose in purposes[:3]:
+        batch = _application_batch(snapshot, purpose, 64, purpose)
+        data["requests"].extend(batch["requests"])
+        data["pipelines"].extend(batch["pipelines"])
+        data["triggers"].update(batch["triggers"])
+    data["triggers"]["report"] = plan.fingerprint(snapshot, "report")
+    data["errors"]["report"] = "No qualified role candidate"
+    fingerprint = plan.fingerprint
+    calls = Counter()
+
+    def counted(current, purpose):
+        calls[purpose] += 1
+        return fingerprint(current, purpose)
+
+    monkeypatch.setattr(plan, "fingerprint", counted)
+    plan.apply(None, snapshot, None, Observation("confirmed", data))
+    assert len(snapshot.jobs) == 192
+    assert all(job["state"] == "proposed" for job in snapshot.jobs.values())
+    assert set(snapshot.bindings["semantic_jobs"]["pipelines"]) == set(purposes[:3])
+    assert snapshot.bindings["semantic_jobs"]["errors"] == data["errors"]
+    assert calls == Counter({purpose: 1 for purpose in purposes})
+
+
+@pytest.mark.parametrize("changed", ["inventory", "graph", "config", "head"])
+def test_semantic_apply_rechecks_each_new_batch_after_evidence_changes(monkeypatch, changed):
+    snapshot = make_snapshot()
+    snapshot.spec = replace(
+        snapshot.spec, reasoning=ReasoningSpec(enabled=True, purposes=("graph_review",))
+    )
+    snapshot.bindings["inventory"] = {"complete": True, "issues": [{"number": 1, "body": "before"}]}
+    first = _application_batch(snapshot, "graph_review", 4, "first")
+    stale = _application_batch(snapshot, "graph_review", 4, "stale")
+    stale["errors"]["graph_review"] = "Stale route failure must not replace current state"
+    fingerprint = plan.fingerprint
+    calls = []
+
+    def counted(current, purpose):
+        calls.append(purpose)
+        return fingerprint(current, purpose)
+
+    monkeypatch.setattr(plan, "fingerprint", counted)
+    plan.apply(None, snapshot, None, Observation("confirmed", first))
+    if changed == "inventory":
+        snapshot.bindings["inventory"]["issues"][0]["body"] = "after"
+    elif changed == "graph":
+        snapshot.graph_revision += 1
+    elif changed == "config":
+        snapshot.config_revision += 1
+    else:
+        next(iter(snapshot.units.values())).bindings["head"] = "new-head"
+    plan.apply(None, snapshot, None, Observation("confirmed", stale))
+    assert len(snapshot.jobs) == 4
+    assert set(snapshot.bindings["semantic_jobs"]["pipelines"]) == {"first"}
+    assert snapshot.bindings["semantic_jobs"]["errors"] == {}
+    assert calls == ["graph_review", "graph_review"]
+    fresh = _application_batch(snapshot, "graph_review", 4, "fresh")
+    calls.clear()
+    plan.apply(None, snapshot, None, Observation("confirmed", fresh))
+    assert len(snapshot.jobs) == 8
+    assert set(snapshot.bindings["semantic_jobs"]["pipelines"]) == {"first", "fresh"}
+    assert calls == ["graph_review"]
+
+
+def test_intake_deferral_scans_stale_partitions_with_one_current_fingerprint(monkeypatch):
+    snapshot = make_snapshot()
+    snapshot.spec = replace(
+        snapshot.spec, reasoning=ReasoningSpec(enabled=True, purposes=("triage",))
+    )
+    snapshot.bindings["inventory"] = {"complete": True, "issues": [{"number": 1, "body": "before"}]}
+    old = _application_batch(snapshot, "triage", 64, "old")
+    plan.apply(None, snapshot, None, Observation("confirmed", old))
+    snapshot.bindings["inventory"]["issues"][0]["body"] = "current"
+    current = _application_batch(snapshot, "triage", 1, "current")
+    plan.apply(None, snapshot, None, Observation("confirmed", current))
+    fingerprint = plan.fingerprint
+    calls = []
+
+    def counted(current, purpose):
+        calls.append(purpose)
+        return fingerprint(current, purpose)
+
+    monkeypatch.setattr(plan, "fingerprint", counted)
+    assert plan.defer_intake(snapshot, now=20)
+    assert calls == ["triage"]
+    snapshot.bindings["inventory"]["issues"][0]["body"] = "changed again"
+    calls.clear()
+    assert not plan.defer_intake(snapshot, now=20)
+    assert calls == ["triage"]

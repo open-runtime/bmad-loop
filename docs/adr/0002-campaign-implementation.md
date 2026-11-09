@@ -846,6 +846,18 @@ GitHub. Keep review bodies, threads and checks complete. This scoped inventory
 supports admission and overlap reasoning; it is not a claim that the whole PR
 received a code review. Required relevant evidence still obeys the detail bounds.
 
+Distinguish a PR's path/link identity from its detailed observation interval.
+Before collecting details, an updated timestamp alone can retain the already
+classified paths and link closure when the native identity, head/base, body and
+lifecycle facts still match. Use the fresh PR metadata and collect fresh review
+and check evidence, accounting for its actual metadata size. Changes during that
+detail interval, including timestamp changes, still invalidate the observation.
+Structural movement remains incomplete and identifies the PR and changed fields;
+never silently narrow scope or substitute stale details.
+Charge fresh metadata enrichment to the aggregate metadata budget for both scoped
+and broad discovery before retaining it; a separate detail budget cannot cover
+unaccounted native metadata.
+
 An inferred body mention such as `audit #22626` is not a native issue identity.
 Record optional unresolved references with their source and target; a 404 means
 not found or inaccessible, not proof of absence or authorization to discard an
@@ -874,7 +886,7 @@ or a campaign containing only coordination units still requires broader discover
 
 An installed coordinator upgrade cannot silently reinterpret frozen native route
 proofs against new worker modules. Permit explicit route requalification only for
-a stopped campaign before its first unit worker, publication or earned acceptance.
+a stopped campaign before its first unit worker, PR publication or earned acceptance.
 Under the repository coordinator lock, compare the expected revision, reject
 unsettled effects/actors, validate freshly earned equivalent route contracts and
 persist a new configuration revision/template without reloading policy or profiles.
@@ -887,8 +899,17 @@ renewal may retain a draft unit with an exact confirmed preparation receipt,
 unchanged clean bootstrap commit and matching workspace/Git identity. Preserve
 its source bindings, never-started intake control and confirmed reflection of the
 same draft workspace before any session. Refuse unknown allocations,
-publication, worker or reasoning attempts, unrelated bindings and earned stage
+PR publication, worker or reasoning attempts, unrelated bindings and earned stage
 evidence; renewing proofs never adopts arbitrary work or rewrites its branch.
+Confirmed bootstrap hierarchy observations and milestone/issue creations can also
+survive this renewal when their exact intents, receipts and native bindings agree.
+Preserve the creations and unfinished hierarchy work without replaying them.
+Concurrent units may propose one identical shared create. Retain every proposing
+unit, deduplicate by the exact tracking key and intent, and require the one
+confirmed GitHub action to belong to that proposing set.
+Unknown or rejected writes, unrelated GitHub mutations and PR history remain
+outside this pre-first-worker recovery contract. Ordinary hierarchy reconciliation
+still checks current remote state before admitting work after resume.
 Semantic renewal compares the declared purposes and contracts in hash-bound proof
 metadata, then validates the complete replacement proof for every purpose. Proof
 coordinates may change; lost corpus or review evidence must not silently narrow

@@ -47,8 +47,11 @@ remain separate from scripted load, canary and onboarding proofs.
 Before any coding or reasoning launch, a stopped campaign may renew equivalent
 route proofs after its deterministic workspace preparation has been reconciled.
 The preparation receipt, clean bootstrap commit and native workspace identity must
-still match; branch/source bindings survive unchanged. Uncertain allocation,
-publication or prior model work remains outside this limited renewal contract.
+still match; branch/source bindings survive unchanged. Exact confirmed bootstrap
+hierarchy observations and milestone/issue creations retain their native IDs,
+intents and receipts without replay. Uncertain allocation, unknown or rejected
+writes, unrelated GitHub mutations, PR publication or prior model work remains
+outside this limited renewal contract.
 
 Oversized semantic inventories use a durable bounded map/reduce job graph. Maps
 retain source identities and cross-partition dependency/ownership facts. Reducers
@@ -65,6 +68,12 @@ These prerequisites must not prevent ordinary unit allocation or observation of
 already admitted jobs. Semantic context identity excludes observation clocks and
 the top-level time-dependent coverage receipt digest; factual inventory changes,
 nested evidence hashes and graph/config revisions still invalidate stale advice.
+Applying a partition batch computes each purpose's current context identity once
+for that application. Every child request, error and pipeline still checks that
+identity, and the next application recomputes it from current evidence. Job
+bookkeeping does not change semantic context; never retain this cache across
+applications or reuse it across purposes. This keeps a large map batch from
+rehashing the full inventory for every child on the coordinator thread.
 Qualify startup through incomplete discovery, recovery, capacity observation,
 workspace allocation and worker launch using the normal coordinator path, rather
 than injecting a workspace into every fixture. This regression is separate from
