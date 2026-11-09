@@ -159,14 +159,14 @@ def test_macos_birth_identity_survives_clock_and_observer_changes(monkeypatch, c
         def create_time(self):
             return births[self.pid] + observer_offset
 
-        def children(self, recursive):
-            assert recursive
-            return [Process(456)]
+        def ppid(self):
+            return 123 if self.pid == 456 else 1
 
         def is_running(self):
             return self._ident == (self.pid, births[self.pid])
 
     monkeypatch.setattr(process_host, "_psutil", lambda: SimpleNamespace(Process=Process))
+    monkeypatch.setattr(process_host, "_macos_child_pids", lambda pid: (456,) if pid == 123 else ())
     host = PosixProcessHost()
     monkeypatch.setattr(host, "is_alive", lambda pid: pid in births)
     stamp = host.identity(456)

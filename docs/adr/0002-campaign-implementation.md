@@ -237,6 +237,19 @@ Their repairs use real child identity and parent-exit barriers, retain actual
 process teardown and fail when cleanup guards are removed. No production
 lifecycle guarantee or native capability is widened by these test repairs.
 
+The next frozen `d0f9cbaf` regression returned 21,100 passes, 261 skips and six
+failures, all exceeding unchanged process-cleanup timing limits under concurrent
+native load. Profiling identified repeated host-wide macOS parent scans as the
+bottleneck. macOS descendant observation now uses kernel-filtered direct-child
+queries with the existing birth identities, PPID and generation checks. Each
+snapshot bounds buffer growth and total candidate observations, retaining already
+authenticated descendants when another branch becomes unreadable. This remains a
+best-effort snapshot, not proof that every possible detached process was observed.
+Linux and Windows paths retain their existing behavior. Independent ABI, identity,
+partial-error and bounded-work reviews and guard ablations pass; the repaired
+candidate still requires full regression, affected native route renewal and load
+qualification. Failed runs remain evidence for their original candidates.
+
 ## Command and configuration contract
 
 Add the following namespace, with injected engine, transport and clock seams:

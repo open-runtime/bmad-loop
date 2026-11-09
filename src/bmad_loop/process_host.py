@@ -16,6 +16,7 @@ in :mod:`bmad_loop.adapters.multiplexer`.
 
 from __future__ import annotations
 
+import ctypes
 import functools
 import math
 import os
@@ -129,8 +130,8 @@ class ProcessHost(ABC):
         NEVER raises: ``{}`` on an unsupported platform, a missing psutil, a gone
         pid, or any read error — this feeds the kill escalation, which must never be
         the thing that raises. The default enumerates via psutil (macOS/Windows);
-        the Linux host overrides it with a psutil-free ``/proc`` scan so the core
-        stays dep-free there."""
+        the Linux host uses a psutil-free ``/proc`` scan; macOS uses kernel-filtered
+        direct children with the same psutil birth identities."""
         if pid <= 0:
             return {}
         return _psutil_descendants(pid)
@@ -228,7 +229,9 @@ class PosixProcessHost(ProcessHost):
             return {}
         if sys.platform.startswith("linux"):
             return _linux_descendants(pid)  # psutil-free: keeps the Linux core dep-free
-        return super().descendants(pid)  # macOS: psutil, guarded by the seam's never-raise
+        if sys.platform == "darwin":
+            return _macos_descendants(pid)
+        return super().descendants(pid)
 
     def hook_interpreter(self) -> str:
         return self.shell_quote(str(Path(sys.executable).absolute()))
@@ -403,6 +406,97 @@ def _psutil_identity(process) -> float:
     if type(birth) not in (int, float) or not math.isfinite(birth) or birth <= 2:
         raise ProcessHostError("macOS process birth identity is invalid")
     return -float(birth)
+
+
+_MACOS_TREE_LIMIT = 4096
+
+
+@functools.lru_cache(maxsize=1)
+def _macos_child_reader():
+    """Bind the SDK libproc ABI lazily; no native calls on other platforms."""
+    library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    reader = library.proc_listchildpids
+    reader.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+    reader.restype = ctypes.c_int
+    return reader
+
+
+def _macos_child_pids(pid: int) -> tuple[int, ...]:
+    """Kernel-filter direct children, retrying a full buffer within a fixed bound.
+
+    proc_listchildpids returns PID count (not bytes). Never substitute psutil's
+    host-wide PPID census on failure: preserve the caller's never-raise seam.
+    """
+    reader = _macos_child_reader()
+    capacity = 64
+    for _ in range(5):
+        children = (ctypes.c_int * capacity)()
+        ctypes.set_errno(0)
+        count = reader(pid, children, ctypes.sizeof(children))
+        if count < 0 or (count == 0 and ctypes.get_errno()):
+            raise OSError(ctypes.get_errno(), "native child observation failed")
+        if count < capacity:
+            return tuple(value for value in children[:count] if value > 0)
+        capacity *= 4
+    raise OSError("native child observation exceeded its bounded snapshot capacity")
+
+
+def _macos_descendants(pid: int) -> dict[int, float | None]:
+    """Walk observed branches without querying every unrelated host PID.
+
+    Keep the existing clock-stable psutil birth stamp. A native PID is only a
+    candidate: verify parent, construction identity and parent generation before
+    recording it. Reparented, reused or unreadable candidates are omitted.
+    Stop after 4,096 candidate PIDs (including duplicates) so ongoing forks cannot
+    extend this best-effort snapshot forever. Retain authenticated results on
+    branch failure or budget exhaustion; neither implies complete quiescence.
+    Every returned stamp is still revalidated by callers before signalling.
+    """
+    out = {}
+    if pid <= 0:
+        return out
+    try:
+        psutil = _psutil()
+        root = psutil.Process(pid)
+        pending = [root]
+        seen = {pid}
+        remaining = _MACOS_TREE_LIMIT
+        while pending and remaining:
+            parent = pending.pop()
+            try:
+                parent_stamp = _psutil_identity(parent)
+                if not parent.is_running():
+                    continue
+                child_pids = _macos_child_pids(parent.pid)
+                if not parent.is_running():
+                    continue
+            except Exception:  # nosec B112 - retain stamped siblings when a branch is unreadable
+                # Retain other authenticated branches when one observation fails.
+                continue
+            for child_pid in child_pids:
+                if not remaining:
+                    break
+                remaining -= 1
+                if child_pid in seen:
+                    continue
+                seen.add(child_pid)
+                try:
+                    child = psutil.Process(child_pid)
+                    stamp = _psutil_identity(child)
+                    if (
+                        stamp > parent_stamp
+                        or child.ppid() != parent.pid
+                        or not child.is_running()
+                        or not parent.is_running()
+                    ):
+                        continue
+                    out[child_pid] = stamp
+                    pending.append(child)
+                except Exception:  # nosec B112 - unreadable/reused candidates remain omitted
+                    continue
+    except Exception:
+        return {}
+    return out
 
 
 def _psutil_descendants(pid: int) -> dict[int, float | None]:

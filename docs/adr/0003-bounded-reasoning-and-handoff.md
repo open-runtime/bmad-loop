@@ -843,6 +843,13 @@ delivery. The normal supervisor's quota/recovery path has separate scripted
 integration coverage. Installed route revalidation, the current full-corpus
 trial and real REM delivery remain required.
 
+A subsequent concurrent regression exposed excessive macOS process-observation
+latency. The direct-child observation repair changes a dependency of tool-bearing
+native routes, so those routes require fresh native qualification. Unchanged
+no-tools extraction/reduction grants may retain their completed maps after exact
+capability, artifact and contract revalidation. A drained source epoch records
+that distinction; it does not rewrite old receipts or relax cleanup deadlines.
+
 Those regression and load results qualify their named earlier candidates.
 The delivery completion extension requires fresh final checks and
 reviews after its changes. Hosted Actions remain disabled; unrun platform gates

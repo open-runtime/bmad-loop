@@ -7,6 +7,10 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Fixed
+
+- Enumerate macOS session descendants without repeatedly scanning every host process.
+
 ## [0.15.7] — 2026-11-08
 
 ### Fixed
