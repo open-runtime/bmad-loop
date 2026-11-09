@@ -7,6 +7,10 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Fixed
+
+- Give Grok tool telemetry a finite wire allowance separate from model output limits.
+
 ## [0.15.8] — 2026-11-08
 
 ### Fixed

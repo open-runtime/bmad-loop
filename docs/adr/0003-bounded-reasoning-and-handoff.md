@@ -1024,6 +1024,13 @@ missing terminal result.
 Native transport framing has its own finite byte budget. Codex app-server input
 echoes and token-delta events are not model output tokens; its wire allowance
 accounts for the frozen input, model output and bounded scoped-tool results.
+Grok read-only and writing routes pool an additional 512 KiB per authorized turn
+for escaped tool results and native telemetry. This is a finite whole-job
+transport allowance, not a claimed native per-call ceiling or permission to
+increase model output. No-tools Grok retains its existing wire limit. Live and
+post-exit wire checks, native turn/token limits and lifecycle checks remain
+required; an exhausted transport capture without a terminal receipt is a failed
+attempt with unknown final usage, never a completed review.
 Model turn/token limits remain unchanged. AGY hook input
 accounts for its complete frozen prompt and bounded arguments rather than a
 small fixed read that can truncate native JSON.
