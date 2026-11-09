@@ -308,6 +308,13 @@ required obligation that cannot fit must not disappear in a summary or clipped
 string. Verify artifact integrity before and after the stage and grant only the
 exact required read-only paths through the existing tool boundary.
 
+Discovery's frozen metadata and aggregate PR-detail allowances bound source
+collection separately from native context limits. A growing, valid linked-work
+closure can require a larger collection allowance without increasing any prompt,
+turn or output budget. Exceeding a collection allowance remains a visible admission
+wait until complete evidence is available; never treat dropped review details as
+an accepted summary or as proof that no competing work exists.
+
 Availability for retrieval is not evidence that the model read the complete
 inventory. Jobs requiring exhaustive interpretation still use explicit partitioned
 input and coverage validation. A no-tools route cannot silently accept unresolved

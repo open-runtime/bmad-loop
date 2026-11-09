@@ -819,8 +819,11 @@ issue and PR identities, bodies and public object shapes within the frozen
 `github.inventory_metadata_bytes` allowance (64 MiB by default), counting the
 combined issue/PR inventory and linked additions. Finite selected-path discovery
 also counts complete patchless PR file metadata after detail enrichment here,
-while selected patches, review bodies, threads and checks consume the unchanged
-per-PR and aggregate detail bounds. Broad or explicitly listed-PR discovery keeps
+while selected patches, review bodies, threads and checks consume separate
+per-PR and aggregate detail bounds. The frozen `github.inventory_pr_detail_bytes`
+allowance defaults to 16 MiB for aggregate PR detail; it does not increase the
+individual PR or branch bounds, or any coding-session budget. Older snapshots
+without the field load this default. Broad or explicitly listed-PR discovery keeps
 its complete expanded file facts in the detail budget.
 Record observed bytes and the allowance. This is a finite observation budget, not a model context allowance or
 a bound on process memory. Exceeding it remains an explicit incomplete observation;
@@ -833,6 +836,9 @@ issues, mapped PRs, path-related PRs and links connecting that work. A title alo
 cannot exclude a candidate. Broad planning retains broad inspection. The receipt
 states which unrelated link closures were not expanded, so scoped completeness
 does not imply an exhaustive recursive audit of every historical conversation.
+Bare numbers such as `#1` inside fenced output are not inferred issue links;
+explicit same-repository URLs and inline-backticked references remain discoverable.
+Preserve the complete original body regardless of link classification.
 Retain every detailed PR file identity, status and rename source, but expand patch
 text only for the declared paths (including either endpoint of a rename). Record
 the selected paths, omitted patch paths and bytes, and patches unavailable from

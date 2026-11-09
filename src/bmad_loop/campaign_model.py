@@ -107,6 +107,7 @@ class GitHubSpec:
     review_teams: tuple[str, ...] = ()
     recent_days: int = 30
     inventory_metadata_bytes: int = 64 * 1024 * 1024
+    inventory_pr_detail_bytes: int = 16 * 1024 * 1024
     max_base_refreshes: int = 8
     max_remote_head_refreshes: int = 8
     allow_publication_wait: bool = False
@@ -412,7 +413,7 @@ def _construct(cls: Any, value: Any, name: str) -> Any:
             "purposes",
         }:
             out[key] = _strings(item, f"{name}.{key}")
-        elif key == "inventory_metadata_bytes":
+        elif key in {"inventory_metadata_bytes", "inventory_pr_detail_bytes"}:
             _positive(item, f"{name}.{key}")
         elif key == "candidate_check_app_id":
             if type(item) is not int or item < 0:
