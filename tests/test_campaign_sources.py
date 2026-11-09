@@ -180,7 +180,13 @@ def test_default_ticket_import_reuses_exact_native_mirror_before_hierarchy_creat
     transport = HierarchyTransport()
     milestone = {"id": 9007, "number": 7, "title": "Native initiative", "state": "open"}
     transport.milestones[7] = milestone
-    transport.issues[10] = {"id": 1010, "number": 10, "state": "open", "milestone": milestone}
+    transport.issues[10] = {
+        "id": 1010,
+        "number": 10,
+        "html_url": "https://github.com/a/b/issues/10",
+        "state": "open",
+        "milestone": milestone,
+    }
     body = f"Owner content\n<!-- github-mirror:issue:{project_v7.initiative}/1.1 -->"
     transport.issues[529] = {
         "id": 1529,
