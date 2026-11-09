@@ -187,6 +187,7 @@ def legacy_mirror():
         "number": 10,
         "title": "Human epic",
         "state": "open",
+        "html_url": "https://github.com/a/b/issues/10",
         "milestone": milestone,
         "updated_at": "t0",
     }
@@ -245,6 +246,7 @@ def test_exact_legacy_ticket_mirror_reuses_issue_and_native_lineage_before_creat
         "native-id",
         "foreign-campaign",
         "conflicting-lineage",
+        "foreign-epic",
     ],
 )
 def test_legacy_mirror_conflicts_refuse_before_any_create(legacy_mirror, fault):
@@ -271,6 +273,8 @@ def test_legacy_mirror_conflicts_refuse_before_any_create(legacy_mirror, fault):
         from bmad_loop.campaign_github import managed_marker
 
         row["body"] += "\n" + managed_marker("other", "other-unit", "issue")
+    elif fault == "foreign-epic":
+        transport.issues[10]["html_url"] = "https://github.com/other/repo/issues/10"
     else:
         state.bindings["github_hierarchy"] = {
             "epic:tickets:initiative:epic": {"database_id": 9999, "number": 99}
@@ -330,6 +334,36 @@ def test_existing_tracker_precedes_legacy_marker_search(legacy_mirror, monkeypat
     )
     step = coordinator.step(state, unit.id, source_metadata=metadata)
     assert step.bindings["story:" + unit.id]["number"] == 529
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_legacy_mirror_uses_imported_effective_initiative_without_changing_identity(
+    legacy_mirror, explicit
+):
+    state, unit, metadata, transport, _, coordinator = legacy_mirror
+    if not explicit:
+        unit.spec = replace(unit.spec, initiative="")
+    metadata[unit.id]["effective_initiative"] = "initiative"
+    original = unit.spec
+    step = coordinator.step(state, unit.id, source_metadata=metadata)
+    assert step.bindings["story:" + unit.id]["number"] == 529
+    assert unit.spec == original and transport.effects == []
+
+
+def test_legacy_mirror_missing_effective_initiative_refuses_before_create(legacy_mirror):
+    state, unit, metadata, transport, _, coordinator = legacy_mirror
+    unit.spec = replace(unit.spec, initiative="")
+    with pytest.raises(GithubError, match="Imported ticket initiative is unavailable"):
+        coordinator.step(state, unit.id, source_metadata=metadata)
+    assert not state.bindings.get("github_hierarchy") and transport.effects == []
+
+
+def test_legacy_mirror_rejects_conflicting_explicit_and_imported_initiative(legacy_mirror):
+    state, unit, metadata, transport, _, coordinator = legacy_mirror
+    metadata[unit.id]["effective_initiative"] = "other"
+    with pytest.raises(GithubError, match="initiative disagrees"):
+        coordinator.step(state, unit.id, source_metadata=metadata)
+    assert not state.bindings.get("github_hierarchy") and transport.effects == []
 
 
 @pytest.mark.parametrize("already_bound", [False, True])
@@ -402,6 +436,291 @@ def test_legacy_identity_refuses_conflicting_confirmed_parent_binding(legacy_mir
         coordinator.step(
             state, unit.id, source_metadata=metadata, receipts={first.action_key: confirmed}
         )
+    assert transport.effects == []
+
+
+def legacy_leaf_receipt(legacy_mirror, *, state="confirmed", row=None, kind="issue"):
+    snapshot, unit, _, transport, gateway, coordinator = legacy_mirror
+    key = "story:" + unit.id
+    intent = gateway.prepare_create(
+        "issue",
+        action_id=coordinator._action(snapshot, key, "create"),
+        campaign_id=snapshot.id,
+        unit_id=key,
+        title=unit.spec.title,
+        body="Previously submitted story creation",
+        generation=snapshot.generation,
+    )
+    return replace(
+        intent,
+        kind=kind,
+        state=state,
+        receipt=dict(transport.issues[529] if row is None else row),
+    )
+
+
+@pytest.mark.parametrize("mismatch", ["number", "database-id", "kind"])
+def test_confirmed_leaf_create_cannot_replace_discovered_legacy_identity(legacy_mirror, mismatch):
+    state, unit, metadata, transport, _, coordinator = legacy_mirror
+    row = dict(transport.issues[529])
+    if mismatch == "number":
+        row["number"] = 530
+    elif mismatch == "database-id":
+        row["id"] = 1530
+    prior = legacy_leaf_receipt(
+        legacy_mirror, row=row, kind="milestone" if mismatch == "kind" else "issue"
+    )
+    with pytest.raises(GithubError, match="Legacy mirror leaf.*confirmed create"):
+        coordinator.step(
+            state, unit.id, source_metadata=metadata, receipts={prior.action_id: prior}
+        )
+    assert not state.bindings.get("github_hierarchy") and transport.effects == []
+
+
+@pytest.mark.parametrize("split_parent", [False, True])
+def test_matching_confirmed_leaf_create_seeds_fresh_native_lineage(legacy_mirror, split_parent):
+    state, unit, metadata, transport, _, coordinator = legacy_mirror
+    if split_parent:
+        parent_id = unit.id + "-parent"
+        state.units[parent_id] = CampaignUnit(
+            replace(unit.spec, id=parent_id, selector="303.8", title="Existing split parent")
+        )
+        unit.spec = replace(unit.spec, parent=parent_id)
+        transport.issues[12] = {
+            **transport.issues[10],
+            "id": 1012,
+            "number": 12,
+            "title": "Native split parent",
+            "html_url": "https://github.com/a/b/issues/12",
+        }
+        state.units[parent_id].bindings["issue"] = coordinator._binding(
+            transport.issues[12], "issue"
+        )
+        transport.parents[529] = 12
+        transport.parents[12] = 10
+    prior = legacy_leaf_receipt(legacy_mirror)
+    # Even a stale creation receipt must not supply current native lineage.
+    prior.receipt["milestone"] = {"id": 9008, "number": 8}
+    step = coordinator.step(
+        state, unit.id, source_metadata=metadata, receipts={prior.action_id: prior}
+    )
+    assert step.bindings["story:" + unit.id]["number"] == 529
+    assert step.bindings["initiative:tickets:initiative"]["number"] == 7
+    assert step.bindings["epic:tickets:initiative:epic"]["number"] == 10
+    if split_parent:
+        assert step.bindings["story:" + unit.spec.parent]["number"] == 12
+    assert transport.effects == []
+
+
+@pytest.fixture
+def legacy_split_mirror(legacy_mirror):
+    state, unit, metadata, transport, _, _ = legacy_mirror
+    parent_id = unit.id + "-parent"
+    state.units[parent_id] = CampaignUnit(
+        replace(unit.spec, id=parent_id, selector="303.8", title="Declared split parent")
+    )
+    unit.spec = replace(unit.spec, parent=parent_id)
+    metadata[parent_id] = {"kind": "tickets", "tracker_id": ""}
+    transport.issues[12] = {
+        **transport.issues[529],
+        "id": 1012,
+        "node_id": "issue-12",
+        "number": 12,
+        "html_url": "https://github.com/a/b/issues/12",
+        "body": "<!-- github-mirror:issue:initiative/303.8 -->",
+    }
+    transport.issues[10]["html_url"] = "https://github.com/a/b/issues/10"
+    transport.parents[529] = 12
+    transport.parents[12] = 10
+    return legacy_mirror
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "missing-parent",
+        "epic-as-parent",
+        "unproven-parent",
+        "missing-epic",
+        "wrong-id",
+        "foreign-parent",
+        "foreign-epic",
+    ],
+)
+def test_legacy_split_lineage_refuses_unproven_or_incomplete_chain(legacy_split_mirror, fault):
+    state, unit, metadata, transport, _, coordinator = legacy_split_mirror
+    if fault == "missing-parent":
+        del transport.parents[529]
+    elif fault == "epic-as-parent":
+        transport.parents[529] = 10
+        # An extra native ancestor makes the chain long enough; only exact
+        # declared-parent identity can detect that the roles are wrong.
+        transport.issues[13] = {
+            **transport.issues[10],
+            "id": 1013,
+            "number": 13,
+            "html_url": "https://github.com/a/b/issues/13",
+        }
+        transport.parents[10] = 13
+    elif fault == "unproven-parent":
+        transport.issues[12]["body"] = "Human parent without imported identity"
+    elif fault == "missing-epic":
+        del transport.parents[12]
+    elif fault == "wrong-id":
+        state.units[unit.spec.parent].bindings["issue"] = {
+            "kind": "issue",
+            "number": 12,
+            "database_id": 9999,
+        }
+    elif fault == "foreign-parent":
+        transport.issues[12]["html_url"] = "https://github.com/other/repo/issues/12"
+        state.units[unit.spec.parent].bindings["issue"] = {"number": 12}
+    else:
+        transport.issues[10]["html_url"] = "https://github.com/other/repo/issues/10"
+    original_parents = dict(transport.parents)
+    with pytest.raises(GithubError, match="Legacy mirror.*(parent|lineage|epic)"):
+        coordinator.step(state, unit.id, source_metadata=metadata)
+    assert not state.bindings.get("github_hierarchy")
+    assert not unit.bindings.get("issue")
+    assert transport.effects == [] and transport.parents == original_parents
+
+
+@pytest.mark.parametrize("identity", ["mirror", "unit", "hierarchy", "tracker"])
+def test_legacy_split_lineage_retains_proven_native_chain(legacy_split_mirror, identity):
+    state, unit, metadata, transport, _, coordinator = legacy_split_mirror
+    parent_id = unit.spec.parent
+    if identity == "unit":
+        state.units[parent_id].bindings["issue"] = coordinator._binding(
+            transport.issues[12], "issue"
+        )
+    elif identity == "hierarchy":
+        state.bindings["github_hierarchy"] = {
+            "story:" + parent_id: coordinator._binding(transport.issues[12], "issue")
+        }
+    elif identity == "tracker":
+        metadata[parent_id]["tracker_id"] = "https://github.com/a/b/issues/12"
+    if identity != "mirror":
+        transport.issues[12]["body"] = "Existing stronger native binding"
+    original_parents = dict(transport.parents)
+    receipts = {}
+    for _ in range(10):
+        step = coordinator.step(state, unit.id, source_metadata=metadata, receipts=receipts)
+        state.bindings["github_hierarchy"] = step.bindings
+        unit.bindings = step.unit_bindings
+        if step.intent:
+            assert step.intent.state == "confirmed"
+            receipts[step.action_key] = step.intent
+        if step.complete:
+            break
+    assert step.complete
+    assert unit.bindings["issue"]["number"] == 529
+    assert state.bindings["github_hierarchy"]["story:" + parent_id]["number"] == 12
+    assert unit.bindings["epic_issue"]["number"] == 10
+    assert transport.effects == [] and transport.parents == original_parents
+
+
+@pytest.mark.parametrize("parent", ["milestone", "epic"])
+def test_unbound_confirmed_parent_receipt_is_reconciled_before_legacy_lineage_conflict(
+    legacy_mirror, parent
+):
+    state, unit, metadata, transport, gateway, coordinator = legacy_mirror
+    key = (
+        "initiative:tickets:initiative" if parent == "milestone" else "epic:tickets:initiative:epic"
+    )
+    kind = "milestone" if parent == "milestone" else "issue"
+    prior = replace(
+        gateway.prepare_create(
+            kind,
+            action_id=coordinator._action(state, key, "create"),
+            campaign_id=state.id,
+            unit_id=key,
+            title="Already published parent",
+            body="Retain confirmed native publication",
+            generation=state.generation,
+        ),
+        state="confirmed",
+        receipt={"id": 9999, "number": 99, "state": "open"},
+    )
+    first = coordinator.step(
+        state, unit.id, source_metadata=metadata, receipts={prior.action_id: prior}
+    )
+    assert first.action_key == prior.action_id and first.intent is None and not first.reason
+    assert first.bindings[key]["database_id"] == 9999
+    assert "story:" + unit.id not in first.bindings
+    state.bindings["github_hierarchy"] = first.bindings
+    with pytest.raises(GithubError, match="Imported (issue|epic parent)"):
+        coordinator.step(
+            state, unit.id, source_metadata=metadata, receipts={prior.action_id: prior}
+        )
+    assert "story:" + unit.id not in state.bindings["github_hierarchy"]
+    assert transport.effects == []
+
+
+@pytest.mark.parametrize("parent", ["milestone", "epic"])
+def test_matching_confirmed_leaf_create_cannot_bypass_native_lineage_conflict(
+    legacy_mirror, parent
+):
+    state, unit, metadata, transport, _, coordinator = legacy_mirror
+    key = (
+        "initiative:tickets:initiative" if parent == "milestone" else "epic:tickets:initiative:epic"
+    )
+    state.bindings["github_hierarchy"] = {
+        key: {
+            "kind": "milestone" if parent == "milestone" else "issue",
+            "number": 99,
+            "database_id": 9999,
+        }
+    }
+    prior = legacy_leaf_receipt(legacy_mirror)
+    with pytest.raises(GithubError, match="Imported (issue|epic parent)"):
+        coordinator.step(
+            state, unit.id, source_metadata=metadata, receipts={prior.action_id: prior}
+        )
+    assert "story:" + unit.id not in state.bindings["github_hierarchy"]
+    assert transport.effects == []
+
+
+def test_uncertain_leaf_receipt_still_holds_matching_legacy_mirror(legacy_mirror):
+    state, unit, metadata, transport, _, coordinator = legacy_mirror
+    prior = legacy_leaf_receipt(legacy_mirror, state="sent_unknown")
+    step = coordinator.step(
+        state, unit.id, source_metadata=metadata, receipts={prior.action_id: prior}
+    )
+    assert step.reason and step.intent is None
+    assert "story:" + unit.id not in step.bindings
+    assert transport.effects == []
+
+
+@pytest.mark.parametrize("binding_kind", ["unit", "hierarchy"])
+def test_existing_native_leaf_binding_precedes_legacy_mirror_receipt(
+    legacy_mirror, monkeypatch, binding_kind
+):
+    state, unit, metadata, transport, gateway, coordinator = legacy_mirror
+    transport.issues[530] = {
+        **transport.issues[529],
+        "id": 1530,
+        "number": 530,
+        "body": "Explicit native binding",
+    }
+    transport.parents[530] = 10
+    prior = legacy_leaf_receipt(legacy_mirror)
+    if binding_kind == "unit":
+        unit.bindings["issue"] = coordinator._binding(transport.issues[530], "issue")
+    else:
+        state.bindings["github_hierarchy"] = {
+            "story:" + unit.id: coordinator._binding(transport.issues[530], "issue"),
+            "initiative:tickets:initiative": coordinator._binding(
+                transport.milestones[7], "milestone"
+            ),
+            "epic:tickets:initiative:epic": coordinator._binding(transport.issues[10], "issue"),
+        }
+    monkeypatch.setattr(
+        gateway, "issues", lambda **kwargs: pytest.fail("Native binding must precede mirror search")
+    )
+    step = coordinator.step(
+        state, unit.id, source_metadata=metadata, receipts={prior.action_id: prior}
+    )
+    assert step.bindings["story:" + unit.id]["number"] == 530
     assert transport.effects == []
 
 

@@ -116,6 +116,18 @@ class HierarchyCoordinator:
                 if prior:
                     if prior.state == "confirmed" and prior.receipt:
                         confirmed = self._binding(prior.receipt, kind)
+                        if key == "story:" + unit.id:
+                            expected = self._binding(imported, kind)
+                            if prior.kind != kind or any(
+                                confirmed[field] != expected[field]
+                                for field in ("kind", "database_id", "number")
+                            ):
+                                raise GithubError(
+                                    "Legacy mirror leaf conflicts with confirmed create receipt"
+                                )
+                            # A matching receipt proves identity, not current
+                            # lineage. Seed from the fresh native issue below.
+                            continue
                         if key not in bindings:
                             bindings[key] = confirmed
                             return TrackingStep(prior_key, None, bindings, unit_bindings)
@@ -135,7 +147,14 @@ class HierarchyCoordinator:
                         reason="Legacy mirror conflicts with prior hierarchy publication; reconcile the existing create first",
                     )
         self._seed_imported_lineage(
-            unit, ancestry, metadata, bindings, milestone_key, epic_key, imported_issue=imported
+            snapshot,
+            unit,
+            ancestry,
+            metadata,
+            bindings,
+            milestone_key,
+            epic_key,
+            imported_issue=imported,
         )
         for key, kind, title, _, story in nodes:
             if key in bindings:
@@ -541,11 +560,32 @@ class HierarchyCoordinator:
         if (
             unit.spec.kind != "story"
             or metadata.get(unit.id, {}).get("kind") != "tickets"
-            or not unit.spec.initiative
             or not unit.spec.selector
         ):
             return None
-        identity = unit.spec.initiative + "/" + unit.spec.selector
+        prepared = unit.bindings.get("effective_source")
+        if prepared is not None and (
+            not isinstance(prepared, dict)
+            or prepared.get("kind") != "tickets"
+            or prepared.get("id") != unit.spec.source
+        ):
+            raise GithubError("Imported ticket prepared source identity conflicts with this unit")
+        initiatives = (
+            unit.spec.initiative,
+            metadata.get(unit.id, {}).get("effective_initiative", ""),
+            prepared.get("initiative", "") if prepared is not None else "",
+        )
+        if any(not isinstance(value, str) for value in initiatives) or not any(initiatives):
+            raise GithubError(
+                "Imported ticket initiative is unavailable; source identity reconciliation required"
+            )
+        resolved = {value for value in initiatives if value}
+        if len(resolved) != 1:
+            raise GithubError(
+                "Imported ticket initiative disagrees with its frozen source identity"
+            )
+        initiative = next(value for value in initiatives if value)
+        identity = initiative + "/" + unit.spec.selector
         matches = [
             row
             for row in self.gateway.issues(state="all")
@@ -593,6 +633,7 @@ class HierarchyCoordinator:
 
     def _seed_imported_lineage(
         self,
+        snapshot: CampaignSnapshot,
         unit: CampaignUnit,
         ancestry: list[CampaignUnit],
         metadata: JsonObject,
@@ -634,19 +675,70 @@ class HierarchyCoordinator:
         for parent_unit in ancestry[1:]:
             parent = self._parent(child["number"])
             if not parent:
+                if imported_issue is not None:
+                    raise GithubError("Legacy mirror declared story parent is missing")
                 return
             key = "story:" + parent_unit.id
             existing = bindings.get(key)
+            if imported_issue is not None:
+                self._prove_legacy_parent(snapshot, parent_unit, metadata, bindings, parent)
             if existing and existing["database_id"] != parent["id"]:
                 raise GithubError("Imported story parent conflicts with existing lineage")
             bindings[key] = {**(existing or {}), **self._binding(parent, "issue")}
             child = parent
         parent = self._parent(child["number"])
+        if imported_issue is not None and len(ancestry) > 1 and not parent:
+            raise GithubError("Legacy mirror split lineage has no terminal native epic")
         if parent:
+            if imported_issue is not None:
+                self._legacy_native_parent(parent)
             existing = bindings.get(epic_key)
             if existing and existing["database_id"] != parent["id"]:
                 raise GithubError("Imported epic parent conflicts with existing lineage")
             bindings[epic_key] = {**(existing or {}), **self._binding(parent, "issue")}
+
+    def _prove_legacy_parent(
+        self,
+        snapshot: CampaignSnapshot,
+        unit: CampaignUnit,
+        metadata: JsonObject,
+        bindings: JsonObject,
+        parent: JsonObject,
+    ) -> None:
+        """Prove a declared split parent without inferring roles from tree depth."""
+        actual = self._legacy_native_parent(parent)
+        bound = bindings.get("story:" + unit.id) or unit.bindings.get("issue")
+        tracker = unit.bindings.get("tracker_id") or metadata.get(unit.id, {}).get("tracker_id")
+        if isinstance(bound, dict) and bound.get("database_id"):
+            expected = {"kind": "issue", **bound}
+        elif bound or tracker:
+            expected_number = (
+                (bound["number"] if isinstance(bound, dict) else bound)
+                if bound
+                else self._tracker_number(str(tracker))
+            )
+            expected = self._binding(self.gateway.issue(int(expected_number)), "issue")
+        else:
+            mirrored = self._legacy_mirror(snapshot, unit, metadata)
+            if mirrored is None:
+                raise GithubError("Legacy mirror declared parent identity is unproven")
+            expected = self._binding(mirrored, "issue")
+        if any(expected.get(field) != actual[field] for field in ("kind", "database_id", "number")):
+            raise GithubError("Legacy mirror declared parent conflicts with native lineage")
+
+    def _legacy_native_parent(self, parent: JsonObject) -> JsonObject:
+        """A native relationship may cross repositories; this projection may not."""
+        number = parent.get("number")
+        if (
+            type(number) is not int
+            or number <= 0
+            or type(parent.get("id")) is not int
+            or parent["id"] <= 0
+            or str(parent.get("html_url", "")).lower()
+            != f"https://github.com/{self.gateway.repository}/issues/{number}".lower()
+        ):
+            raise GithubError("Legacy mirror parent lacks exact same-repository native identity")
+        return self._binding(parent, "issue")
 
     def _parent(self, number: int) -> JsonObject | None:
         try:

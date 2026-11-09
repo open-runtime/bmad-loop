@@ -104,6 +104,10 @@ hierarchy creation. Concurrent triage may interpret new intent, but its timing
 cannot be relied on to populate a story's native issue binding before execution.
 Exact same-repository mirror comments preserve existing issue/parent identity;
 ambiguous evidence remains a visible reconciliation wait.
+Default-initiative resolution is captured in frozen source observations or the
+prepared source binding, with stable unit IDs and no live-policy fallback.
+Confirmed publication receipts cannot override a different mirror or bypass
+the native lineage checks.
 
 ### Approved route selection
 

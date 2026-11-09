@@ -1,6 +1,6 @@
 """Import real source fixtures and isolate stores before starting campaign work."""
 
-from dataclasses import replace
+from dataclasses import asdict, replace
 
 import pytest
 from conftest import (
@@ -136,6 +136,109 @@ def test_ticket_import_uses_actual_native_ids_dependencies_hitl_and_closure(proj
     assert imported.observations[second]["hitl"] is True
     assert imported.observations[first]["plan_checkpoint"] is True
     assert imported.observations[closure]["all_children_selected"] is True
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_ticket_import_freezes_effective_initiative_without_renaming_units(project_v7, explicit):
+    write_ticket_tree(project_v7, DEFAULT_TREE)
+    source = SourceSelector(
+        "tickets", id="tickets", initiative=project_v7.initiative if explicit else ""
+    )
+    imported = import_sources(project_v7.project, spec(source))
+    unit_id = qualified(source, "1.1")
+    unit = next(unit for unit in imported.units if unit.id == unit_id)
+    assert unit.id == f"tickets:{project_v7.initiative if explicit else 'project'}:1.1"
+    assert unit.initiative == source.initiative
+    assert imported.observations[unit_id]["effective_initiative"] == project_v7.initiative
+
+
+@pytest.mark.parametrize(
+    "observation_version",
+    ["current", "old-prepared", "wrong-kind", "wrong-id", "conflicting-initiative"],
+)
+def test_default_ticket_import_reuses_exact_native_mirror_before_hierarchy_create(
+    project_v7, tmp_path, observation_version
+):
+    from test_campaign_tracking import HierarchyTransport
+
+    from bmad_loop.campaign_github import GithubError, GithubGateway
+    from bmad_loop.campaign_model import CampaignSnapshot, CampaignUnit
+    from bmad_loop.campaign_sources import prepare_source_view
+    from bmad_loop.campaign_tracking import HierarchyCoordinator
+
+    write_ticket_tree(project_v7, DEFAULT_TREE)
+    source = SourceSelector(
+        "tickets", id="tickets", units=("1.1",), completion_scope="selected-units"
+    )
+    campaign = spec(source)
+    imported = import_sources(project_v7.project, campaign)
+    native = imported.units[0]
+    assert native.id == "tickets:project:1.1" and native.initiative == ""
+    snapshot = CampaignSnapshot(
+        "campaign", "a/b", campaign, {native.id: CampaignUnit(native)}, generation=1
+    )
+    transport = HierarchyTransport()
+    milestone = {"id": 9007, "number": 7, "title": "Native initiative", "state": "open"}
+    transport.milestones[7] = milestone
+    transport.issues[10] = {"id": 1010, "number": 10, "state": "open", "milestone": milestone}
+    body = f"Owner content\n<!-- github-mirror:issue:{project_v7.initiative}/1.1 -->"
+    transport.issues[529] = {
+        "id": 1529,
+        "node_id": "native-529",
+        "number": 529,
+        "html_url": "https://github.com/a/b/issues/529",
+        "repository_url": "https://api.github.com/repos/a/b",
+        "state": "open",
+        "body": body,
+        "milestone": milestone,
+    }
+    transport.parents[529] = 10
+    coordinator = HierarchyCoordinator(GithubGateway(transport, "a/b"))
+    unit = snapshot.units[native.id]
+    if observation_version != "current":
+        if observation_version == "old-prepared":
+            imported.observations[native.id].pop("effective_initiative")
+        workspace = tmp_path / "prepared-worker"
+        git(project_v7.project, "worktree", "add", "-b", "prepared-worker", str(workspace), "HEAD")
+        canonical_config = {
+            path: path.read_bytes() for path in (project_v7.project / "_bmad").rglob("*.toml")
+        }
+        prepared = prepare_source_view(project_v7.project, workspace, source)
+        assert prepared.selector.initiative == project_v7.initiative
+        assert all(path.read_bytes() == raw for path, raw in canonical_config.items())
+        unit.bindings["effective_source"] = asdict(prepared.selector)
+    if observation_version in {"wrong-kind", "wrong-id", "conflicting-initiative"}:
+        key, value = {
+            "wrong-kind": ("kind", "stories"),
+            "wrong-id": ("id", "other-source"),
+            "conflicting-initiative": ("initiative", "other-initiative"),
+        }[observation_version]
+        unit.bindings["effective_source"][key] = value
+        with pytest.raises(GithubError, match="source identity|prepared source"):
+            coordinator.step(snapshot, native.id, source_metadata=imported.observations)
+        assert transport.effects == [] and transport.issues[529]["body"] == body
+        return
+    receipts = {}
+    for _ in range(10):
+        step = coordinator.step(
+            snapshot, native.id, source_metadata=imported.observations, receipts=receipts
+        )
+        snapshot.bindings["github_hierarchy"] = step.bindings
+        unit.bindings = step.unit_bindings
+        if step.intent:
+            assert (
+                step.intent.state == "confirmed"
+            ), "Existing native mirror must precede any create"
+            receipts[step.action_key] = step.intent
+        if step.complete:
+            break
+    assert step.complete
+    assert unit.bindings["issue"]["number"] == 529
+    assert unit.bindings["epic_issue"]["number"] == 10
+    assert unit.bindings["milestone"]["number"] == 7
+    assert "initiative:tickets:sources" in step.bindings  # Existing namespace stays stable.
+    assert unit.spec == native
+    assert transport.effects == [] and transport.issues[529]["body"] == body
 
 
 def test_partial_ticket_epic_does_not_claim_whole_epic_closure(project_v7):

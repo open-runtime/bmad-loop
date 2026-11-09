@@ -1269,6 +1269,17 @@ Re-read the native issue identity and its existing lineage before any hierarchy
 create. Conflicting markers, closed issues, foreign identity or prior unresolved
 publication remain visible reconciliation waits; title similarity and issue-list
 order never establish identity. Intake timing cannot substitute for this check.
+Capture a default initiative in frozen source observations without changing unit
+IDs or namespaces. Older prepared units may use their matching frozen effective
+ticket-source selector; conflicting or absent identities cannot authorize a new
+hierarchy. A confirmed story-create receipt must match the discovered mirror and
+still pass fresh lineage checks before binding the story. For split stories,
+prove each existing parent against an explicit identity or its exact source
+mirror; missing or mismatched ancestry never authorizes inserting new parents
+above an existing human issue or epic.
+Validate the terminal epic's owning repository as well. New mirror adoption
+reports unsupported cross-repository ancestry instead of treating a foreign
+issue number as local.
 For unsupported native hierarchy, expose the capability gap and link existing
 objects without claiming a native parent relationship.
 

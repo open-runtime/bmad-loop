@@ -143,6 +143,10 @@ def import_sources(
                 )
                 observations[unit_id] = {
                     "kind": "tickets",
+                    # Source selectors may inherit the active initiative. Keep
+                    # that resolved identity without renaming persisted units
+                    # or their established hierarchy namespaces.
+                    "effective_initiative": paths.active_initiative,
                     "path": row.file or "",
                     "status": row.status,
                     "state": row.state,
@@ -300,11 +304,13 @@ def _prepare_ticket_source(
             initiative=initiative,
         )
     elif (
-        source.initiative
-        and source.initiative
+        selected.initiative
+        and selected.initiative
         != bmadconfig.load_paths(workspace, want_tickets=True).active_initiative
     ):
-        ticketstore.redirect_mount_config(workspace, main_store=None, initiative=source.initiative)
+        ticketstore.redirect_mount_config(
+            workspace, main_store=None, initiative=selected.initiative
+        )
     paths = source_paths(workspace, selected)
     if not paths.output_folder.resolve().is_relative_to(workspace.resolve()):
         raise CampaignError("worker source still resolves outside its private checkout")
