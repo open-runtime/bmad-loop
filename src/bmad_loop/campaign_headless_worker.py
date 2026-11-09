@@ -205,6 +205,14 @@ def child_main(path: Path) -> int:
         wire_limit = request.limits.output_tokens * 16 + 65536
         if capability["protocol"] == "muse-json":
             wire_limit = envelope["input"]["bytes"] * 3 + request.limits.output_tokens * 128 + 65536
+        elif capability["protocol"] == "grok-json" and envelope["permissions"] in {
+            "read-only-tools",
+            "workspace-tools",
+        }:
+            # Native tool results include JSON escaping and byte-array output.
+            # Pool a finite transport allowance per authorized turn; this is
+            # not a native per-call limit or extra model output/turn authority.
+            wire_limit += request.limits.max_turns * 512 * 1024
         elif capability["protocol"] in {"codex-app-server", "codex-native-review"}:
             # Native RPC echoes input and emits one framed event per text delta.
             # Scoped command results can be echoed and JSON-escaped; reserve
