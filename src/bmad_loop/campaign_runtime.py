@@ -2299,6 +2299,8 @@ class CampaignRuntime:
             .isoformat()
             .replace("+00:00", "Z")
         )
+        from .campaign_runtime_intake import control as intake_control
+
         scope_sets = [
             tuple(
                 path.replace("\\", "/")
@@ -2306,6 +2308,16 @@ class CampaignRuntime:
                 if path and not Path(path).is_absolute() and ":" not in path
             )
             for unit in snapshot.units.values()
+            # The controller's intake workspace has a scheduling resource claim,
+            # not unknown product ownership. Keep the product units' finite
+            # scope while retaining global metadata and selected/mapped links.
+            if not (
+                unit.spec.kind == "planning"
+                and unit.spec.source == "campaign-intake"
+                and intake_control(unit) is not None
+                and unit.spec.scopes == ("resource:campaign-plan",)
+                and not unit.spec.paths
+            )
         ]
         relevant_paths = (
             tuple(sorted({path for paths in scope_sets for path in paths}))

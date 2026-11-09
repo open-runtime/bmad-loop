@@ -1,9 +1,11 @@
-"""Explicit capability renewal for a stopped campaign that never began unit work.
+"""Explicit capability renewal before a stopped campaign's first worker.
 
 This is not a general mid-delivery configuration upgrade. Fresh native proofs
 replace only executable/evidence coordinates; policy, profiles, permissions,
 limits and source obligations remain frozen. Prior templates and receipts stay
 immutable, and a successful renewal never starts or resumes the campaign.
+Confirmed, unpublished deterministic workspace preparation can be preserved;
+uncertain allocation or any worker/publication history cannot be upgraded.
 """
 
 from __future__ import annotations
@@ -116,27 +118,217 @@ def _surface(value, *, validate_semantics=True):
     }
 
 
-def _startup_only(snapshot: CampaignSnapshot) -> None:
+def _prepared_unit(snapshot: CampaignSnapshot, unit: CampaignUnit, directory: Path) -> None:
+    """Recognize only the deterministic, unpublished prepare-unit result.
+
+    Historical action receipts remain authority after SQLite archival. A current
+    checkout alone cannot authorize renewal, nor can a lost allocation ACK.
+    """
+    from . import verify
+    from .campaign_action_history import actions
+    from .campaign_runtime_intake import control
+
+    rows = actions(snapshot, kinds=("prepare-unit",), unit=unit.id)
+    if len(rows) != 1 or rows[0].state != "confirmed" or rows[0].payload:
+        raise CampaignError("renewal requires one confirmed ordinary workspace preparation")
+    action = rows[0]
+    if any(
+        row.kind
+        not in {
+            "prepare-unit",
+            "source-observation",
+            "reflection",
+            "communication",
+            "semantic-plan",
+            "reasoning-wait",
+            "reasoning-stale",
+        }
+        for row in actions(snapshot, unit=unit.id)
+    ):
+        raise CampaignError(
+            "prepared-workspace renewal refuses publication or further unit effects"
+        )
+    receipt = action.receipt
+    fields = {
+        "workspace",
+        "branch",
+        "base",
+        "head",
+        "native",
+        "effective_source",
+        "private_paths",
+        "canonical_source",
+        "canonical_selector",
+        "source_authority_root",
+        "initial_source",
+        "planning_manifest",
+        "effective_sources",
+        "spec_path",
+    }
+    retained = {
+        key: value
+        for key, value in unit.bindings.items()
+        if key not in {"intake_control", "reflection"}
+    }
+    if set(receipt) != fields or retained != receipt:
+        raise CampaignError("prepared workspace bindings differ from the confirmed receipt")
+    if "reflection" in unit.bindings:
+        reflected = unit.bindings["reflection"]
+        confirmations = [
+            row
+            for row in actions(snapshot, kinds=("reflection",), unit=unit.id)
+            if row.state == "confirmed"
+        ]
+        native = receipt["native"]
+        workspace_projection = reflected.get("workspace") if isinstance(reflected, dict) else None
+        if (
+            not snapshot.spec.paradev.reflect
+            or not confirmations
+            or reflected != confirmations[-1].receipt
+            or not isinstance(reflected, dict)
+            or not isinstance(native, dict)
+            or not isinstance(workspace_projection, dict)
+            or reflected.get("stage") != {"state": "pending", "windows": []}
+            or any(workspace_projection.get(key) != value for key, value in native.items())
+            or workspace_projection.get("campaign_id") != snapshot.id
+            or workspace_projection.get("phase") != "draft"
+            or workspace_projection.get("attempt") != 0
+            or workspace_projection.get("pr_url")
+        ):
+            raise CampaignError(
+                "prepared reflection differs from confirmed unstarted workspace projection"
+            )
+    if any(
+        not isinstance(receipt[key], str) or not receipt[key]
+        for key in ("workspace", "branch", "base", "head")
+    ):
+        raise CampaignError("prepared workspace receipt lacks exact Git coordinates")
+    intake = control(unit)
+    if "intake_control" in unit.bindings:
+        matching = [
+            row
+            for row in actions(snapshot, kinds=("intake-control",))
+            if row.state == "confirmed"
+            and row.payload.get("packet_id") == (intake or {}).get("packet_id")
+        ]
+        if len(matching) != 1:
+            raise CampaignError("prepared intake unit lacks confirmed control authority")
+        payload = matching[0].payload
+        expected = {
+            "schema_version": 1,
+            "input_versions": payload.get("input_versions"),
+            "state": "triage_pending",
+            "optional": True,
+            "packet_id": payload.get("packet_id"),
+        }
+        from .campaign_intake_flow import INBOX
+
+        records = snapshot.bindings.get(INBOX, {}).get("records", {})
+        if (
+            intake != expected
+            or unit.spec.kind != "planning"
+            or unit.id
+            != "campaign:" + snapshot.id + ":intake:" + str(payload.get("packet_id"))[:16]
+            or not expected["input_versions"]
+            or not isinstance(expected["input_versions"], list)
+            or any(not isinstance(version, str) for version in expected["input_versions"])
+            or any(
+                records.get(version, {}).get("control_unit") != unit.id
+                or records.get(version, {}).get("state") != "reserved"
+                or records.get(version, {}).get("attempts") != 0
+                for version in expected["input_versions"]
+            )
+        ):
+            raise CampaignError("prepared intake control has begun work or changed identity")
+    workspace = Path(receipt["workspace"])
+    if (
+        not workspace.is_absolute()
+        or not verify.worktree_is_registered(Path(snapshot.root), workspace)
+        or verify.rev_parse_head(workspace) != receipt["head"]
+        or verify.current_branch(workspace) != receipt["branch"]
+    ):
+        raise CampaignError("prepared workspace Git identity or bootstrap head changed")
+    dirty = verify.git_bytes(workspace, "status", "--porcelain", "-z", "--untracked-files=all")
+    if dirty.returncode or dirty.stdout:
+        raise CampaignError("prepared workspace must retain its clean bootstrap checkout")
+    native = receipt["native"]
+    if snapshot.spec.paradev.reflect:
+        from .adapters.paradev_runtime import read_private_json
+        from .campaign_paradev import _git_path
+
+        allocation = (
+            directory
+            / "reflection"
+            / "allocations"
+            / (hashlib.sha256(action.id.encode()).hexdigest() + ".json")
+        )
+        if (
+            is_link_like(allocation)
+            or not allocation.is_file()
+            or allocation.stat().st_size > 1024 * 1024
+        ):
+            raise CampaignError("prepared native allocation evidence is unavailable")
+        observed = read_private_json(allocation)
+        if (
+            not isinstance(native, dict)
+            or observed.get("state") != "confirmed"
+            or observed.get("binding") != native
+            or native.get("unit_id") != unit.id
+            or native.get("action_id") != action.id
+            or native.get("project_id") != snapshot.spec.paradev.project_id
+            or native.get("path") != str(workspace)
+            or native.get("branch") != receipt["branch"]
+            or native.get("common_dir") != snapshot.common_dir
+            or native.get("common_dir") != str(_git_path(workspace, "--git-common-dir"))
+            or native.get("git_dir") != str(_git_path(workspace, "--absolute-git-dir"))
+        ):
+            raise CampaignError("prepared native allocation differs from its pinned identity")
+    elif native:
+        raise CampaignError("unexpected native allocation in an unreflected campaign")
+
+
+def _startup_only(snapshot: CampaignSnapshot, directory: Path) -> bool:
     from .campaign_acceptance import ensure
 
     if snapshot.phase != "stopped":
         raise CampaignError("capability requalification requires a stopped campaign")
+    prepared = False
+    if any(action.state not in {"confirmed", "rejected"} for action in snapshot.outbox):
+        raise CampaignError("capability requalification requires settled outbound effects")
     for unit in snapshot.units.values():
         expected = CampaignUnit(unit.spec)
         ensure(expected)
         if (
-            unit.state != UnitState.PENDING
+            unit.state not in {UnitState.PENDING, UnitState.DRAFT}
             or unit.attempt
             or unit.claim is not None
-            or unit.bindings
             or unit.evidence != expected.evidence
             or unit.resume_state is not None
+            or unit.failure_attempts
+            or unit.resolution_attempts
+            or unit.review_attempts
+            or unit.legacy_outcome
         ):
             raise CampaignError("capability requalification requires units with no prior work")
-    if any(action.state not in {"confirmed", "rejected"} for action in snapshot.outbox):
-        raise CampaignError("capability requalification requires settled outbound effects")
+        if unit.state == UnitState.DRAFT:
+            _prepared_unit(snapshot, unit, directory)
+            prepared = True
+        elif unit.bindings:
+            raise CampaignError("capability requalification requires units with no prior work")
+    if prepared:
+        from .campaign_action_history import actions
+
+        if actions(snapshot, kinds=("launch", "reasoning-launch")):
+            raise CampaignError("prepared-workspace renewal refuses any prior worker launch intent")
+        workers = directory / "workers"
+        if is_link_like(workers) or (
+            workers.exists() and (not workers.is_dir() or any(workers.iterdir()))
+        ):
+            raise CampaignError("prepared-workspace renewal refuses existing worker artifacts")
     for row in snapshot.jobs.values():
         claim = row.get("claim")
+        if prepared and (claim is not None or row.get("attempt") != 0):
+            raise CampaignError("prepared-workspace renewal refuses prior native job work")
         if claim and claim.get("quiescent") is not True:
             raise CampaignError("capability requalification requires quiescent reasoning jobs")
         if row["state"] not in TERMINAL and (
@@ -146,9 +338,10 @@ def _startup_only(snapshot: CampaignSnapshot) -> None:
             or row["state"] not in {"proposed", "capacity_wait"}
         ):
             raise CampaignError("capability requalification cannot invalidate an attempted job")
+    return prepared
 
 
-def _stored_jobs_quiescent(snapshot: CampaignSnapshot) -> None:
+def _stored_jobs_quiescent(snapshot: CampaignSnapshot, *, never_attempted=False) -> None:
     """Cold terminal records can still contain uncertain ownership; inspect them."""
     if not isinstance(snapshot.events, EventJournal):
         return  # Legacy JSON already exposes every job to _startup_only.
@@ -157,6 +350,8 @@ def _stored_jobs_quiescent(snapshot: CampaignSnapshot) -> None:
         for row in rows:
             validate_record(row)
             claim = row.get("claim")
+            if never_attempted and (claim is not None or row.get("attempt") != 0):
+                raise CampaignError("prepared-workspace renewal refuses stored native job work")
             if claim and claim.get("quiescent") is not True:
                 raise CampaignError("requalification requires quiescent stored reasoning jobs")
         last = rows[-1]["id"]
@@ -184,7 +379,7 @@ def requalify(
 ) -> CampaignSnapshot:
     """Renew startup-only native evidence under coordinator lock and revision CAS.
 
-    Refuse any existing unit work, unsettled external effect, uncertain reasoning
+    Refuse unit work beyond confirmed preparation, unsettled external effects, uncertain reasoning
     owner or attempted nonterminal job. Never-launched optional jobs become stale
     with their original requests retained. A crash before CAS can leave an inert
     new template directory; it cannot replace the prior authoritative binding.
@@ -203,8 +398,8 @@ def requalify(
             raise RevisionConflict(
                 f"campaign revision {snapshot.revision}, expected {expected_revision}"
             )
-        _startup_only(snapshot)
-        _stored_jobs_quiescent(snapshot)
+        prepared = _startup_only(snapshot, store.directory(campaign_id))
+        _stored_jobs_quiescent(snapshot, never_attempted=prepared)
         provenance = installation()
         if (
             not provenance.get("qualified")

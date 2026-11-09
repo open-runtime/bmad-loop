@@ -2,7 +2,7 @@
 
 import copy
 import json
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import pytest
@@ -26,6 +26,289 @@ from bmad_loop.campaign_model import (
     WorkerClaim,
 )
 from bmad_loop.campaign_store import CampaignStore, RevisionConflict, add_action
+
+
+@pytest.fixture
+def allocated_campaign(campaign, tmp_path, monkeypatch, request):
+    """Earn allocation receipts with production preparation and a real Git checkout."""
+    from conftest import git
+    from test_campaign_paradev import Host
+    from test_campaign_runtime_intake import observed
+
+    from bmad_loop import campaign_paradev, campaign_runtime, campaign_runtime_intake
+    from bmad_loop.campaign_intake import IntakeBatch
+    from bmad_loop.campaign_model import ParadevSpec, UnitState
+    from bmad_loop.campaign_supervisor import Observation
+
+    native, intake = getattr(request, "param", (False, False))
+    store, snapshot, template, manifest = campaign
+    repo = Path(snapshot.root)
+    remote = tmp_path / "allocation-remote.git"
+    git(repo, "clone", "--bare", str(repo), str(remote))
+    git(repo, "remote", "add", "origin", str(remote))
+    root = tmp_path / "allocation-worktrees"
+    root.mkdir()
+    host = Host(repo, root)
+    monkeypatch.setattr(campaign_paradev, "Host", lambda: host)
+    unit = next(iter(snapshot.units.values()))
+    unit.spec = replace(unit.spec, kind="planning")
+    snapshot.graph_revision += 1
+    snapshot.spec = replace(
+        snapshot.spec,
+        units=(unit.spec,),
+        worktree_root=str(root),
+        paradev=ParadevSpec(reflect=native, project_id="project", worktree_root=str(root)),
+    )
+    snapshot.config_revision += 1
+    snapshot.config_snapshot["configuration_revision"] = snapshot.config_revision
+    template = replace(
+        template,
+        config_revision=snapshot.config_revision,
+        directory=template.directory.with_name("allocation-config"),
+    )
+    path, sha = template.save()
+    snapshot.bindings["execution_template"] = {"path": str(path), "digest": sha}
+    runtime = campaign_runtime.CampaignRuntime(repo, store)
+    if intake:
+        snapshot.bindings["inventory"] = {"complete": True, "issues": [], "pulls": []}
+        observation = replace(
+            observed(),
+            repository=snapshot.repository,
+            url=f"https://github.com/{snapshot.repository}/issues/7",
+        )
+        campaign_runtime_intake.apply_poll(
+            snapshot,
+            {
+                "batch": asdict(IntakeBatch((observation,), observation.updated_at, True, 0)),
+                "observed_at": 100,
+            },
+        )
+        payload = {"packet_id": "a" * 64, "input_versions": [observation.version_id]}
+        action = add_action(snapshot, "intake-control", "", payload)
+        runtime.apply(snapshot, action, Observation("confirmed", payload))
+        action.state, action.receipt = "confirmed", payload
+        unit = snapshot.units["campaign:" + snapshot.id + ":intake:" + "a" * 16]
+    unit.state = UnitState.PLANNING
+    action = add_action(snapshot, "prepare-unit", unit.id, {})
+    snapshot = store.save(snapshot, snapshot.revision)
+    action = next(row for row in snapshot.outbox if row.id == action.id)
+    result = runtime._perform_prepare_unit(snapshot, action)
+    assert result.state == "confirmed"
+    runtime.apply(snapshot, action, result)
+    action.state, action.receipt = "confirmed", result.data
+    snapshot = store.save(snapshot, snapshot.revision)
+    return (store, snapshot, template, manifest), unit.id, action.id, host
+
+
+@pytest.mark.parametrize(
+    "allocated_campaign", [(False, False), (True, False), (True, True)], indirect=True
+)
+def test_confirmed_bootstrap_allocation_renews_without_recreating_or_accepting_work(
+    allocated_campaign,
+):
+    from conftest import git
+
+    from bmad_loop.campaign_model import UnitState
+
+    case, key, action_id, host = allocated_campaign
+    store, before, _, _ = case
+    unit = before.units[key]
+    original = copy.deepcopy(unit)
+    calls = copy.deepcopy(host.calls)
+    head = git(Path(unit.bindings["workspace"]), "rev-parse", "HEAD")
+    after = apply(case)
+    assert after.units[key] == original and after.units[key].state == UnitState.DRAFT
+    assert after.phase == "stopped" and after.config_revision == before.config_revision + 1
+    assert (
+        host.calls == calls and git(Path(unit.bindings["workspace"]), "rev-parse", "HEAD") == head
+    )
+    assert after.units[key].attempt == 0 and after.units[key].claim is None
+    assert not after.units[key].bindings.get("pr")
+    from bmad_loop.campaign_action_history import action
+
+    assert action(after, action_id).receipt == action(before, action_id).receipt
+    assert store.load(after.id).units == after.units
+
+
+@pytest.mark.parametrize("allocated_campaign", [(True, False)], indirect=True)
+@pytest.mark.parametrize(
+    "fault", [None, "unconfirmed", "receipt", "native", "stage", "extra-history"]
+)
+def test_prepared_reflection_requires_exact_confirmed_unstarted_projection(
+    allocated_campaign, fault
+):
+    from bmad_loop.campaign_runtime import CampaignRuntime
+
+    case, key, _, _ = allocated_campaign
+    store, before, template, manifest = case
+    runtime = CampaignRuntime(Path(before.root), store)
+    action = add_action(before, "reflection", key, {})
+    result = runtime._perform_reflection(before, action)
+    assert result.state == "confirmed"
+    assert result.data["stage"] == {"state": "pending", "windows": []}
+    assert result.data["lifecycle"] == {
+        "state": "pending",
+        "detail": "No stage claim",
+        "windows": [],
+    }
+    runtime.apply(before, action, result)
+    action.state, action.receipt = "confirmed", copy.deepcopy(result.data)
+    unit = before.units[key]
+    if fault == "unconfirmed":
+        action.state = "rejected"
+    elif fault == "receipt":
+        unit.bindings["reflection"]["fingerprint"] = "unconfirmed-change"
+    elif fault in {"native", "stage"}:
+        changed = unit.bindings["reflection"]
+        if fault == "native":
+            changed["workspace"]["task_id"] = "unconfirmed-task"
+        else:
+            changed["stage"] = {"state": "active", "windows": [{"window_id": "unexpected"}]}
+        action.receipt = copy.deepcopy(changed)
+    elif fault == "extra-history":
+        unit.bindings["reflection_history"] = [copy.deepcopy(result.data)]
+    original = copy.deepcopy(unit)
+    before = store.save(before, before.revision)
+    current = (store, before, template, manifest)
+    if fault is not None:
+        with pytest.raises(CampaignError, match="reflection|bindings differ"):
+            apply(current)
+        assert store.load(before.id).revision == before.revision
+    else:
+        after = apply(current)
+        assert after.units[key] == original
+        assert after.units[key].bindings["native"]["task_id"] is None
+        assert after.config_revision == before.config_revision + 1
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "unknown",
+        "receipt",
+        "adoption",
+        "branch",
+        "head",
+        "dirty",
+        "pr",
+        "launch-history",
+        "publication-history",
+        "worker-artifact",
+        "job-history",
+    ],
+)
+def test_prepared_renewal_refuses_unsettled_changed_or_started_work(allocated_campaign, fault):
+    from conftest import git
+
+    from bmad_loop.campaign_action_history import action as historical_action
+
+    case, key, action_id, _ = allocated_campaign
+    store, before, template, manifest = case
+    unit = before.units[key]
+    workspace = Path(unit.bindings["workspace"])
+    if fault in {"unknown", "receipt", "adoption"}:
+        original = historical_action(before, action_id)
+        if not any(row.id == original.id for row in before.outbox):
+            before.outbox.append(original)
+        if fault == "unknown":
+            original.state = "sent_unknown"
+        elif fault == "receipt":
+            original.receipt = {**original.receipt, "head": "0" * 40}
+        else:
+            original.payload["adoption"] = True
+    elif fault == "branch":
+        git(workspace, "checkout", "-b", "unexpected-renewal-branch")
+    elif fault == "head":
+        git(workspace, "commit", "--allow-empty", "-m", "Unreviewed later work")
+    elif fault == "dirty":
+        (workspace / "new-work.txt").write_text("unaccepted", encoding="utf-8")
+    elif fault == "pr":
+        unit.bindings["pr"] = {"number": 123}
+    elif fault in {"launch-history", "publication-history"}:
+        prior = add_action(
+            before,
+            "reasoning-launch" if fault == "launch-history" else "prepare-pr",
+            "" if fault == "launch-history" else key,
+            {},
+        )
+        prior.state = "confirmed"
+        prior.receipt = (
+            {"launched": True} if fault == "launch-history" else {"intent": {"state": "prepared"}}
+        )
+    elif fault == "worker-artifact":
+        worker = store.directory(before.id) / "workers" / "uncertain"
+        worker.mkdir(parents=True)
+        (worker / "request.json").write_text("{}", encoding="utf-8")
+    else:
+        database = CampaignDatabase(store.directory(before.id))
+        with database.connect(write=True) as connection:
+            with connection:
+                connection.execute(
+                    "UPDATE jobs SET state='stale',payload=json_set(payload,'$.state','stale','$.attempt',1)"
+                )
+        before = store.load(before.id)
+    before = store.save(before, before.revision)
+    with pytest.raises(CampaignError, match="prepar|settled|bootstrap"):
+        apply((store, before, template, manifest))
+    assert store.load(before.id).revision == before.revision
+
+
+@pytest.mark.parametrize("allocated_campaign", [(True, False)], indirect=True)
+@pytest.mark.parametrize("fault", ["git-dir", "allocation-pin"])
+def test_native_preparation_requires_current_per_worktree_and_saved_identity(
+    allocated_campaign, monkeypatch, fault
+):
+    import hashlib
+
+    from bmad_loop import campaign_paradev
+    from bmad_loop.adapters.paradev_runtime import private_json, read_private_json
+
+    case, key, action_id, _ = allocated_campaign
+    store, before, _, _ = case
+    if fault == "git-dir":
+        original = campaign_paradev._git_path
+        monkeypatch.setattr(
+            campaign_paradev,
+            "_git_path",
+            lambda repo, flag: (
+                Path(before.common_dir) / "worktrees/replaced"
+                if flag == "--absolute-git-dir"
+                else original(repo, flag)
+            ),
+        )
+    else:
+        path = (
+            store.directory(before.id)
+            / "reflection/allocations"
+            / (hashlib.sha256(action_id.encode()).hexdigest() + ".json")
+        )
+        record = read_private_json(path)
+        record["binding"]["workspace_id"] = "different-workspace"
+        private_json(path, record)
+    with pytest.raises(CampaignError, match="pinned identity"):
+        apply(case)
+    assert store.load(before.id).revision == before.revision
+
+
+@pytest.mark.parametrize("allocated_campaign", [(True, True)], indirect=True)
+@pytest.mark.parametrize("fault", ["control", "attempted", "reservation"])
+def test_prepared_intake_requires_authentic_unattempted_reservation(allocated_campaign, fault):
+    from bmad_loop.campaign_intake_flow import INBOX
+
+    case, key, _, _ = allocated_campaign
+    store, before, template, manifest = case
+    control = before.units[key].bindings["intake_control"]
+    if fault == "control":
+        control["state"] = "planning"
+    else:
+        record = before.bindings[INBOX]["records"][control["input_versions"][0]]
+        record["attempts" if fault == "attempted" else "control_unit"] = (
+            1 if fault == "attempted" else "other-unit"
+        )
+    before = store.save(before, before.revision)
+    with pytest.raises(CampaignError, match="intake control"):
+        apply((store, before, template, manifest))
+    assert store.load(before.id).revision == before.revision
 
 
 def semantic_proof(directory, capability, proof, purposes):

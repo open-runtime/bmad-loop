@@ -866,6 +866,12 @@ Legacy JSON remains bounded. Exclude this campaign's own unit and reasoning clai
 from external ownership while retaining other campaigns' claims. Expose discovery
 waits and their causes through the ordinary status contract.
 
+The internal intake planning unit's `resource:campaign-plan` scheduling claim
+does not widen filesystem discovery. Retain the actual product units' scopes,
+global GitHub intent and file identities, and selected/mapped/link closure. Real
+planning with unknown product scope, an intake unit with explicit file paths,
+or a campaign containing only coordination units still requires broader discovery.
+
 An installed coordinator upgrade cannot silently reinterpret frozen native route
 proofs against new worker modules. Permit explicit route requalification only for
 a stopped campaign before its first unit worker, publication or earned acceptance.
@@ -875,6 +881,14 @@ persist a new configuration revision/template without reloading policy or profil
 Retain old proofs and invalidate never-launched optional advice. Resume remains a
 separate action. This limited startup recovery does not claim general migration
 of campaigns already in delivery.
+Deterministic workspace preparation alone does not count as a launched worker.
+After the upgraded coordinator reconciles all allocation effects while stopped,
+renewal may retain a draft unit with an exact confirmed preparation receipt,
+unchanged clean bootstrap commit and matching workspace/Git identity. Preserve
+its source bindings, never-started intake control and confirmed reflection of the
+same draft workspace before any session. Refuse unknown allocations,
+publication, worker or reasoning attempts, unrelated bindings and earned stage
+evidence; renewing proofs never adopts arbitrary work or rewrites its branch.
 Semantic renewal compares the declared purposes and contracts in hash-bound proof
 metadata, then validates the complete replacement proof for every purpose. Proof
 coordinates may change; lost corpus or review evidence must not silently narrow
