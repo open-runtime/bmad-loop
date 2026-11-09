@@ -13,6 +13,9 @@ from collections.abc import Iterable
 
 
 def _text(value: str, limit: int) -> str:
+    # Native terminal titles discard replacement characters and Braille spinner
+    # frames. Normalize before recording the expected title for exact readback.
+    value = re.sub(r"[\ufffd\u2800-\u28ff]", "", value)
     clean = " ".join(
         "".join(char if not unicodedata.category(char).startswith("C") else " " for char in value)
         .replace(",", "/")
@@ -22,7 +25,7 @@ def _text(value: str, limit: int) -> str:
 
 
 def _values(values: Iterable[str], *, limit: int = 30) -> str:
-    values = sorted({_text(value, 128) for value in values if value.strip()})
+    values = sorted({clean for value in values if (clean := _text(value, 128))})
     if not values:
         return "pending"
     shown = values[:2]
@@ -52,6 +55,59 @@ def navigation_title(
     remaining = limit - len(prefix) - 3
     detail = _text(description, remaining) if description and remaining > 1 else ""
     return prefix + (" · " + detail if detail else "")
+
+
+def navigation_tag(
+    *,
+    names: Iterable[str] = (),
+    epics: Iterable[str] = (),
+    issues: Iterable[str] = (),
+    prs: Iterable[str] = (),
+    limit: int = 35,
+) -> str:
+    """Fit all navigation fields in the host's remaining UTF-16 tag budget.
+
+    The caller reserves the immutable ownership suffix separately. Normalize
+    before measuring, as the native host lowercases tags and counts JavaScript
+    string units. An ellipsis marks shortened values; ``?`` means not observed.
+    Full titles and group metadata retain the longer labels.
+    """
+    names, epics, issues, prs = tuple(names), tuple(epics), tuple(issues), tuple(prs)
+
+    def size(value: str) -> int:
+        return sum(2 if ord(char) > 0xFFFF else 1 for char in value)
+
+    full = navigation_title(names=names, epics=epics, issues=issues, prs=prs).lower()
+    if size(full) <= limit:
+        return full
+    actors = ["@" + name for name in names if re.fullmatch(r"[a-z][a-z0-9_-]{2,31}", name)]
+    values = [
+        _values(actors).lower() if actors else "hcom:?",
+        *(_values(items).lower() if items else "?" for items in (epics, issues, prs)),
+    ]
+    labels = ("", "e:", "i:", "pr:")
+    budgets = [size(value) for value in values]
+    minima = [2 if actors else len("hcom:?"), 1, 1, 1]
+    overhead = len(" · ") * 3 + sum(map(len, labels))
+    if limit < overhead + sum(minima):
+        raise ValueError("Navigation tag budget cannot retain all four fields")
+    while overhead + sum(budgets) > limit:
+        index = max((i for i in range(4) if budgets[i] > minima[i]), key=budgets.__getitem__)
+        budgets[index] -= 1
+
+    def shorten(value: str, budget: int) -> str:
+        if size(value) <= budget:
+            return value
+        prefix = ""
+        for char in value:
+            if size(prefix + char) > budget - 1:
+                break
+            prefix += char
+        return prefix + "…"
+
+    return " · ".join(
+        label + shorten(value, budget) for label, value, budget in zip(labels, values, budgets)
+    )
 
 
 def _number(binding: object, url: str = "") -> tuple[str, ...]:

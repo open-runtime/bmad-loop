@@ -20,6 +20,7 @@ from typing import Any, Callable
 from .adapters.paradev_backend import ParadevMultiplexer
 from .adapters.paradev_host import Host, HostError
 from .adapters.paradev_runtime import WORKSPACE_KEY, private_json, read_private_json
+from .campaign_titles import navigation_tag
 from .platform_util import file_lock
 from .verify import git_bytes
 
@@ -405,6 +406,7 @@ class ParadevWorkspaceProvider:
         held: bool = False,
         title: str = "",
         group_title: str = "",
+        group_fields: dict | None = None,
     ) -> dict:
         """Reconcile one sortable managed folder while retaining operator tags.
 
@@ -435,11 +437,16 @@ class ParadevWorkspaceProvider:
         prefix = f"bmad-{campaign_id}-".lower()
         campaign_marker = " · bmad-" + hashlib.sha256(campaign_id.encode()).hexdigest()[:8] + "-"
         suffix = campaign_marker + hashlib.sha256(binding.group.encode()).hexdigest()[:12]
-        folder = (
-            group_title.replace(",", "/") + suffix
-            if group_title
-            else prefix + binding.group.replace(",", "-")
-        ).lower()
+        legacy = (prefix + binding.group.replace(",", "-")).lower()
+        if group_fields is not None or group_title or len(legacy.encode("utf-16-le")) // 2 > 64:
+            folder = (
+                navigation_tag(
+                    **(group_fields or {"epics": (epic,) if epic else ()}), limit=64 - len(suffix)
+                )
+                + suffix
+            )
+        else:
+            folder = legacy
         tags = [
             t
             for t in _tags(row)
@@ -447,6 +454,8 @@ class ParadevWorkspaceProvider:
             and not re.search(re.escape(campaign_marker) + r"[0-9a-f]{12}$", t)
         ]
         tags.append(folder)
+        if len(set(tags)) > 32:
+            raise ReflectionError("Workspace has no free native tag slot; operator tags retained")
         if set(tags) != set(_tags(row)) or (title and row.get("name") != title):
             # Replacement-only host API: read back and refuse concurrent human
             # changes instead of repeatedly erasing them.
@@ -478,6 +487,7 @@ class ParadevWorkspaceProvider:
             "pr_url": pr_url,
             "held": held,
             "folder": folder,
+            "group_title": group_title,
             "title": title or row.get("name", ""),
             "competing_tags": [
                 t for t in tags if t != folder and not t.startswith("zz-bmad-action-")

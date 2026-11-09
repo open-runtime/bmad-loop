@@ -18,6 +18,17 @@ from typing import Mapping
 from .campaign_completion_scope import retained_parent_reason
 from .campaign_github import GithubError, GithubGateway, JsonObject, MutationIntent, managed_marker
 from .campaign_model import CampaignSnapshot, CampaignUnit, UnitState
+from .fences import fenced_spans
+
+
+def _mirror_markers(body: str) -> set[str]:
+    """Only standalone legacy identity comments, never quoted code examples."""
+    spans = fenced_spans(body)
+    return {
+        match[1]
+        for match in re.finditer(r"(?m)^<!-- github-mirror:issue:([^\r\n<>]+) -->[ \t]*\r?$", body)
+        if not any(start <= match.start() < end for start, end in spans)
+    }
 
 
 def _settled_member(unit: CampaignUnit) -> bool:
@@ -85,12 +96,47 @@ class HierarchyCoordinator:
             current = snapshot.units[current.spec.parent]
         if len(ancestry) > 7:
             raise GithubError("Native subissue hierarchy exceeds GitHub's supported depth")
-        self._seed_imported_lineage(unit, ancestry, metadata, bindings, milestone_key, epic_key)
         parent_key = epic_key
         for story in reversed(ancestry):
             key = "story:" + story.id
             nodes.append((key, "issue", story.spec.title, parent_key, story))
             parent_key = key
+        imported = None
+        if (
+            "story:" + unit.id not in bindings
+            and not unit.bindings.get("issue")
+            and not unit.bindings.get("tracker_id")
+            and not metadata.get(unit.id, {}).get("tracker_id")
+        ):
+            imported = self._legacy_mirror(snapshot, unit, metadata)
+        if imported is not None:
+            for key, kind, _, _, _ in nodes:
+                prior_key = self._action(snapshot, key, "create")
+                prior = saved.get(prior_key)
+                if prior:
+                    if prior.state == "confirmed" and prior.receipt:
+                        confirmed = self._binding(prior.receipt, kind)
+                        if key not in bindings:
+                            bindings[key] = confirmed
+                            return TrackingStep(prior_key, None, bindings, unit_bindings)
+                        if any(
+                            bindings[key].get(field) != confirmed[field]
+                            for field in ("kind", "database_id", "number")
+                        ):
+                            raise GithubError(
+                                "Legacy mirror binding conflicts with confirmed create receipt"
+                            )
+                        continue
+                    return TrackingStep(
+                        prior_key,
+                        None,
+                        bindings,
+                        unit_bindings,
+                        reason="Legacy mirror conflicts with prior hierarchy publication; reconcile the existing create first",
+                    )
+        self._seed_imported_lineage(
+            unit, ancestry, metadata, bindings, milestone_key, epic_key, imported_issue=imported
+        )
         for key, kind, title, _, story in nodes:
             if key in bindings:
                 continue
@@ -482,6 +528,69 @@ class HierarchyCoordinator:
             return TrackingStep(action_key, intent, bindings, {})
         return TrackingStep("", None, bindings, {}, complete=True)
 
+    def _legacy_mirror(
+        self, snapshot: CampaignSnapshot, unit: CampaignUnit, metadata: JsonObject
+    ) -> JsonObject | None:
+        """Reuse exact native ticket mirrors before publishing a new hierarchy.
+
+        Intake runs concurrently with existing stories and cannot guarantee their
+        tracker IDs are populated first. A repository-scoped, unique mirror
+        comment is identity evidence; a matching title or selected issue order is
+        not. The fresh issue and its existing parents remain the native authority.
+        """
+        if (
+            unit.spec.kind != "story"
+            or metadata.get(unit.id, {}).get("kind") != "tickets"
+            or not unit.spec.initiative
+            or not unit.spec.selector
+        ):
+            return None
+        identity = unit.spec.initiative + "/" + unit.spec.selector
+        matches = [
+            row
+            for row in self.gateway.issues(state="all")
+            if identity in _mirror_markers(str(row.get("body") or ""))
+        ]
+        if not matches:
+            return None
+        if len(matches) != 1:
+            raise GithubError("Conflicting legacy GitHub mirror matches")
+        expected_campaign_marker = managed_marker(snapshot.id, "story:" + unit.id, "issue")
+
+        def validate(row: JsonObject) -> None:
+            number = row.get("number")
+            body = str(row.get("body") or "")
+            if (
+                type(number) is not int
+                or number <= 0
+                or type(row.get("id")) is not int
+                or row["id"] <= 0
+                or "pull_request" in row
+                or str(row.get("html_url", "")).lower()
+                != f"https://github.com/{self.gateway.repository}/issues/{number}".lower()
+                or (
+                    row.get("repository_url") is not None
+                    and str(row["repository_url"]).lower()
+                    != f"https://api.github.com/repos/{self.gateway.repository}".lower()
+                )
+            ):
+                raise GithubError("Legacy mirror lacks exact same-repository native issue identity")
+            if row.get("state") != "open":
+                raise GithubError("Legacy mirror issue is not open; owner reconciliation required")
+            if _mirror_markers(body) != {identity}:
+                raise GithubError("Legacy mirror identity changed or has conflicting markers")
+            campaign_markers = re.findall(r"<!-- bmad-campaign:v1:[a-f0-9]{64} -->", body)
+            if any(marker != expected_campaign_marker for marker in campaign_markers):
+                raise GithubError("Legacy mirror has another campaign ownership marker")
+
+        found = matches[0]
+        validate(found)
+        current = self.gateway.issue(found["number"])
+        validate(current)
+        if any(current.get(key) != found.get(key) for key in ("id", "number", "node_id")):
+            raise GithubError("Legacy mirror native identity changed during observation")
+        return current
+
     def _seed_imported_lineage(
         self,
         unit: CampaignUnit,
@@ -490,6 +599,8 @@ class HierarchyCoordinator:
         bindings: JsonObject,
         milestone_key: str,
         epic_key: str,
+        *,
+        imported_issue: JsonObject | None = None,
     ) -> None:
         leaf_key = "story:" + unit.id
         if leaf_key in bindings:
@@ -498,14 +609,17 @@ class HierarchyCoordinator:
             unit.bindings.get("tracker_id") or metadata.get(unit.id, {}).get("tracker_id") or ""
         )
         bound = unit.bindings.get("issue")
-        if not tracker and not bound:
+        if not tracker and not bound and imported_issue is None:
             return
-        number = (
-            (bound["number"] if isinstance(bound, dict) else bound)
-            if bound
-            else self._tracker_number(tracker)
-        )
-        issue = self.gateway.issue(int(number))
+        if imported_issue is not None and not tracker and not bound:
+            issue = imported_issue
+        else:
+            number = (
+                (bound["number"] if isinstance(bound, dict) else bound)
+                if bound
+                else self._tracker_number(tracker)
+            )
+            issue = self.gateway.issue(int(number))
         bindings[leaf_key] = self._binding(issue, "issue")
         milestone = issue.get("milestone")
         if milestone:

@@ -553,8 +553,14 @@ quiescent group members; native tasks also receive the linked PR URL.
 Campaign-created tabs inherit terminal titles. Existing manually titled tabs
 retain their operator label and can mask a terminal's automatic tab title.
 Operator terminal text follows the managed navigation prefix. Native tags are
-lowercased; earlier-sorting operator tags can still determine the sidebar folder,
+lowercased and limited to 64 UTF-16 units, including their ownership marker.
+Group labels shorten field values to fit, using `?` for unknown bindings and an
+ellipsis for shortened values; full titles retain longer labels. Existing
+operator tags are preserved, and a full 32-tag set reports a projection wait.
+Earlier-sorting operator tags can still determine the sidebar folder,
 which reflection reports as `operator-tag-precedence`.
+Managed titles follow the native host's normalization of replacement characters
+and Braille spinner glyphs; other Unicode text is retained.
 
 Headless reasoning jobs use an owned campaign workspace for their terminal while
 keeping their input/output state outside the editing tree. Portfolio jobs wait

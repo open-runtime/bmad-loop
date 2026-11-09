@@ -2,6 +2,8 @@
 
 import dataclasses
 
+import pytest
+
 from bmad_loop.campaign_model import (
     CampaignSnapshot,
     CampaignSpec,
@@ -10,7 +12,12 @@ from bmad_loop.campaign_model import (
     UnitSpec,
     WorkerClaim,
 )
-from bmad_loop.campaign_titles import group_navigation, navigation_title, unit_navigation
+from bmad_loop.campaign_titles import (
+    group_navigation,
+    navigation_tag,
+    navigation_title,
+    unit_navigation,
+)
 
 
 def unit(name="story", *, initiative="first", actor="tina"):
@@ -44,6 +51,36 @@ def test_navigation_prefix_reserves_all_fields_ahead_of_long_description():
 def test_unknown_fields_are_explicit_and_control_characters_cannot_hide_navigation():
     assert navigation_title(description="hello\n\x1bworld") == (
         "hcom:pending · E:pending · I:pending · PR:pending · hello world"
+    )
+
+
+@pytest.mark.parametrize("discarded", ["\ufffd", "\u2800", "\u28ff"])
+def test_navigation_matches_native_terminal_normalization_without_losing_unicode(discarded):
+    title = navigation_title(
+        names=("tina",),
+        epics=("École" + discarded + "中文🚀",),
+        issues=("#529",),
+        prs=("#2286",),
+        description="début" + discarded + "fin🛰",
+    )
+    assert title == "@tina · E:École中文🚀 · I:#529 · PR:#2286 · débutfin🛰"
+    # Characterization of the installed host's terminal.rename normalization.
+    observed = "".join(
+        char
+        for char in title
+        if not (
+            ord(char) <= 31
+            or 127 <= ord(char) <= 159
+            or ord(char) == 65533
+            or 10240 <= ord(char) <= 10495
+        )
+    ).strip()[:200]
+    assert observed == title
+
+
+def test_native_discarded_only_field_retains_explicit_pending_navigation():
+    assert navigation_title(epics=("\ufffd\u2800\u28ff",)) == (
+        "hcom:pending · E:pending · I:pending · PR:pending"
     )
 
 
@@ -107,3 +144,23 @@ def test_aggregate_overflow_reports_omitted_members_in_each_field():
         prs=("#4", "#5", "#6"),
     )
     assert title == "@luna/@nava +1 · E:epic · I:#1/#2 +1 · PR:#4/#5 +1"
+
+
+def test_compact_tag_keeps_short_known_coordinates_and_explicit_pending():
+    assert (
+        navigation_tag(names=("tina",), epics=("303",), issues=("#529",), prs=("#2286",))
+        == "@tina · e:303 · i:#529 · pr:#2286"
+    )
+    assert navigation_tag(epics=("intake",)) == "hcom:? · e:intake · i:? · pr:?"
+
+
+@pytest.mark.parametrize("epic", ["İ" * 60, "🚀" * 60, "İ🚀" * 30])
+def test_compact_tag_counts_lowercase_expansion_and_utf16_before_allocation(epic):
+    result = navigation_tag(
+        names=("longactor" * 3,), epics=(epic,), issues=("#123456789",), prs=("#987654321",)
+    )
+    assert len(result.encode("utf-16-le")) // 2 <= 35
+    assert result == result.lower()
+    assert result.startswith("@")
+    assert all(label in result for label in (" · e:", " · i:", " · pr:"))
+    assert "…" in result

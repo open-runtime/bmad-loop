@@ -9,6 +9,7 @@ import pytest
 
 from bmad_loop import verify
 from bmad_loop.campaign_paradev import ParadevWorkspaceProvider, ReflectionError
+from bmad_loop.campaign_titles import navigation_title
 
 
 class Host:
@@ -65,6 +66,11 @@ class Host:
             tags = [args[i + 1] for i, arg in enumerate(args) if arg == "--tag"]
             if any(not tag for tag in tags):
                 raise ValueError("Empty --tag is not --clear-tags")
+            tags = [tag.strip().lower() for tag in tags]
+            if any(not tag or len(tag.encode("utf-16-le")) // 2 > 64 for tag in tags):
+                raise ValueError("Native tag must be 1-64 UTF-16 units")
+            if len(set(tags)) > 32:
+                raise ValueError("Native workspace permits at most 32 tags")
             if "--clear-tags" in args:
                 assert not tags
                 row["tags"] = ""
@@ -270,6 +276,7 @@ def test_navigation_titles_refresh_without_changing_allocation_or_operator_tags(
         attempt=1,
         title=first,
         group_title=first,
+        group_fields={"epics": ("epic",)},
     )
     title = "@tina · E:epic · I:#42 · PR:#18 · Story"
     updated = p.reflect(
@@ -280,6 +287,7 @@ def test_navigation_titles_refresh_without_changing_allocation_or_operator_tags(
         attempt=1,
         title=title,
         group_title=title,
+        group_fields={"names": ("tina",), "epics": ("epic",), "issues": ("#42",), "prs": ("#18",)},
     )
     assert host.workspaces[0]["name"] == title
     assert updated["folder"].startswith("@tina · e:epic · i:#42 · pr:#18")
@@ -293,6 +301,90 @@ def test_navigation_titles_refresh_without_changing_allocation_or_operator_tags(
     )
     assert p.reconcile("action") == binding
     assert sum(call[:2] == ["workspaces", "create"] for call in host.calls) == 1
+
+
+@pytest.mark.parametrize("epic", ["intake", "epic-m3-generated-outputs-and-contracts", "İ🚀" * 30])
+def test_native_tag_budget_preserves_navigation_and_full_titles(provider, epic):
+    p, host = provider
+    fields = {"epics": (epic,), "issues": ("#529",), "prs": ("#2286",)}
+    full = navigation_title(**fields, description="Full story description")
+    binding = p.allocate("unit", "campaign-unit", full, "action", group=epic)
+    host.workspaces[0]["tags"] = "owner-folder"
+    data = p.reflect(
+        binding,
+        campaign_id="campaign-20261109-034256-b84ae801",
+        epic=epic,
+        phase="draft",
+        attempt=0,
+        title=full,
+        group_title=navigation_title(**fields),
+        group_fields=fields,
+    )
+    assert len(data["folder"].encode("utf-16-le")) // 2 <= 64
+    assert data["folder"].startswith("hcom:?")
+    assert all(label in data["folder"] for label in (" · e:", " · i:", " · pr:"))
+    assert data["group_title"] == navigation_title(**fields)
+    assert host.workspaces[0]["name"] == full
+    assert set(host.workspaces[0]["tags"].split(",")) == {"owner-folder", data["folder"]}
+    calls = len(host.calls)
+    assert (
+        p.reflect(
+            binding,
+            campaign_id="campaign-20261109-034256-b84ae801",
+            epic=epic,
+            phase="draft",
+            attempt=0,
+            title=full,
+            group_title=navigation_title(**fields),
+            group_fields=fields,
+        )["folder"]
+        == data["folder"]
+    )
+    assert len(host.calls) == calls
+
+
+def test_compact_projection_lost_ack_reconciles_same_workspace_without_second_write(provider):
+    p, host = provider
+    binding = p.allocate("unit", "campaign-unit", "Story", "action", group="epic")
+    host.workspaces[0]["tags"] = "owner-folder"
+    original = host.cli
+
+    def lose_update(args):
+        result = original(args)
+        if args[:2] == ["workspaces", "update"]:
+            raise TimeoutError("lost acknowledgement")
+        return result
+
+    host.cli = lose_update
+    kwargs = dict(
+        campaign_id="campaign",
+        epic="epic",
+        phase="draft",
+        attempt=0,
+        group_fields={"epics": ("epic",)},
+    )
+    with pytest.raises(TimeoutError):
+        p.reflect(binding, **kwargs)
+    written = host.workspaces[0]["tags"]
+    calls = len(host.calls)
+    host.cli = original
+    data = p.reflect(binding, **kwargs)
+    assert len(host.calls) == calls
+    assert host.workspaces[0]["tags"] == written
+    assert data["workspace_id"] == binding.workspace_id
+    assert len(host.workspaces) == 1
+
+
+def test_native_tag_slot_exhaustion_retains_all_operator_tags(provider):
+    p, host = provider
+    binding = p.allocate("unit", "campaign-unit", "Story", "action")
+    tags = ",".join("owner-" + str(i) for i in range(32))
+    host.workspaces[0]["tags"] = tags
+    calls = len(host.calls)
+    with pytest.raises(ReflectionError, match="no free native tag slot"):
+        p.reflect(binding, campaign_id="campaign", epic="epic", phase="draft", attempt=0)
+    assert host.workspaces[0]["tags"] == tags
+    assert len(host.calls) == calls
 
 
 def test_task_navigation_refresh_retains_description_and_exact_task(provider):
