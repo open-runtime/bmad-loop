@@ -15,6 +15,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 from .childrun import hard_stop_pending, kill_tree
 from .process_host import get_process_host
@@ -53,15 +54,16 @@ class StatusProcess:
         self.buffer = b""
         self.eof = False
         self.protocol = False
-        self.proc = subprocess.Popen(
+        # Binary pipes keep JSON-RPC framing as LF on every platform. text=True
+        # would rewrite stdin newlines to CRLF on Windows, and os.read on a
+        # TextIOWrapper fileno races that wrapper's buffered decoder.
+        self.proc: subprocess.Popen[Any] = subprocess.Popen(
             argv,
             cwd=project,
             env=env,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
         )
         self.threads = []
         try:
@@ -137,7 +139,7 @@ class StatusProcess:
         self._check()
         assert self.proc.stdin is not None
         try:
-            self.proc.stdin.write(json.dumps(message) + "\n")
+            self.proc.stdin.write((json.dumps(message) + "\n").encode("utf-8"))
             self.proc.stdin.flush()
         except (BrokenPipeError, OSError) as exc:
             raise ProbeError("native capacity input closed") from exc
