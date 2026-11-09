@@ -7,6 +7,8 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+## [0.15.8] — 2026-11-08
+
 ### Fixed
 
 - Enumerate macOS session descendants without repeatedly scanning every host process.
@@ -7042,7 +7044,8 @@ enforced in CI.
   implementation phase, driven by a Python control loop with hook-based session transport and
   resumable on-disk run state.
 
-[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.15.7...HEAD
+[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.15.8...HEAD
+[0.15.8]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.15.8
 [0.15.7]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.15.7
 [0.15.6]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.15.6
 [0.15.5]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.15.5
