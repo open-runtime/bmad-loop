@@ -150,61 +150,101 @@ def _inventory_view(inventory: dict, unit: dict, issue_numbers, pr_numbers, reco
     view["selected_records_omitted"] = 0
     used = 0
     scopes = (*unit.get("scopes", ()), *unit.get("paths", ()))
+    issue_numbers = tuple(number for number in issue_numbers if number is not None)
+    pr_numbers = tuple(number for number in pr_numbers if number is not None)
+    issue_set, pr_set = set(issue_numbers), set(pr_numbers)
+    selected_keys = set()
+
+    def row_paths(collection, row):
+        paths = row.get("branch_evidence", {}).get("changed_paths", row.get("changed_paths", ()))
+        if collection == "pulls":
+            paths = [
+                *row.get("discovery_path_coverage", {}).get("changed_paths", ()),
+                *(
+                    path
+                    for file in (*row.get("changed_files_detail", ()), *row.get("files", ()))
+                    for path in (file.get("filename"), file.get("previous_filename"))
+                    if isinstance(path, str)
+                ),
+            ]
+        return paths
+
+    def summary_for(collection, position, row):
+        summary = {
+            key: row[key]
+            for key in (
+                "id",
+                "number",
+                "title",
+                "state",
+                "html_url",
+                "updated_at",
+                "ref",
+                "sha",
+                "inspection",
+                "branch_evidence_ref",
+            )
+            if key in row
+        }
+        summary["collection"] = collection
+        summary["source_record"] = records[("inventory", collection, position)]
+        return summary
+
+    def consider(summary):
+        nonlocal used
+        size = len(_encoded(summary))
+        if used + size > 16 * 1024:
+            view["selected_records_omitted"] += 1
+            return
+        view["selected"].append(summary)
+        used += size
+
+    # Reserve mapped PR then issue identities (caller puts unit-mapped issues
+    # first) before intake fillers and path-overlap rows can consume the budget.
+    for collection, numbers, allowed in (
+        ("pulls", pr_numbers, pr_set),
+        ("issues", issue_numbers, issue_set),
+    ):
+        by_number = {}
+        for position, row in enumerate(inventory.get(collection, ())):
+            number = row.get("number")
+            if number in allowed and number not in by_number:
+                by_number[number] = (position, row)
+        for number in numbers:
+            hit = by_number.get(number)
+            if hit is None:
+                continue
+            position, row = hit
+            key = (collection, position)
+            if key in selected_keys:
+                continue
+            selected_keys.add(key)
+            consider(summary_for(collection, position, row))
+
     for collection in collections:
         for position, row in enumerate(inventory.get(collection, ())):
-            paths = row.get("branch_evidence", {}).get(
-                "changed_paths", row.get("changed_paths", ())
-            )
-            if collection == "pulls":
-                paths = [
-                    *row.get("discovery_path_coverage", {}).get("changed_paths", ()),
-                    *(
-                        path
-                        for file in (*row.get("changed_files_detail", ()), *row.get("files", ()))
-                        for path in (file.get("filename"), file.get("previous_filename"))
-                        if isinstance(path, str)
-                    ),
-                ]
-            related = (
+            key = (collection, position)
+            if key in selected_keys:
+                continue
+            if (
                 collection == "issues"
-                and row.get("number") in issue_numbers
+                and row.get("number") in issue_set
                 or collection == "pulls"
-                and row.get("number") in pr_numbers
-                or collection in {"pulls", "local_refs", "remote_refs"}
-                and any(
-                    scope in {"*", "."}
-                    or path == scope.rstrip("/")
-                    or path.startswith(scope.rstrip("/") + "/")
-                    for path in paths
-                    for scope in scopes
-                )
+                and row.get("number") in pr_set
+            ):
+                continue
+            paths = row_paths(collection, row)
+            related = collection in {"pulls", "local_refs", "remote_refs"} and any(
+                scope in {"*", "."}
+                or path == scope.rstrip("/")
+                or path.startswith(scope.rstrip("/") + "/")
+                for path in paths
+                for scope in scopes
             )
             if not related:
                 continue
-            summary = {
-                key: row[key]
-                for key in (
-                    "id",
-                    "number",
-                    "title",
-                    "state",
-                    "html_url",
-                    "updated_at",
-                    "ref",
-                    "sha",
-                    "inspection",
-                    "branch_evidence_ref",
-                )
-                if key in row
-            }
-            summary["collection"] = collection
-            summary["source_record"] = records[("inventory", collection, position)]
-            size = len(_encoded(summary))
-            if used + size > 16 * 1024:
-                view["selected_records_omitted"] += 1
-                continue
-            view["selected"].append(summary)
-            used += size
+            selected_keys.add(key)
+            consider(summary_for(collection, position, row))
     return view
 
 
