@@ -110,6 +110,8 @@ Confirmed publication receipts cannot override a different mirror or bypass
 the native lineage checks.
 Supplied ancestor identities must agree across hierarchy bindings, unit bindings
 and source trackers before adoption.
+Shared parent discovery precedes creation across imported initiative members;
+native ancestor milestones participate even when a story has no milestone.
 
 ### Approved route selection
 

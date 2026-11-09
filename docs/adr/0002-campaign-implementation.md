@@ -1279,6 +1279,13 @@ mirror; missing or mismatched ancestry never authorizes inserting new parents
 above an existing human issue or epic.
 All supplied hierarchy, unit and source tracker identities must agree with that
 parent; one matching binding cannot mask another conflicting binding.
+Before creating shared parents, reconcile imported members of the same initiative
+namespace, including other epics, so story ordering cannot create duplicate
+parents. Collect milestone facts from the native story and its proven ancestors;
+an absent milestone contributes no identity, while conflicting facts require
+reconciliation. Prior publication receipts remain authoritative debt to reconcile.
+Apply the existing reviewed-extension requirement to closed native parent scope
+before creating a new epic or story beneath it.
 Validate the terminal epic's owning repository as well. New mirror adoption
 reports unsupported cross-repository ancestry instead of treating a foreign
 issue number as local.

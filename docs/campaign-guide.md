@@ -301,6 +301,10 @@ The hierarchy maps initiatives to milestones, epics to parent issues, stories to
 subissues and independently executable splits to nested subissues. Each executable
 unit owns a branch, worktree and draft PR. Small checklist tasks remain in the
 story. Existing issue identities and tracker lineage are preserved.
+Before creating shared parents, imported stories in the initiative contribute
+their existing GitHub lineage, including milestones held by parent issues.
+Conflicting identities or unresolved prior writes pause reconciliation instead
+of creating duplicate parents or moving existing work.
 
 GitHub intake observes selected issues or all open and newly edited issues.
 Repository discovery includes existing PRs, branches and accessible local work.

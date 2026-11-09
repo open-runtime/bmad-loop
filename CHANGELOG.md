@@ -19,6 +19,7 @@ breaking changes may land in a minor release.
 - Normalize managed terminal titles before comparing their native readback.
 - Reuse exact legacy ticket-mirror issues and existing parents before creating campaign hierarchy.
 - Preserve resolved ticket initiatives in worker preparation and reject conflicting mirror ancestry.
+- Resolve shared native parents and enforce closed-scope holds before creating child issues.
 - Clear temporary Paradev allocation tags with the supported empty-tag-set command.
 - Renew equivalent native proofs after confirmed workspace preparation before the first worker.
 - Preserve finite product discovery when GitHub intake adds a coordination workspace.
