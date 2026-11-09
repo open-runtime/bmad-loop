@@ -753,9 +753,11 @@ class RepositoryDiscovery:
             retained_metadata_bytes = sum(
                 len(json.dumps(row).encode()) for row in (*issues, *pulls)
             )
+            metadata["retained_bytes"] = retained_metadata_bytes
+            metadata["observed_bytes"]["pr_enrichment"] = 0
             if scoped:
-                metadata.update(retained_bytes=retained_metadata_bytes, file_metadata_rows=0)
-                metadata["observed_bytes"].update(pr_enrichment=0, file_metadata=0)
+                metadata["file_metadata_rows"] = 0
+                metadata["observed_bytes"]["file_metadata"] = 0
             issues_by_number = {row["number"]: row for row in issues}
             detailed: list[JsonObject] = []
             detail_bytes = 0
@@ -812,35 +814,39 @@ class RepositoryDiscovery:
                         truncated.append(f"pr:{row['number']}:files")
                     patch_coverage = None
                     file_metadata = []
+                    file_metadata_bytes = 0
                     if scoped:
                         files, patch_coverage = self._scoped_file_patches(files, paths)
                         file_metadata = [
                             {key: value for key, value in item.items() if key != "patch"}
                             for item in files
                         ]
-                        enrichment_bytes = len(json.dumps({**row, **full}).encode()) - len(
-                            json.dumps(row).encode()
-                        )
                         file_metadata_bytes = len(json.dumps(file_metadata).encode())
-                        metadata["observed_bytes"]["pr_enrichment"] += enrichment_bytes
                         metadata["observed_bytes"]["file_metadata"] += file_metadata_bytes
-                        metadata["observed_total_bytes"] = sum(metadata["observed_bytes"].values())
                         metadata["file_metadata_rows"] += len(file_metadata)
-                        if (
-                            retained_metadata_bytes + enrichment_bytes + file_metadata_bytes
-                            > self.max_metadata_bytes
-                        ):
-                            truncated.append(f"pr:{number}:metadata_byte_limit")
-                            detailed.append(
-                                {
-                                    **row,
-                                    "details_truncated": True,
-                                    "discovery_detail_coverage": "metadata_byte_limit",
-                                }
-                            )
-                            continue
-                        retained_metadata_bytes += enrichment_bytes + file_metadata_bytes
-                        metadata["retained_bytes"] = retained_metadata_bytes
+                    # Fresh full PR metadata shares the global bound in every
+                    # mode. Broad detail content still includes all file facts;
+                    # only scoped discovery accounts patchless files separately.
+                    enrichment_bytes = len(json.dumps({**row, **full}).encode()) - len(
+                        json.dumps(row).encode()
+                    )
+                    metadata["observed_bytes"]["pr_enrichment"] += enrichment_bytes
+                    metadata["observed_total_bytes"] = sum(metadata["observed_bytes"].values())
+                    if (
+                        retained_metadata_bytes + enrichment_bytes + file_metadata_bytes
+                        > self.max_metadata_bytes
+                    ):
+                        truncated.append(f"pr:{number}:metadata_byte_limit")
+                        detailed.append(
+                            {
+                                **row,
+                                "details_truncated": True,
+                                "discovery_detail_coverage": "metadata_byte_limit",
+                            }
+                        )
+                        continue
+                    retained_metadata_bytes += enrichment_bytes + file_metadata_bytes
+                    metadata["retained_bytes"] = retained_metadata_bytes
                     facts = {
                         "changed_files_detail": files,
                         "reviews": self.gateway.reviews(row["number"]),

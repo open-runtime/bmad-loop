@@ -854,6 +854,9 @@ and check evidence, accounting for its actual metadata size. Changes during that
 detail interval, including timestamp changes, still invalidate the observation.
 Structural movement remains incomplete and identifies the PR and changed fields;
 never silently narrow scope or substitute stale details.
+Charge fresh metadata enrichment to the aggregate metadata budget for both scoped
+and broad discovery before retaining it; a separate detail budget cannot cover
+unaccounted native metadata.
 
 An inferred body mention such as `audit #22626` is not a native issue identity.
 Record optional unresolved references with their source and target; a 404 means
@@ -901,6 +904,9 @@ evidence; renewing proofs never adopts arbitrary work or rewrites its branch.
 Confirmed bootstrap hierarchy observations and milestone/issue creations can also
 survive this renewal when their exact intents, receipts and native bindings agree.
 Preserve the creations and unfinished hierarchy work without replaying them.
+Concurrent units may propose one identical shared create. Retain every proposing
+unit, deduplicate by the exact tracking key and intent, and require the one
+confirmed GitHub action to belong to that proposing set.
 Unknown or rejected writes, unrelated GitHub mutations and PR history remain
 outside this pre-first-worker recovery contract. Ordinary hierarchy reconciliation
 still checks current remote state before admitting work after resume.

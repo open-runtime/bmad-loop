@@ -1209,6 +1209,79 @@ def test_pre_detail_clock_refresh_reads_fresh_metadata_and_review_facts(
         assert calls == [2, 2, 2, 2]  # One classification and one fresh detail boundary, no retry.
 
 
+@pytest.mark.parametrize("metadata_limit", [64 * 1024 * 1024, 8000])
+@pytest.mark.parametrize("detailed_prs", [None, (2,)])
+def test_unscoped_fresh_pr_metadata_respects_shared_bound(
+    semantic_inventory, metadata_limit, detailed_prs
+):
+    repo, _, _, _, gateway = semantic_inventory
+    gateway.items[1]["body"] = ""
+    gateway.prs[2]["body"] = ""
+    original = gateway.pull
+    labels = [{"id": 17, "name": "hold", "description": "Current owner context " * 1500}]
+    title = "Expanded native title " * 500
+
+    def refreshed(number):
+        return {
+            **original(number),
+            "updated_at": "2026-11-10T00:00:00Z",
+            "labels": labels,
+            "title": title,
+        }
+
+    gateway.pull = refreshed
+    receipt = RepositoryDiscovery(gateway, repo, max_metadata_bytes=metadata_limit).collect(
+        remote="inventory", detailed_prs=detailed_prs
+    )
+    metadata = receipt.github_coverage["metadata"]
+    full = receipt.pulls[0]
+    if metadata_limit == 8000:
+        assert not receipt.complete and "pr:2:metadata_byte_limit" in receipt.truncated
+        assert metadata["retained_bytes"] <= metadata_limit < metadata["observed_total_bytes"]
+        assert full["title"] == gateway.prs[2]["title"]
+        assert "labels" not in full and "reviews" not in full
+        assert full["discovery_detail_coverage"] == "metadata_byte_limit"
+    else:
+        assert receipt.complete, (receipt.unavailable, receipt.truncated)
+        assert full["title"] == title and full["labels"] == labels
+        assert full["reviews"] == gateway.reviews(2)
+        assert full["changed_files_detail"] == gateway.files(2)
+        assert "patch_coverage" not in full  # Broad detail remains unfiltered.
+    assert metadata["observed_bytes"]["pr_enrichment"] > 40_000
+    assert "file_metadata" not in metadata["observed_bytes"]
+    assert receipt.github_coverage["details"]["byte_scope"] == "expanded_facts"
+
+
+def test_unscoped_enrichment_consumes_one_aggregate_across_pulls(semantic_inventory):
+    import json
+
+    repo, _, _, _, gateway = semantic_inventory
+    gateway.items[1]["body"] = ""
+    for row in gateway.prs.values():
+        row["body"] = ""
+    gateway.pulls = lambda: [dict(gateway.prs[number]) for number in (2, 9)]
+    original = gateway.pull
+    labels = [{"id": 17, "name": "hold", "description": "Current owner context " * 1500}]
+
+    def refreshed(number):
+        return {**original(number), "updated_at": "2026-11-10T00:00:00Z", "labels": labels}
+
+    gateway.pull = refreshed
+    assert len(json.dumps(refreshed(2)).encode()) < 50_000
+    receipt = RepositoryDiscovery(gateway, repo, max_metadata_bytes=50_000).collect(
+        remote="inventory", detailed_prs=(2, 9)
+    )
+    assert not receipt.complete
+    assert receipt.truncated == ("pr:9:metadata_byte_limit",)
+    first, second = receipt.pulls
+    assert first["labels"] == labels and first["reviews"] == gateway.reviews(2)
+    assert second["number"] == 9 and "labels" not in second and "reviews" not in second
+    metadata = receipt.github_coverage["metadata"]
+    assert metadata["retained_bytes"] < 50_000 < metadata["observed_total_bytes"]
+    assert metadata["observed_total_bytes"] == sum(metadata["observed_bytes"].values())
+    assert metadata["observed_bytes"]["pr_enrichment"] > 60_000
+
+
 def test_pr_clock_change_during_details_still_refuses_mixed_facts(semantic_inventory):
     repo, _, _, _, gateway = semantic_inventory
     gateway.items[1]["body"] = ""

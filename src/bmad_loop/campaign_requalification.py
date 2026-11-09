@@ -244,17 +244,19 @@ def _bootstrap_tracking(snapshot: CampaignSnapshot) -> set[str]:
             ):
                 refuse()
             prior = proposals.get(data["action_key"])
-            value = (action.unit, key, intent)
-            if prior is not None and prior != value:
-                refuse()
-            proposals[data["action_key"]] = value
+            if prior is None:
+                proposals[data["action_key"]] = (key, intent, {action.unit})
+            else:
+                if prior[:2] != (key, intent):
+                    refuse()
+                prior[2].add(action.unit)
         else:
             proposed = proposals.get(action.id)
             if proposed is None:
                 refuse()
-            owner, key, intent = proposed
+            key, intent, owners = proposed
             if (
-                action.unit != owner
+                action.unit not in owners
                 or action.generation != intent["generation"]
                 or action.payload
                 != {
