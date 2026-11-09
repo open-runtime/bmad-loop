@@ -1,6 +1,6 @@
 # ADR 0003: Bounded reasoning jobs and portable session handoff
 
-- **Status:** Delivery completion in progress; writable continuation, final reviews and activation pending
+- **Status:** Delivery completion in progress; full-history qualification, final checks and activation pending
 - **Date:** 2026-11-06
 - **Extends:** [ADR 0002](0002-native-sdlc-campaign.md) and its [implementation contract](0002-campaign-implementation.md)
 - **Delivery:** The same campaign implementation PR, before autonomous project activation
@@ -830,6 +830,18 @@ compact-artifact requests. The current full-corpus trial retains its completed
 maps and immutable attempts across a drained source-repair checkpoint. Completion
 of that trial, an independent full-source audit and writable continuation remain
 separate requirements.
+
+On the frozen `e7f409e8` candidate, all eight selected route recipes validate:
+five writers, two read-only routes and the actual main/custom native review pair.
+Both real writable continuation directions also pass. Each uses a native
+predecessor, Grok extraction, an independent Muse audit and a native successor;
+committed, staged, unstaged and untracked content, ancestry, branch/local PR
+identity and both writer families survive. Every observed process is quiescent.
+These are native adapter/handoff stage proofs with small histories, not a claim
+of actual provider quota exhaustion, full native supervisor execution or GitHub
+delivery. The normal supervisor's quota/recovery path has separate scripted
+integration coverage. Installed route revalidation, the current full-corpus
+trial and real REM delivery remain required.
 
 Those regression and load results qualify their named earlier candidates.
 The delivery completion extension requires fresh final checks and

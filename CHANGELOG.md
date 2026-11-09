@@ -7,6 +7,11 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Fixed
+
+- Supply native PR identities in queue publication fixtures.
+- Synchronize process-cleanup tests on observed children and post-return barriers.
+
 ## [0.15.6] — 2026-11-08
 
 ### Fixed

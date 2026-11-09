@@ -1,6 +1,6 @@
 # ADR 0002: A deterministic SDLC campaign with GitHub delivery
 
-- **Status:** Delivery completion in progress; native continuation, final reviews and activation pending
+- **Status:** Delivery completion in progress; full-history qualification, final checks and activation pending
 - **Date:** 2026-11-05
 - **Scope:** An opt-in campaign supervisor, isolated workers, planning, GitHub synchronization and native Paradev reflection
 

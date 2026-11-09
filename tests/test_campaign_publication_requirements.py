@@ -439,7 +439,11 @@ def test_queue_observation_retains_h_requirements_alongside_successful_g(
             else replace(good, requested_teams=("team",)) if defect == "team" else good
         )
     )
-    unit = CampaignUnit(UnitSpec("unit", "s", "e", "Unit"), state=UnitState.MERGE_REQUESTED)
+    unit = CampaignUnit(
+        UnitSpec("unit", "s", "e", "Unit"),
+        state=UnitState.MERGE_REQUESTED,
+        bindings={"pr": {"number": 1}},
+    )
     spec = CampaignSpec(
         "queue",
         units=(unit.spec,),
@@ -465,6 +469,7 @@ def test_queue_observation_retains_h_requirements_alongside_successful_g(
         queue,
         "membership",
         lambda *args: {
+            "id": "PR_1",
             "merged": False,
             "state": "OPEN",
             "mergeQueueEntry": {"state": "AWAITING_CHECKS"},
@@ -506,7 +511,11 @@ def test_queue_without_group_keeps_fresh_publication_veto(monkeypatch, publishab
             else replace(good, requested_teams=("security",)) if defect == "team" else good
         )
     )
-    unit = CampaignUnit(UnitSpec("unit", "s", "e", "Unit"), state=UnitState.MERGE_REQUESTED)
+    unit = CampaignUnit(
+        UnitSpec("unit", "s", "e", "Unit"),
+        state=UnitState.MERGE_REQUESTED,
+        bindings={"pr": {"number": 1}},
+    )
     spec = CampaignSpec(
         "queue-wait",
         units=(unit.spec,),
@@ -529,6 +538,7 @@ def test_queue_without_group_keeps_fresh_publication_veto(monkeypatch, publishab
         queue,
         "membership",
         lambda *args: {
+            "id": "PR_1",
             "merged": False,
             "state": "OPEN",
             "mergeQueueEntry": {"state": "AWAITING_CHECKS"},
@@ -687,7 +697,12 @@ def test_failed_h_check_waits_for_queue_removal_then_uses_bounded_fresh_remote_r
     group = QueueGroup(
         "a/b", 1, "main", "entry", "g" * 40, candidate.base, candidate.head, "AWAITING_CHECKS", 100
     )
-    member = {"merged": False, "state": "OPEN", "mergeQueueEntry": {"state": "AWAITING_CHECKS"}}
+    member = {
+        "id": "PR_1",
+        "merged": False,
+        "state": "OPEN",
+        "mergeQueueEntry": {"state": "AWAITING_CHECKS"},
+    }
     monkeypatch.setattr(old.gateway, "pull", lambda _: observation.pr)
     monkeypatch.setattr(queue, "membership", lambda *args: member)
     monkeypatch.setattr(

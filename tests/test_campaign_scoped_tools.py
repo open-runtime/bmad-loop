@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from conftest import git
+from conftest import git, read_pid, wait_pid_gone
 
 from bmad_loop.campaign_model import CampaignError
 from bmad_loop.campaign_scoped_tools import ScopedTools
@@ -92,22 +92,56 @@ def test_duplicates_return_cached_result_and_restart_keeps_budget(scoped):
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="actual macOS confinement")
 @pytest.mark.parametrize("mode", ["timeout", "output", "background", "double-fork", "detached"])
-def test_command_bounds_and_background_child_are_settled(scoped, mode):
+def test_command_bounds_and_background_child_are_settled(scoped, mode, reap_leftovers):
     workspace, grants, directory = scoped
-    tool = ScopedTools(grants, directory, timeout_s=1, max_output_bytes=512)
+    background = mode in {"background", "double-fork", "detached"}
+    # Foreground exits/detachment drive these cases; 30 seconds is only a hang
+    # guard. A fixed two-second write raced teardown on loaded process tables.
+    tool = ScopedTools(grants, directory, timeout_s=30 if background else 1, max_output_bytes=512)
+    child = (
+        "import os,time; from pathlib import Path; "
+        "Path('src/background.pid').write_text(str(os.getpid())); "
+        "exec(\"while not Path('src/released-after-return').exists(): time.sleep(0.01)\"); "
+        "Path('src/late.txt').write_text('late')"
+    )
+    wait_ready = "exec(\"while not Path('src/background.pid').exists(): time.sleep(0.01)\")"
     code = {
         "timeout": "import time; time.sleep(30)",
         "output": "print('x'*100000)",
-        "background": "import subprocess,sys; subprocess.Popen([sys.executable,'-c',\"import time; time.sleep(2); from pathlib import Path; Path('src/late.txt').write_text('late')\"],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)",
-        "double-fork": "import os,time; p=os.fork(); os._exit(0) if p else None; p=os.fork(); os._exit(0) if p else None; time.sleep(2); from pathlib import Path; Path('src/late.txt').write_text('late')",
-        "detached": "import subprocess,sys,time; subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)'],start_new_session=True); time.sleep(2)",
+        "background": (
+            "import subprocess,sys,time; from pathlib import Path; "
+            f"subprocess.Popen([sys.executable,'-c',{child!r}],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); "
+            + wait_ready
+        ),
+        "double-fork": (
+            "import os,time; from pathlib import Path; p=os.fork(); "
+            f"exec({wait_ready!r}) if p else None; os._exit(0) if p else None; "
+            "p=os.fork(); os._exit(0) if p else None; " + child
+        ),
+        "detached": (
+            "import subprocess,sys,time; from pathlib import Path; "
+            f"subprocess.Popen([sys.executable,'-c',{child!r}],start_new_session=True); "
+            + wait_ready
+            + "; time.sleep(60)"
+        ),
     }[mode]
     result = run(tool, code)
+    job = read_pid(workspace / "src/background.pid")
+    if job is not None:
+        reap_leftovers.append(job)
     assert not result["success"], result
     record = receipt(directory)
     assert record["processes_quiescent"] is True
     assert record["quiescence_scope"] == "owned-session-and-observed-descendants"
     assert record["reason"]
+    if background:
+        assert job is not None, "background writer never reached its readiness barrier"
+        identities = {row["pid"]: row["identity"] for row in record["processes"]}
+        assert identities.get(job) is not None, "writer was not birth-stamped in teardown"
+        assert wait_pid_gone(job), "writer survived a quiescent scoped-tool return"
+        assert "timeout" not in record["reason"], "foreground lifecycle barrier never completed"
+        # If the owned process survived, it can only write after this marker.
+        (workspace / "src/released-after-return").touch()
     assert not (workspace / "src/late.txt").exists()
     assert len(result["contentItems"][0]["text"].encode()) < 1024
 

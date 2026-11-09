@@ -20,6 +20,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -213,76 +214,130 @@ def test_exception_unwinding_kills_the_tree_and_reraises(tmp_path, monkeypatch, 
             get_process_host().force_kill(grandchild)
 
 
+def _observed_root_exit(monkeypatch, tmp_path):
+    """Release a real root only after its live child entered the loop's known tree.
+
+    Fixed child/root sleeps do not establish that ordering on a loaded host.
+    The command's remaining timeout is a hang guard, not the synchronization.
+    """
+    pid_file, release = tmp_path / "job.pid", tmp_path / "release-root"
+    roots, observed = [], {}
+    popen, harvest = childrun.subprocess.Popen, childrun._loop_harvest
+
+    def spawn(*args, **kwargs):
+        proc = popen(*args, **kwargs)
+        roots.append(proc)
+        return proc
+
+    def observe(host, proc, known):
+        result = harvest(host, proc, known)
+        job = read_pid(pid_file)
+        if job is not None and known.get(job) is not None:
+            observed[job] = known[job]
+            release.touch()
+        return result
+
+    monkeypatch.setattr(childrun.subprocess, "Popen", spawn)
+    monkeypatch.setattr(childrun, "_loop_harvest", observe)
+    monkeypatch.setattr(childrun, "HARVEST_S", 0.1)
+    command = f"sleep 60 & echo $! > '{pid_file}'; while [ ! -f '{release}' ]; do sleep 0.01; done"
+    return pid_file, roots, observed, command
+
+
 @POSIX_ONLY
 def test_timeout_reaches_the_job_of_an_exited_root(tmp_path, monkeypatch, reap_leftovers):
-    """DW-477, exited root: the shell backgrounds a job, lives across a loop
-    harvest, then exits, leaving the job holding the pipes. The timeout finds the
-    root already reaped — nothing is enumerable from its pid any more — so only
-    the tree the loop accumulated while it ran can reach the job.
+    """A known child remains reachable after a causally released root exits.
 
-    Ablation: drop the poll-loop harvest in `run_child` (or pass no `known` to
-    `kill_tree`) and the job survives the timeout."""
-    monkeypatch.setattr(childrun, "HARVEST_S", 0.1)
-    pid_file = tmp_path / "job.pid"
-    started = time.monotonic()
+    Advance only the supervision clock after that exit, so the timeout follows
+    the observed harvest/root-exit ordering without betting on scan duration.
+    Dropping loop harvest or the known tree still fails the anti-vacuity/kill.
+    """
+    pid_file, roots, observed, command = _observed_root_exit(monkeypatch, tmp_path)
+    monotonic = time.monotonic
+    expired_at = None
+
+    def supervision_clock():
+        nonlocal expired_at
+        if expired_at is None and observed and roots and roots[0].poll() is not None:
+            expired_at = monotonic()
+        return monotonic() + (120 if expired_at is not None else 0)
+
+    monkeypatch.setattr(
+        childrun, "time", SimpleNamespace(monotonic=supervision_clock, sleep=time.sleep)
+    )
     with stop_probe(lambda: False):
-        run = childrun.run_child(
-            f"sleep 60 & echo $! > '{pid_file}'; sleep 0.6", cwd=tmp_path, timeout=1.5
-        )
-    elapsed = time.monotonic() - started
+        run = childrun.run_child(command, cwd=tmp_path, timeout=10)
     job = read_pid(pid_file)
     assert job is not None
     reap_leftovers.append(job)
-
+    assert job in observed and expired_at is not None, "no live loop harvest/root-exit barrier"
     assert run.timed_out is True and run.interrupted is False
-    # anti-vacuity: rc 0 means the root exited on its own before the timeout; a
-    # root still up there (-SIGTERM) lets the pre-signal harvest reach the job
     assert run.returncode == 0, "the root was still running at the timeout"
     assert wait_pid_gone(job), f"job {job} survived the timeout of its exited root"
-    assert elapsed < 1.5 + 4 * childrun.KILL_WAIT_S + childrun.DRAIN_S + 2.0
+    assert monotonic() - expired_at < _RETURN_CEILING_S
 
 
 @POSIX_ONLY
 def test_unwinding_kill_reaches_the_job_of_an_exited_root(tmp_path, monkeypatch, reap_leftovers):
-    """The common POSIX hard stop: the engine's SIGTERM handler raises
-    `RunStopped` through the poll loop, so the kill is the `finally` one. It must
-    get the known tree too — the root has already exited, so without it nothing
-    reaches the job it left holding the pipes.
+    """Unwind after an observed child is orphaned, without a wall-clock guess."""
+    pid_file, roots, observed, command = _observed_root_exit(monkeypatch, tmp_path)
 
-    Ablation: call `kill_tree(proc)` without `known` in `run_child`'s `finally`
-    and the job survives."""
-    monkeypatch.setattr(childrun, "HARVEST_S", 0.1)
-    pid_file = tmp_path / "job.pid"
-    started = time.monotonic()
-
-    def late_raise() -> bool:
-        if time.monotonic() - started >= 1.2:  # the root exited at ~0.6 s
+    def after_root_exit() -> bool:
+        if observed and roots and roots[0].poll() is not None:
             raise RuntimeError("unwinding")
         return False
 
-    with stop_probe(late_raise), pytest.raises(RuntimeError, match="unwinding"):
-        childrun.run_child(
-            f"sleep 60 & echo $! > '{pid_file}'; sleep 0.6", cwd=tmp_path, timeout=120
-        )
+    with stop_probe(after_root_exit), pytest.raises(RuntimeError, match="unwinding"):
+        childrun.run_child(command, cwd=tmp_path, timeout=10)
     job = read_pid(pid_file)
     assert job is not None
     reap_leftovers.append(job)
-
+    assert job in observed and roots[0].returncode == 0
     assert wait_pid_gone(job), f"job {job} survived the unwinding kill of its exited root"
 
 
 @POSIX_ONLY
-def test_hard_stop_reaches_a_process_forked_in_the_roots_grace(tmp_path, reap_leftovers):
-    """DW-477, fork during grace: the root traps TERM and, in the trap, forks a
-    job and then exits. The job did not exist at the pre-signal harvest; only the
-    re-harvest while the root waits out its grace sees it before the root's exit
-    reparents it.
+def test_hard_stop_reaches_a_process_forked_in_the_roots_grace(
+    tmp_path, monkeypatch, reap_leftovers
+):
+    """Release the TERM trap only after a real grace harvest sees its new child.
 
-    Ablation: drop the re-harvest in `_grace_wait` and the job survives."""
-    ready = tmp_path / "ready"
-    pid_file = tmp_path / "job.pid"
+    The child did not exist at pre-signal harvest. Removing the grace harvest
+    leaves the barrier closed and the child untracked, rather than sometimes
+    passing because a particular host sampled inside a fixed half-second sleep.
+    """
+    ready, pid_file, release = tmp_path / "ready", tmp_path / "job.pid", tmp_path / "release"
+    observed, in_grace = {}, False
+    host = get_process_host()
+    descendants, grace_wait = host.descendants, childrun._grace_wait
+
+    def harvest(pid):
+        result = descendants(pid)
+        job = read_pid(pid_file)
+        if in_grace and job is not None and result.get(job) is not None:
+            observed[job] = result[job]
+            release.touch()
+        return result
+
+    def grace(*args, **kwargs):
+        nonlocal in_grace
+        # The first PID census must start after the trap creates the child.
+        # Otherwise one slow pre-birth census can exhaust the whole grace.
+        deadline = time.monotonic() + 5
+        while read_pid(pid_file) is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert read_pid(pid_file) is not None, "TERM trap did not reach its readiness barrier"
+        in_grace = True
+        try:
+            return grace_wait(*args, **kwargs)
+        finally:
+            in_grace = False
+
+    monkeypatch.setattr(host, "descendants", harvest)
+    monkeypatch.setattr(childrun, "_grace_wait", grace)
     command = (
-        f"trap 'sleep 60 & echo $! > \"{pid_file}\"; sleep 0.5; exit 0' TERM; "
+        f'trap \'sleep 60 & echo $! > "{pid_file}"; '
+        f'while [ ! -f "{release}" ]; do sleep 0.01; done; exit 0\' TERM; '
         f"echo up > '{ready}'; while :; do sleep 0.05; done"
     )
     probe = _FiredAt(ready.exists)
@@ -292,7 +347,7 @@ def test_hard_stop_reaches_a_process_forked_in_the_roots_grace(tmp_path, reap_le
     job = read_pid(pid_file)
     assert job is not None, "the TERM trap never ran"
     reap_leftovers.append(job)
-
+    assert job in observed, "no grace harvest observed the post-TERM child"
     assert run.interrupted is True
     assert elapsed < _RETURN_CEILING_S
     assert wait_pid_gone(job), f"job {job} forked in the grace survived the hard stop"
@@ -1166,7 +1221,7 @@ def test_drain_timeout_output_goes_through_timeout_stream(tmp_path):
     arm is ever not reached."""
     emit = tmp_path / "emit.py"
     emit.write_text(
-        "import sys\n" f"sys.stdout.buffer.write({_DRAIN_RAW!r})\n" "sys.stdout.buffer.flush()\n",
+        f"import sys\nsys.stdout.buffer.write({_DRAIN_RAW!r})\nsys.stdout.buffer.flush()\n",
         encoding="utf-8",
     )
     holder_pid = tmp_path / "holder.pid"
@@ -1501,7 +1556,7 @@ def test_capped_drain_timeout_decodes_like_the_completed_path(tmp_path):
     if the give-up arm was not reached."""
     emit = tmp_path / "emit.py"
     emit.write_text(
-        "import sys\n" f"sys.stdout.buffer.write({_DRAIN_RAW!r})\n" "sys.stdout.buffer.flush()\n",
+        f"import sys\nsys.stdout.buffer.write({_DRAIN_RAW!r})\nsys.stdout.buffer.flush()\n",
         encoding="utf-8",
     )
     holder_pid = tmp_path / "holder.pid"
