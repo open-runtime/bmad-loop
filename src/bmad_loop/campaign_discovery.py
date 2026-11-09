@@ -327,7 +327,9 @@ class RepositoryDiscovery:
             except (GithubError, GitError, ValueError) as exc:
                 unavailable.append("ref:" + row["ref"] + ":" + str(exc))
 
-    def _git(self, args: list[str], *, repo: Path | None = None) -> str:
+    def _git(
+        self, args: list[str], *, repo: Path | None = None, input_data: bytes | None = None
+    ) -> str:
         # Status/diff observations must not refresh another live worker's index.
         result = git_bytes(
             repo or self.repo,
@@ -335,6 +337,7 @@ class RepositoryDiscovery:
             "diff.autoRefreshIndex=false",
             *args,
             env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+            input_data=input_data,
         )
         if result.returncode:
             raise GithubError("Repository inventory git observation failed: " + args[0])
@@ -615,20 +618,72 @@ class RepositoryDiscovery:
         if paths and not expanded:
             return {**shared, "commits": [], "commits_truncated": False}
         pathspec = [":(literal)" + path for path in sorted(expanded)] if paths else []
+        commits, commits_truncated = self._branch_commits(before, after, pathspec)
+        return {**shared, "commits": commits, "commits_truncated": commits_truncated}
+
+    def _branch_commits(
+        self, before: str, after: str, pathspec: list[str]
+    ) -> tuple[list[JsonObject], bool]:
+        """Bound Git's output before capture, including arbitrarily large subjects.
+
+        Fixed-width IDs include one more row than could fit the evidence budget.
+        Measure immutable objects in one batch before formatting a bounded prefix;
+        both source-byte and retained-byte overflow remain incomplete coverage.
+        """
+        count = max(1, self.max_detail_bytes // len(after) + 1)
+        hashes = self._git(
+            [
+                "log",
+                "--no-show-signature",
+                "--no-notes",
+                "--format=%H",
+                f"--max-count={count}",
+                before + ".." + after,
+                "--",
+                *pathspec,
+            ]
+        ).splitlines()
+        commits_truncated = len(hashes) == count
+        # An empty selected-path checkpoint still contributes its exact tip.
+        hashes = list(dict.fromkeys(([after] if pathspec else []) + hashes))
+        if not hashes:
+            return [], commits_truncated
+        if any(not re.fullmatch(r"[0-9a-f]{" + str(len(after)) + "}", sha) for sha in hashes):
+            raise GithubError("Branch commit inventory returned malformed identities")
+        sizes = self._git(
+            ["cat-file", "--batch-check=%(objectname) %(objectsize)"],
+            input_data="".join(sha + "\n" for sha in hashes).encode(),
+        ).splitlines()
+        if len(sizes) != len(hashes):
+            raise GithubError("Branch commit size coverage is incomplete")
+        selected: list[str] = []
+        source_bytes = 0
+        for sha, row in zip(hashes, sizes):
+            fields = row.split()
+            if len(fields) != 2 or fields[0] != sha or not fields[1].isdigit():
+                raise GithubError("Branch commit size observation is malformed")
+            source_bytes += int(fields[1])
+            if source_bytes > self.max_detail_bytes:
+                commits_truncated = True
+                break
+            selected.append(sha)
+        if not selected:
+            return [], commits_truncated
         raw_commits = self._git(
-            ["log", "--format=%H%x00%P%x00%s%x00", before + ".." + after, "--", *pathspec]
+            [
+                "log",
+                "--no-walk=unsorted",
+                "--no-show-signature",
+                "--no-notes",
+                "--format=%H%x00%P%x00%s%x00",
+                "--stdin",
+            ],
+            input_data="".join(sha + "\n" for sha in selected).encode(),
         )
-        # A native checkpoint can be empty on selected paths; retain the exact
-        # observed tip in addition to every selected-path commit, for lineage.
-        if paths:
-            raw_commits = (
-                self._git(["show", "-s", "--format=%H%x00%P%x00%s%x00", after, "--"]) + raw_commits
-            )
         fields = raw_commits.split("\0")
         commits: list[JsonObject] = []
         seen: set[str] = set()
         commit_bytes = 0
-        commits_truncated = False
         for index in range(0, len(fields) - 2, 3):
             sha = fields[index].strip()
             if sha in seen:
@@ -644,7 +699,7 @@ class RepositoryDiscovery:
                 commits_truncated = True
                 break
             commits.append(commit)
-        return {**shared, "commits": commits, "commits_truncated": commits_truncated}
+        return commits, commits_truncated
 
     def _branch_delta(
         self, merge_base: str, after: str, paths: tuple[str, ...]

@@ -462,6 +462,98 @@ def test_scoped_branch_evidence_excludes_unrelated_patch_and_commit_history(sema
     assert broad["commits_truncated"] is True
 
 
+def test_long_selected_history_bounds_capture_and_keeps_every_commit_that_fits(
+    semantic_inventory, monkeypatch
+):
+    from conftest import git
+
+    from bmad_loop import campaign_discovery
+
+    repo, _, base, _, gateway = semantic_inventory
+    trees = [git(repo, "rev-parse", ref + "^{tree}") for ref in (base, "external-work")]
+    tip = base
+    expected = set()
+    for index in range(140):
+        tip = git(
+            repo,
+            "commit-tree",
+            trees[index % 2],
+            "-p",
+            tip,
+            "-m",
+            f"Selected change {index}",
+        )
+        if index:
+            expected.add(tip)
+    calls = []
+    run_git = campaign_discovery.git_bytes
+
+    def measured(repo, *args, **kwargs):
+        result = run_git(repo, *args, **kwargs)
+        calls.append((args, result.stdout))
+        return result
+
+    monkeypatch.setattr(campaign_discovery, "git_bytes", measured)
+    bounded = RepositoryDiscovery(gateway, repo, max_detail_bytes=2000).inspect_branch(
+        base, tip, relevant_paths=("src/shared.py",)
+    )
+    assert bounded["truncated"] is False
+    assert bounded["commits_truncated"] is True
+    assert bounded["commits"][0]["sha"] == tip
+    history = [data for args, data in calls if "log" in args]
+    # Fixed-width IDs add LF framing and one overflow sentinel to the 2 KiB cap.
+    assert history and max(map(len, history)) <= 2100
+    assert sum("cat-file" in args for args, _ in calls) == 1
+    assert sum("--stdin" in args for args, _ in calls) == 1
+
+    complete = RepositoryDiscovery(gateway, repo, max_detail_bytes=100_000).inspect_branch(
+        base, tip, relevant_paths=("src/shared.py",)
+    )
+    assert complete["commits_truncated"] is False
+    # The initial commit has the base tree; all 139 later commits change scope.
+    assert len(complete["commits"]) == 139
+    assert {row["sha"] for row in complete["commits"]} == expected
+
+
+@pytest.mark.parametrize("scoped", [False, True])
+def test_oversized_commit_subject_is_refused_before_payload_capture(
+    semantic_inventory, monkeypatch, scoped
+):
+    import subprocess
+
+    from conftest import git
+
+    from bmad_loop import campaign_discovery
+
+    repo, _, base, _, gateway = semantic_inventory
+    tree = git(repo, "rev-parse", "external-work^{tree}")
+    tip = subprocess.run(
+        ["git", "-C", str(repo), "commit-tree", tree, "-p", base, "-F", "-"],
+        input="oversized subject " * 20_000 + "\n",
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.strip()
+    calls = []
+    run_git = campaign_discovery.git_bytes
+
+    def measured(repo, *args, **kwargs):
+        result = run_git(repo, *args, **kwargs)
+        calls.append((args, result.stdout))
+        return result
+
+    monkeypatch.setattr(campaign_discovery, "git_bytes", measured)
+    detail = RepositoryDiscovery(gateway, repo, max_detail_bytes=8000).inspect_branch(
+        base, tip, relevant_paths=("src/shared.py",) if scoped else ()
+    )
+    assert detail["truncated"] is False
+    assert detail["commits_truncated"] is True
+    assert detail["commits"] == []
+    assert any("cat-file" in args for args, _ in calls)
+    assert not any("--stdin" in args for args, _ in calls)
+    assert max(len(data) for _, data in calls) < 8000
+
+
 def test_main_only_changes_do_not_become_unfinished_branch_work(semantic_inventory):
     from conftest import git
 

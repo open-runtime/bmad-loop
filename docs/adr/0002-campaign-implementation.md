@@ -808,6 +808,10 @@ selected renames. Empty or repository-wide planning scopes retain full inspectio
 genuinely oversized relevant evidence remains explicitly incomplete. GitHub may
 paginate through numeric repository URLs: bind that ID to the selected repository
 metadata and preserve the original endpoint and query scope on every page.
+Bound commit-ID retrieval with an overflow sentinel and measure immutable object
+sizes before loading formatted history. A limit on retained JSON alone does not
+bound Git's captured output; oversized histories or individual commits must remain
+explicitly incomplete.
 
 Native campaign discovery reads an ownership projection in one SQLite transaction,
 independently of growing cached inventories, job inputs and event history. Keep
