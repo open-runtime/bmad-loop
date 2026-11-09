@@ -115,6 +115,59 @@ def test_large_inventory_is_exact_indexed_source_with_bounded_required_context(
         context_artifacts(tmp_path, descriptors)
 
 
+def test_selected_view_reserves_mapped_issue_and_pr_ahead_of_related_fillers(tmp_path):
+    from bmad_loop.campaign_stage_prompt import prepare_context
+
+    context = large_context()
+    filler = "retained-title-" + "x" * 700
+    context["inventory"]["issues"] = [
+        {
+            "id": index,
+            "number": index,
+            "title": f"intake {index} {filler}",
+            "state": "open",
+        }
+        for index in range(1, 50)
+    ] + [
+        {
+            "id": 900,
+            "number": 900,
+            "title": f"mapped unit {filler}",
+            "state": "open",
+        }
+    ]
+    context["inventory"]["pulls"] = [
+        {
+            "id": 1000 + index,
+            "number": 1000 + index,
+            "title": f"path overlap {index} {filler}",
+            "state": "open",
+            "files": [{"filename": "src/owned.py"}],
+        }
+        for index in range(1, 50)
+    ] + [
+        {
+            "id": 42,
+            "number": 42,
+            "title": f"mapped pr {filler}",
+            "state": "open",
+            "files": [{"filename": "src/owned.py"}],
+        }
+    ]
+    # Mapped identities lead the number lists; older intake/path rows would
+    # otherwise consume the 16 KiB selected window first in inventory order.
+    view, _ = prepare_context(
+        tmp_path,
+        context,
+        issue_numbers=(900, *range(1, 50)),
+        pr_numbers=(42,),
+    )
+    selected_numbers = {(row["collection"], row["number"]) for row in view["inventory"]["selected"]}
+    assert ("issues", 900) in selected_numbers
+    assert ("pulls", 42) in selected_numbers
+    assert view["inventory"]["selected_records_omitted"] > 0
+
+
 @pytest.mark.parametrize("shape", ["files", "changed_files_detail", "discovery_path_coverage"])
 def test_large_coverage_metadata_is_indexed_and_renamed_scope_remains_navigable(tmp_path, shape):
     from bmad_loop.campaign_stage_prompt import prepare_context

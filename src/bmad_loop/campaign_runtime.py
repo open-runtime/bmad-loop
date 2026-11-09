@@ -538,9 +538,7 @@ class CampaignRuntime:
             "hierarchy_finalized_graph"
         ) == snapshot.graph_revision and snapshot.bindings.get("intake", {}).get(
             "observed_at", 0
-        ) >= snapshot.bindings.get(
-            "last_delivery_at", 0
-        )
+        ) >= snapshot.bindings.get("last_delivery_at", 0)
 
     def communication_settled(self, snapshot) -> bool:
         if snapshot.spec.communication.mode != "managed":
@@ -3752,7 +3750,7 @@ class CampaignRuntime:
             )
             from .campaign_stage_prompt import attach_context, prepare_context
 
-            selected_issue_numbers = set(snapshot.spec.intake.issue_numbers)
+            mapped_issue_numbers = set()
             story_binding = snapshot.bindings.get("github_hierarchy", {}).get(
                 "story:" + unit.id, {}
             )
@@ -3760,16 +3758,22 @@ class CampaignRuntime:
             for row in (unit.bindings.get("issue"), unit.bindings.get("epic_issue"), mapped_story):
                 number = row.get("number") if isinstance(row, dict) else row
                 if number is not None:
-                    selected_issue_numbers.add(int(number))
+                    mapped_issue_numbers.add(int(number))
             tracker = unit.bindings.get("tracker_id") or context["source"].get("tracker_id")
             if tracker and not unit.bindings.get("issue") and not mapped_story:
-                selected_issue_numbers.add(
+                mapped_issue_numbers.add(
                     HierarchyCoordinator(self.gateway(snapshot))._tracker_number(str(tracker))
                 )
+            intake_issue_numbers = set(snapshot.spec.intake.issue_numbers)
+            # Mapped unit identities lead so the selected view reserves them
+            # before intake numbers and path-overlapping portfolio rows.
             context, context_files = prepare_context(
                 directory,
                 context,
-                issue_numbers=tuple(sorted(selected_issue_numbers)),
+                issue_numbers=(
+                    tuple(sorted(mapped_issue_numbers))
+                    + tuple(sorted(intake_issue_numbers - mapped_issue_numbers))
+                ),
                 pr_numbers=((unit.bindings.get("pr") or {}).get("number"),),
             )
             if context_files:
