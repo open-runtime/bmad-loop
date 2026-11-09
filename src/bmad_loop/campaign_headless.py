@@ -82,18 +82,30 @@ def file_digest(path: Path) -> str:
 
 
 def provider_family(model: str) -> str:
+    """Recognize observed IDs, including matching provider-qualified model IDs."""
+    if not isinstance(model, str):
+        return ""
     name = model.lower()
+    namespace = ""
+    if "/" in name:
+        namespace, name = name.split("/", 1)
+        if namespace not in {"openai", "anthropic", "google", "models", "xai", "meta"}:
+            return ""
+        if "/" in name:
+            return ""
+    family = ""
     if name.startswith(("gpt-", "o1", "o3", "o4")):
-        return "openai"
-    if name.startswith("claude-"):
-        return "anthropic"
-    if name.startswith(("gemini-", "models/gemini-")):
-        return "google"
-    if name.startswith("grok-"):
-        return "xai"
-    if name.startswith(("muse-", "meta/", "llama-")):
-        return "meta"
-    return ""
+        family = "openai"
+    elif name.startswith("claude-"):
+        family = "anthropic"
+    elif name.startswith("gemini-"):
+        family = "google"
+    elif name.startswith("grok-"):
+        family = "xai"
+    elif name.startswith(("muse-", "llama-")):
+        family = "meta"
+    expected = "google" if namespace == "models" else namespace
+    return family if not namespace or family == expected else ""
 
 
 def _validate_capability(

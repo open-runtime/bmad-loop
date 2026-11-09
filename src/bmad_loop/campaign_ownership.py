@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from . import bmadconfig, sprintstatus, verify
-from .campaign_model import CampaignError, normalize_scope
+from .campaign_model import CampaignError, product_scopes
 
 
 def validate_execution(unit: Any, receipt: dict[str, Any], source: dict[str, Any]) -> list[str]:
@@ -24,11 +24,7 @@ def validate_execution(unit: Any, receipt: dict[str, Any], source: dict[str, Any
     if result.returncode:
         raise CampaignError("execution ownership observation failed")
     paths = [raw.decode("utf-8") for raw in result.stdout.split(b"\0") if raw]
-    scopes = tuple(
-        normalize_scope(value)
-        for value in (unit.spec.paths or unit.spec.scopes)
-        if not value.startswith("resource:")
-    )
+    scopes = product_scopes(unit.spec)
     bookkeeping = set()
     for artifact in receipt.get("source_artifacts", []):
         bookkeeping.update(artifact[name] for name in ("path", "review_path"))
@@ -47,8 +43,6 @@ def validate_execution(unit: Any, receipt: dict[str, Any], source: dict[str, Any
         for key in before.keys() | after.keys():
             if key != unit.spec.selector and before.get(key) != after.get(key):
                 raise CampaignError("execution changed an unowned sprint board row: " + key)
-    if not scopes:
-        return paths  # unknown product footprint was exclusively admitted
     escaped = [
         path
         for path in paths
@@ -72,9 +66,34 @@ def canonical_unchanged(unit: Any) -> None:
     if not raw:
         return
     binding = SourceBinding.from_dict(raw)
-    if binding.versioning == "code-repo":
+    needs_product = unit.spec.kind != "closure" and binding.kind in {"tickets", "sprint-status"}
+    if needs_product and (binding.product_inputs is None or not binding.product_project):
+        raise CampaignError(
+            "canonical product-input dispatch evidence is unavailable; refresh and review required"
+        )
+    if binding.versioning == "code-repo" and not needs_product:
         return  # fresh-main integration and exact artifact review cover this path
     source = SourceSelector(**unit.bindings["canonical_selector"])
+    if needs_product:
+        from .campaign_source_intent import overlay, private_inputs
+
+        product = SourcePublication(
+            Path(binding.product_project), Path(unit.bindings["source_authority_root"])
+        ).capture(source, unit.spec)
+        if (
+            private_inputs(product.product_inputs or ()) != private_inputs(binding.product_inputs)
+            or any(row[2] == "tracked-overlay" for row in product.product_inputs or ())
+            or any(
+                overlay(Path(binding.product_project), row[0])
+                for row in binding.product_inputs or ()
+                if row[2] == "tracked-clean"
+            )
+        ):
+            raise CampaignError(
+                "canonical source changed: selected product input differs from dispatch"
+            )
+    if binding.versioning == "code-repo":
+        return
     observed = SourcePublication(
         Path(binding.project), Path(unit.bindings["source_authority_root"])
     ).capture(source, unit.spec)

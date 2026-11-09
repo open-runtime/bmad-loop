@@ -124,8 +124,11 @@ class CampaignStore:
             candidate.updated_at = candidate.created_at
             for event in candidate.events:
                 event.setdefault("observed_at", candidate.created_at)
+            directory.mkdir(parents=True, mode=0o700)
+            from .campaign_hold import initialize
+
+            initialize(directory, candidate)
             if self.storage == "sqlite":
-                directory.mkdir(parents=True, mode=0o700)
                 database = CampaignDatabase(directory)
                 database.initialize(_state_document(candidate), list(candidate.events))
                 self._write(directory / "snapshot.json", MARKER)
@@ -288,6 +291,10 @@ class CampaignStore:
             for event in candidate.events[len(previous.events) :]:
                 event.setdefault("observed_at", candidate.updated_at)
             self._validate(candidate)
+            from .campaign_hold import initialize
+
+            initialize(directory, previous)
+            candidate.bindings["hold_channels_version"] = previous.bindings["hold_channels_version"]
             if database is not None:
                 archived = database.commit(
                     _state_document(candidate),

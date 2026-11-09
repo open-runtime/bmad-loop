@@ -49,3 +49,49 @@ def test_execution_and_child_review_candidates_reach_frozen_launch(checkpoint_ca
     assert request["headless_grants"]["git_branch"] == case.unit.bindings["branch"]
     assert case.snapshot.spec.target in request["headless_grants"]["protected_branches"]
     assert template.policy.adapter.resolved("dev").model != "dev-model"
+
+
+@pytest.mark.parametrize(
+    "scopes,paths", [((), ()), (("resource:campaign-plan",), ()), (("src",), ("src/owned",))]
+)
+def test_writer_grants_keep_the_admitted_file_authority_and_exact_bookkeeping(
+    checkpoint_case, monkeypatch, scopes, paths
+):
+    from bmad_loop.platform_util import safe_segment
+
+    case = checkpoint_case
+    case.unit.spec = replace(case.unit.spec, scopes=scopes, paths=paths)
+    action = next(row for row in case.snapshot.outbox if row.id == case.unit.claim.launch_id)
+    captured = []
+
+    class Captured(Exception):
+        pass
+
+    def capture(envelope, request):
+        captured.append(request)
+        raise Captured
+
+    monkeypatch.setattr(campaign_runtime, "prepare_launch", capture)
+    with pytest.raises(Captured):
+        case.runtime._perform_launch(case.snapshot, action)
+    request = captured[0]
+    grants = request["headless_grants"]
+    if scopes == ("resource:campaign-plan",):
+        namespace = "docs/bmad-campaign/" + safe_segment(case.unit.id)
+        assert grants["scopes"] == [namespace, namespace + ".md"]
+        assert "*" not in grants["scopes"] and "." not in grants["scopes"]
+        from bmad_loop.campaign_execution_sandbox import write_paths
+
+        control = case.monitor.directory / "grant-check"
+        control.mkdir()
+        workspace, writable, _ = write_paths(grants, control)
+        assert workspace not in writable
+        assert workspace / namespace in writable
+        assert workspace / (namespace + ".md") in writable
+        assert workspace / "src.txt" not in writable
+    else:
+        assert grants["scopes"] == (["src/owned"] if paths else ["."])
+    assert grants["write_paths"] == [
+        *request["private_paths"],
+        str(case.workspace / "specs/epic/stories/first-story.md"),
+    ]

@@ -345,6 +345,18 @@ def perform(runtime, snapshot, action) -> dict[str, Any]:
         store_repo=previous.store_repo,
         selector_path=source.path,
     )
+    from .campaign_source_intent import rebind
+
+    binding = rebind(
+        binding,
+        observed,
+        runtime._source_publisher(snapshot).capture(source, target.spec),
+        project=runtime.project,
+        workspace=workspace,
+        copied_root=generation,
+        origin_root=root,
+        revision=canonical,
+    )
     spec_path = workspace / target.bindings["spec_path"]
     atomic_write_text(
         spec_path,

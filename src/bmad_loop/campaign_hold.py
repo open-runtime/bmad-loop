@@ -10,11 +10,14 @@ from __future__ import annotations
 import contextvars
 import dataclasses
 import json
+import os
+import stat
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Callable
 
-from .platform_util import atomic_write_text, file_lock, is_link_like, safe_segment
+from . import platform_util as fs
+from .platform_util import file_lock, safe_segment
 
 
 @dataclasses.dataclass(frozen=True)
@@ -82,28 +85,92 @@ def channel(directory: Path, unit: str) -> Path:
     return directory / "holds" / (safe_segment(unit) + ".json")
 
 
+def initialize(directory: Path, snapshot) -> None:
+    """Mint channels once from trusted state under the campaign store-save lock.
+
+    An initialized directory is never recreated. Legacy state may initialize it
+    once, preserving every existing record and materializing persisted holds.
+    """
+    from .campaign_model import CampaignError
+
+    if snapshot.bindings.get("hold_channels_version") == 1:
+        return
+    directory = directory.absolute()
+    fs.make_dirs_confined(directory / "holds", confine_root=Path(directory.anchor))
+    for unit in snapshot.units.values():
+        if unit.hold is None or unit.hold.kind != "operator":
+            continue
+        path = channel(directory, unit.id)
+        try:
+            descriptor = fs.create_exclusive_confined(path, confine_root=Path(directory.anchor))
+        except FileExistsError:
+            if not active(path, campaign=snapshot.id, unit=unit.id):
+                raise CampaignError("legacy hold channel contradicts its committed operator hold")
+            continue
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8", closefd=False) as stream:
+                json.dump(
+                    {"campaign": snapshot.id, "unit": unit.id, "hold": unit.hold.id or "operator"},
+                    stream,
+                )
+        finally:
+            os.close(descriptor)
+    snapshot.bindings["hold_channels_version"] = 1
+
+
 def write(path: Path, *, campaign: str, unit: str, hold: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_text(
-        path, json.dumps({"campaign": campaign, "unit": unit, "hold": hold}), follow_symlinks=False
-    )
+    from .campaign_model import CampaignError
+
+    path = path.absolute()
+    root = Path(path.anchor)
+    try:
+        fs.atomic_write_text_confined(
+            path, json.dumps({"campaign": campaign, "unit": unit, "hold": hold}), confine_root=root
+        )
+    except OSError as exc:
+        raise CampaignError("campaign hold authority is missing or redirected") from exc
 
 
 def active(path: Path, *, campaign: str, unit: str) -> bool:
+    """Read beneath the authority handle; redirected ancestors are never release."""
+    path = path.absolute()
+    authority = path.parent.parent
+    descriptor = parent = record = None
     try:
-        if is_link_like(path):
+        if not fs.HANDLE_ANCHORED_WRITES or ".." in path.parts:
             return True
-        if not path.exists():
+        # Campaign paths are canonical absolute authority paths. Starting at
+        # the filesystem anchor checks even an ancestor above the campaign
+        # directory; a fresh lstat pin on only that last component would follow
+        # a redirected ancestor and accidentally pin the attacker's directory.
+        descriptor = fs.open_dir_confined(Path(authority.anchor), authority)
+        if descriptor is None:
+            return True
+        parent = fs.open_at(
+            descriptor, path.parent.name, os.O_RDONLY | fs.AT_DIRECTORY | fs.AT_NOFOLLOW
+        )
+        try:
+            record = fs.open_at(parent, path.name, os.O_RDONLY | fs.AT_NOFOLLOW | fs.AT_NONBLOCK)
+        except FileNotFoundError:
             return False
-        if not path.is_file() or path.stat().st_size > 16384:
+        info = os.fstat(record)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 16384:
             return True
-        data = json.loads(path.read_text(encoding="utf-8"))
+        with os.fdopen(record, "rb", closefd=False) as stream:
+            payload = stream.read(16385)
+        if len(payload) > 16384:
+            return True
+        data = json.loads(payload.decode("utf-8"))
         # A wrong binding is uncertainty, never permission to nudge.
         return (
             bool(data.get("hold")) or data.get("campaign") != campaign or data.get("unit") != unit
         )
     except (OSError, ValueError, AttributeError):
         return True
+    finally:
+        for handle in (record, parent, descriptor):
+            if handle is not None:
+                os.close(handle)
 
 
 def install(probe: Callable[[], bool], *, admission_lock=None, admission_probe=None):

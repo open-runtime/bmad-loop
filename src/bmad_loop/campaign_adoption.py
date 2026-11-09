@@ -1050,6 +1050,15 @@ def prepare(runtime, snapshot, action) -> dict[str, Any]:
             if binding.versioning == "code-repo"
             else runtime._source_publisher(snapshot).capture(selector, unit.spec)
         )
+        from .campaign_source_intent import rebind
+
+        canonical = rebind(
+            canonical,
+            binding,
+            runtime._source_publisher(snapshot).capture(selector, unit.spec),
+            project=runtime.project,
+            workspace=workspace,
+        )
         state["source"] = {
             "effective_source": source_to_dict(prepared.selector),
             "canonical_source": canonical.to_dict(),

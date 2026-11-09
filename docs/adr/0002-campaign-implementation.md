@@ -155,6 +155,16 @@ checkpoint-safe append-only recovery, frozen-policy reload suppression and ordin
 macOS temporary-path socket coverage. An isolated rerun does not resolve an xdist
 failure.
 
+Before final review, reconcile every unresolved GitHub review thread and findings
+present only in review summaries, including comments on older revisions. Bind
+each disposition to the current production path and a regression that exercises
+the reported condition. Outdated line anchors and a green aggregate suite do not
+establish that a finding is fixed. Ownership validation must agree with admission
+and checkpoint grants, source freshness must include selected native requirements,
+and unavailable route or suppressed-action observations must not abort unrelated
+work. Preserve explicit unknown contributor attribution and refused transition
+journaling. Only resolve a review thread after its actual defect is addressed.
+
 Use root integration plus three concurrent native workers, rotating specialists
 across waves: contracts/upstream, runtime/GitHub/operator repairs, harness/history/
 handoff, semantic integration/qualification/docs, then independent reviews.
@@ -175,14 +185,16 @@ records separate qualification obligations and earned evidence, including final
 publication executor, real installed harnesses, semantic fidelity and operator UI.
 The [qualification boundary](0003-bounded-reasoning-and-handoff.md#qualification-achieved-and-remaining-gates)
 records the completed history, integrated regression and fresh load checks, with
-remaining route and activation gates. The frozen code candidate `7c43140a` passed
-20,886 tests with 261 skips; the separate managed 48-story load passed on
-`402879e9`. Pyright, Trunk, package build, isolated wheel checks and release checks
-passed. Independent review then reproduced a launch-lock control race and a
-history prompt/schema mismatch despite that green suite. Their repairs and
-current-version summary reuse require fresh review and affected native
-qualification. These checkpoint results do not establish current deployment
-readiness or satisfy the writable continuation and REM delivery gates.
+remaining route and activation gates. The frozen code candidate `3fa00c5d` passed
+20,932 regression tests with 261 skips in 518.69 seconds; the dedicated managed
+48-story load passed on `3efacd77`. Pyright, Trunk, package build, isolated wheel
+checks and release checks passed. Independent reviews cleared the launch-lock
+control race, history prompt/schema mismatch and late optional-warmup admission
+repair. A subsequent audit of historical GitHub reviews reproduced unresolved
+ownership, hold, source-freshness, attribution and observation defects despite
+that green suite. Those repairs require their own regressions and review before
+merge. These checkpoint results do not establish current deployment readiness
+or satisfy writable continuation and REM delivery.
 
 ## Command and configuration contract
 
@@ -234,6 +246,13 @@ planning/execution/publication/reflection readiness separately, and never starts
 an agent, creates a workspace or alters repository rules. Attach is interactive
 and has no JSON promise. Release removes an explicit operator hold; it never
 approves missing verification, changes a policy or adopts an uncertain process.
+
+Initialize hold-channel directories from committed campaign authority before
+processing controls or admitting children. Read and write through confined
+directory handles. An absent unit record inside an intact namespace means no
+operator hold; a missing or redirected initialized namespace remains held.
+Releasing one unit must never recreate that namespace and lose another unit's
+hold. Upgrade legacy channel state before processing its queued controls.
 
 Use a versioned TOML specification. Version 1 has repository remote/target,
 one or more source selectors, optional brief/planning stages, worker and resource
@@ -538,6 +557,13 @@ semantic conflicts between branches. Verification slots are released only after
 the owned verification process exits. Existing project-wide verify locks remain
 authoritative where other non-campaign workers also use the machine.
 
+Explicit product paths can narrow declared file scopes, never widen them. A
+resource-only declaration grants no product-file access; exact accepted source
+artifacts retain their separate bookkeeping permission. Use the same effective
+file authority in graph validation, checkpoint sealing, execution/recovery grants
+and terminal validation. Only a genuinely undeclared footprint retains exclusive
+repository-wide admission and its corresponding file permission.
+
 Count planning, development, repair and final review against campaign budgets
 and session capacity. Preserve existing account/router policies; a configured
 adapter name is not proof of the provider actually used. Capacity refusals and
@@ -699,6 +725,15 @@ conflict signal, not automatic duplication. Deterministic delivery reconciliatio
 must confirm an already-delivered claim; closed-unmerged PRs and patch similarity
 alone cannot satisfy dependencies. Superseding abandoned work requires a recorded
 reason so later planning does not repeatedly revive rejected approaches.
+
+Bind selected native input authority separately from its private publication
+copy. Clean tracked requirements follow the fetched main candidate and artifact
+review; ignored or shared requirements retain their exact canonical preimage.
+Check staged and working overlays of the selected tracked input without rejecting
+unrelated entries in shared planning files. Apply this same binding when preparing
+new work, adopting an existing PR and refreshing a reviewed amendment. A private
+worker's lifecycle edits must neither replace canonical owner intent nor cause a
+false canonical-drift hold.
 
 An active external PR becomes an observed dependency or overlap hold, with no
 second worker assigned to its covered scope. Continue the same PR automatically

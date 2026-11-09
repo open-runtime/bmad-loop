@@ -10,7 +10,7 @@ from bmad_loop import frontmatter, runs, sprintstatus, verify
 from bmad_loop.campaign_model import SourceSelector, UnitSpec
 from bmad_loop.campaign_source_publication import SourcePublication, SourcePublicationHold, digest
 from bmad_loop.journal import Journal
-from bmad_loop.tickettree import TicketsError, TicketTree
+from bmad_loop.tickettree import TicketsError, TicketsTransitionRefused, TicketTree
 
 
 def head(repo):
@@ -411,6 +411,39 @@ def test_planning_plan_uses_guarded_mark_and_refuses_redefining_built(shared, tm
             journal=Journal(tmp_path / "journal"),
             publication=accepted,
         )
+
+
+def test_campaign_planning_transition_refusal_keeps_native_api_and_journal(shared, tmp_path):
+    publication, source, unit, plan = shared
+    plan.write_bytes(plan.read_bytes().replace(b"ready-for-dev", b"built"))
+    before = plan.read_bytes()
+    binding = publication.capture(source, unit)
+    artifact = before.replace(b"built", b"draft")
+    merge, acceptance = reviewed(publication, artifact)
+    accepted = publication.prepare_plan(
+        "planning-refusal",
+        binding,
+        artifact,
+        merge=merge,
+        acceptance=acceptance,
+        purpose="planning",
+    )
+    journal = Journal(tmp_path / "refused-journal")
+    with pytest.raises(TicketsTransitionRefused) as refused:
+        TicketTree(publication.project).mark(
+            unit.selector,
+            "draft",
+            reason="campaign-plan",
+            expected_plan=plan,
+            journal=journal,
+            publication=accepted,
+        )
+    assert isinstance(refused.value, TicketsError)
+    assert plan.read_bytes() == before
+    marks = [row for row in journal.entries() if row["kind"] == "ticket-mark"]
+    assert len(marks) == 1
+    assert marks[0]["outcome"] == "refused"
+    assert marks[0]["before"] == marks[0]["after"] == "built"
 
 
 def test_merged_mirror_mismatch_cannot_publish_local_private_artifact(shared):

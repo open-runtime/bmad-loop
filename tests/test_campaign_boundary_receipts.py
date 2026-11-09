@@ -66,3 +66,41 @@ def test_never_launched_or_historical_receipts_keep_their_inputs():
     assert project(state, old, {"inputs": {"github": "historical"}}) == {
         "inputs": {"github": "historical"}
     }
+
+
+def test_held_boundary_is_harvested_with_its_suppression_receipt(project, tmp_path):
+    import dataclasses
+    from concurrent.futures import Future
+
+    from bmad_loop.campaign_model import Hold
+    from bmad_loop.campaign_runtime import CampaignRuntime
+    from bmad_loop.campaign_store import CampaignStore
+    from bmad_loop.campaign_supervisor import CampaignSupervisor
+
+    state, unit, _ = setup()
+    state.spec = dataclasses.replace(state.spec, units=(unit.spec,))
+    unit.hold = Hold("operator", "Pause new work", id="hold")
+    action = OutboxAction(
+        "held-boundary",
+        "stage-boundary-before",
+        unit.id,
+        {},
+        state.generation,
+        state="sent_unknown",
+    )
+    state.outbox.append(action)
+    store = CampaignStore(tmp_path / "state")
+    state = store.create(state)
+    runtime = CampaignRuntime(project.project, store)
+    observed = runtime.perform(state, action)
+    assert observed.data == {"operator_suppressed": True}
+    future = Future()
+    future.set_result(observed)
+    supervisor = CampaignSupervisor(store, runtime)
+    supervisor._active[action.id] = future
+    harvested = supervisor._harvest(state)
+    saved = store.load(harvested.id)
+    assert saved.outbox[0].state == "confirmed"
+    assert saved.outbox[0].receipt == {"operator_suppressed": True}
+    assert saved.units[unit.id].hold.kind == "operator"
+    assert any(event["kind"] == "operator-held-effect-suppressed" for event in saved.events)

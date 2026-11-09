@@ -34,6 +34,8 @@ def project(
     snapshot: CampaignSnapshot, action: OutboxAction, data: dict[str, Any]
 ) -> dict[str, Any]:
     """Called only after a confirmed effect's full inputs have been applied."""
+    if data.get("operator_suppressed") is True:
+        return data  # No boundary inputs were collected for an acknowledged hold.
     if action.kind in {"stage-boundary-before", "stage-boundary-after"}:
         return {**data, "inputs": input_reference(data["inputs"])}
     if action.kind == "launch" and data.get("launched") and action.payload.get("stage_boundary"):

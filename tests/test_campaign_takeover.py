@@ -32,7 +32,7 @@ from bmad_loop.campaign_source_publication import SourceBinding
 from bmad_loop.campaign_store import CampaignStore
 
 
-def configured(project, tmp_path):
+def configured(project, tmp_path, *, persist=True):
     spec = UnitSpec("s:epic:one", "s", "epic", "One", scopes=("src/one",))
     snapshot = CampaignSnapshot("campaign", "org/repo", CampaignSpec("takeover", units=(spec,)))
     unit = CampaignUnit(spec, UnitState.READY_TO_PUBLISH)
@@ -53,11 +53,15 @@ def configured(project, tmp_path):
         project.project, CampaignStore(tmp_path / "campaigns"), clock=lambda: 100
     )
     runtime._role = lambda *args, **kwargs: None
+    if persist:
+        snapshot = runtime.store.create(snapshot)
+        unit = snapshot.units[unit.id]
     return runtime, snapshot, unit
 
 
 def test_hold_channel_is_scoped_and_unreadable_channel_fails_held(tmp_path):
     path = campaign_hold.channel(tmp_path, "s:one")
+    path.parent.mkdir()
     assert not campaign_hold.active(path, campaign="campaign", unit="s:one")
     campaign_hold.write(path, campaign="campaign", unit="s:one", hold="hold-1")
     assert campaign_hold.active(path, campaign="campaign", unit="s:one")
@@ -314,7 +318,7 @@ def test_final_submission_lock_is_short_and_serializes_only_submissions(project,
 
 
 def test_issued_direct_merge_fence_ends_only_after_canonical_reconciliation(project, tmp_path):
-    runtime, snapshot, first = configured(project, tmp_path)
+    runtime, snapshot, first = configured(project, tmp_path, persist=False)
     first.state = UnitState.MERGE_REQUESTED
     second = CampaignUnit(
         dataclasses.replace(first.spec, id="s:epic:two"),

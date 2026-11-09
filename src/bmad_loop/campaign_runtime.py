@@ -2492,11 +2492,22 @@ class CampaignRuntime:
             observed_source = self._source_publisher(snapshot, project=workspace).capture(
                 effective, unit.spec
             )
-            canonical_binding = (
+            binding = (
                 observed_source
                 if observed_source.versioning == "code-repo"
                 else self._source_publisher(snapshot).capture(source, unit.spec)
-            ).to_dict()
+            )
+            if observed_source.product_inputs is not None:
+                from .campaign_source_intent import rebind
+
+                binding = rebind(
+                    binding,
+                    observed_source,
+                    self._source_publisher(snapshot).capture(source, unit.spec),
+                    project=self.project,
+                    workspace=workspace,
+                )
+            canonical_binding = binding.to_dict()
             if observed_source.path:
                 initial_source = {
                     "path": Path(observed_source.path).relative_to(workspace).as_posix(),
@@ -3301,6 +3312,7 @@ class CampaignRuntime:
             "graph_revision": snapshot.graph_revision,
             "config_revision": snapshot.config_revision,
         }
+        from .campaign_model import product_scopes
         from .campaign_sources import worker_story_write_paths
 
         story_writes = worker_story_write_paths(
@@ -3309,7 +3321,11 @@ class CampaignRuntime:
         request["headless_grants"] = {
             "schema_version": 1,
             "workspace": str(workspace.resolve()),
-            "scopes": list(unit.spec.scopes or unit.spec.paths or (".",)),
+            "scopes": ["." if scope == "*" else scope for scope in product_scopes(unit.spec)]
+            or [
+                "docs/bmad-campaign/" + safe_segment(unit.id),
+                "docs/bmad-campaign/" + safe_segment(unit.id) + ".md",
+            ],
             "write_paths": list(
                 dict.fromkeys([*request["private_paths"], *(str(path) for path in story_writes)])
             ),
@@ -3379,7 +3395,7 @@ class CampaignRuntime:
                 canonical_project=str(self.project),
                 publication_state=str(self.store.directory(snapshot.id) / "publication"),
                 recovery_action="recover-" + request["original_launch"],
-                allowed_paths=list(unit.spec.paths or unit.spec.scopes or (".",)),
+                allowed_paths=list(product_scopes(unit.spec)),
             )
         elif request["kind"] in {"verify", "verify_existing"}:
             request["config_revision"] = str(snapshot.config_revision)

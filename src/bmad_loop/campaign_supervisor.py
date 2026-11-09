@@ -293,7 +293,12 @@ class CampaignSupervisor:
     def _reconciled(self, campaign_id: str, executor: ThreadPoolExecutor) -> CampaignSnapshot:
         # Queued holds/stops must reach the authority before an uncertain
         # effect can authorize any retry during startup reconciliation.
-        snapshot = self._commands(self.store.load(campaign_id))
+        snapshot = self.store.load(campaign_id)
+        if snapshot.bindings.get("hold_channels_version") != 1:
+            # Migrate from committed authority before queued controls can write
+            # channels. This save never recreates an already initialized root.
+            snapshot = self._save(snapshot)
+        snapshot = self._commands(snapshot)
         prepare_resume = getattr(self.driver, "prepare_resume", None)
         if prepare_resume is not None and prepare_resume(snapshot):
             snapshot = self._save(snapshot)

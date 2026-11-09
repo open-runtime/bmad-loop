@@ -642,6 +642,10 @@ class TicketTree:
                             )
                         if plan.read_bytes() != data or _plan_fields(plan)[1] != target:
                             raise SourcePublicationHold("accepted canonical plan did not read back")
+                    except PlanTransitionRefused as exc:
+                        raise TicketsTransitionRefused(
+                            exc.ref, exc.current, exc.target, exc.reason, exc.why
+                        ) from exc
                     except (SourcePublicationHold, OSError, ValueError) as exc:
                         raise TicketsPlanIOError(
                             f"{ref}: campaign source publication refused: {exc}"

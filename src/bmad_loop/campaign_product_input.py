@@ -49,7 +49,9 @@ def _product(
     }
 
 
-def collect(workspace: Path, source: SourceSelector, unit: UnitSpec) -> tuple[dict[str, str], ...]:
+def collect(
+    workspace: Path, source: SourceSelector, unit: UnitSpec, *, canonical: bool = False
+) -> tuple[dict[str, str], ...]:
     """Capture genuine native intent, preserving exact source preimage hashes."""
     workspace = workspace.resolve()
     if unit.kind in {"planning", "tracking"}:
@@ -57,23 +59,49 @@ def collect(workspace: Path, source: SourceSelector, unit: UnitSpec) -> tuple[di
     if source.kind not in {"tickets", "stories", "sprint-status"}:
         return ()
     paths = source_paths(workspace, source)
+
+    def document(path: Path) -> bytes:
+        return _document(root_for(path), path)
+
+    def product(path: Path, data: bytes, **kwargs) -> dict[str, str]:
+        root = root_for(path)
+        value = _product(root, path, data, **kwargs)
+        if canonical:
+            # Preserve an external store's identity; a relative leaf alone can
+            # name a different store after configuration changes.
+            value["path"] = str(root / value["path"])
+        return value
+
+    def root_for(path: Path) -> Path:
+        roots = (workspace,)
+        if canonical:
+            roots += (
+                paths.output_folder,
+                paths.implementation_artifacts,
+                paths.planning_artifacts,
+            )
+        for root in roots:
+            if path.is_relative_to(root):
+                return root
+        raise CampaignError("selected product input escaped its configured source roots")
+
     if source.kind == "tickets":
         if paths.initiative_folder is None:
             raise CampaignError("native product input requires the selected initiative")
         if unit.kind == "closure":
             path = ticketlayout.epic_file(paths.initiative_folder, unit.selector)
-            return (_product(workspace, path, _document(workspace, path)),)
+            return (product(path, document(path)),)
         found = TicketTree(workspace, folder=paths.initiative_folder).find(unit.selector)
         plan = Path(found.plan)
         if plan.is_file():
-            return (_product(workspace, plan, _document(workspace, plan)),)
+            return (product(plan, document(plan)),)
         if found.story_file:
             leaf = Path(found.story_file)
-            return (_product(workspace, leaf, _document(workspace, leaf)),)
+            return (product(leaf, document(leaf)),)
         if not found.epic_file:
             raise CampaignError("unplanned native ticket has no exact product source")
         manifest = ticketlayout.breakdown_dir(Path(found.epic_file).parent) / ticketlayout.BREAKDOWN
-        data = _document(workspace, manifest)
+        data = document(manifest)
         rows = tomllib.loads(data.decode("utf-8-sig")).get("entry", [])
         selected = [row for row in rows if str(row.get("id")) == str(found.row.id)]
         if len(selected) != 1 or selected[0].get("title") != found.row.title:
@@ -88,8 +116,7 @@ def collect(workspace: Path, source: SourceSelector, unit: UnitSpec) -> tuple[di
         if not str(row.get("title", "")).strip():
             raise CampaignError("selected native ticket has no product intent")
         return (
-            _product(
-                workspace,
+            product(
                 manifest,
                 data,
                 text=json.dumps(row, ensure_ascii=False, indent=2),
@@ -100,20 +127,20 @@ def collect(workspace: Path, source: SourceSelector, unit: UnitSpec) -> tuple[di
         folder = stories.resolve_spec_folder(workspace, source.path)
         selected = stories.resolve_story_spec(folder, unit.selector)
         if selected.path is not None and selected.kind == stories.KIND_PRESENT:
-            return (_product(workspace, selected.path, _document(workspace, selected.path)),)
+            return (product(selected.path, document(selected.path)),)
         if selected.kind != stories.KIND_PENDING:
             raise CampaignError("selected story product input is ambiguous")
         manifest = folder / stories.STORIES_FILENAME
-        data = _document(workspace, manifest)
+        data = document(manifest)
         entry = stories.find_entry(stories.load_stories(folder), unit.selector)
         text = json.dumps(
             {"id": entry.id, "title": entry.title, "description": entry.description},
             ensure_ascii=False,
             indent=2,
         )
-        if _document(workspace, manifest) != data:
+        if document(manifest) != data:
             raise CampaignError("selected stories product input changed during capture")
-        return (_product(workspace, manifest, data, text=text, fragment="#story:" + entry.id),)
+        return (product(manifest, data, text=text, fragment="#story:" + entry.id),)
     if not re.fullmatch(r"\d+-\d+[a-z]?-[A-Za-z0-9_-]+", unit.selector):
         raise CampaignError("sprint product input requires an exact selected story key")
     matches = [
@@ -127,13 +154,13 @@ def collect(workspace: Path, source: SourceSelector, unit: UnitSpec) -> tuple[di
     if len(matches) > 1:
         raise CampaignError("selected sprint product spec is ambiguous")
     if matches:
-        return (_product(workspace, matches[0], _document(workspace, matches[0])),)
+        return (product(matches[0], document(matches[0])),)
     # An unplanned sprint story can use its exact native Markdown story section;
     # never publish the other stories from a shared epics document.
     manifest = paths.planning_artifacts / "epics.md"
     if not manifest.is_file():
         return ()
-    data = _document(workspace, manifest)
+    data = document(manifest)
     text = data.decode("utf-8-sig")
     epic, number, _ = unit.selector.split("-", 2)
     pattern = re.compile(
@@ -148,6 +175,4 @@ def collect(workspace: Path, source: SourceSelector, unit: UnitSpec) -> tuple[di
         r"^#{1," + str(len(start.group(1))) + r"}\s+", text[start.end() :], re.MULTILINE
     )
     section = text[start.start() : start.end() + end.start() if end else len(text)]
-    return (
-        _product(workspace, manifest, data, text=section, fragment="#Story-" + epic + "." + number),
-    )
+    return (product(manifest, data, text=section, fragment="#Story-" + epic + "." + number),)

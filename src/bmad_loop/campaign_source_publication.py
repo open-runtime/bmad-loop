@@ -310,9 +310,18 @@ class SourceBinding:
     # A missing plan alone never proves a dropped ticket.
     dropped_children: tuple[tuple[str, str, str, str, str], ...] = ()
     retrospective: tuple[str, str | None] | None = None
+    # None means a legacy binding never captured selected native product intent;
+    # an empty tuple proves the selected input was absent at dispatch.
+    product_inputs: tuple[tuple[str, str, str], ...] | None = None
+    product_project: str = ""
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        result = asdict(self)
+        if self.product_inputs is None:
+            result.pop("product_inputs")
+        if not self.product_project:
+            result.pop("product_project")
+        return result
 
     @classmethod
     def from_dict(cls, raw: dict) -> SourceBinding:
@@ -321,6 +330,8 @@ class SourceBinding:
             data[field_name] = tuple(tuple(pair) for pair in data.get(field_name, ()))
         if data.get("retrospective") is not None:
             data["retrospective"] = tuple(data["retrospective"])
+        if data.get("product_inputs") is not None:
+            data["product_inputs"] = tuple(tuple(pair) for pair in data["product_inputs"])
         return cls(**data)
 
 
@@ -533,6 +544,11 @@ class SourcePublication:
                 None,
             )
         paths = source_paths(self.project, source)
+        product_inputs = None
+        if source.kind in {"tickets", "sprint-status"} and unit.kind != "closure":
+            from .campaign_source_intent import capture
+
+            product_inputs = capture(self.project, source, unit)
         native_ticket = ""
         children: list[tuple[str, str]] = []
         dropped_children: list[tuple[str, str, str, str, str]] = []
@@ -689,6 +705,8 @@ class SourcePublication:
             source.path,
             tuple(dropped_children),
             retrospective,
+            product_inputs,
+            str(self.project) if product_inputs is not None else "",
         )
 
     def _mapped_story_binding(self, binding: SourceBinding, path: Path, head: str) -> SourceBinding:

@@ -754,11 +754,11 @@ reasoning work. Only trusted hook-bound native prefixes qualify for live warmup;
 active managed-headless streams retain their quiescent-export boundary. No
 native-store import writer or universal live-history capability is claimed.
 
-The frozen scripted load qualification on `402879e9` delivered 48 stories across
+The frozen scripted load qualification on `3efacd77` delivered 48 stories across
 24 active epics, reached eight verification slots, eight review slots and four
 reasoning jobs within 32 shared sessions, and completed parent tracking after stop,
-drain and resume. It applied 47 messages and closed 293 managed endpoints. Stop
-acknowledgement was 0.968 seconds; the measured scenario took 1,101.34 seconds. This
+drain and resume. It applied 47 messages and closed 302 managed endpoints. Stop
+acknowledgement was 0.554 seconds; the measured scenario took 1,265.90 seconds. This
 demonstrates tested concurrency and responsiveness, not maximum throughput or a
 REM/provider benchmark.
 
@@ -773,14 +773,26 @@ fresh proof. The actual main/custom native review pair has since earned separate
 proof: both native reviews precede a third schema-mapping turn, with retained
 delegate artifacts and exact candidate/base identity. Writable continuation remains
 a separate gate, followed by installation-bound revalidation.
-The frozen code candidate `7c43140a` passed the integrated regression suite with
-20,886 passes and 261 skips in 563.59 seconds; the dedicated scale case runs
-separately. All 620 source/test hashes remained unchanged during that run.
+The frozen code candidate `3fa00c5d` passed the integrated regression suite with
+20,932 passes and 261 skips in 518.69 seconds; the dedicated scale case runs
+separately. All 624 source/test hashes remained unchanged during that run.
 Pyright, Trunk, package build, isolated wheel installation and release checks
-passed. Subsequent independent review reproduced a launch-lock control race and
-an embedded-versus-enforced history schema mismatch. Those findings require
-repairs, affected qualification renewal and fresh review; the green suite alone
-does not establish readiness.
+passed. The launch-lock control race, embedded-versus-enforced history schema
+mismatch and optional-warmup admission fixes passed scoped independent review.
+Historical GitHub review findings subsequently reproduced missing ownership,
+hold, source-freshness, attribution and observation protections. Their repairs
+remain release work; the green suite alone does not establish readiness.
+
+Five fresh extraction jobs earned current map-contract semantic evidence through
+independent native audits. Current compact-reducer trials failed native output,
+time or normalized-artifact bounds; no reducer grant or writable continuation is
+inferred from them. Diagnose such non-convergence before spending another attempt.
+A small measured writer-input allowance can make the destination packet much
+smaller than its native advertised context. Qualifying a larger input requires a
+new canary, immutable proof and actual delivery; an advertised window is not that
+proof. Recompute new packet and artifact budgets only from earned capabilities,
+then run new reduction and continuation jobs. Never reinterpret a failed receipt
+under a larger later budget. Preserve the retained history and exact owner index.
 
 Those regression and load results qualify their named earlier candidates.
 The delivery completion extension requires fresh final checks and

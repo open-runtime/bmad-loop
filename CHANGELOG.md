@@ -7,6 +7,14 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserve pool fallback after capacity-command spawn failures and pass through suppressed stage receipts.
+- Align product ownership across admission, checkpoints, writer grants and final validation.
+- Confine operator hold reads and recheck selected native requirements before source publication.
+- Retain unknown contributor attribution, normalize qualified model IDs and journal campaign transition refusals.
+- Resolve campaign skill installation and module updates from the fork.
+
 ## [0.15.3] — 2026-11-08
 
 ### Fixed

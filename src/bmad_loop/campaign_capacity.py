@@ -78,7 +78,14 @@ def observe(
 ) -> CapacityObservation:
     observed_at = time.time() if now is None else now
     command = candidate.capacity_command or ("teamrouter", "status", "--json")
-    result = run_argv(command, cwd=project, timeout=15, encoding="utf-8")
+    try:
+        result = run_argv(command, cwd=project, timeout=15, encoding="utf-8")
+    except OSError as exc:
+        return CapacityObservation(
+            False,
+            reason=f"capacity probe could not start: {type(exc).__name__}",
+            known=False,
+        )
     if result.returncode or result.timed_out or result.interrupted:
         return CapacityObservation(False, reason="capacity probe unavailable", known=False)
     try:

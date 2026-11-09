@@ -18,7 +18,7 @@ from typing import Any
 
 from . import verify
 from .campaign_action_history import action as historical_action
-from .campaign_model import CampaignError, SourceSelector, UnitSpec
+from .campaign_model import CampaignError, SourceSelector, UnitSpec, product_scopes
 from .platform_util import atomic_write_text, is_link_like, safe_segment
 
 NAME = "checkpoint-progress.json"
@@ -32,11 +32,8 @@ def owned_paths(workspace: Path, request: dict[str, Any]) -> list[str]:
     from .campaign_sources import source_paths
 
     unit = UnitSpec(**request["unit"])
-    code = list(unit.paths or unit.scopes)
-    allowed = [value for value in code if not value.startswith("resource:")]
+    allowed = list(product_scopes(unit))
     allowed.extend(request.get("checkpoint_extra_paths", []))
-    if not code:
-        allowed.append(".")  # Unknown scope reserves the repository in admission.
     namespace = "docs/bmad-campaign/" + safe_segment(unit.id)
     allowed.extend((namespace, namespace + ".md"))
     if unit.kind == "planning":

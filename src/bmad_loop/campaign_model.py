@@ -482,7 +482,9 @@ def unit_from_dict(raw: Mapping[str, Any]) -> UnitSpec:
         raise CampaignError("unit.id must be a qualified identifier")
     for scope in out["scopes"]:
         normalize_scope(scope)
-    return UnitSpec(**out)
+    unit = UnitSpec(**out)
+    product_scopes(unit)
+    return unit
 
 
 def validate_graph(
@@ -512,6 +514,7 @@ def validate_graph(
     for key in indexed:
         visit(key)
     for unit in units:
+        product_scopes(unit)
         if (
             unit.parent
             and unit.parent not in indexed
@@ -547,6 +550,26 @@ def normalize_scope(scope: str) -> str:
         raise CampaignError(f"invalid ownership scope {scope!r}")
     normalized = "/".join(part for part in scope.split("/") if part != ".")
     return normalized or "*"
+
+
+def product_scopes(unit: UnitSpec) -> tuple[str, ...]:
+    """File authority bounded by admission; affected paths may only narrow it.
+
+    Only a genuinely unknown footprint reserves the whole repository. A named
+    resource grants no file authority. Validate direct specs and old snapshots at
+    every writer boundary as well as when accepting a graph.
+    """
+    declared = tuple(normalize_scope(value) for value in unit.scopes)
+    scopes = tuple(value for value in declared if not value.startswith("resource:"))
+    paths = tuple(normalize_scope(value) for value in unit.paths)
+    if any(value.startswith("resource:") for value in paths):
+        raise CampaignError(f"{unit.id}: unit.paths must contain file paths")
+    if declared and any(
+        not any(scope == "*" or path == scope or path.startswith(scope + "/") for scope in scopes)
+        for path in paths
+    ):
+        raise CampaignError(f"{unit.id}: unit.paths widens declared ownership scopes")
+    return paths or (scopes if declared else ("*",))
 
 
 def scopes_overlap(left: tuple[str, ...], right: tuple[str, ...]) -> bool:
