@@ -335,6 +335,7 @@ class ScriptedGithub:
                         row.update(
                             head={
                                 "ref": payload["head"],
+                                "repo": {"full_name": "a/b"},
                                 "sha": git(
                                     self.remote, "rev-parse", "refs/heads/" + payload["head"]
                                 ),

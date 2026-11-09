@@ -333,6 +333,7 @@ def status_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
     from .campaign_action_history import counts as action_counts
 
     """Project execution identities; omit private configuration and evidence."""
+    from .campaign_external_provenance import summary as external_provenance_summary
     from .campaign_metrics import document as timing_document
     from .campaign_operator import diagnostics
     from .campaign_scheduler import admit
@@ -444,6 +445,7 @@ def status_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
                 ),
                 "usage": unit.evidence.get("usage", {}),
                 "checkpoint": _checkpoint_document(snapshot, unit, time.time()),
+                "external_contributions": external_provenance_summary(unit),
                 "queue": {
                     "group": unit.evidence.get("queue", {}).get("group"),
                     "workspace": unit.evidence.get("queue", {}).get("workspace"),

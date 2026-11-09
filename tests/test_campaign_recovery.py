@@ -1,5 +1,6 @@
 """Real Git history and remote publication qualify append-only recovery."""
 
+import json
 import subprocess
 from dataclasses import replace
 
@@ -98,6 +99,259 @@ def test_lost_push_reply_reconciles_success_without_second_push(case):
     assert pusher.push("checkpoint", head).state == "confirmed"
     assert pusher.push("checkpoint", head).state == "confirmed"
     assert len(calls) == 1
+
+
+def divergent_heads(case):
+    repo, baseline, _, recovery = case
+    head = commit(repo, "local.py", "local work\n", "local continuation")
+    git(repo, "checkout", "-b", "review-bot", baseline)
+    remote_head = commit(repo, "review.py", "review fix\n", "external review fix")
+    git(repo, "push", "campaign-test", remote_head + ":refs/heads/campaign-unit")
+    git(repo, "checkout", "campaign-unit")
+    return head, remote_head
+
+
+def test_divergent_checkpoint_is_durable_unsent_debt_then_settles_by_descendant(case):
+    repo, _, remote, recovery = case
+    head, remote_head = divergent_heads(case)
+    pushes = []
+
+    def runner(root, *args, **kwargs):
+        if args[0] == "push":
+            pushes.append(args)
+        return verify.git_bytes(root, *args, **kwargs)
+
+    pusher = CheckpointPusher(
+        repo, recovery.root, "campaign-test", "campaign-unit", git_runner=runner
+    )
+    observed = pusher.push("checkpoint", head)
+    assert observed == PushObservation("checkpoint", head, "remote_changed", remote_head)
+    journal = json.loads(pusher._path("checkpoint").read_text())
+    assert journal["submission"] == "not-submitted"
+    assert journal["head"] == head
+    assert pusher.push("checkpoint", head) == observed
+    assert pusher.reconcile("checkpoint") == observed
+    assert git(remote, "rev-parse", "campaign-unit") == remote_head
+    assert pushes == []
+
+    git(repo, "merge", "--no-edit", remote_head)
+    combined = git(repo, "rev-parse", "HEAD")
+    assert verify.is_ancestor(repo, head, combined)
+    assert verify.is_ancestor(repo, remote_head, combined)
+    with pytest.raises(RecoveryHold, match="reused"):
+        pusher.push("checkpoint", combined)
+    assert pusher.push("combined-checkpoint", combined).state == "confirmed"
+    assert pusher.reconcile("checkpoint") == PushObservation(
+        "checkpoint", head, "confirmed", combined
+    )
+    assert len(pushes) == 1
+    assert json.loads(pusher._path("checkpoint").read_text())["submission"] == "not-submitted"
+
+
+def test_remote_ahead_confirms_backup_but_exposes_different_candidate(case):
+    repo, baseline, _, recovery = case
+    remote_head = commit(repo, "review.py", "external continuation\n", "review fix")
+    git(repo, "push", "campaign-test", remote_head + ":refs/heads/campaign-unit")
+    observed = recovery.pusher.push("old-checkpoint", baseline)
+    assert observed == PushObservation("old-checkpoint", baseline, "confirmed", remote_head)
+
+
+def test_divergent_remote_only_commit_is_fetched_for_older_ancestry_endpoint(case):
+    repo, baseline, remote, recovery = case
+    head = commit(repo, "local.py", "local work\n", "local continuation")
+    remote_head = git(
+        remote,
+        "-c",
+        "user.name=Scripted Bot",
+        "-c",
+        "user.email=bot@example.test",
+        "commit-tree",
+        baseline + "^{tree}",
+        "-p",
+        baseline,
+        "-m",
+        "remote-only continuation",
+    )
+    git(remote, "update-ref", "refs/heads/campaign-unit", remote_head, baseline)
+    assert verify.git_bytes(repo, "cat-file", "-e", remote_head).returncode != 0
+    before_refs = git(repo, "for-each-ref", "--format=%(refname) %(objectname)")
+    observed = recovery.pusher.push("remote-only", head)
+    assert observed == PushObservation("remote-only", head, "remote_changed", remote_head)
+    assert git(repo, "for-each-ref", "--format=%(refname) %(objectname)") == before_refs
+    assert git(repo, "rev-parse", "HEAD") == head
+    assert git(remote, "rev-parse", "campaign-unit") == remote_head
+
+
+def test_recovery_retains_remote_commit_and_settles_prior_unsent_debt(case):
+    repo, baseline, _, recovery = case
+    head, remote_head = divergent_heads(case)
+    assert recovery.pusher.push("checkpoint", head).state == "remote_changed"
+    git(repo, "merge", "--no-edit", remote_head)
+    combined = git(repo, "rev-parse", "HEAD")
+    recovery.begin(
+        "repair-after-integration",
+        expected_head=combined,
+        baseline=baseline,
+        owned_paths=("local.py",),
+        quiescence=quiet(combined),
+    )
+    corrected = recovery.recover("repair-after-integration", quiescence=quiet(combined))
+    result = recovery.finish("repair-after-integration", quiescence=quiet(corrected.head))
+    assert result.state == "complete"
+    assert verify.is_ancestor(repo, remote_head, result.head)
+    assert verify.is_ancestor(repo, head, result.head)
+    assert (repo / "review.py").read_text() == "review fix\n"
+    assert recovery.pusher.reconcile("checkpoint").state == "confirmed"
+
+
+def test_issued_unknown_push_never_becomes_unsent_on_remote_divergence(case):
+    repo, baseline, _, recovery = case
+    head = commit(repo, "local.py", "local work\n", "local continuation")
+    pushes = []
+
+    def runner(root, *args, **kwargs):
+        if args[0] == "push":
+            pushes.append(args)
+            raise verify.GitError("lost reply; publication unknown")
+        return verify.git_bytes(root, *args, **kwargs)
+
+    pusher = CheckpointPusher(
+        repo, recovery.root, "campaign-test", "campaign-unit", git_runner=runner
+    )
+    assert pusher.push("checkpoint", head).state == "sent_unknown"
+    git(repo, "checkout", "-b", "review-bot", baseline)
+    remote_head = commit(repo, "review.py", "review fix\n", "external review fix")
+    git(repo, "push", "campaign-test", remote_head + ":refs/heads/campaign-unit")
+    git(repo, "checkout", "campaign-unit")
+    assert pusher.reconcile("checkpoint").state == "sent_unknown"
+    assert pusher.push("checkpoint", head).state == "sent_unknown"
+    journal = json.loads(pusher._path("checkpoint").read_text())
+    assert journal["last_observed_remote"] == remote_head
+    assert journal.get("submission") != "not-submitted"
+    assert len(pushes) == 1
+
+
+def test_remote_push_racing_checkpoint_has_definitive_porcelain_refusal(case):
+    repo, baseline, remote, recovery = case
+    head = commit(repo, "local.py", "local work\n", "local continuation")
+    git(repo, "checkout", "-b", "review-bot", baseline)
+    remote_head = commit(repo, "review.py", "review fix\n", "external review fix")
+    git(repo, "checkout", "campaign-unit")
+    pushes = []
+
+    def runner(root, *args, **kwargs):
+        if args[0] == "push":
+            pushes.append(args)
+            git(repo, "push", "campaign-test", remote_head + ":refs/heads/campaign-unit")
+        return verify.git_bytes(root, *args, **kwargs)
+
+    pusher = CheckpointPusher(
+        repo, recovery.root, "campaign-test", "campaign-unit", git_runner=runner
+    )
+    assert pusher.push("racing-checkpoint", head) == PushObservation(
+        "racing-checkpoint", head, "remote_changed", remote_head
+    )
+    journal = json.loads(pusher._path("racing-checkpoint").read_text())
+    assert journal["submission"] == "not-submitted"
+    assert journal["reason"] == "non_fast_forward_refusal"
+    assert pusher.push("racing-checkpoint", head).state == "remote_changed"
+    assert len(pushes) == 1
+    assert git(remote, "rev-parse", "campaign-unit") == remote_head
+
+
+@pytest.mark.parametrize(
+    "output,returncode",
+    [
+        ("!\\t{head}:refs/heads/another-branch\\t[rejected] (fetch first)\\n", 1),
+        ("!\\tHEAD:refs/heads/campaign-unit\\t[rejected] (fetch first)\\n", 1),
+        (
+            "!\\t{head}:refs/heads/campaign-unit\\t[remote rejected] (pre-receive hook declined)\\n",
+            1,
+        ),
+        ("!\\t{head}:refs/heads/campaign-unit\\t[rejected] (fetch first)\\n", 128),
+        (
+            "!\\t{head}:refs/heads/campaign-unit\\t[rejected] (fetch first)\\n!\\tother:refs/heads/other\\t[rejected] (fetch first)\\n",
+            1,
+        ),
+        ("fatal: non-fast-forward push rejected", 1),
+    ],
+)
+def test_unqualified_push_failures_remain_uncertain(case, output, returncode):
+    repo, _, _, recovery = case
+    head = commit(repo, "local.py", "local work\n", "local continuation")
+    pushes = []
+
+    def runner(root, *args, **kwargs):
+        if args[0] == "push":
+            pushes.append(args)
+            raw = output.format(head=head).replace("\\t", "\t").replace("\\n", "\n").encode()
+            return subprocess.CompletedProcess(args, returncode, raw, b"fetch first; rejected")
+        return verify.git_bytes(root, *args, **kwargs)
+
+    pusher = CheckpointPusher(
+        repo, recovery.root, "campaign-test", "campaign-unit", git_runner=runner
+    )
+    assert pusher.push("uncertain-checkpoint", head).state == "sent_unknown"
+    assert pusher.push("uncertain-checkpoint", head).state == "sent_unknown"
+    assert len(pushes) == 1
+    assert (
+        json.loads(pusher._path("uncertain-checkpoint").read_text()).get("submission")
+        != "not-submitted"
+    )
+
+
+def test_prepared_push_detects_divergence_without_issuing_after_restart(case, monkeypatch):
+    import bmad_loop.campaign_recovery as module
+
+    repo, baseline, _, recovery = case
+    head = commit(repo, "local.py", "local work\n", "local continuation")
+    save = module._save
+
+    def crash(path, row):
+        save(path, row)
+        if row.get("state") == "prepared":
+            raise RuntimeError("stopped before submission")
+
+    monkeypatch.setattr(module, "_save", crash)
+    with pytest.raises(RuntimeError, match="before submission"):
+        recovery.pusher.push("checkpoint", head)
+    monkeypatch.setattr(module, "_save", save)
+    git(repo, "checkout", "-b", "review-bot", baseline)
+    remote_head = commit(repo, "review.py", "review fix\n", "external review fix")
+    git(repo, "push", "campaign-test", remote_head + ":refs/heads/campaign-unit")
+    git(repo, "checkout", "campaign-unit")
+
+    def no_push(root, *args, **kwargs):
+        assert args[0] != "push", "divergent checkpoint must not submit a Git push"
+        return verify.git_bytes(root, *args, **kwargs)
+
+    pusher = CheckpointPusher(
+        repo, recovery.root, "campaign-test", "campaign-unit", git_runner=no_push
+    )
+    assert pusher.push("checkpoint", head).state == "remote_changed"
+    assert json.loads(pusher._path("checkpoint").read_text())["submission"] == "not-submitted"
+
+
+@pytest.mark.parametrize("method", ["push", "observe_existing"])
+def test_dangling_push_journal_is_not_treated_as_missing(case, method):
+    repo, baseline, _, recovery = case
+    path = recovery.pusher._path("checkpoint")
+    path.parent.mkdir(parents=True)
+    path.symlink_to(path.parent / "missing-target")
+    with pytest.raises(RecoveryHold, match="bounded regular"):
+        getattr(recovery.pusher, method)("checkpoint", baseline)
+    assert path.is_symlink()
+    assert not (path.parent / "missing-target").exists()
+
+
+def test_dangling_recovery_fence_is_not_treated_as_absent(case):
+    _, baseline, _, recovery = case
+    path = recovery.pusher.scope / "fence.json"
+    path.symlink_to(path.parent / "missing-fence")
+    with pytest.raises(RecoveryHold, match="bounded regular"):
+        recovery.pusher.push("checkpoint", baseline)
+    assert path.is_symlink()
+    assert not recovery.pusher._path("checkpoint").exists()
 
 
 def test_unknown_inflight_push_ancestor_can_be_settled_by_recovery(case):

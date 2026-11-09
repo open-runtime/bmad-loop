@@ -470,6 +470,15 @@ After Claude and Codex both write a candidate, neither family becomes independen
 because the other was the latest writer. Select another qualified review family
 or expose the review-capacity wait; never erase earlier contributions.
 
+Remote contributions to an owned PR retain a separate immutable Git-provenance
+ledger through integration and handoff. An unknown external model stays unknown;
+neither a bot name nor an Astra conflict-resolution receipt supplies its identity.
+Record Astra's own writing separately and preserve every already-authenticated
+writer family. Missing campaign session telemetry still blocks publication and
+cannot be converted into an external-origin exception. Review the full combined
+candidate afresh, with the external attribution limitation visible; do not claim
+provider independence from model identities that were never observed.
+
 The successor retains campaign/unit/worktree/branch/PR and gets a new native
 session identity with predecessor and handoff-digest links. Apply only current
 configured permissions, not imported approvals. Preserve contribution lineage

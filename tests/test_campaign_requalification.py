@@ -201,19 +201,25 @@ def test_renewal_preserves_configuration_authority_and_history_without_resuming(
     assert any(row["kind"] == "campaign-capabilities-requalified" for row in after.events)
 
 
-def test_legacy_inventory_budget_default_preserves_template_and_renews_normally(campaign):
+@pytest.mark.parametrize(
+    "field,default",
+    [("inventory_metadata_bytes", 64 * 1024 * 1024), ("max_remote_head_refreshes", 8)],
+)
+def test_legacy_inventory_budget_default_preserves_template_and_renews_normally(
+    campaign, field, default
+):
     store, before, template, _ = campaign
     database = CampaignDatabase(store.directory(before.id))
     with database.connect(write=True) as connection:
         with connection:
             connection.execute(
-                "UPDATE authority SET payload=json_remove(payload,"
-                "'$.spec.github.inventory_metadata_bytes') WHERE id=1"
+                "UPDATE authority SET payload=json_remove(payload, ?) WHERE id=1",
+                ("$.spec.github." + field,),
             )
     raw, _ = database.read()
-    assert "inventory_metadata_bytes" not in raw["spec"]["github"]
+    assert field not in raw["spec"]["github"]
     loaded = store.load(before.id)
-    assert loaded.spec.github.inventory_metadata_bytes == 64 * 1024 * 1024
+    assert getattr(loaded.spec.github, field) == default
     assert loaded.spec == before.spec
     assert digest(loaded.config_snapshot) == digest(raw["config_snapshot"])
     binding = loaded.bindings["execution_template"]
@@ -228,7 +234,7 @@ def test_legacy_inventory_budget_default_preserves_template_and_renews_normally(
     assert replace(restored, directory=template.directory, config_revision=1) == template
     assert Path(binding["path"]).read_bytes() == old_template
     saved, _ = database.read()
-    assert saved["spec"]["github"]["inventory_metadata_bytes"] == 64 * 1024 * 1024
+    assert saved["spec"]["github"][field] == default
 
 
 @pytest.mark.parametrize(

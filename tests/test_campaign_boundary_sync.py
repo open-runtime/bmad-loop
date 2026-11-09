@@ -84,12 +84,19 @@ def setup(project, tmp_path):
     git(project.project, "clone", "--bare", str(project.project), str(tmp_path / "remote.git"))
     git(project.project, "remote", "add", "origin", str(tmp_path / "remote.git"))
     runtime, snapshot, unit = configured(project, tmp_path)
+    git(project.project, "switch", "-c", "campaign-boundary")
+    git(project.project, "push", "origin", "campaign-boundary")
+    snapshot.remote_url = str(tmp_path / "remote.git")
     unit.spec = dataclasses.replace(unit.spec, kind="planning")
     unit.bindings.update(
-        pr={"number": 2, "url": "https://github.com/org/repo/pull/2"},
+        pr={"number": 2, "node_id": "P2", "url": "https://github.com/org/repo/pull/2"},
         issue={"number": 1, "url": "https://github.com/org/repo/issues/1"},
+        branch="campaign-boundary",
+        remote_head_anchor=unit.bindings["head"],
     )
     runtime._gateway = Gateway(unit.bindings["head"])
+    runtime._gateway.pr["merged"] = False
+    runtime._gateway.pr["head"].update(ref="campaign-boundary", repo={"full_name": "org/repo"})
     runtime.template = lambda *args: type(
         "Template",
         (),
@@ -134,6 +141,106 @@ def completed(runtime, snapshot, unit):
         },
     }
     return OutboxAction("after", "stage-boundary-after", unit.id, {}, snapshot.generation)
+
+
+def advance_owned_remote(project, tmp_path, runtime):
+    """Create a real remote-only descendant without moving the worker checkout."""
+    remote = tmp_path / "remote.git"
+    before = runtime._gateway.pr["head"]["sha"]
+    head = git(
+        project.project,
+        "--git-dir=" + str(remote),
+        "commit-tree",
+        before + "^{tree}",
+        "-p",
+        before,
+        "-m",
+        "outside contributor",
+    ).strip()
+    git(
+        project.project,
+        "--git-dir=" + str(remote),
+        "update-ref",
+        "refs/heads/campaign-boundary",
+        head,
+    )
+    runtime._gateway.pr["head"]["sha"] = head
+    return head
+
+
+def test_before_boundary_records_external_head_before_another_writing_stage(project, tmp_path):
+    runtime, snapshot, unit = setup(project, tmp_path)
+    unit.state = UnitState.READY
+    local = unit.bindings["head"]
+    remote = advance_owned_remote(project, tmp_path, runtime)
+    payload, inputs = prepared(runtime, snapshot, unit)
+    debt = unit.evidence["remote_head_sync"]
+    assert debt["head"] == remote and debt["local_head"] == debt["provenance_before"] == local
+    assert debt["pr_node_id"] == "P2" and debt["branch"] == "campaign-boundary"
+    assert inputs["github"]["pulls"]["2"]["pr"]["head"]["sha"] == remote
+    assert "stage_boundary_ready" not in unit.evidence
+    assert (
+        boundary.before_proposal(runtime, snapshot, Proposal("launch", unit.id, payload)).kind
+        != "launch"
+    )
+    assert git(project.project, "rev-parse", "HEAD").strip() == local
+    assert unit.state == UnitState.READY and unit.hold is None
+
+
+def test_after_boundary_retains_completed_receipt_and_rearms_stage_after_external_head(
+    project, tmp_path
+):
+    runtime, snapshot, unit = setup(project, tmp_path)
+    action = completed(runtime, snapshot, unit)
+    receipt = copy.deepcopy(unit.evidence["stage_sync_debt"]["receipt"])
+    unit.evidence["planning_flow"] = {
+        "history": [{"launch_id": "model", "stage": "requirements", "state": "prepared"}],
+        "attempts": {"requirements": 1},
+        "stages": {},
+        "state": "planning",
+    }
+    runtime._validate_stage_receipt = lambda *args: pytest.fail("accepted stale stage evidence")
+    runtime._apply_stage_result = lambda *args: pytest.fail("advanced an obsolete stage")
+    remote = advance_owned_remote(project, tmp_path, runtime)
+    result = boundary.after_effect(runtime, snapshot, action)
+    assert result.data["changed"] and not result.data["validated"]
+    boundary.after_apply(runtime, snapshot, action, result.data)
+    assert unit.evidence["remote_head_sync"]["head"] == remote
+    assert unit.evidence["stage_input_invalidations"][-1]["receipt"] == receipt
+    assert "stage_sync_debt" not in unit.evidence and "stage_boundary_ready" not in unit.evidence
+    assert unit.claim.quiescent and unit.state == UnitState.RUNNING and unit.hold is None
+    assert unit.evidence["planning_flow"]["attempts"]["requirements"] == 0
+
+
+def test_unpushed_local_descendant_is_not_external_debt(project, tmp_path):
+    runtime, snapshot, unit = setup(project, tmp_path)
+    git(project.project, "commit", "--allow-empty", "-m", "owned unpublished work")
+    unit.bindings["head"] = git(project.project, "rev-parse", "HEAD").strip()
+    payload, _ = prepared(runtime, snapshot, unit)
+    assert "remote_head_sync" not in unit.evidence and unit.hold is None
+    assert (
+        boundary.before_proposal(runtime, snapshot, Proposal("launch", unit.id, payload)).kind
+        == "launch"
+    )
+
+
+@pytest.mark.parametrize("fault", ["identity", "lag"])
+def test_boundary_never_converts_untrusted_or_disagreeing_remote_to_launch(
+    project, tmp_path, fault
+):
+    from bmad_loop.campaign_remote_head import RemoteHeadPending
+
+    runtime, snapshot, unit = setup(project, tmp_path)
+    if fault == "identity":
+        runtime._gateway.pr["head"]["repo"]["full_name"] = "other/repo"
+        prepared(runtime, snapshot, unit)
+        assert unit.hold.kind == "ownership_uncertain"
+    else:
+        runtime._gateway.pr["head"]["sha"] = "f" * 40
+        with pytest.raises(RemoteHeadPending, match="disagree"):
+            prepared(runtime, snapshot, unit)
+        assert unit.hold is None
+    assert "remote_head_sync" not in unit.evidence and "stage_boundary_ready" not in unit.evidence
 
 
 def test_before_inputs_are_durable_before_any_model_launch_and_include_native_versions(

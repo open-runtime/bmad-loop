@@ -32,7 +32,7 @@ class RecoveryHold(RuntimeError):
 class PushObservation:
     action_id: str
     head: str
-    state: str  # prepared, sent_unknown, in_flight, confirmed, superseded
+    state: str  # prepared, sent_unknown, in_flight, confirmed, remote_changed, superseded
     remote_head: str | None = None
 
 
@@ -100,6 +100,22 @@ def _env(**extra: str) -> dict[str, str]:
     return {**{k: v for k, v in os.environ.items() if not k.startswith("GIT_")}, **extra}
 
 
+def _nonfastforward_refusal(result: Any, head: str, branch: str) -> bool:
+    """Only Git's exact single-ref porcelain result proves no update occurred.
+
+    A timeout, exception, generic error or human-readable stderr is not a
+    negative acknowledgement. The command pushes one immutable SHA to one ref;
+    its machine result must identify precisely that rejected update.
+    """
+    if result.returncode != 1 or not isinstance(result.stdout, bytes):
+        return False
+    rows = [line.split(b"\t") for line in result.stdout.splitlines() if b"\t" in line]
+    return len(rows) == 1 and rows[0] in [
+        [b"!", (head + ":refs/heads/" + branch).encode(), reason]
+        for reason in (b"[rejected] (fetch first)", b"[rejected] (non-fast-forward)")
+    ]
+
+
 class CheckpointPusher:
     """One immutable SHA per durable action, serialized only on its branch.
 
@@ -150,10 +166,22 @@ class CheckpointPusher:
     def _ancestor(self, older: str, newer: str) -> bool:
         result = self.git(self.repo, "merge-base", "--is-ancestor", older, newer, env=_env())
         if result.returncode not in (0, 1):
-            # A remote actor may have introduced an object not fetched locally.
-            self._run(
-                "fetch", "--no-tags", "--no-write-fetch-head", "--refmap=", self.remote, newer
-            )
+            # Either endpoint may be remote-only: push admission asks whether
+            # the remote head (older) is contained by our local candidate.
+            # Fetch only missing immutable commits, never update shared refs.
+            for head in (older, newer):
+                present = self.git(
+                    self.repo, "cat-file", "-e", _oid(head) + "^{commit}", env=_env()
+                )
+                if present.returncode:
+                    self._run(
+                        "fetch",
+                        "--no-tags",
+                        "--no-write-fetch-head",
+                        "--refmap=",
+                        self.remote,
+                        head,
+                    )
             result = self.git(self.repo, "merge-base", "--is-ancestor", older, newer, env=_env())
         if result.returncode not in (0, 1):
             raise RecoveryHold("Checkpoint ancestry observation unavailable")
@@ -171,7 +199,7 @@ class CheckpointPusher:
 
     def fenced(self) -> str | None:
         path = self.scope / "fence.json"
-        if not path.exists():
+        if not path.exists() and not is_link_like(path):
             return None
         row = _load(path)
         return row["action_id"] if row["active"] else None
@@ -185,7 +213,7 @@ class CheckpointPusher:
         _oid(head)
         with file_lock(self.scope / "push.lock"):
             path = self._path(action_id)
-            if path.exists():
+            if path.exists() or is_link_like(path):
                 if _load(path)["head"] != head:
                     raise RecoveryHold("Checkpoint observation cannot replace its durable head")
                 return self._reconcile_locked(action_id)
@@ -227,7 +255,7 @@ class CheckpointPusher:
             if fence and recovery_action != fence:
                 raise RecoveryHold("Unit recovery fence rejects new checkpoint pushes")
             path = self._path(action_id)
-            if path.exists():
+            if path.exists() or is_link_like(path):
                 prior = _load(path)
                 if prior["head"] != head or prior.get("recovery_action") != recovery_action:
                     raise RecoveryHold("Checkpoint action identity was reused for different input")
@@ -247,7 +275,25 @@ class CheckpointPusher:
                     }
                     _save(path, row)
                     return PushObservation(action_id, head, "confirmed", remote)
-                raise RecoveryHold("Remote branch diverged; checkpoint requires integration")
+                # No push command has been submitted for this action. Preserve
+                # that positive fact separately from an issued uncertain write,
+                # so the coordinator can integrate the owned remote branch. The
+                # original immutable checkpoint remains unpaid until a later
+                # remote descendant contains it; do not relabel this as backup
+                # success or silently retry this action with another SHA.
+                row = {
+                    "schema_version": 1,
+                    "action_id": action_id,
+                    "head": head,
+                    "state": "remote_changed",
+                    "remote_head": remote,
+                    "remote_before": remote,
+                    "recovery_action": recovery_action,
+                    "submission": "not-submitted",
+                    "reason": "remote_branch_diverged",
+                }
+                _save(path, row)
+                return PushObservation(action_id, head, "remote_changed", remote)
             row = {
                 "schema_version": 1,
                 "action_id": action_id,
@@ -260,7 +306,33 @@ class CheckpointPusher:
             row["state"] = "sent_unknown"
             _save(path, row)
             try:
-                self._run("push", "--porcelain", self.remote, head + ":refs/heads/" + self.branch)
+                result = self.git(
+                    self.repo,
+                    "push",
+                    "--porcelain",
+                    self.remote,
+                    head + ":refs/heads/" + self.branch,
+                    timeout_s=30,
+                    env=_env(),
+                )
+                if _nonfastforward_refusal(result, head, self.branch):
+                    # A competing writer may append between ls-remote and
+                    # push. This exact protocol refusal settles submission,
+                    # but does not settle the original checkpoint's backup.
+                    try:
+                        changed = self.remote_head()
+                    except (OSError, verify.GitError, RecoveryHold):
+                        changed = None
+                    row.update(
+                        state="remote_changed",
+                        remote_head=changed,
+                        submission="not-submitted",
+                        reason="non_fast_forward_refusal",
+                    )
+                    _save(path, row)
+                    return PushObservation(action_id, head, "remote_changed", changed)
+                if result.returncode:
+                    raise RecoveryHold("Git operation failed: push")
             except (OSError, verify.GitError, RecoveryHold) as exc:
                 row["failure"] = type(exc).__name__
                 _save(path, row)
@@ -371,6 +443,7 @@ class CampaignRecovery:
                     "sent_unknown",
                     "in_flight",
                     "confirmed",
+                    "remote_changed",
                     "superseded",
                 ):
                     raise RecoveryHold("Unknown checkpoint publication state")
@@ -659,7 +732,7 @@ class CampaignRecovery:
         # Unknown old writes can only advance to ancestors of this exact remote
         # head. Their history remains; confirmed ancestry settles their risk.
         for prior in self.pusher.observations():
-            if prior.state in ("sent_unknown", "in_flight"):
+            if prior.state in ("sent_unknown", "in_flight", "remote_changed"):
                 self.pusher.reconcile(prior.action_id)
         with file_lock(self.pusher.scope / "push.lock"):
             if self.pusher.fenced() != action_id or self.pusher.remote_head() != row["head"]:

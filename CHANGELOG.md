@@ -14,6 +14,7 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Preserve external commits on owned PRs with scoped reconciliation and honest author provenance.
 - Scope linked GitHub evidence to selected work and expose unresolved optional references.
 - Deliver large campaign context through bounded stage prompts and immutable read-only artifacts.
 - Recover proved stage preparation failures without treating them as uncertain worker launches.

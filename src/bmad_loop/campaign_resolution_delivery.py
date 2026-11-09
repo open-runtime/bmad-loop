@@ -149,6 +149,17 @@ def finish(runtime: Any, snapshot: Any, unit: Any, action: Any) -> Observation:
     if source_identity != coordinates.source_revision:
         return Observation("rejected", reason="canonical source observation changed during repair")
     pushed = runtime._pusher(snapshot, unit).push(action.id, head)
+    if pushed.state == "remote_changed":
+        observed = runtime._push_observation(snapshot, action, pushed)
+        if observed.state != "confirmed":
+            return observed
+        return Observation(
+            "confirmed",
+            {
+                **observed.data,
+                "resolution_remote_changed": {"proposal_id": accepted["id"], "head": head},
+            },
+        )
     if pushed.state != "confirmed":
         return Observation("unknown", reason="repair checkpoint push awaits remote readback")
     records = tuple(

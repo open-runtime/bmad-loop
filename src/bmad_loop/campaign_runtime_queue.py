@@ -7,13 +7,18 @@ admitted. A replaced G invalidates local/hosted evidence for the earlier group.
 
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 from .campaign_github import GithubError
 from .campaign_merge_adapter import AdapterReceipt
 from .campaign_model import Hold, UnitState
-from .campaign_publication import PublicationController, PublicationRequirements, read_rules
+from .campaign_publication import (
+    Candidate,
+    PublicationController,
+    PublicationRequirements,
+    read_rules,
+)
 from .campaign_queue import (
     QueueGroup,
     allocate_checkout,
@@ -78,7 +83,34 @@ def _terminal_effect(runtime, snapshot, action, candidate, pr):
     """Reconcile terminal remote state through the ordinary landing proof."""
     if pr.get("merged") is not True and pr.get("state") == "open":
         return None
-    owned = snapshot.units[action.unit].bindings["pr"]
+    unit = snapshot.units[action.unit]
+    owned = unit.bindings["pr"]
+    if (
+        (pr.get("head") or {}).get("sha") != candidate.head
+        and pr.get("number") == candidate.pr_number
+        and owned.get("node_id")
+        and pr.get("node_id") == owned["node_id"]
+        and (pr.get("head") or {}).get("ref") == unit.bindings.get("branch")
+        and (pr.get("head") or {}).get("repo", {}).get("full_name") == snapshot.repository
+        and (pr.get("base") or {}).get("repo", {}).get("full_name") == snapshot.repository
+        and (pr.get("base") or {}).get("ref") == candidate.target
+        and pr.get("state") == "closed"
+        and type(pr.get("merged")) is bool
+    ):
+        # A terminal external head cannot inherit H's review. Settling removal
+        # frees the uncertain outbox; it never proves this new head delivered.
+        return Observation(
+            "confirmed",
+            {
+                "closed": True,
+                "reason": "owned queued PR became terminal at an unreviewed external head",
+                "external_head_terminal": {
+                    "candidate": asdict(candidate),
+                    "head": pr["head"]["sha"],
+                    "merged": pr["merged"],
+                },
+            },
+        )
     if (
         pr.get("number") != candidate.pr_number
         or (pr.get("head") or {}).get("sha") != candidate.head
@@ -112,6 +144,55 @@ def observe_effect(runtime, snapshot, action) -> Observation:
     if terminal is not None:
         return terminal
     prior = unit.evidence.get("queue", {})
+    if (
+        (pr.get("head") or {}).get("sha") != candidate.head
+        or prior.get("remote_head_observation")
+        or prior.get("remote_head_pending")
+    ):
+        from .campaign_remote_head import checked
+
+        remote = checked(runtime, snapshot, unit, pr=pr)
+        if remote.get("remote_head_error"):
+            return Observation("confirmed", remote)
+        debt = remote.get("remote_head_sync")
+        if not isinstance(debt, dict):
+            return Observation(
+                "confirmed",
+                {
+                    "remote_head_error": "previously observed queued contribution disappeared before integration"
+                },
+            )
+        for name in ("remote_head_observation", "remote_head_pending"):
+            previous = (prior.get(name) or {}).get("remote_head_sync")
+            if previous and not runtime._pusher(snapshot, unit)._ancestor(
+                previous["head"], debt["head"]
+            ):
+                return Observation(
+                    "confirmed",
+                    {
+                        "remote_head_error": "queued remote branch lost a previously observed contribution"
+                    },
+                )
+        removal = replace(candidate, head=debt["head"])
+        member = membership(gateway, removal)
+        if member.get("id") != debt["pr_node_id"]:
+            raise GithubError("queue removal PR native identity changed")
+        if member.get("merged") is not False or member.get("state") != "OPEN":
+            return Observation(
+                "unknown",
+                reason="changed queued PR lacks open/unmerged removal proof",
+                retry_at=runtime.clock() + 5,
+            )
+        return Observation(
+            "confirmed",
+            {
+                "observed_at": runtime.clock(),
+                "candidate": asdict(candidate),
+                "removal_candidate": asdict(removal),
+                "remote_head_observation": remote,
+                "dequeued": member.get("mergeQueueEntry") is None,
+            },
+        )
     member = membership(gateway, candidate)
     expected_node = unit.bindings["pr"].get("node_id")
     if not member.get("id") or (expected_node and member["id"] != expected_node):
@@ -390,21 +471,69 @@ def dequeue_effect(runtime, snapshot, action) -> Observation:
     # Settle terminal/removal readback before considering another mutation.
     current = observe_effect(runtime, snapshot, action)
     if current.state != "confirmed" or any(
-        key in current.data for key in ("merged", "closed", "dequeued")
+        current.data.get(key) for key in ("merged", "closed", "dequeued", "remote_head_error")
     ):
         return current
     unit = snapshot.units[action.unit]
+    removal = current.data.get("removal_candidate")
     intent = prepare_dequeue(
         runtime.gateway(snapshot),
-        runtime._candidate(snapshot, unit),
+        Candidate(**removal) if removal else runtime._candidate(snapshot, unit),
         action_id=action.id + "-dequeue",
         generation=snapshot.generation,
     )
+    if removal:
+        debt = current.data["remote_head_observation"]["remote_head_sync"]
+        if (intent.coordinates or {}).get("node_id") != debt["pr_node_id"]:
+            raise GithubError("queue removal preparation PR native identity changed")
+        intent = replace(
+            intent,
+            coordinates={
+                **(intent.coordinates or {}),
+                "remote_head_removal": debt,
+                "accepted_candidate": current.data["candidate"],
+            },
+        )
     return Observation("confirmed", {"intent": intent.to_dict(), "purpose": "queue-dequeue"})
 
 
 def apply_effect(runtime, snapshot, unit, action, data) -> None:
     state = unit.evidence.setdefault("queue", {})
+    if data.get("remote_head_error"):
+        runtime._set_hold(unit, Hold("remote_head_error", data["remote_head_error"], id=action.id))
+        return
+    if data.get("remote_head_observation"):
+        # The observed head identifies removal only; it has earned none of the
+        # old candidate's verification, reviews or publication authority.
+        candidate = asdict(runtime._candidate(snapshot, unit))
+        if candidate != data["candidate"]:
+            state["observed_at"] = 0
+            add_event(snapshot, "queue-removal-readback-stale", unit=unit.id)
+            return
+        state.update(
+            observed_at=data["observed_at"],
+            candidate=candidate,
+            removal_candidate=data["removal_candidate"],
+            remote_head_observation=data["remote_head_observation"],
+            needs_dequeue=True,
+            restart_acceptance=True,
+            failure_check_attempted=True,
+            gate_reasons=["owned PR head changed; remove queue entry before integration"],
+        )
+        if not data.get("dequeued"):
+            return
+        if unit.claim and not unit.claim.quiescent:
+            state["observed_at"] = 0
+            return
+        from .campaign_remote_head import apply as apply_remote
+
+        state["dequeue_confirmed"] = data["removal_candidate"]
+        unit.bindings.pop("merge_request_id", None)
+        transition(snapshot, unit.id, UnitState.SYNCING)
+        unit.resume_state = UnitState.SYNCING
+        apply_remote(runtime, snapshot, unit, data["remote_head_observation"])
+        add_event(snapshot, "queue-remote-head-removed", unit=unit.id, head=candidate["head"])
+        return
     if "merged" in data:
         unit.evidence["merge"] = data["merged"]
         if data["merged"].get("landing_acceptance"):
@@ -412,7 +541,9 @@ def apply_effect(runtime, snapshot, unit, action, data) -> None:
         transition(snapshot, unit.id, UnitState.MERGED_PENDING_SYNC)
         return
     if data.get("closed"):
-        unit.hold = Hold("external_wait", data["reason"], id=action.id, actor="github")
+        if data.get("external_head_terminal"):
+            state["external_head_terminal"] = data["external_head_terminal"]
+        runtime._set_hold(unit, Hold("external_wait", data["reason"], id=action.id, actor="github"))
         return
     if data.get("membership_missing"):
         state.update(

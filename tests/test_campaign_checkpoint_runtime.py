@@ -167,11 +167,11 @@ def test_issued_checkpoint_reconciles_its_original_sha_after_lost_reply_and_late
     original = progress(case, "first published milestone\n")
     pending = action(case, original)
     selected = progress(case, "newest valid progress before any push intent\n")
-    run, readback = case.pusher._run, case.pusher.remote_head
+    run, readback = case.pusher.git, case.pusher.remote_head
     calls, state = [], {"lost": False}
 
-    def lose_reply(*args, **kwargs):
-        result = run(*args, **kwargs)
+    def lose_reply(root, *args, **kwargs):
+        result = run(root, *args, **kwargs)
         if args[0] == "push":
             calls.append(args)
             state["lost"] = True
@@ -183,7 +183,7 @@ def test_issued_checkpoint_reconciles_its_original_sha_after_lost_reply_and_late
             raise RecoveryHold("readback temporarily unavailable")
         return readback()
 
-    monkeypatch.setattr(case.pusher, "_run", lose_reply)
+    monkeypatch.setattr(case.pusher, "git", lose_reply)
     monkeypatch.setattr(case.pusher, "remote_head", unavailable)
     monkeypatch.setattr(case.runtime, "_pusher", lambda *args: case.pusher)
     result = case.runtime._perform_checkpoint(case.snapshot, pending)

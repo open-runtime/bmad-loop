@@ -891,6 +891,29 @@ class CampaignRuntime:
                 or (unit.claim and not unit.claim.quiescent)
             ):
                 continue
+            if unit.evidence.get("remote_head_check_needed"):
+                proposals.append(Proposal("remote-head", key))
+                continue
+            if unit.evidence.get("remote_head_sync") and unit.state in {
+                UnitState.READY,
+                UnitState.RUNNING,
+            }:
+                if reserve("execution"):
+                    from .campaign_remote_head import request as remote_request
+
+                    proposals.append(
+                        Proposal(
+                            "launch",
+                            key,
+                            {"kind": "integrate", **remote_request(unit, snapshot=snapshot)},
+                        )
+                    )
+                continue
+            if unit.evidence.get("remote_head_continuation") and unit.evidence.get("integrated"):
+                proposals.append(
+                    Proposal("push", key, {"head": unit.evidence["integrated"]["head"]})
+                )
+                continue
             from .campaign_handoff_flow import resume_proposal
 
             continuation = resume_proposal(snapshot, unit, runtime=self)
@@ -1051,7 +1074,15 @@ class CampaignRuntime:
                             )
             elif unit.state == UnitState.LOCALLY_COMPLETE:
                 if reserve("execution"):
-                    proposals.append(Proposal("launch", key, {"kind": "integrate"}))
+                    from .campaign_remote_head import request as remote_request
+
+                    proposals.append(
+                        Proposal(
+                            "launch",
+                            key,
+                            {"kind": "integrate", **remote_request(unit, snapshot=snapshot)},
+                        )
+                    )
             elif unit.state == UnitState.SYNCING and unit.evidence.get("integrated"):
                 if unit.evidence.get("pushed") != unit.evidence["integrated"]["head"]:
                     proposals.append(
@@ -1061,7 +1092,15 @@ class CampaignRuntime:
                     proposals.append(Proposal("launch", key, {"kind": "verify"}))
             elif unit.state == UnitState.SYNCING and not unit.evidence.get("integrated"):
                 if reserve("execution"):
-                    proposals.append(Proposal("launch", key, {"kind": "integrate"}))
+                    from .campaign_remote_head import request as remote_request
+
+                    proposals.append(
+                        Proposal(
+                            "launch",
+                            key,
+                            {"kind": "integrate", **remote_request(unit, snapshot=snapshot)},
+                        )
+                    )
             elif unit.state == UnitState.REVIEWING:
                 from .campaign_native_review_flow import accepted as pair_accepted
 
@@ -1372,6 +1411,7 @@ class CampaignRuntime:
             if (
                 snapshot.spec.checkpoints.push
                 and not unit.hold
+                and not unit.evidence.get("remote_head_sync")
                 and writable_session
                 and progress.get("state") == "observed"
                 and progress.get("launch_id") == claim.launch_id
@@ -1484,6 +1524,14 @@ class CampaignRuntime:
                     current.error = "another actual writer owns overlapping scope"
                     self._set_hold(unit, Hold("ownership_uncertain", current.error, id=current.id))
                     return
+                if payload.get("kind") == "integrate" and payload.get("remote_resume_state"):
+                    if payload["remote_resume_state"] not in {"ready", "running"}:
+                        raise CampaignError(
+                            "remote-head integration has invalid unfinished-stage continuation"
+                        )
+                    unit.evidence.setdefault(
+                        "remote_head_continuation", {"state": payload["remote_resume_state"]}
+                    )
                 from .campaign_usage import admission_reason
 
                 reason = admission_reason(snapshot, unit, payload)
@@ -1850,14 +1898,17 @@ class CampaignRuntime:
             pusher = self._pusher(snapshot, unit)
             if action.kind == "checkpoint":
                 return self._reconcile_checkpoint(snapshot, action)
+            if not any(row.action_id == action.id for row in pusher.observations()):
+                # Re-enter the original immutable input, through the same
+                # journal-before-write branch guard; absence is not success.
+                return self._perform_push(snapshot, action)
             row = pusher.reconcile(action.id)
-            return Observation(
-                "confirmed" if row.state == "confirmed" else "unknown", dataclasses.asdict(row)
-            )
+            return self._push_observation(snapshot, action, row)
         # These effects are read-only, pure local state observations, or have
         # action-bound create/adopt logic. Re-running them does not launch twice.
         if action.kind in {
             "inventory",
+            "remote-head",
             "source-observation",
             "reconcile-existing",
             "capacity",
@@ -3019,8 +3070,51 @@ class CampaignRuntime:
             Path(unit.bindings["workspace"]), action.payload["head"], unit.bindings.get("base", "")
         )
         row = self._pusher(snapshot, unit).push(action.id, action.payload["head"])
+        return self._push_observation(snapshot, action, row)
+
+    def _perform_remote_head(self, snapshot, action) -> Observation:
+        from .campaign_remote_head import observe
+
+        try:
+            return Observation("confirmed", observe(self, snapshot, snapshot.units[action.unit]))
+        except CampaignError as exc:
+            return Observation("confirmed", {"remote_head_error": str(exc)})
+
+    def _push_observation(self, snapshot, action, row) -> Observation:
+        data = dataclasses.asdict(row)
+        unit = snapshot.units[action.unit]
+        if row.state == "remote_changed" or (
+            row.state == "confirmed" and row.remote_head and row.remote_head != row.head
+        ):
+            from .campaign_remote_head import observe
+
+            if not unit.bindings.get("pr"):
+                return Observation(
+                    "confirmed",
+                    {
+                        **data,
+                        "remote_head_error": "unowned remote branch cannot authorize recovery",
+                    },
+                )
+            try:
+                data.update(observe(self, snapshot, unit))
+            except CampaignError as exc:
+                data["remote_head_error"] = str(exc)
+            data["backup_pending"] = row.state == "remote_changed"
+        if row.state == "confirmed":
+            settled = []
+            for prior in unit.evidence.get("external_backup_debt", {}):
+                result = self._pusher(snapshot, unit).reconcile(prior)
+                if result.state != "confirmed":
+                    return Observation(
+                        "unknown",
+                        data,
+                        "preserved external backup debt awaits exact descendant readback",
+                    )
+                settled.append(prior)
+            data["settled_backup_debt"] = settled
         return Observation(
-            "confirmed" if row.state == "confirmed" else "unknown", dataclasses.asdict(row)
+            "confirmed" if row.state in {"confirmed", "remote_changed"} else "unknown", data
         )
 
     def _perform_checkpoint(self, snapshot, action) -> Observation:
@@ -3102,9 +3196,10 @@ class CampaignRuntime:
             return self._checkpoint_wait(
                 snapshot, action, str(exc), {"head": head, "coalescing": coalescing}
             )
+        observed = self._push_observation(snapshot, action, row)
         return (
-            self._checkpoint_done(action, {**dataclasses.asdict(row), "coalescing": coalescing})
-            if row.state == "confirmed"
+            self._checkpoint_done(action, {**observed.data, "coalescing": coalescing})
+            if observed.state == "confirmed"
             else self._checkpoint_wait(
                 snapshot,
                 action,
@@ -3193,7 +3288,10 @@ class CampaignRuntime:
                         snapshot, action, "exhausted backup readback unavailable: " + str(exc)
                     )
                 if observed.state == "confirmed":
-                    return self._checkpoint_done(action, dataclasses.asdict(observed))
+                    result = self._push_observation(snapshot, action, observed)
+                    if result.state == "confirmed":
+                        return self._checkpoint_done(action, result.data)
+                    return self._checkpoint_wait(snapshot, action, result.reason, result.data)
                 return self._checkpoint_wait(
                     snapshot,
                     action,
@@ -3205,8 +3303,11 @@ class CampaignRuntime:
             row = pusher.reconcile(action.id)
         except Exception as exc:
             return self._checkpoint_wait(snapshot, action, str(exc))
-        if row.state == "confirmed":
-            return self._checkpoint_done(action, dataclasses.asdict(row))
+        if row.state in {"confirmed", "remote_changed"}:
+            result = self._push_observation(snapshot, action, row)
+            if result.state == "confirmed":
+                return self._checkpoint_done(action, result.data)
+            return self._checkpoint_wait(snapshot, action, result.reason, result.data)
         if prior.state == "prepared":
             if (
                 action.receipt.get("backup_failures", 0)
@@ -3382,7 +3483,21 @@ class CampaignRuntime:
         from .campaign_adoption import AdoptionError, guard_owned
 
         try:
-            guard_owned(self, snapshot, unit.id)
+            external = (
+                action.payload.get("remote_head_sync")
+                if action.payload.get("kind") == "integrate"
+                else None
+            )
+            if (
+                action.payload.get("result_contract") == "repair-v1"
+                and action.payload.get("role") == "conflict_repair"
+                and unit.evidence.get("integration_conflict", {}).get("remote_head_sync")
+            ):
+                external = unit.evidence["integration_conflict"]["remote_head_sync"]
+            if external:
+                guard_owned(self, snapshot, unit.id, remote_head_sync=external)
+            else:
+                guard_owned(self, snapshot, unit.id)
         except AdoptionError as exc:
             return Observation("confirmed", {"not_launched": True, "adoption_refused": str(exc)})
         if action.payload.get("result_contract") == "repair-v1" and unit.evidence.get(
@@ -3501,6 +3616,8 @@ class CampaignRuntime:
             "private_paths": unit.bindings.get("private_paths", []),
             "checkpoint_interval_s": snapshot.spec.checkpoints.target_interval_s,
         }
+        if request["kind"] == "integrate":
+            request["source_artifacts"] = unit.evidence.get("source_artifacts", [])
         if request.get("landing"):
             landing = unit.evidence["landing_acceptance"]
             request.update(
@@ -3651,6 +3768,19 @@ class CampaignRuntime:
                 "source_artifact_digest": unit.bindings.get("source_revision", ""),
                 "feedback": unit.evidence.get("required_findings", []),
             }
+            if unit.evidence.get("external_contributions"):
+                context["prior_artifacts"] = [
+                    *context["prior_artifacts"],
+                    *(
+                        {"external_contribution": entry}
+                        for entry in unit.evidence["external_contributions"]
+                    ),
+                ]
+                context["external_contribution_notice"] = {
+                    "count": len(unit.evidence["external_contributions"]),
+                    "model_attribution": "unobserved external contributors; independence is established against authenticated campaign/imported families only",
+                    "requirement": "Review the full combined diff, including external contributions; no historical review satisfies the changed candidate.",
+                }
             if request.get("landing"):
                 context["verification"] = unit.evidence["landing_acceptance"]["verification"]
                 context["actual_landing"] = unit.evidence["landing_acceptance"]["merge_commit"]
@@ -4121,6 +4251,10 @@ class CampaignRuntime:
             return Observation("confirmed", {"acceptance_stale": True})
         require_pair(snapshot, unit)
         pr = self.gateway(snapshot).pull(unit.bindings["pr"]["number"])
+        if pr.get("head", {}).get("sha") != unit.evidence["integrated"]["head"]:
+            from .campaign_remote_head import checked
+
+            return Observation("confirmed", checked(self, snapshot, unit, pr=pr))
         intent = self.gateway(snapshot).prepare_ready(
             pr["node_id"],
             action_id=action.id + "-ready",
@@ -4194,6 +4328,10 @@ class CampaignRuntime:
             from .campaign_external_merge import inspect as inspect_external_merge
 
             return inspect_external_merge(self, snapshot, unit, observation)
+        if observation.pr.get("head", {}).get("sha") != candidate.head:
+            from .campaign_remote_head import checked
+
+            return Observation("confirmed", checked(self, snapshot, unit, pr=observation.pr))
         from .campaign_remote_feedback import collect as collect_remote_feedback
 
         remote_defects = collect_remote_feedback(
@@ -4747,6 +4885,23 @@ class CampaignRuntime:
         data = observation.data
         unit = snapshot.units.get(action.unit)
         kind = action.kind
+        if action.unit in snapshot.units and data.get("remote_head_error"):
+            if data.get("head"):
+                unit.evidence.setdefault("external_backup_debt", {})[action.id] = data["head"]
+            self._set_hold(
+                unit, Hold("ownership_uncertain", data["remote_head_error"], id=action.id)
+            )
+            add_event(
+                snapshot, "remote-head-refused", unit=unit.id, reason=data["remote_head_error"]
+            )
+            return
+        if kind == "prepare-ready" and (
+            data.get("remote_head_sync") or data.get("remote_head_current")
+        ):
+            from .campaign_remote_head import apply as apply_remote
+
+            apply_remote(self, snapshot, unit, data)
+            return
         if kind in {"prepare-ready", "prepare-merge"} and data.get("acceptance_stale"):
             from .campaign_review_freshness import invalidate
 
@@ -5100,9 +5255,14 @@ class CampaignRuntime:
 
             apply_backoff(snapshot, unit.id, now=self.clock())
         elif kind == "resolution-finish":
-            from .campaign_resolution_delivery import apply as apply_resolution
+            if data.get("resolution_remote_changed"):
+                from .campaign_remote_head import interrupt_resolution
 
-            apply_resolution(snapshot, unit, data)
+                interrupt_resolution(self, snapshot, unit, action, data)
+            else:
+                from .campaign_resolution_delivery import apply as apply_resolution
+
+                apply_resolution(snapshot, unit, data)
         elif kind == "resolution-exhausted":
             unit.hold = Hold(
                 "resolution_attempts_exhausted",
@@ -5119,6 +5279,10 @@ class CampaignRuntime:
             unit.bindings["stop_requested_for"] = data["launch_id"]
         elif kind == "github":
             if data.get("canceled_before_write"):
+                if data.get("remote_head_sync") or data.get("remote_head_current"):
+                    from .campaign_remote_head import apply as apply_remote
+
+                    apply_remote(self, snapshot, unit, data)
                 add_event(
                     snapshot,
                     "metadata-write-canceled",
@@ -5155,6 +5319,10 @@ class CampaignRuntime:
                     "url": receipt.get("html_url", ""),
                     "node_id": receipt.get("node_id", ""),
                 }
+                unit.bindings.setdefault(
+                    "remote_head_anchor",
+                    unit.bindings.get("last_pushed_head", unit.bindings["head"]),
+                )
             elif purpose == "ready":
                 unit.bindings["ready_for_review"] = True
             elif purpose == "review-requests":
@@ -5316,19 +5484,41 @@ class CampaignRuntime:
         elif kind == "checkpoint-progress":
             unit.evidence["checkpoint_progress"] = data
             unit.bindings["checkpoint_observed_at"] = self.clock()
+        elif kind == "remote-head":
+            from .campaign_remote_head import apply as apply_remote
+
+            apply_remote(self, snapshot, unit, data)
         elif kind in {"push", "checkpoint"}:
             unit.bindings["last_checkpoint_at"] = self.clock()
+            for settled in data.get("settled_backup_debt", []):
+                unit.evidence.get("external_backup_debt", {}).pop(settled, None)
+            if data.get("remote_head_sync") or data.get("remote_head_current"):
+                from .campaign_remote_head import apply as apply_remote
+
+                apply_remote(self, snapshot, unit, data)
+            if data.get("backup_pending"):
+                unit.evidence.setdefault("external_backup_debt", {})[action.id] = data["head"]
+                return
             if not data.get("skipped"):
                 unit.bindings["last_pushed_head"] = data["head"]
                 unit.bindings["last_pushed_at"] = time.time()
-            if kind == "push":
+            if data.get("remote_head") == data.get("head"):
+                unit.bindings["remote_head_anchor"] = data["head"]
+            if kind == "push" and not data.get("remote_head_sync"):
                 unit.evidence["pushed"] = data["head"]
+                from .campaign_remote_head import resume_unfinished
+
+                resume_unfinished(snapshot, unit)
         elif kind in {"queue-observe", "queue-checkout", "queue-publish", "queue-dequeue"}:
             from .campaign_runtime_queue import apply_effect
 
             apply_effect(self, snapshot, unit, action, data)
         elif kind in {"pr-head-checkout", "pr-head-publish"}:
-            if data.get("needs_integration"):
+            if data.get("remote_head_sync") or data.get("remote_head_current"):
+                from .campaign_remote_head import apply as apply_remote
+
+                apply_remote(self, snapshot, unit, data)
+            elif data.get("needs_integration"):
                 from .campaign_publication_retry import invalidate
 
                 held = invalidate(snapshot, unit.id, action.id, data.get("base", ""))
@@ -5341,7 +5531,11 @@ class CampaignRuntime:
             else:
                 self._queue_intent(snapshot, unit, data)
         elif kind == "prepare-merge":
-            if data.get("remote_feedback"):
+            if data.get("remote_head_sync") or data.get("remote_head_current"):
+                from .campaign_remote_head import apply as apply_remote
+
+                apply_remote(self, snapshot, unit, data)
+            elif data.get("remote_feedback"):
                 from .campaign_remote_feedback import RemoteFeedback
                 from .campaign_remote_feedback import apply as apply_remote_feedback
 
@@ -5631,11 +5825,17 @@ class CampaignRuntime:
                     id=claim.launch_id,
                 )
         elif outcome == "integrated":
+            from .campaign_remote_head import accept as accept_remote
+
+            accept_remote(snapshot, unit, receipt)
             unit.evidence["integrated"] = receipt
             for key in ("verification", "review", "native_review_pair"):
                 unit.evidence.pop(key, None)
             if unit.evidence.get("pushed") != receipt["head"]:
                 unit.evidence.pop("pushed", None)
+        elif outcome == "remote_head_changed":
+            unit.evidence["remote_head_check_needed"] = receipt
+            unit.evidence.pop("integrated", None)
         elif outcome == "verified":
             if receipt.get("stage") == "resolution_verify":
                 receipt["resolution_id"] = unit.evidence["accepted_resolution"]["id"]
@@ -5677,6 +5877,9 @@ class CampaignRuntime:
             else:
                 unit.resume_state = UnitState.READY
             if outcome == "integration_conflict":
+                from .campaign_remote_head import accept as accept_remote
+
+                accept_remote(snapshot, unit, receipt)
                 unit.evidence["preserved_refs"] = receipt.get("preserved_refs", [])
                 unit.evidence["preserved_heads"] = receipt.get("preserved_heads", [])
                 unit.evidence["integration_conflict"] = receipt

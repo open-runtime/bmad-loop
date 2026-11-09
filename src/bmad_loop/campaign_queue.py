@@ -572,13 +572,48 @@ def reconcile_dequeue(
 ) -> MutationIntent:
     from dataclasses import replace
 
-    candidate = Candidate(**(intent.coordinates or {})["candidate"])
+    coordinates = intent.coordinates or {}
+    candidate = Candidate(**coordinates["candidate"])
+    removal = coordinates.get("remote_head_removal")
+    if removal:
+        # A lost removal acknowledgement is not permission to dequeue a later
+        # entry. A new head can identify the same owned PR for absence readback
+        # only; it does not inherit the original accepted candidate's evidence.
+        if (
+            removal.get("repository") != gateway.repository
+            or removal.get("repository") != candidate.repository
+            or removal.get("pr_number") != candidate.pr_number
+            or removal.get("target") != candidate.target
+            or removal.get("head") != candidate.head
+            or removal.get("pr_node_id") != coordinates.get("node_id")
+            or not removal.get("branch")
+        ):
+            raise GithubError("remote-head dequeue coordinates changed")
+        current = gateway.pull(candidate.pr_number)
+        if (
+            current.get("number") != candidate.pr_number
+            or current.get("node_id") != coordinates["node_id"]
+            or (current.get("head") or {}).get("ref") != removal["branch"]
+            or (current.get("head") or {}).get("repo", {}).get("full_name") != candidate.repository
+            or (current.get("base") or {}).get("repo", {}).get("full_name") != candidate.repository
+            or (current.get("base") or {}).get("ref") != candidate.target
+        ):
+            raise GithubError("remote-head dequeue lost owned PR/ref/repository identity")
+        head = (current.get("head") or {}).get("sha")
+        if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40,64}", head):
+            raise GithubError("remote-head dequeue current head is unavailable")
+        candidate = replace(candidate, head=head)
     pr = membership(gateway, candidate)
     if pr.get("id") != (intent.coordinates or {}).get("node_id"):
         raise GithubError("dequeue PR native identity changed")
     if pr.get("mergeQueueEntry") is None:
+        if removal and not (
+            (pr.get("merged") is False and pr.get("state") in {"OPEN", "CLOSED"})
+            or (pr.get("merged") is True and pr.get("state") == "CLOSED")
+        ):
+            return replace(intent, error="queue removal lacks authenticated PR state")
         return replace(intent, state="confirmed", receipt=pr, error="")
-    if allow_retry:
+    if allow_retry and not removal:
         if generation is None or generation != intent.generation:
             raise GithubError("queue dequeue retry requires current coordinator authorization")
         return gateway.execute(replace(intent, state="sent_unknown"), generation=generation)

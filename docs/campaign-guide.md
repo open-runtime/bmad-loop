@@ -373,11 +373,38 @@ and is followed by independent GitHub readback. There is no native merge fallbac
 Development attribution comes from the latest completed primary dev/fix session's
 observed main model. Clean follow-up reviews and plugin telemetry do not replace
 that identity; explicit planning and repair writers retain their own attribution.
-Every prior writer family, including interrupted contributors, remains in the
-candidate's attribution. A reviewer from any contributing family is ineligible.
+Every authenticated campaign writer family, including interrupted contributors,
+remains in the candidate's attribution. A reviewer from any known contributing
+family is ineligible.
 Missing observed development identity remains visible and prevents independent
 publication acceptance. Resume can recover the identity from saved native
 receipts and invalidates a publication review that is no longer independent.
+
+Bot or collaborator commits pushed to an already-owned PR retain their exact Git
+history and a separate external-contribution ledger. Git author/committer bytes,
+commit/parent IDs and content digests are provenance, not model observations.
+Unknown external models remain visibly unobserved; they are never renamed after
+the campaign agent that integrates them. Existing campaign attribution debt stays
+blocking. Fresh full-diff reviews cover the complete combined candidate, but do
+not claim provider independence from unknown external models.
+
+Remote-head reconciliation waits for the owned writer to settle, validates the
+new paths against the approved scope, preserves local/remote/target history and
+uses append-only integration. Conflicts use the configured conflict-repair route.
+The resulting head requires fresh verification and reviews. Provenance collection
+refuses more than 4,096 new commits or 8 MiB of raw commit objects rather than
+silently omitting authors. Other PRs still require the explicit adoption contract.
+
+`github.max_remote_head_refreshes` bounds distinct remote-head changes separately
+from main refreshes (default eight); repeat observations do not consume another
+attempt. Exhaustion leaves an operator hold. Uncertain push acknowledgements and
+active recovery fences must reconcile before integration; an out-of-scope change
+does not expand the campaign's ownership.
+
+Status reports pending remote-head debt, distinct imported commit counts, missing
+campaign attribution and the latest sixteen provenance observations. Explicit
+omission counts and worker receipt links retain access to the complete ledger;
+public summaries do not expose raw author bytes or private commit bodies.
 
 `github.max_base_refreshes` bounds repeated acceptance restarts when main moves
 (default eight). Exhaustion leaves a visible operator hold on that unit and

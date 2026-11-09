@@ -902,6 +902,50 @@ appear after discovery. Periodic reconciliation catches that overlap and holds
 affected publication. Do not promise global duplicate exclusion across humans,
 other hosts and independent schedulers.
 
+Commits pushed by a bot or collaborator to an already-owned PR are new candidate
+inputs, not permission to overwrite either history. Bind the observation to the
+exact repository, PR/node identity, branch, authenticated remote checkpoint,
+local/remote heads and graph/config/source revisions. Reconcile pending push
+effects and wait for the affected writer to settle before scoped integration.
+Preserve local, remote and target heads; validate newly imported paths, including both sides of
+renames, before treating remote history as an allowed conflict-resolution source.
+Use append-only integration and the configured Astra conflict-repair route. A
+changed combined candidate owes fresh verification, native reviews when enabled,
+independent publication review and server checks. Another remote change makes
+that candidate evidence stale; unrelated units may continue.
+Stage boundaries perform the same owned-head observation before allowing another
+writing stage. A quiescent planning or admission stage resumes its unfinished work
+after scoped integration and backup; integration alone does not finish that work.
+
+Keep this debt distinct from an uncertain push. A proved no-submission remote
+change can schedule reconciliation; a sent-unknown write must first reconcile
+its original journal. Active rollback/recovery fences remain holds under their
+original preimage authority; external changes do not authorize clearing them. Count distinct
+remote heads durably against `github.max_remote_head_refreshes` (default eight),
+deduplicate repeat observations and expose an operator hold on exhaustion.
+Unapproved paths or protected source/config changes remain ownership failures,
+not permission to widen a repair. Releasing a hold never restores stale reviews.
+
+Keep external commit provenance separate from campaign session attribution.
+Record exact imported commit/parent IDs, byte-preserved author and committer
+headers, content digests and the observation's coordinates. Enumeration includes
+remote history absent from both the first observation's local candidate and accepted target, with
+explicit refusal above 4,096 commits or 8 MiB of cumulative raw commit objects.
+Do not truncate a provenance ledger or infer models from Git names, signatures
+or commit messages. External model attribution remains `unobserved_external`;
+Git authorship does not prove human-only authorship either.
+Preserve that first-observation checkpoint when a live writer incorporates the
+remote commits itself; an eventual no-op integration still owes their provenance.
+
+The family-independence gate retains every authenticated campaign contributor
+family and any family established by trusted imported session evidence. Missing
+campaign-writer telemetry remains blocking debt; integration, later known writers,
+handoff and existing-source verification cannot clear it. A repair adds only its
+own observed writer family. Full-diff review includes the imported code, while
+independence from an unobserved external model remains explicitly unproven. This
+does not create a generic `verify-existing` exemption: its built/done-source and
+no-development-session proof requirements remain unchanged.
+
 ## Intake and triage
 
 Always refresh mapped issues/PRs in the selected repository. Generic intake uses

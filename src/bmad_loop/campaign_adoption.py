@@ -1128,7 +1128,7 @@ def prepare(runtime, snapshot, action) -> dict[str, Any]:
     return result
 
 
-def guard_owned(runtime, snapshot, unit_id: str) -> None:
+def guard_owned(runtime, snapshot, unit_id: str, *, remote_head_sync=None) -> None:
     """Keep the original external admissions fence live for every later actor."""
     unit = snapshot.units[unit_id]
     if unit.bindings.get("adoption", {}).get("state") != "owned":
@@ -1154,9 +1154,25 @@ def guard_owned(runtime, snapshot, unit_id: str) -> None:
         raise AdoptionError("owned adopted PR changed native branch/repository identity")
     remote_head = _remote_head(runtime.project, snapshot.spec.remote, manifest.branch)
     local_head = verify.rev_parse_head(Path(unit.bindings["workspace"]))
+    sync = remote_head_sync or {}
+    debt = unit.evidence.get("remote_head_sync") or {}
+    preserved_external = bool(
+        sync
+        and debt.get("id") == sync.get("id")
+        and sync.get("repository") == snapshot.repository
+        and sync.get("pr_number") == manifest.pr_number
+        and sync.get("pr_node_id") == manifest.pr_node_id
+        and sync.get("branch") == manifest.branch
+        and sync.get("target") == manifest.target
+        and sync.get("head") == remote_head == debt.get("head")
+        and verify.is_ancestor(runtime.project, manifest.head, remote_head)
+    )
     if (
         pr.get("head", {}).get("sha") != remote_head
         or not verify.is_ancestor(runtime.project, manifest.head, local_head)
-        or not verify.is_ancestor(runtime.project, remote_head, local_head)
+        or (
+            not preserved_external
+            and not verify.is_ancestor(runtime.project, remote_head, local_head)
+        )
     ):
         raise AdoptionError("adopted remote branch gained unowned work or lost preserved ancestry")
