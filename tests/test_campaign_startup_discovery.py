@@ -32,6 +32,7 @@ from bmad_loop.campaign_supervisor import CampaignSupervisor
 def test_startup_recovers_complete_discovery_before_allocating_or_planning(
     production_case, prepared, tmp_path, monkeypatch
 ):
+    """Ablation: restoring the old aggregate byte allowance prevents complete admission."""
     case = production_case
     runtime = case.runtime
     _, _, _, candidate, capability = prepared
@@ -120,6 +121,18 @@ def test_startup_recovers_complete_discovery_before_allocating_or_planning(
     original_request = case.service.request
     recovery = {"available": False}
     pages = []
+    unrelated_body = "An audit #22626 is not a selected issue.\n" + "retained context\n" * 3500
+    unrelated_issues = [
+        {
+            "id": 9002 + index,
+            "number": 9002 + index,
+            "title": f"Unrelated second page issue {index}",
+            "body": unrelated_body,
+            "state": "open",
+        }
+        for index in range(80)
+    ]
+    assert len(json.dumps(unrelated_issues).encode()) > 4_000_000
 
     def request(method, path, payload=None):
         parsed = urlsplit(path)
@@ -133,15 +146,7 @@ def test_startup_recovers_complete_discovery_before_allocating_or_planning(
                     return ApiResponse(503, {"message": "temporary page outage"}, {})
                 return ApiResponse(
                     200,
-                    [
-                        {
-                            "id": 9002,
-                            "number": 9002,
-                            "title": "Unrelated second page issue",
-                            "body": "",
-                            "state": "open",
-                        }
-                    ],
+                    unrelated_issues,
                     {},
                 )
             result = original_request(method, path, payload)
@@ -192,6 +197,9 @@ def test_startup_recovers_complete_discovery_before_allocating_or_planning(
             inventory = snapshot.bindings["inventory"]
             assert inventory["complete"], (inventory["unavailable"], inventory["truncated"])
             assert any(row["number"] == 9002 for row in inventory["issues"])
+            retained = [row for row in inventory["issues"] if 9002 <= row["number"] < 9082]
+            assert len(retained) == 80
+            assert all(row["body"] == unrelated_body for row in retained)
             branch = next(
                 row
                 for row in inventory["remote_refs"]

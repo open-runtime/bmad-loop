@@ -808,6 +808,39 @@ selected renames. Empty or repository-wide planning scopes retain full inspectio
 genuinely oversized relevant evidence remains explicitly incomplete. GitHub may
 paginate through numeric repository URLs: bind that ID to the selected repository
 metadata and preserve the original endpoint and query scope on every page.
+
+Repository metadata and selected detail have separate budgets. Preserve complete
+issue and PR identities, bodies and public object shapes within the frozen
+`github.inventory_metadata_bytes` allowance (64 MiB by default), counting the
+combined issue/PR inventory and linked additions. Finite selected-path discovery
+also counts complete patchless PR file metadata after detail enrichment here,
+while selected patches, review bodies, threads and checks consume the unchanged
+per-PR and aggregate detail bounds. Broad or explicitly listed-PR discovery keeps
+its complete expanded file facts in the detail budget.
+Record observed bytes and the allowance. This is a finite observation budget, not a model context allowance or
+a bound on process memory. Exceeding it remains an explicit incomplete observation;
+do not silently clip bodies or report omitted rows as complete coverage.
+
+For finite selected paths, classify open and recent PRs by exact changed paths,
+including both sides of renames and conservative merge-base coverage. Retain
+global metadata while expanding links and review/check details for selected
+issues, mapped PRs, path-related PRs and links connecting that work. A title alone
+cannot exclude a candidate. Broad planning retains broad inspection. The receipt
+states which unrelated link closures were not expanded, so scoped completeness
+does not imply an exhaustive recursive audit of every historical conversation.
+Retain every detailed PR file identity, status and rename source, but expand patch
+text only for the declared paths (including either endpoint of a rename). Record
+the selected paths, omitted patch paths and bytes, and patches unavailable from
+GitHub. Keep review bodies, threads and checks complete. This scoped inventory
+supports admission and overlap reasoning; it is not a claim that the whole PR
+received a code review. Required relevant evidence still obeys the detail bounds.
+
+An inferred body mention such as `audit #22626` is not a native issue identity.
+Record optional unresolved references with their source and target; a 404 means
+not found or inaccessible, not proof of absence or authorization to discard an
+obligation. Deduplicate these observations and count failed lookups toward the
+request budget. Required selected/mapped objects, native hierarchy links and
+authentication, transport or other observation failures retain their holds.
 Bound commit-ID retrieval with an overflow sentinel and measure immutable object
 sizes before loading formatted history. A limit on retained JSON alone does not
 bound Git's captured output; oversized histories or individual commits must remain

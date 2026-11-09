@@ -2145,6 +2145,41 @@ class CampaignRuntime:
         return Journal(directory, pin=pin)
 
     def _perform_inventory(self, snapshot, action) -> Observation:
+        gateway = self.gateway(snapshot)
+        hierarchy = HierarchyCoordinator(gateway)
+        selected_issues = set(snapshot.spec.intake.issue_numbers)
+        issue_bindings = [
+            unit.bindings[name]
+            for unit in snapshot.units.values()
+            for name in ("issue", "epic_issue")
+            if unit.bindings.get(name)
+        ]
+        issue_bindings.extend(
+            binding
+            for binding in snapshot.bindings.get("github_hierarchy", {}).values()
+            if binding.get("kind") == "issue"
+        )
+        for binding in issue_bindings:
+            number = binding.get("number") if isinstance(binding, dict) else binding
+            if isinstance(number, str) and number.isdigit():
+                number = int(number)
+            if type(number) is not int or number <= 0:
+                raise CampaignError("Inventory mapped issue must have a positive native number")
+            selected_issues.add(number)
+        for unit in snapshot.units.values():
+            if (
+                unit.bindings.get("issue")
+                or snapshot.bindings.get("github_hierarchy", {})
+                .get("story:" + unit.id, {})
+                .get("kind")
+                == "issue"
+            ):
+                continue
+            tracker = unit.bindings.get("tracker_id") or snapshot.bindings.get(
+                "source_observations", {}
+            ).get(unit.id, {}).get("tracker_id")
+            if tracker:
+                selected_issues.add(hierarchy._tracker_number(str(tracker)))
         mapped = tuple(
             sorted(
                 {
@@ -2176,13 +2211,15 @@ class CampaignRuntime:
             else ()
         )
         receipt = RepositoryDiscovery(
-            self.gateway(snapshot),
+            gateway,
             self.project,
             cache=self.__dict__.setdefault("_discovery_objects", {}),
+            max_metadata_bytes=snapshot.spec.github.inventory_metadata_bytes,
         ).collect(
             remote=snapshot.spec.remote,
             recent_since=since,
             mapped_prs=mapped,
+            selected_issues=tuple(sorted(selected_issues)),
             detailed_prs=None,
             archive_roots=tuple(Path(path) for path in snapshot.spec.archive_roots),
             target=snapshot.spec.target,
@@ -3543,10 +3580,36 @@ class CampaignRuntime:
                     "admission_review",
                 },
             )
+            from .campaign_stage_prompt import attach_context, prepare_context
+
+            selected_issue_numbers = set(snapshot.spec.intake.issue_numbers)
+            story_binding = snapshot.bindings.get("github_hierarchy", {}).get(
+                "story:" + unit.id, {}
+            )
+            mapped_story = story_binding if story_binding.get("kind") == "issue" else None
+            for row in (unit.bindings.get("issue"), unit.bindings.get("epic_issue"), mapped_story):
+                number = row.get("number") if isinstance(row, dict) else row
+                if number is not None:
+                    selected_issue_numbers.add(int(number))
+            tracker = unit.bindings.get("tracker_id") or context["source"].get("tracker_id")
+            if tracker and not unit.bindings.get("issue") and not mapped_story:
+                selected_issue_numbers.add(
+                    HierarchyCoordinator(self.gateway(snapshot))._tracker_number(str(tracker))
+                )
+            context, context_files = prepare_context(
+                directory,
+                context,
+                issue_numbers=tuple(sorted(selected_issue_numbers)),
+                pr_numbers=((unit.bindings.get("pr") or {}).get("number"),),
+            )
+            if context_files:
+                request["context_artifacts"] = context_files
+                request["headless_grants"].setdefault("read_only_paths", []).extend(context_files)
             request["prompt"] = request.get("custom_prompt") or stage_packet(
                 coordinates,
                 context=context,
                 skill=dict(snapshot.spec.planning.skills).get(stage, ""),
+                compact=bool(context_files),
             )
             if request.get("custom_prompt"):
                 from .campaign_boundary_sync import custom_prompt
@@ -3554,6 +3617,8 @@ class CampaignRuntime:
                 request["prompt"] = custom_prompt(
                     request["custom_prompt"], context["github_stage_inputs"]
                 )
+                if context_files:
+                    request["prompt"] = attach_context(request["prompt"], context)
             if unit.spec.kind == "planning" and stage in snapshot.spec.planning.stages:
                 from .campaign_planning_skill import packet as planning_packet
 

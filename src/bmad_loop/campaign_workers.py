@@ -711,8 +711,17 @@ def _stage(request: dict[str, Any], envelope: CampaignExecution) -> dict[str, An
         from .campaign_checkpoint import instruction as checkpoint_instruction
 
         prompt += checkpoint_instruction(envelope.checkpoint_interval_s)
-    from .campaign_stage_prompt import instruction, materialize
+    from .campaign_stage_prompt import context_artifacts, instruction, materialize
 
+    source_packets = context_artifacts(envelope.directory, request.get("context_artifacts", []))
+    if source_packets and getattr(adapter, "requires_inline_context", False):
+        capability = getattr(adapter, "capability", None) or {}
+        grants = getattr(adapter, "grants", None) or {}
+        if capability.get("permissions") not in {"workspace-tools", "read-only-tools"}:
+            raise CampaignError("file-backed campaign context requires a qualified tool route")
+        granted = grants.get("read_only_paths", [])
+        if any(packet.descriptor() not in granted for packet in source_packets):
+            raise CampaignError("campaign context lacks its exact read-only retrieval grant")
     input_packet = materialize(envelope.directory, prompt)
     spec = SessionSpec(
         task_id=task_id,
@@ -753,6 +762,8 @@ def _stage(request: dict[str, Any], envelope: CampaignExecution) -> dict[str, An
 
     save_stage_usage(request, envelope.directory, usage, result)
     input_packet.verify()
+    for packet in source_packets:
+        packet.verify()
     models = tuple(usage.models or ()) if usage else ()
     observed = models[0] if models else ""
     model_source = "transcript_primary" if observed else ""
@@ -847,6 +858,7 @@ def _stage(request: dict[str, Any], envelope: CampaignExecution) -> dict[str, An
             "sha256": input_packet.sha256,
             "size_bytes": input_packet.size_bytes,
         },
+        "context_artifacts": [packet.descriptor() for packet in source_packets],
         "transcript_path": result.transcript_path,
         "usage": dataclasses.asdict(usage) if usage else None,
         "base": before,

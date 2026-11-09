@@ -4,6 +4,7 @@ import dataclasses
 import sys
 from pathlib import Path
 
+import pytest
 from test_campaign_headless import prepared as prepared
 
 from bmad_loop.campaign_model import CampaignSnapshot, CampaignSpec, RoleCandidate, RoleSpec
@@ -80,9 +81,57 @@ def test_repository_inventory_honors_frozen_recent_pull_window(project, tmp_path
 
     runtime, snapshot, _, _ = configured(project, tmp_path)
     snapshot.spec = dataclasses.replace(
-        snapshot.spec, github=dataclasses.replace(snapshot.spec.github, recent_days=45)
+        snapshot.spec,
+        github=dataclasses.replace(
+            snapshot.spec.github, recent_days=45, inventory_metadata_bytes=1234567
+        ),
     )
     runtime.clock = lambda: 1700000000
+    observed = []
+    monkeypatch.setattr(
+        RepositoryDiscovery,
+        "collect",
+        lambda self, **kwargs: observed.append(
+            {**kwargs, "max_metadata_bytes": self.max_metadata_bytes}
+        )
+        or SimpleNamespace(to_dict=lambda: {"complete": True}, digest="inventory"),
+    )
+    assert runtime._perform_inventory(snapshot, None).state == "confirmed"
+    since = datetime.fromisoformat(observed[0]["recent_since"].replace("Z", "+00:00"))
+    assert since == datetime.fromtimestamp(runtime.clock(), timezone.utc) - timedelta(days=45)
+    assert observed[0]["max_metadata_bytes"] == 1234567
+
+
+def test_repository_inventory_selects_explicit_and_native_issue_bindings(
+    project, tmp_path, monkeypatch
+):
+    from types import SimpleNamespace
+
+    from bmad_loop.campaign_discovery import RepositoryDiscovery
+    from bmad_loop.campaign_model import CampaignUnit, UnitSpec
+
+    runtime, snapshot, _, _ = configured(project, tmp_path)
+    snapshot.spec = dataclasses.replace(
+        snapshot.spec, intake=dataclasses.replace(snapshot.spec.intake, issue_numbers=(13, 11))
+    )
+    first = CampaignUnit(UnitSpec("source:epic:first", "source", "epic", "First"))
+    first.bindings.update(issue={"number": 11}, epic_issue="17")
+    second = CampaignUnit(UnitSpec("source:epic:second", "source", "epic", "Second"))
+    second.bindings["pr"] = {"number": 31}
+    third = CampaignUnit(UnitSpec("source:epic:third", "source", "epic", "Third"))
+    third.bindings["tracker_id"] = "#19"
+    fourth = CampaignUnit(UnitSpec("source:epic:fourth", "source", "epic", "Fourth"))
+    snapshot.units = {unit.id: unit for unit in (first, second, third, fourth)}
+    snapshot.bindings["source_observations"] = {
+        first.id: {"tracker_id": "https://github.com/foreign/repo/issues/999"},
+        second.id: {"tracker_id": "https://github.com/org/repo/issues/23"},
+        third.id: {"tracker_id": "https://github.com/foreign/repo/issues/999"},
+        fourth.id: {"tracker_id": "https://github.com/foreign/repo/issues/999"},
+    }
+    snapshot.bindings["github_hierarchy"] = {
+        "story:" + fourth.id: {"kind": "issue", "number": 29},
+        "milestone": {"kind": "milestone", "number": 97},
+    }
     observed = []
     monkeypatch.setattr(
         RepositoryDiscovery,
@@ -91,8 +140,52 @@ def test_repository_inventory_honors_frozen_recent_pull_window(project, tmp_path
         or SimpleNamespace(to_dict=lambda: {"complete": True}, digest="inventory"),
     )
     assert runtime._perform_inventory(snapshot, None).state == "confirmed"
-    since = datetime.fromisoformat(observed[0]["recent_since"].replace("Z", "+00:00"))
-    assert since == datetime.fromtimestamp(runtime.clock(), timezone.utc) - timedelta(days=45)
+    assert observed[0]["selected_issues"] == (11, 13, 17, 19, 23, 29)
+    assert observed[0]["mapped_prs"] == (31,)
+
+
+@pytest.mark.parametrize("binding", [{"number": True}, {"number": 0}, {"number": "bad"}])
+def test_repository_inventory_refuses_malformed_native_issue_binding(
+    project, tmp_path, monkeypatch, binding
+):
+    from types import SimpleNamespace
+
+    from bmad_loop.campaign_discovery import RepositoryDiscovery
+    from bmad_loop.campaign_model import CampaignError, CampaignUnit, UnitSpec
+
+    monkeypatch.setattr(
+        RepositoryDiscovery,
+        "collect",
+        lambda self, **kwargs: SimpleNamespace(to_dict=lambda: {"complete": True}, digest="test"),
+    )
+    runtime, snapshot, _, _ = configured(project, tmp_path)
+    unit = CampaignUnit(UnitSpec("source:epic:first", "source", "epic", "First"))
+    unit.bindings["issue"] = binding
+    snapshot.units[unit.id] = unit
+    with pytest.raises(CampaignError, match="positive native number"):
+        runtime._perform_inventory(snapshot, None)
+
+
+def test_repository_inventory_refuses_foreign_imported_tracker(project, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from bmad_loop.campaign_discovery import RepositoryDiscovery
+    from bmad_loop.campaign_github import GithubError
+    from bmad_loop.campaign_model import CampaignUnit, UnitSpec
+
+    monkeypatch.setattr(
+        RepositoryDiscovery,
+        "collect",
+        lambda self, **kwargs: SimpleNamespace(to_dict=lambda: {"complete": True}, digest="test"),
+    )
+    runtime, snapshot, _, _ = configured(project, tmp_path)
+    unit = CampaignUnit(UnitSpec("source:epic:first", "source", "epic", "First"))
+    snapshot.units[unit.id] = unit
+    snapshot.bindings["source_observations"] = {
+        unit.id: {"tracker_id": "https://github.com/foreign/repo/issues/999"}
+    }
+    with pytest.raises(GithubError, match="does not identify an issue in this repository"):
+        runtime._perform_inventory(snapshot, None)
 
 
 def test_never_submitted_merge_wait_reenters_fresh_gate(project, tmp_path, monkeypatch):

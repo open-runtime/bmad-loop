@@ -293,6 +293,24 @@ shell argv. Stream parsing is bounded and retains diagnostics separately from
 the structured result. Missing output, limits reached or incomplete streams fail
 the job; bounded repair may retry with smaller chunks.
 
+Ordinary planning, implementation, review and repair stages also obey the earned
+route's input bound. Do not embed a complete repository inventory into every
+stage packet. Materialize immutable full-source artifacts before rendering the
+prompt, sharding large collections within the existing per-file bound. Supply a
+bounded selected-work view with explicit coverage, counts and retrieval references.
+Keep the unit's acceptance, owner decisions and required findings intact; a
+required obligation that cannot fit must not disappear in a summary or clipped
+string. Verify artifact integrity before and after the stage and grant only the
+exact required read-only paths through the existing tool boundary.
+
+Availability for retrieval is not evidence that the model read the complete
+inventory. Jobs requiring exhaustive interpretation still use explicit partitioned
+input and coverage validation. A no-tools route cannot silently accept unresolved
+file references. Qualification must construct the real production request from
+a representative large inventory without inference, verify its input size and
+required obligations, and exercise retrieval, tampering and permission failures.
+An isolated discovery test or small scripted stage does not prove this connection.
+
 Turns, time, output tokens, reasoning tokens and total spend are different limits.
 Enforce a whole-job bound even if a CLI resets its turn limit on each queued input.
 Do not enqueue unlimited follow-ups. Pure extraction gets no repository mutation

@@ -29,7 +29,13 @@ class StageCoordinates:
     source_revision: str = ""
 
 
-def stage_packet(coordinates: StageCoordinates, *, context: dict[str, Any], skill: str = "") -> str:
+def stage_packet(
+    coordinates: StageCoordinates,
+    *,
+    context: dict[str, Any],
+    skill: str = "",
+    compact: bool = False,
+) -> str:
     instruction = {
         "requirements": "Derive requirements and acceptance criteria from the approved brief and repository inventory.",
         "architecture": "Specify interfaces, ownership boundaries, dependencies and verification without duplicating existing work.",
@@ -82,7 +88,7 @@ def stage_packet(coordinates: StageCoordinates, *, context: dict[str, Any], skil
                 "reason": "specific relevance of recorded proof",
             }
         ]
-    return prefix + json.dumps(body, ensure_ascii=False, indent=2)
+    return prefix + json.dumps(body, ensure_ascii=False, indent=None if compact else 2)
 
 
 def validate_result(

@@ -10,9 +10,12 @@ breaking changes may land in a minor release.
 ### Added
 
 - Renew installed native route proofs explicitly for stopped campaigns before their first worker.
+- Configure the campaign's aggregate GitHub metadata budget independently of detail limits.
 
 ### Fixed
 
+- Scope linked GitHub evidence to selected work and expose unresolved optional references.
+- Deliver large campaign context through bounded stage prompts and immutable read-only artifacts.
 - Give Grok tool telemetry a finite wire allowance separate from model output limits.
 - Admit explicitly enabled TeamRouter credit routes using exact-model account evidence.
 - Observe native Grok and Muse allowance without inference; preserve unknown provider concurrency.
