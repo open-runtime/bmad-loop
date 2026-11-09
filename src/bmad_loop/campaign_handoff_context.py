@@ -33,6 +33,14 @@ class HandoffPacket:
     omitted_summary_ids: tuple[str, ...] = ()
 
 
+class HistoryContextRecoveryNeeded(CampaignError):
+    """The bounded initial view cannot carry a useful complete historical fact."""
+
+
+class AuditedConstraintsTooLarge(HistoryContextRecoveryNeeded):
+    """Owner constraints fit only after their existing independently audited reduction."""
+
+
 def _indexed_json(reference):
     from .campaign_headless import file_digest, read_json
 
@@ -122,6 +130,248 @@ def reconcile_summary_omissions(payload, artifact_root):
         "count": len(omitted),
     }
     return tuple(omitted_final)
+
+
+def _history_facts(payload):
+    """Read final nodes only; intermediate evidence remains in the complete index."""
+    result = {}
+    for row in load_summary_index(payload):
+        if not row.get("final"):
+            continue
+        summary = _read_summary_row(row)
+        for fact in summary.get("facts", []):
+            identity = (row["id"], fact.get("id"))
+            if not isinstance(identity[1], str) or not identity[1] or identity in result:
+                raise CampaignError("Retained summary facts require unique validated identities")
+            result[identity] = {
+                "summary_id": row["id"],
+                "summary_sha256": row["sha256"],
+                "fact_id": fact["id"],
+                "kind": fact["kind"],
+                "text": fact["text"],
+                "authority": "context",
+                "semantic_fidelity": "unqualified",
+            }
+    return result
+
+
+def _fact_omissions(facts, selected):
+    included = {(row["summary_id"], row["fact_id"]) for row in selected}
+    return {
+        "schema_version": 1,
+        "omitted": [
+            {"summary_id": parent, "fact_id": fact}
+            for parent, fact in facts
+            if (parent, fact) not in included
+        ],
+    }
+
+
+def _fact_index_reference(root, content):
+    data = encoded(content)
+    sha256 = hashlib.sha256(data).hexdigest()
+    return {
+        "path": str(root / (sha256 + ".json")),
+        "sha256": sha256,
+        "count": len(content["omitted"]),
+    }
+
+
+def validate_history_view(payload):
+    """Bind every selected/omitted fact to its unchanged complete parent artifact."""
+    if "history_view_version" not in payload:
+        if "history_view" in payload or "omitted_history_fact_index" in payload:
+            raise CampaignError("Handoff history view version is missing")
+        return  # Legacy packets retain their original complete-summary format.
+    if (
+        type(payload["history_view_version"]) is not int
+        or payload["history_view_version"] != 1
+        or payload.get("summaries") != []
+        or payload.get("latest_owner_direction") != []
+    ):
+        raise CampaignError(
+            "Partial history views cannot carry unaudited owner text or complete summaries"
+        )
+    facts = _history_facts(payload)
+    selected = payload.get("history_view")
+    if not isinstance(selected, list):
+        raise CampaignError("Handoff history view is missing")
+    seen = set()
+    for row in selected:
+        identity = (row.get("summary_id"), row.get("fact_id"))
+        if identity in seen or facts.get(identity) != row:
+            raise CampaignError("Handoff history view differs from its immutable parent fact")
+        seen.add(identity)
+    reference = payload.get("omitted_history_fact_index")
+    if not isinstance(reference, dict):
+        raise CampaignError("Handoff history fact omission index is missing")
+    expected = _fact_omissions(facts, selected)
+    if _indexed_json(reference) != expected or reference.get("count") != len(expected["omitted"]):
+        raise CampaignError("Handoff history fact omission coverage changed")
+    if facts and not selected:
+        raise HistoryContextRecoveryNeeded("No useful complete history fact fits the successor")
+    rows = load_summary_index(payload)
+    omitted = _indexed_json(payload["omitted_summary_index"])
+    if omitted != {
+        "schema_version": 1,
+        "summary_ids": [row["id"] for row in rows],
+        "final_summary_ids": [row["id"] for row in rows if row.get("final")],
+    }:
+        raise CampaignError("Partial history view lost complete summary omission coverage")
+
+
+def retrieve_history_fact(payload, summary_id, fact_id):
+    """Retrieve exact provenance behind a selected or omitted bounded-view fact."""
+    validate_history_view(payload)
+    parent = retrieve_summary(payload, summary_id)
+    found = next((row for row in parent.get("facts", []) if row.get("id") == fact_id), None)
+    if found is None:
+        raise CampaignError("Requested history fact is absent from its retained parent")
+    return found
+
+
+def mandatory_context_digest(payload):
+    """Bind authority/current state independently of optional historical views."""
+    optional = {
+        "summaries",
+        "latest_owner_direction",
+        "summary_index",
+        "omitted_summary_index",
+        "history_view_version",
+        "history_view",
+        "omitted_history_fact_index",
+        "history_compaction",
+    }
+    return digest({key: value for key, value in payload.items() if key not in optional})
+
+
+def _verify_authority_references(references):
+    seen = {}
+    for reference in references:
+        path, expected = reference.get("path"), reference.get("sha256")
+        if not isinstance(path, str) or not isinstance(expected, str):
+            raise CampaignError("Handoff authority reference is malformed")
+        if path in seen and seen[path] != expected:
+            raise CampaignError("Handoff authority reference has conflicting identities")
+        seen[path] = expected
+        if hashlib.sha256(Path(path).read_bytes()).hexdigest() != expected:
+            raise CampaignError("Handoff authority evidence changed before continuation")
+
+
+def bind_authority_evidence(payload, artifact_root, references):
+    """Seal the exact audited inputs/results/indexes used by fresh assembly."""
+    unique = list({(row["path"], row["sha256"]): row for row in references}.values())
+    _verify_authority_references(unique)
+    data = encoded({"schema_version": 1, "references": unique})
+    path = blob(artifact_root / "authority", data)
+    payload["authority_provenance"] = {
+        "path": str(path),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "count": len(unique),
+    }
+
+
+def validate_authority_evidence(payload, expected_digest):
+    """Read back every mandatory evidence leaf before releasing a writer."""
+    if not expected_digest or mandatory_context_digest(payload) != expected_digest:
+        raise CampaignError("Handoff mandatory context differs from its audited packet")
+    reference = payload.get("authority_provenance")
+    if not isinstance(reference, dict):
+        raise CampaignError("Handoff authority provenance requires a fresh audited packet")
+    document = _indexed_json(reference)
+    rows = document.get("references")
+    if (
+        document.get("schema_version") != 1
+        or not isinstance(rows, list)
+        or reference.get("count") != len(rows)
+    ):
+        raise CampaignError("Handoff authority provenance index is malformed")
+    _verify_authority_references(rows)
+
+
+def fit_audited_history(payload, artifact_root, *, ceiling):
+    """Fill only the bytes left after mandatory audited state; never clip a fact.
+
+    The complete artifacts are independent of the initial context size. A partial
+    view is context, not summary validation or permission to omit obligations.
+    """
+    payload["summaries"] = []
+    payload["latest_owner_direction"] = []  # Exact audited constraints already retain these.
+    payload["history_view_version"] = 1
+    payload["history_view"] = []
+    reconcile_summary_omissions(payload, artifact_root)
+    facts = _history_facts(payload)
+    index_root = artifact_root / "history-view"
+    # Content hashes and their file names have fixed serialized width. Budget
+    # this exact reference shape now; write/hash the potentially huge omitted
+    # index once after selection, not once per candidate fact.
+    payload["omitted_history_fact_index"] = {
+        "path": str(index_root / ("0" * 64 + ".json")),
+        "sha256": "0" * 64,
+        "count": len(facts),
+    }
+    current_bytes = len(encoded(payload))
+    if current_bytes > ceiling:
+        canonical_only = {
+            key: value
+            for key, value in payload.items()
+            if key not in {"resolved_constraints", "recovered_constraints"}
+        }
+        if len(encoded(canonical_only)) <= ceiling:
+            raise AuditedConstraintsTooLarge(
+                "Audited owner constraints exceed the complete packet budget"
+            )
+        raise HistoryContextRecoveryNeeded("Mandatory continuation context exceeds the successor")
+    priorities = {
+        kind: rank
+        for rank, kind in enumerate(
+            (
+                "next_action",
+                "contradiction",
+                "question",
+                "failure",
+                "constraint",
+                "file",
+                "decision",
+                "goal",
+                "progress",
+                "verification_claim",
+                "owner_request",
+                "nuance",
+            )
+        )
+    }
+    # Newer final nodes first, round-robin within each kind so one workstream
+    # cannot consume every historical slot. No model decides what has authority.
+    parents = list(dict.fromkeys(parent for parent, _ in facts))[::-1]
+    grouped = {}
+    for (parent, _), row in facts.items():
+        grouped.setdefault((row["kind"], parent), []).append(row)
+    for kind in priorities:
+        queues = [grouped.get((kind, parent), [])[::-1] for parent in parents]
+        for position in range(max((len(queue) for queue in queues), default=0)):
+            for queue in queues:
+                if position >= len(queue):
+                    continue
+                selected = payload["history_view"]
+                omitted_count = len(facts) - len(selected)
+                proposed_bytes = (
+                    current_bytes
+                    + len(encoded(queue[position]))
+                    + bool(selected)
+                    + len(str(omitted_count - 1))
+                    - len(str(omitted_count))
+                )
+                if proposed_bytes <= ceiling:
+                    selected.append(queue[position])
+                    current_bytes = proposed_bytes
+    content = _fact_omissions(facts, payload["history_view"])
+    payload["omitted_history_fact_index"] = _fact_index_reference(index_root, content)
+    blob(index_root, encoded(content))
+    validate_history_view(payload)
+    final_bytes = len(encoded(payload))
+    if final_bytes != current_bytes or final_bytes > ceiling:
+        raise CampaignError("Final history view metadata exceeded destination budget")
 
 
 def assemble_packet(

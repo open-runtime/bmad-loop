@@ -641,13 +641,39 @@ own cooldown. Unknown native claims must drain before replanning, and replayed
 observations cannot cancel a replacement from a newer plan epoch.
 
 Campaign history reduction separates native output tokens from destination
-artifact bytes. The qualified native allowance includes provider reasoning. Each
-reducer's normalized artifact must fit the successor's existing one-third summary
-allocation; its prompt requests compact JSON at half that size to leave provenance
-headroom. The actual normalized byte count remains the hard check. Oversize
-results report both observed and permitted sizes, retain immutable sources and
-consume the existing bounded failure budget. Coverage, owner-obligation audits,
-final packet limits and the eight-round convergence bound remain mandatory.
+context bytes. The qualified native allowance includes provider reasoning.
+Fresh campaign reducers retain complete structurally validated artifacts using
+the existing unallocated-artifact mode; the successor's initial context does not
+limit stored provenance. Previously failed requests keep their immutable bounds
+and failure debt. A single retained root needs no further reduction merely to
+fit context. Hierarchy rounds retain their exact byte/node measurements. No
+observed shrink or the eight-round bound produces explicit compaction-limited
+evidence, followed by source audits and bounded retrieval selection; only a
+complete applied frontier can take this path.
+
+Packet assembly reserves exact serialized space for canonical obligations,
+current state, independently audited owner constraints, uncertainty and indexes
+before selecting historical facts. Complete canonical obligations must fit;
+oversize owner constraints retain their separate audited reduction path.
+Whole facts are selected by kind and recency, round-robin across final nodes,
+without clipping text or granting authority. Every selected fact binds its
+unchanged parent hash and fact identity. Partial views remain distinct from
+complete summaries; hashed omission indexes retain every omitted fact and node.
+If history contains facts but no useful whole fact fits, continuation requires
+visible context recovery. Final exact packet bounds and launch-time provenance
+and canonical-obligation checks remain mandatory. Versioned prompt templates and
+schema definitions remain unchanged; fresh requests bind the selected artifact
+mode and limits. Fresh native reduction and independent qualification still
+precede use of a new route.
+
+New durable packets also bind the complete mandatory context independently of
+the optional fact view. Final consumption verifies every authority result,
+immutable audit input and owner/obligation/constraint index used by assembly,
+including compressed-constraint and recovered-authority evidence. Legacy ready
+packets without this binding refresh through the ordinary drained handoff path;
+the controller never manufactures a binding from their mutable contents. Live
+successors continue under their existing claim and enter a fresh fenced handoff
+only after normal observation establishes their interruption and quiescence.
 Extraction and reduction prompts embed their exact job-bound native schema,
 including eligible citations and quote IDs. The corrected `history-extract-v3`
 and `history-reduce-v5` contracts require fresh extraction and reducer semantic

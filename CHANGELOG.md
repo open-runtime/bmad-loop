@@ -7,6 +7,13 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Fixed
+
+- Keep every bundled skill's source aligned with the fork's module record.
+- Preserve native Grok turn-limit classification through worker receipts and recovery.
+- Fit audited continuation history without omitting canonical obligations or discarding retained evidence.
+- Recheck continuation authority artifacts before launch and refresh unbound saved packets.
+
 ## [0.15.4] — 2026-11-08
 
 ### Fixed

@@ -481,6 +481,10 @@ def _obsolete_summaries(runtime, snapshot, value):
         summary_contract_current,
     )
 
+    if value.get("phase") in {"ready", "assemble"} and not value.get("packet", {}).get(
+        "mandatory_context_sha256"
+    ):
+        return True  # A quiescent legacy packet needs fresh authority readback binding.
     for key in value.get("jobs", ()):
         row = snapshot.jobs.get(key)
         if row is None and runtime is not None:
@@ -1174,6 +1178,8 @@ def _reduce(runtime, snapshot, unit, value):
         summary_schema,
     )
 
+    if any(_job(runtime, snapshot, key)["state"] != "applied" for key in value["jobs"]):
+        raise CampaignError("History compaction requires a complete applied frontier")
     children = tuple(
         (
             SummaryJobSpec(
@@ -1194,22 +1200,44 @@ def _reduce(runtime, snapshot, unit, value):
     ceiling = min(
         snapshot.spec.reasoning.packet_token_limit, _budget(target, target_cap).payload_tokens
     )
-    if sum(len(encoded(child)) for _, child in children) <= ceiling // 3:
+    if any(child.get("structural_coverage") is not True for _, child in children):
+        raise CampaignError("History compaction requires complete structural coverage")
+    frontier = {"bytes": sum(len(encoded(child)) for _, child in children), "nodes": len(children)}
+    if len(children) <= 1 or (not value.get("reduction_level", 0) and frontier["bytes"] <= ceiling):
         return None
-    if value.get("reduction_level", 0) >= 8:
-        raise CampaignError("History reduction failed to converge within eight qualified rounds")
+    previous = value.get("reduction_frontier")
+    limited = (
+        "eight-round-limit"
+        if value.get("reduction_level", 0) >= 8
+        else (
+            "no-observed-shrink"
+            if previous and all(frontier[key] >= previous[key] for key in ("bytes", "nodes"))
+            else ""
+        )
+    )
+    if limited:
+        return {
+            "history_compaction": {
+                "status": "compaction-limited",
+                "reason": limited,
+                "frontier": frontier,
+                "previous_frontier": previous,
+                "rounds": value.get("reduction_level", 0),
+                "retained_jobs": list(value["jobs"]),
+            }
+        }
     candidate, cap = _summary_route(
         runtime, snapshot, "summarization", value, purpose="handoff_reduce", contract=""
     )
     budget = _budget(candidate, cap)
-    # Native output includes provider reasoning and is independent of the
-    # destination's byte budget. Summaries occupy at most one third of the
-    # packet; provenance is included in the checked artifact, never clipped.
+    # Stored native/structural evidence is independent of the initial view.
+    # Complete artifacts remain indexed; assembly budgets selected context only
+    # after mandatory current authority has been independently audited.
     planned = plan_reduction(
         children,
         budget,
         _root(runtime, snapshot, value) / "reductions",
-        artifact_bytes=ceiling // 3,
+        artifact_bytes=0,
         project_native_events=True,
     )
     jobs = []
@@ -1256,7 +1284,7 @@ def _reduce(runtime, snapshot, unit, value):
                 )
             )
         )
-    return {"requests": jobs, "reduction": True}
+    return {"requests": jobs, "reduction": True, "reduction_frontier": frontier}
 
 
 def _reduction_failure_keys(runtime, snapshot, spec):
@@ -1400,7 +1428,7 @@ def _audit_plan(runtime, snapshot, unit, value):
     from .campaign_summary import SummaryJobSpec, load_input
 
     reduced = _reduce(runtime, snapshot, unit, value)
-    if reduced is not None:
+    if reduced is not None and "requests" in reduced:
         return reduced
     map_families = {
         (_job(runtime, snapshot, key).get("receipt") or {}).get("provider_family")
@@ -1497,7 +1525,7 @@ def _audit_plan(runtime, snapshot, unit, value):
                     )
                 )
             )
-    return {"requests": jobs}
+    return {"requests": jobs, **(reduced or {})}
 
 
 def apply_audit(runtime, snapshot, row):
@@ -1962,7 +1990,13 @@ def _current_constraints(runtime, snapshot, value):
 
 
 def _assemble(runtime, snapshot, unit, value):
-    from .campaign_handoff_context import assemble_packet, reconcile_summary_omissions
+    from .campaign_handoff_context import (
+        AuditedConstraintsTooLarge,
+        assemble_packet,
+        bind_authority_evidence,
+        fit_audited_history,
+        mandatory_context_digest,
+    )
     from .campaign_summary import SummaryJobSpec
 
     if not value.get("audits") or any(
@@ -2058,11 +2092,33 @@ def _assemble(runtime, snapshot, unit, value):
         payload["constraint_audit_receipts"] = value["constraint_audits"]
     payload["read_only"] = _permission(value) != "workspace-tools"
     payload["history_omissions_resolved_by"] = value["audits"]
-    # Audits have established the current constraints. Do not duplicate the
-    # same historical owner quotations and complete summaries in the initial
-    # working context; their immutable indexes remain available for retrieval.
-    # This is deterministic removal of redundant context, never clipping a
-    # current constraint or canonical obligation.
+    # Establish every mandatory field before allocating optional history bytes.
+    # The generic read-only packet builder may omit obligations; audited writer
+    # continuation cannot inherit that omission and simply clear read_only.
+    payload["obligations"] = list(value["capture"]["obligations"])
+    payload["latest_owner_direction"] = []
+    payload["summaries"] = []
+    payload["omission_index"] = str(
+        blob(
+            _root(runtime, snapshot, value) / "packet",
+            encoded(
+                {
+                    "owner_ids": list(dict.fromkeys(row["source_id"] for row in complete_spans)),
+                    "obligation_ids": [],
+                }
+            ),
+        )
+    )
+    if value.get("history_compaction"):
+        payload["history_compaction"] = {
+            key: content
+            for key, content in value["history_compaction"].items()
+            if key != "retained_jobs"
+        }
+        payload["history_compaction"]["retained_job_count"] = len(
+            value["history_compaction"].get("retained_jobs", [])
+        )
+        payload["history_compaction"]["retained_summary_index"] = payload["summary_index"]
     ceiling = min(snapshot.spec.reasoning.packet_token_limit, _budget(target, cap).payload_tokens)
     for field in (
         "current_constraint_audits",
@@ -2078,16 +2134,57 @@ def _assemble(runtime, snapshot, unit, value):
                 "count": len(payload[field]),
             }
             payload[field] = []
+    references = []
+    for key in dict.fromkeys(
+        [
+            *value["audits"],
+            *value.get("constraint_all_jobs", []),
+            *value.get("recovery_jobs", []),
+            *value.get("recovery_audits", []),
+        ]
+    ):
+        row = _job(runtime, snapshot, key)
+        if row["state"] != "applied":
+            continue  # Failed attempts confer no authority and remain in the job ledger.
+        artifact = row["applied_result"]
+        references.append(
+            {"path": artifact["artifact_path"], "sha256": artifact["artifact_sha256"]}
+        )
+        references.extend(
+            {"path": source["path"], "sha256": source["sha256"]}
+            for source in row["request"]["inputs"]
+        )
+    for field in (
+        "owner_index",
+        "obligation_index",
+        "exact_current_constraint_index",
+        "recovered_constraints_index",
+        "constraint_tree",
+        "current_constraint_audits_index",
+        "constraint_audit_receipts_index",
+        "history_omissions_resolved_by_index",
+    ):
+        if field in payload:
+            references.append({"path": payload[field]["path"], "sha256": payload[field]["sha256"]})
+    bind_authority_evidence(payload, _root(runtime, snapshot, value) / "packet", references)
+    canonical_only = {
+        key: content
+        for key, content in payload.items()
+        if key not in {"resolved_constraints", "recovered_constraints"}
+    }
+    if len(encoded(canonical_only)) > ceiling:
+        raise CampaignError(
+            "Canonical obligations and state exceed successor context; recovery required"
+        )
     if len(encoded(payload)) > ceiling:
-        payload["latest_owner_direction"] = []
-    if len(encoded(payload)) > ceiling:
-        payload["summaries"] = []
-    reconcile_summary_omissions(payload, _root(runtime, snapshot, value) / "packet")
-    data = encoded(payload)
-    if len(data) > ceiling:
         raise ConstraintReductionNeeded(
             "Resolved current constraints exceed successor context; further bounded reduction required"
         )
+    try:
+        fit_audited_history(payload, _root(runtime, snapshot, value) / "packet", ceiling=ceiling)
+    except AuditedConstraintsTooLarge as exc:
+        raise ConstraintReductionNeeded(str(exc)) from exc
+    data = encoded(payload)
     path = blob(_root(runtime, snapshot, value) / "packet", data)
     return {
         "packet": {
@@ -2095,6 +2192,8 @@ def _assemble(runtime, snapshot, unit, value):
             "sha256": hashlib.sha256(data).hexdigest(),
             "tokens": len(data),
             "read_only": payload["read_only"],
+            "history_view_version": 1,
+            "mandatory_context_sha256": mandatory_context_digest(payload),
         },
         "audits": value["audits"],
     }
@@ -2441,6 +2540,8 @@ def apply(runtime, snapshot, action, observation):
                 if row["state"] != "applied":
                     row["state"] = "canceled"
             for field in (
+                "history_compaction",
+                "reduction_frontier",
                 "constraint_jobs",
                 "constraint_audits",
                 "constraint_all_jobs",
@@ -2522,6 +2623,14 @@ def apply(runtime, snapshot, action, observation):
             }
         if data.get("reduction"):
             value["reduction_level"] = value.get("reduction_level", 0) + 1
+            if data.get("reduction_frontier"):
+                value["reduction_frontier"] = data["reduction_frontier"]
+            value.pop("history_compaction", None)
+        if data.get("history_compaction"):
+            value["history_compaction"] = data["history_compaction"]
+            add_event(
+                snapshot, "handoff-compaction-limited", unit=unit.id, **data["history_compaction"]
+            )
         value[field], value["phase"] = ids, phase
     elif action.kind == "handoff-assemble":
         value["packet"], value["phase"] = data["packet"], "assemble"
@@ -2619,8 +2728,23 @@ def decorate_launch(snapshot, unit, request):
         raise CampaignError("Handoff retrieval root is not bound to the owned continuation")
     if hashlib.sha256(packet_path.read_bytes()).hexdigest() != value["packet"]["sha256"]:
         raise CampaignError("Handoff packet changed before launch")
-    if read_json(packet_path).get("read_only") != read_only:
+    packet = read_json(packet_path)
+    expected_view = value["packet"].get("history_view_version")
+    if expected_view is not None and (
+        type(expected_view) is not int
+        or expected_view != 1
+        or type(packet.get("history_view_version")) is not int
+        or packet.get("history_view_version") != expected_view
+    ):
+        raise CampaignError("Handoff history view version differs from its durable packet")
+    if packet.get("read_only") != read_only:
         raise CampaignError("Handoff packet content changed the frozen permission boundary")
+    if packet.get("obligations") != list(value["capture"]["obligations"]):
+        raise CampaignError("Handoff packet omitted or changed canonical obligations")
+    from .campaign_handoff_context import validate_authority_evidence, validate_history_view
+
+    validate_history_view(packet)
+    validate_authority_evidence(packet, value["packet"].get("mandatory_context_sha256"))
     grants = request.get("headless_grants")
     if grants is not None:
         grants["read_only_paths"] = [

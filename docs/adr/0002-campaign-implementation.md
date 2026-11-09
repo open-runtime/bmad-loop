@@ -192,9 +192,22 @@ checks and release checks passed. Independent reviews cleared the launch-lock
 control race, history prompt/schema mismatch and late optional-warmup admission
 repair. A subsequent audit of historical GitHub reviews reproduced unresolved
 ownership, hold, source-freshness, attribution and observation defects despite
-that green suite. Those repairs require their own regressions and review before
-merge. These checkpoint results do not establish current deployment readiness
-or satisfy writable continuation and REM delivery.
+that green suite. Those repairs received independent scoped reviews and resolved
+all twelve historical GitHub threads. On the subsequent frozen `75ed1b5d`
+candidate, 21,023 regression tests passed with 261 skips and three failures:
+inconsistent bundled skill sources and two direct-control fixtures that omitted
+normal store initialization. Correct the metadata and fixtures without weakening
+the missing-hold-namespace refusal, then repeat the affected and final checks.
+
+The same frozen candidate passed the managed 48-story load in 1,063.12 seconds,
+with all 632 source/test hashes unchanged. It delivered every unit and parent
+tracking, applied or closed 46 messages, and closed all 256 managed endpoints.
+It reached 24 execution workers/active epics, eight verification slots, eight
+review slots and four reasoning jobs within 32 shared sessions. Stop acknowledgement
+took 0.969 seconds. This is scripted integration evidence; it does not establish
+real-provider throughput. Later changes require impact assessment and affected
+qualification, and these checkpoints do not satisfy writable continuation,
+installation-bound route proofs or REM delivery.
 
 ## Command and configuration contract
 

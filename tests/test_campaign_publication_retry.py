@@ -33,7 +33,9 @@ def test_repeated_main_movement_holds_only_starved_unit_and_survives_resume(
     snapshot = CampaignSnapshot(
         "campaign", "org/repo", spec, units={unit.id: unit, sibling.id: sibling}
     )
-    runtime = CampaignRuntime(project.project, CampaignStore(tmp_path / "campaigns"))
+    store = CampaignStore(tmp_path / "campaigns")
+    snapshot = store.create(snapshot)
+    runtime = CampaignRuntime(project.project, store)
     for index in range(2):
         unit = snapshot.units["unit"]
         unit.state = UnitState.READY_TO_PUBLISH

@@ -750,6 +750,16 @@ inputs. Omitted final summaries remain retrievable after audited context fitting
 their child references lead to the detailed summary tree. Retrieval verifies the
 catalog, summary bytes and original input, and refuses missing or changed data.
 
+After independent current-constraint audits, the initial packet includes complete
+canonical obligations and a bounded view of whole historical facts. Each fact
+names its immutable parent summary and fact identity; omitted facts and complete
+nodes remain explicitly indexed. Partial views carry context, not approval or
+completion authority. Missing canonical obligations or a packet with no room for
+any useful historical fact requires context recovery before writable continuation.
+Successor launch rechecks the bound authority inputs and audit artifacts. Saved
+packets lacking that binding refresh their evidence before reuse; a running
+successor is allowed to reach its normal completion boundary.
+
 For retrieval inside the macOS execution sandbox, prefer a direct interpreter
 command such as `python -c` or an explicitly granted script file. Shell heredocs
 may need temporary files outside the permitted paths even when `TMPDIR` names a
@@ -928,18 +938,22 @@ Output token limits use verified native telemetry when available, including the
 provider's reported reasoning contribution. Unknown usage retains a conservative
 UTF-8 byte bound. Model-supplied usage fields do not establish that measurement.
 
-Campaign reducers separately bound the normalized summary artifact in UTF-8 bytes.
-Their prompts state both the native token allowance and the compact-result goal;
-provider reasoning does not consume the artifact's byte allocation. Provenance
-expansion must fit the same checked artifact limit. Oversized results retain their
-sources and fail with explicit observed/bound sizes, without dropping owner
-obligations. Retry cooldowns are persisted per failed attempt, so polling and
-restart do not continually postpone the only available route.
+Campaign reducers retain complete validated artifacts separately from the bounded
+initial context. Native input, output, turn and time limits still apply. Packet
+assembly budgets the exact remaining bytes after mandatory state and independently
+audited constraints; it selects whole facts without clipping their text. Explicit
+artifact limits on older jobs remain enforced, and a later packet policy cannot
+turn an earlier rejected result into a successful receipt. Retry cooldowns are
+persisted per failed attempt, so polling and restart do not continually postpone
+the only available route.
+
 When a stopped reducer exceeds its native output-token allowance, recovery can
 split its input at whole-child summary boundaries. Completed sibling summaries,
 source coverage and retry counts survive; the pipeline does not restart all
-history extraction. Unknown worker state blocks replacement, and the existing
-eight-round reduction ceiling still applies.
+history extraction. Unknown worker state blocks replacement. At eight completed
+reduction rounds, or when a completed frontier stops shrinking, the campaign
+records limited compaction and retains its complete artifacts for audited context
+selection. Failed, live or structurally incomplete jobs cannot use that fallback.
 
 Completed job receipts and validated results allow the same command to resume;
 changed sources, route or limits require a new trial directory. Failure stops new

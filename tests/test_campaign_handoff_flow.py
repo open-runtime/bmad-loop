@@ -406,30 +406,15 @@ def test_post_audit_context_fit_retains_omitted_summary_retrieval(campaign, monk
 
     monkeypatch.setattr(context, "assemble_packet", observe_initial)
     baseline = flow._assemble(runtime, snapshot, unit, value)
-    baseline_size = baseline["packet"]["tokens"]
-    for ceiling in range(baseline_size - 64, 2000, -128):
-        snapshot.spec = dataclasses.replace(
-            snapshot.spec,
-            reasoning=dataclasses.replace(snapshot.spec.reasoning, packet_token_limit=ceiling),
-        )
-        try:
-            result = flow._assemble(runtime, snapshot, unit, value)
-        except CampaignError:
-            continue
-        payload = read_json(Path(result["packet"]["path"]))
-        if initial[-1] and not payload["summaries"]:
-            assert result["packet"]["tokens"] <= ceiling
-            assert context.retrieve_summary(payload, row["id"]) == flow._applied(row)
-            parent = context.retrieve_summary(payload, row["id"])
-            assert parent["covered_ids"] == [child["id"]]
-            assert context.retrieve_summary(payload, parent["covered_ids"][0]) == flow._applied(
-                child
-            )
-            omitted = read_json(Path(payload["omitted_summary_index"]["path"]))
-            assert omitted["final_summary_ids"] == [row["id"]]
-            break
-    else:
-        pytest.fail("Fixture never exercised post-audit removal of an initially included summary")
+    payload = read_json(Path(baseline["packet"]["path"]))
+    assert initial[-1] and not payload["summaries"] and payload["history_view"]
+    assert baseline["packet"]["tokens"] <= snapshot.spec.reasoning.packet_token_limit
+    assert context.retrieve_summary(payload, row["id"]) == flow._applied(row)
+    parent = context.retrieve_summary(payload, row["id"])
+    assert parent["covered_ids"] == [child["id"]]
+    assert context.retrieve_summary(payload, parent["covered_ids"][0]) == flow._applied(child)
+    omitted = read_json(Path(payload["omitted_summary_index"]["path"]))
+    assert omitted["final_summary_ids"] == [row["id"]]
 
 
 def test_live_predecessor_and_uncertain_push_fence_capture(campaign):
@@ -513,7 +498,11 @@ def test_late_handoff_result_preserves_new_operator_hold(campaign):
 def test_native_review_uses_explicit_review_pool_and_preserves_dev_candidate(campaign):
     runtime, snapshot, unit, receipt = campaign
     original = dict(snapshot.outbox[0].payload["candidate"])
-    receipt = {**receipt, "interruption": {"kind": "quota", "role": "review"}}
+    receipt = {
+        **receipt,
+        "sessions": [{**row, "role": "review"} for row in receipt["sessions"]],
+        "interruption": {"kind": "quota", "role": "review"},
+    }
     flow.intercept_terminal(runtime, snapshot, unit, receipt)
     value = unit.evidence["handoff"]
     assert value["route_role"] == "execution_review" and value["candidate"] is None
@@ -524,9 +513,13 @@ def test_native_review_uses_explicit_review_pool_and_preserves_dev_candidate(cam
     assert proposal.kind == "handoff-route"
     action = OutboxAction("route", proposal.kind, unit.id, proposal.payload, 0)
     flow.apply(runtime, snapshot, action, flow.perform(runtime, snapshot, action))
-    value["capture"] = {"audit_context": flow._audit_context(snapshot, unit)}
-    value["phase"] = "ready"
-    value["packet"] = {"read_only": False}
+    step(runtime, snapshot, unit, "handoff-capture")
+    step(runtime, snapshot, unit, "handoff-plan")
+    complete_maps(runtime, snapshot, unit)
+    step(runtime, snapshot, unit, "handoff-audit-plan")
+    complete_audits(runtime, snapshot, unit)
+    step(runtime, snapshot, unit, "handoff-assemble")
+    step(runtime, snapshot, unit, "handoff-release")
     proposal = flow.resume_proposal(snapshot, unit)
     assert proposal.payload["candidate"] == original
     assert proposal.payload["review_candidate"]["profile"] == "claude"

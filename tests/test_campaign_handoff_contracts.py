@@ -364,6 +364,10 @@ def test_ready_fallback_reuses_or_replans_packet_for_fresh_destination_capacity(
     )
     cap = runtime.fixture_cap(alternative, True)
     cap["input_tokens"] = min(input_limit, cap["input_tokens"])
+    if input_limit == 50000:
+        # Derive a genuinely smaller destination from the current compact view,
+        # rather than assuming an obsolete complete-summary packet size.
+        cap["input_tokens"] = min(cap["input_tokens"], 2 * (packet["tokens"] + 16384 - 1))
     snapshot.config_snapshot["reasoning_capabilities"]["codex:gpt-available"] = {"execution": cap}
     runtime._role = lambda snapshot, role, *, permissions, allowed_candidates, **kwargs: next(
         (candidate for candidate in allowed_candidates if candidate == alternative), None

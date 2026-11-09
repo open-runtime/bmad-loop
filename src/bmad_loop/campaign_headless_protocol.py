@@ -36,6 +36,7 @@ def _grok_messages(frames, *, partial=False):
     """
     session = model = ""
     terminal = None
+    errors = []
     for frame in frames:
         if terminal is not None:
             raise CampaignError("Grok native stream continues after its terminal receipt")
@@ -52,6 +53,10 @@ def _grok_messages(frames, *, partial=False):
             model = frame.get("model", "")
         if frame.get("type") == "result":
             terminal = frame
+        elif frame.get("type") in {"error", "turn.failed"}:
+            # Native provider errors may precede a generic terminal ceiling.
+            # Preserve their typed recovery evidence, never assistant/tool text.
+            errors.append(frame)
     if terminal is None:
         if partial:
             return [{"type": "system", "session_id": session, "model": model}]
@@ -61,12 +66,15 @@ def _grok_messages(frames, *, partial=False):
     if not terminal["is_error"] and terminal.get("stop_reason") not in {"end_turn", "max_tokens"}:
         raise CampaignError("Grok native terminal has no completed stop reason")
     return [
+        # A successful native terminal proves its preceding transient errors
+        # recovered. Only failed terminals need the earlier recovery cause.
+        *(errors if terminal["is_error"] else []),
         {
             **terminal,
             "sessionId": session,
             "stopReason": terminal.get("stop_reason"),
             "structuredOutput": terminal.get("structured_output"),
-        }
+        },
     ]
 
 
@@ -294,6 +302,7 @@ def parse_output(
     usage: dict[str, int | float] = {}
     outcome, reason, truncated = "completed", "", False
     failure_kind = ""
+    limit_kind = ""
     native_terminal_completed = False
     turns = 0
     for frame in frames:
@@ -392,7 +401,21 @@ def parse_output(
         if kind in {"error", "turn.failed"} or (kind == "result" and frame.get("is_error") is True):
             error = frame.get("error") or {}
             code = error.get("code") or error.get("type") if isinstance(error, dict) else ""
-            if code or outcome == "completed":
+            if (
+                protocol == "grok-json"
+                and kind == "result"
+                and frame.get("is_error") is True
+                and frame.get("subtype") == "error_max_turns"
+                and frame.get("stop_reason") == "max_turn_requests"
+                and not code
+                and outcome == "completed"
+            ):
+                outcome, reason, limit_kind = (
+                    "limit",
+                    "native result: max_turn_requests",
+                    "native-turns",
+                )
+            elif code or outcome == "completed":
                 outcome = _ERRORS.get(str(code), "failed")
                 reason = f"native {kind}: {code or 'unclassified failure'}"
         if protocol in {"agy-json", "codex-app-server", "codex-native-review"} and frame.get(
@@ -491,5 +514,6 @@ def parse_output(
         "turns": turns,
         "truncated": partial or truncated,
         "failure_kind": failure_kind,
+        **({"limit_kind": limit_kind} if limit_kind and outcome == "limit" else {}),
         "native_terminal_completed": not partial and native_terminal_completed,
     }
