@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .adapters.paradev_backend import ParadevMultiplexer
-from .adapters.paradev_host import Host
+from .adapters.paradev_host import Host, HostError
 from .adapters.paradev_runtime import WORKSPACE_KEY, private_json, read_private_json
 from .platform_util import file_lock
 from .verify import git_bytes
@@ -369,13 +369,22 @@ class ParadevWorkspaceProvider:
             if len(fresh) != 1 or _tags(fresh[0]) != _tags(row):
                 raise ReflectionError("Workspace tags changed before temporary marker removal")
             args = ["workspaces", "update", binding.workspace_id, "--local"]
-            for tag in tags or [""]:
-                args += ["--tag", tag]
+            if tags:
+                for tag in tags:
+                    args += ["--tag", tag]
+            else:
+                args.append("--clear-tags")
             failure = None
             try:
                 self.host.cli(args)
             except Exception as exc:
                 failure = type(exc).__name__
+                if (
+                    isinstance(exc, HostError)
+                    and isinstance(exc.code, str)
+                    and re.fullmatch(r"(?:CLI|HOST)_[A-Z0-9_]{1,48}", exc.code)
+                ):
+                    failure += f" ({exc.code})"
             after = [r for r in self._rows("workspace.list") if r.get("id") == binding.workspace_id]
             if len(after) != 1 or set(_tags(after[0])) != set(tags):
                 raise ReflectionError(

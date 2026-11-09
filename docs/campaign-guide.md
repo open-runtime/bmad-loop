@@ -650,6 +650,11 @@ with the same contracts and the current campaign revision. It preserves prior
 proofs and configuration templates, leaves the campaign stopped, and does not
 reload project policy. Campaigns with launched workers or publication history
 require their original qualified installation; this command refuses those cases.
+An allocated draft can also renew after `reconcile` settles its workspace
+preparation under the upgraded installation. Its recorded bootstrap commit must
+remain clean and unchanged, with the same native workspace and Git identity.
+The command preserves those bindings and their confirmed pre-worker reflection,
+and refuses unresolved allocation effects or other prior work.
 
 When reasoning and `handoff_map` are enabled with a qualified summarization route,
 live sessions with exact hook-backed transcripts prepare optional prefix summaries.

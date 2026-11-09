@@ -15,6 +15,9 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Clear temporary Paradev allocation tags with the supported empty-tag-set command.
+- Renew equivalent native proofs after confirmed workspace preparation before the first worker.
+- Preserve finite product discovery when GitHub intake adds a coordination workspace.
 - Preserve external commits on owned PRs with scoped reconciliation and honest author provenance.
 - Retain writing-stage contributors across input invalidation, failed sessions and resume.
 - Bind recovery and approved amendments to confirmed checkpoints; preserve post-merge landing reviews.

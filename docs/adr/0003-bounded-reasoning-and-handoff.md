@@ -44,6 +44,12 @@ routes require renewal when their paths or dependencies change. Unchanged semant
 proofs may be retained after validation. Real target delivery and live operator checks
 remain separate from scripted load, canary and onboarding proofs.
 
+Before any coding or reasoning launch, a stopped campaign may renew equivalent
+route proofs after its deterministic workspace preparation has been reconciled.
+The preparation receipt, clean bootstrap commit and native workspace identity must
+still match; branch/source bindings survive unchanged. Uncertain allocation,
+publication or prior model work remains outside this limited renewal contract.
+
 Oversized semantic inventories use a durable bounded map/reduce job graph. Maps
 retain source identities and cross-partition dependency/ownership facts. Reducers
 must account for complete input coverage before the final purpose-specific result
