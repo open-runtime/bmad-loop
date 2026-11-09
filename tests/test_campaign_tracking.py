@@ -321,6 +321,108 @@ def test_legacy_adoption_requires_exact_imported_ticket_marker(legacy_mirror, ca
     assert transport.effects == []
 
 
+@pytest.mark.parametrize(
+    "native_parent,expect_epic,expect_effects",
+    [
+        (None, None, True),  # Standalone mirror: may create epic, never gain a parent.
+        (10, 10, False),  # Already under the human epic: reuse, do not nest that epic.
+    ],
+)
+def test_legacy_mirror_split_story_preserves_native_parent(
+    legacy_mirror, native_parent, expect_epic, expect_effects
+):
+    state, unit, metadata, transport, gateway, coordinator = legacy_mirror
+    parent_spec = UnitSpec(
+        "tickets/initiative/epic/parent",
+        "tickets",
+        "epic",
+        "Parent Story",
+        initiative="initiative",
+    )
+    child_spec = replace(unit.spec, id="tickets/initiative/epic/child", parent=parent_spec.id)
+    state.units = {
+        parent_spec.id: CampaignUnit(parent_spec),
+        child_spec.id: CampaignUnit(child_spec),
+    }
+    unit = state.units[child_spec.id]
+    metadata = {child_spec.id: metadata[next(iter(metadata))]}
+    transport.parents.pop(529, None)
+    if native_parent is not None:
+        transport.parents[529] = native_parent
+    prior_parents = dict(transport.parents)
+    receipts = {}
+    for _ in range(20):
+        step = coordinator.step(state, child_spec.id, source_metadata=metadata, receipts=receipts)
+        state.bindings["github_hierarchy"] = step.bindings
+        unit.bindings = step.unit_bindings
+        if step.intent:
+            if step.intent.state == "confirmed":
+                receipts[step.action_key] = step.intent
+            else:
+                receipts[step.action_key] = gateway.execute(
+                    replace(step.intent, state="sent_unknown"), generation=1
+                )
+        if step.complete:
+            break
+    assert step.complete
+    assert unit.bindings["issue"]["number"] == 529
+    assert "story:" + parent_spec.id not in state.bindings["github_hierarchy"]
+    if expect_epic is None:
+        assert unit.bindings["epic_issue"]["number"] != 10
+        assert 529 not in transport.parents
+    else:
+        assert unit.bindings["epic_issue"]["number"] == expect_epic
+        assert transport.parents == prior_parents
+    if not expect_effects:
+        assert transport.effects == []
+    else:
+        assert all(not route.endswith("/sub_issues") for _, route, _ in transport.effects)
+
+
+def test_legacy_mirror_split_story_reuses_matching_native_chain(legacy_mirror):
+    state, unit, metadata, transport, gateway, coordinator = legacy_mirror
+    parent_spec = UnitSpec(
+        "tickets/initiative/epic/parent",
+        "tickets",
+        "epic",
+        "Parent Story",
+        initiative="initiative",
+    )
+    child_spec = replace(unit.spec, id="tickets/initiative/epic/child", parent=parent_spec.id)
+    state.units = {
+        parent_spec.id: CampaignUnit(parent_spec),
+        child_spec.id: CampaignUnit(child_spec),
+    }
+    unit = state.units[child_spec.id]
+    metadata = {child_spec.id: metadata[next(iter(metadata))]}
+    transport.issues[50] = {
+        "id": 1050,
+        "number": 50,
+        "title": "Existing parent story",
+        "state": "open",
+        "milestone": transport.milestones[7],
+        "updated_at": "t0",
+    }
+    transport.parents[529] = 50
+    transport.parents[50] = 10
+    receipts = {}
+    for _ in range(10):
+        step = coordinator.step(state, child_spec.id, source_metadata=metadata, receipts=receipts)
+        state.bindings["github_hierarchy"] = step.bindings
+        unit.bindings = step.unit_bindings
+        if step.intent:
+            assert step.intent.state == "confirmed"
+            receipts[step.action_key] = step.intent
+        if step.complete:
+            break
+    assert step.complete
+    assert unit.bindings["issue"]["number"] == 529
+    assert unit.bindings["epic_issue"]["number"] == 10
+    assert state.bindings["github_hierarchy"]["story:" + parent_spec.id]["number"] == 50
+    assert transport.parents == {529: 50, 50: 10}
+    assert transport.effects == []
+
+
 def test_existing_tracker_precedes_legacy_marker_search(legacy_mirror, monkeypatch):
     state, unit, metadata, transport, gateway, coordinator = legacy_mirror
     metadata[unit.id]["tracker_id"] = "https://github.com/a/b/issues/529"

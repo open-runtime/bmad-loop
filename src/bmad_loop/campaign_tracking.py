@@ -137,6 +137,19 @@ class HierarchyCoordinator:
         self._seed_imported_lineage(
             unit, ancestry, metadata, bindings, milestone_key, epic_key, imported_issue=imported
         )
+        leaf_key = "story:" + unit.id
+        # parent_confirmed on an adopted leaf means native lineage was shorter than
+        # the campaign split; keep collapsing on later steps after imported is unset.
+        if (
+            len(ancestry) > 1
+            and bindings.get(leaf_key, {}).get("parent_confirmed")
+            and any("story:" + story.id not in bindings for story in ancestry[1:])
+        ):
+            nodes = [
+                (key, kind, title, epic_key if key == leaf_key else parent, story)
+                for key, kind, title, parent, story in nodes
+                if story is None or key == leaf_key
+            ]
         for key, kind, title, _, story in nodes:
             if key in bindings:
                 continue
@@ -629,6 +642,45 @@ class HierarchyCoordinator:
                     "Imported issue belongs to another milestone; explicit migration required"
                 )
             bindings[milestone_key] = {**(existing or {}), **self._binding(milestone, "milestone")}
+        # Legacy mirrors may predate campaign split-story parents. Only reuse a
+        # full native chain that already matches; otherwise keep the leaf's real
+        # parent (or parentless state) and do not invent intermediate stories.
+        if imported_issue is not None and not tracker and not bound and len(ancestry) > 1:
+            child = issue
+            mapped: list[tuple[CampaignUnit, JsonObject]] = []
+            for parent_unit in ancestry[1:]:
+                parent = self._parent(child["number"])
+                if not parent:
+                    break
+                mapped.append((parent_unit, parent))
+                child = parent
+            else:
+                parent = self._parent(child["number"])
+                if parent:
+                    for parent_unit, row in mapped:
+                        key = "story:" + parent_unit.id
+                        existing = bindings.get(key)
+                        if existing and existing["database_id"] != row["id"]:
+                            raise GithubError(
+                                "Imported story parent conflicts with existing lineage"
+                            )
+                        bindings[key] = {**(existing or {}), **self._binding(row, "issue")}
+                    existing = bindings.get(epic_key)
+                    if existing and existing["database_id"] != parent["id"]:
+                        raise GithubError("Imported epic parent conflicts with existing lineage")
+                    bindings[epic_key] = {
+                        **(existing or {}),
+                        **self._binding(parent, "issue"),
+                    }
+                    return
+            parent = self._parent(issue["number"])
+            if parent:
+                existing = bindings.get(epic_key)
+                if existing and existing["database_id"] != parent["id"]:
+                    raise GithubError("Imported epic parent conflicts with existing lineage")
+                bindings[epic_key] = {**(existing or {}), **self._binding(parent, "issue")}
+            bindings[leaf_key]["parent_confirmed"] = True
+            return
         child = issue
         # A declared split-story parent maps to its actual parent before the epic.
         for parent_unit in ancestry[1:]:
