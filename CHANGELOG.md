@@ -11,12 +11,14 @@ breaking changes may land in a minor release.
 
 - Renew installed native route proofs explicitly for stopped campaigns before their first worker.
 - Configure the campaign's aggregate GitHub metadata budget independently of detail limits.
+- Configure aggregate PR discovery detail separately from individual PR and model limits.
 
 ### Fixed
 
 - Preserve external commits on owned PRs with scoped reconciliation and honest author provenance.
 - Retain writing-stage contributors across input invalidation, failed sessions and resume.
 - Bind recovery and approved amendments to confirmed checkpoints; preserve post-merge landing reviews.
+- Ignore bare issue-like numbers in fenced output while retaining explicit repository links.
 - Scope linked GitHub evidence to selected work and expose unresolved optional references.
 - Deliver large campaign context through bounded stage prompts and immutable read-only artifacts.
 - Recover proved stage preparation failures without treating them as uncertain worker launches.

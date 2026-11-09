@@ -30,6 +30,15 @@ snapshot save records the default explicitly.
 Exceeding it leaves discovery explicitly incomplete and prevents admission;
 metadata rows and issue bodies are never silently clipped to make them fit.
 
+`inventory_pr_detail_bytes` independently bounds aggregate expanded PR detail and
+defaults to `16777216` (16 MiB). It must be a positive integer and is frozen with
+the campaign specification. This includes selected patches, reviews, threads,
+checks and linked-object references. Each PR retains its individual detail bound;
+branch detail, metadata and model context limits remain separate. Older saved
+specifications without this field load the default. Exceeding either detail bound
+leaves discovery incomplete; increasing aggregate capacity never hides a missing
+or oversized individual record.
+
 This aggregate observation budget is independent of the per-object detail limits
 and the input limits of coding sessions. It does not increase model context or
 promise that the complete inventory fits in a session prompt. See the

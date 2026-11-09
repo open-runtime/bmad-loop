@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Callable, Literal
 
 from .campaign_github import GithubError, GithubGateway, JsonObject
+from .fences import fenced_spans
 from .verify import GitError, git_bytes
 
 
@@ -145,6 +146,7 @@ class RepositoryDiscovery:
         *,
         clock: Callable[[], float] = time.time,
         max_detail_bytes: int = 1_000_000,
+        max_pr_detail_bytes: int | None = None,
         max_metadata_bytes: int = 64 * 1024 * 1024,
         cache: dict[str, str] | None = None,
         max_cache_entries: int = 64,
@@ -154,6 +156,13 @@ class RepositoryDiscovery:
         self.repo = repo.resolve()
         self.clock = clock
         self.max_detail_bytes = max_detail_bytes
+        if max_pr_detail_bytes is not None and (
+            type(max_pr_detail_bytes) is not int or max_pr_detail_bytes < 1
+        ):
+            raise ValueError("GitHub PR detail byte limit must be a positive integer")
+        self.max_pr_detail_bytes = (
+            max_detail_bytes * 4 if max_pr_detail_bytes is None else max_pr_detail_bytes
+        )
         if type(max_metadata_bytes) is not int or max_metadata_bytes < 1:
             raise ValueError("GitHub metadata byte limit must be a positive integer")
         self.max_metadata_bytes = max_metadata_bytes
@@ -184,11 +193,17 @@ class RepositoryDiscovery:
     def _references(self, row: JsonObject) -> tuple[int, ...]:
         repository = re.escape(self.gateway.repository)
         pattern = rf"https://github\.com/{repository}/(?:issues|pull)/(\d+)(?!\d)|(?<![\w/])#([1-9][0-9]*)"
+        body = str(row.get("body") or "")
+        spans = fenced_spans(body)
         return tuple(
             sorted(
                 {
-                    int(first or second)
-                    for first, second in re.findall(pattern, str(row.get("body") or ""))
+                    int(match.group(1) or match.group(2))
+                    for match in re.finditer(pattern, body)
+                    # Explicit URLs are intentional references even in examples;
+                    # bare output ranks/error numbers in fenced blocks are not.
+                    if match.group(1)
+                    or not any(start <= match.start() < end for start, end in spans)
                 }
             )
         )
@@ -853,7 +868,7 @@ class RepositoryDiscovery:
                             ),
                         }
                     detail_bytes += observed_bytes
-                    if detail_bytes > self.max_detail_bytes * 4:
+                    if detail_bytes > self.max_pr_detail_bytes:
                         if "github:pr_detail_byte_limit" not in truncated:
                             truncated.append("github:pr_detail_byte_limit")
                         detail = {**metadata_detail, "details_truncated": True}
@@ -879,7 +894,7 @@ class RepositoryDiscovery:
                 "detailed": detail_count,
                 "metadata_only": len(pulls) - detail_count,
                 "observed_bytes": detail_bytes,
-                "limit_bytes": self.max_detail_bytes * 4,
+                "limit_bytes": self.max_pr_detail_bytes,
                 "byte_scope": (
                     "selected_patches_reviews_threads_checks_and_references"
                     if scoped

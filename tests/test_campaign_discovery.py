@@ -987,11 +987,114 @@ def test_pr_detail_budget_counts_expansion_separately_from_global_metadata(seman
     assert complete.pulls[0]["reviews"][0]["state"] == "APPROVED"
     assert complete.github_coverage["details"]["observed_bytes"] < 8000
     gateway.review_threads = lambda number: [{"body": "required review finding " * 1000}]
-    limited = RepositoryDiscovery(gateway, repo, max_detail_bytes=8000).collect(
-        remote="inventory", detailed_prs=(2,), relevant_paths=("unrelated.py",)
-    )
+    limited = RepositoryDiscovery(
+        gateway, repo, max_detail_bytes=8000, max_pr_detail_bytes=64_000
+    ).collect(remote="inventory", detailed_prs=(2,), relevant_paths=("unrelated.py",))
     assert not limited.complete and "pr:2:detail" in limited.truncated
     assert limited.pulls[0]["body"] == gateway.prs[2]["body"]
+
+
+@pytest.mark.parametrize("value", [0, -1, True, False, 1.5, "4000000"])
+def test_aggregate_pr_detail_budget_requires_positive_integer(project, value):
+    with pytest.raises(ValueError, match="PR detail byte limit.*positive integer"):
+        RepositoryDiscovery(Gateway(), project.project, max_pr_detail_bytes=value)
+
+
+def test_aggregate_pr_detail_budget_retains_every_required_review(semantic_inventory):
+    import copy
+
+    repo, _, _, _, gateway = semantic_inventory
+    gateway.items[1]["body"] = ""
+    template = gateway.prs[2]
+    numbers = tuple(range(2, 10))
+    gateway.prs = {
+        number: {
+            **copy.deepcopy(template),
+            "number": number,
+            "id": 200 + number,
+            "body": "Full owner intent " * 1000,
+        }
+        for number in numbers
+    }
+    gateway.pulls = lambda: list(gateway.prs.values())
+    gateway.reviews = lambda number: [{"id": number, "state": "APPROVED", "body": "r" * 4300}]
+    gateway.review_threads = lambda number: [{"id": number, "body": "t" * 1000}]
+    arguments = {"remote": "inventory", "detailed_prs": numbers, "relevant_paths": ("src",)}
+    legacy = RepositoryDiscovery(gateway, repo, max_detail_bytes=8000).collect(**arguments)
+    assert not legacy.complete and legacy.truncated == ("github:pr_detail_byte_limit",)
+    coverage = legacy.github_coverage["details"]
+    assert coverage["limit_bytes"] == 32000
+    assert coverage["observed_bytes"] > coverage["limit_bytes"]
+    assert (
+        RepositoryDiscovery(
+            gateway, repo, max_detail_bytes=8000, max_pr_detail_bytes=None
+        ).max_pr_detail_bytes
+        == 32000
+    )
+
+    budget = coverage["observed_bytes"]
+    complete = RepositoryDiscovery(
+        gateway, repo, max_detail_bytes=8000, max_pr_detail_bytes=budget
+    ).collect(**arguments)
+    assert complete.complete, (complete.unavailable, complete.truncated)
+    assert complete.github_coverage["details"]["limit_bytes"] == budget
+    assert len(complete.pulls) == len(numbers)
+    for row in complete.pulls:
+        assert row["body"] == gateway.prs[row["number"]]["body"]
+        assert row["reviews"] == gateway.reviews(row["number"])
+        assert row["review_threads"] == gateway.review_threads(row["number"])
+        assert row["check_runs"][0]["conclusion"] == "success"
+        assert row["changed_files_detail"] == gateway.files(row["number"])
+
+    limited = RepositoryDiscovery(
+        gateway, repo, max_detail_bytes=8000, max_pr_detail_bytes=budget - 1
+    ).collect(**arguments)
+    assert not limited.complete and limited.truncated == ("github:pr_detail_byte_limit",)
+    assert limited.github_coverage["details"]["limit_bytes"] == budget - 1
+    assert limited.pulls[-1]["details_truncated"] is True
+    assert "reviews" not in limited.pulls[-1]
+    assert [row["body"] for row in limited.pulls] == [row["body"] for row in complete.pulls]
+
+
+@pytest.mark.parametrize(
+    "opening,interior,closing",
+    [
+        ("```text", "", "```"),
+        ("~~~json", "", "~~~"),
+        ("  ````text", "```\n#71\n~~~~\n#72\n````not-a-close\n#73\n", "  `````  "),
+        ("~~~~", "~~~\n#71\n```\n#72\n~~~~not-a-close\n#73\n", "~~~~~"),
+    ],
+)
+def test_body_reference_fences_ignore_bare_numbers_but_preserve_explicit_links(
+    project, opening, interior, closing
+):
+    body = (
+        f"Keep `PR #161` and #249.\n{opening}\n"
+        "full-text #1 Clas Ohlson order\nerror (P3-T10c, #70)\n"
+        "Explicit https://github.com/a/b/pull/254 remains required.\n"
+        f"{interior}{closing}\nAfter #300.\n"
+    )
+    row = {"body": body}
+    assert RepositoryDiscovery(Gateway(), project.project)._references(row) == (161, 249, 254, 300)
+    assert row["body"] == body
+
+
+def test_fenced_output_does_not_expand_unrelated_existing_pr(semantic_inventory):
+    repo, _, _, _, gateway = semantic_inventory
+    body = "```text\nfull-text #9 rank\nhttps://github.com/org/repo/pull/2\n```\n"
+    gateway.items[1]["body"] = body
+    gateway.prs[2]["body"] = ""
+    receipt = RepositoryDiscovery(gateway, repo).collect(
+        remote="inventory",
+        relevant_paths=("unrelated.py",),
+        selected_issues=(1,),
+        detailed_prs=None,
+    )
+    assert receipt.complete, (receipt.unavailable, receipt.truncated)
+    assert {row["number"] for row in receipt.pulls} == {2}
+    assert ("issue", 9) not in gateway.calls
+    assert receipt.pulls[0]["reviews"][0]["state"] == "APPROVED"
+    assert receipt.issues[0]["body"] == body
 
 
 def test_legacy_receipt_digest_survives_optional_coverage_extension(project):
