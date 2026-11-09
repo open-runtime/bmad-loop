@@ -619,6 +619,58 @@ def test_legacy_split_lineage_retains_proven_native_chain(legacy_split_mirror, i
     assert transport.effects == [] and transport.parents == original_parents
 
 
+@pytest.mark.parametrize(
+    "supplied",
+    [
+        ("hierarchy", "unit"),
+        ("hierarchy", "unit-tracker"),
+        ("hierarchy", "source-tracker"),
+        ("unit", "unit-tracker"),
+        ("unit", "source-tracker"),
+        ("unit-tracker", "source-tracker"),
+    ],
+)
+def test_legacy_parent_reconciles_all_supplied_native_identities(legacy_split_mirror, supplied):
+    state, unit, metadata, transport, _, coordinator = legacy_split_mirror
+    parent = state.units[unit.spec.parent]
+    transport.issues[60] = {
+        **transport.issues[12],
+        "id": 1060,
+        "number": 60,
+        "html_url": "https://github.com/a/b/issues/60",
+    }
+    for source, number in zip(supplied, (12, 60), strict=True):
+        binding = coordinator._binding(transport.issues[number], "issue")
+        if source == "hierarchy":
+            state.bindings["github_hierarchy"] = {"story:" + parent.id: binding}
+        elif source == "unit":
+            parent.bindings["issue"] = binding
+        elif source == "unit-tracker":
+            parent.bindings["tracker_id"] = f"https://github.com/a/b/issues/{number}"
+        else:
+            metadata[parent.id]["tracker_id"] = f"https://github.com/a/b/issues/{number}"
+    original_parents = dict(transport.parents)
+    with pytest.raises(GithubError, match="declared parent conflicts with native lineage"):
+        coordinator.step(state, unit.id, source_metadata=metadata)
+    assert "story:" + unit.id not in state.bindings.get("github_hierarchy", {})
+    assert transport.effects == [] and transport.parents == original_parents
+
+
+def test_legacy_parent_accepts_agreement_between_all_supplied_identities(legacy_split_mirror):
+    state, unit, metadata, transport, _, coordinator = legacy_split_mirror
+    parent = state.units[unit.spec.parent]
+    binding = coordinator._binding(transport.issues[12], "issue")
+    state.bindings["github_hierarchy"] = {"story:" + parent.id: binding}
+    parent.bindings["issue"] = binding
+    parent.bindings["tracker_id"] = "https://github.com/a/b/issues/12"
+    metadata[parent.id]["tracker_id"] = "#12"
+    step = coordinator.step(state, unit.id, source_metadata=metadata)
+    assert step.bindings["story:" + unit.id]["number"] == 529
+    assert step.bindings["story:" + parent.id]["number"] == 12
+    assert step.bindings["epic:tickets:initiative:epic"]["number"] == 10
+    assert not step.reason and transport.effects == []
+
+
 @pytest.mark.parametrize("parent", ["milestone", "epic"])
 def test_unbound_confirmed_parent_receipt_is_reconciled_before_legacy_lineage_conflict(
     legacy_mirror, parent

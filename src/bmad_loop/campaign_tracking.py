@@ -707,23 +707,32 @@ class HierarchyCoordinator:
     ) -> None:
         """Prove a declared split parent without inferring roles from tree depth."""
         actual = self._legacy_native_parent(parent)
-        bound = bindings.get("story:" + unit.id) or unit.bindings.get("issue")
-        tracker = unit.bindings.get("tracker_id") or metadata.get(unit.id, {}).get("tracker_id")
-        if isinstance(bound, dict) and bound.get("database_id"):
-            expected = {"kind": "issue", **bound}
-        elif bound or tracker:
-            expected_number = (
-                (bound["number"] if isinstance(bound, dict) else bound)
-                if bound
-                else self._tracker_number(str(tracker))
-            )
-            expected = self._binding(self.gateway.issue(int(expected_number)), "issue")
-        else:
+        expected: list[JsonObject] = []
+        for bound in (bindings.get("story:" + unit.id), unit.bindings.get("issue")):
+            if not bound:
+                continue
+            if isinstance(bound, dict) and bound.get("database_id"):
+                expected.append({"kind": "issue", **bound})
+            else:
+                number = bound["number"] if isinstance(bound, dict) else bound
+                expected.append(self._binding(self.gateway.issue(int(number)), "issue"))
+        for tracker in (
+            unit.bindings.get("tracker_id"),
+            metadata.get(unit.id, {}).get("tracker_id"),
+        ):
+            if tracker:
+                number = self._tracker_number(str(tracker))
+                expected.append(self._binding(self.gateway.issue(number), "issue"))
+        if not expected:
             mirrored = self._legacy_mirror(snapshot, unit, metadata)
             if mirrored is None:
                 raise GithubError("Legacy mirror declared parent identity is unproven")
-            expected = self._binding(mirrored, "issue")
-        if any(expected.get(field) != actual[field] for field in ("kind", "database_id", "number")):
+            expected.append(self._binding(mirrored, "issue"))
+        if any(
+            binding.get(field) != actual[field]
+            for binding in expected
+            for field in ("kind", "database_id", "number")
+        ):
             raise GithubError("Legacy mirror declared parent conflicts with native lineage")
 
     def _legacy_native_parent(self, parent: JsonObject) -> JsonObject:

@@ -1277,6 +1277,8 @@ still pass fresh lineage checks before binding the story. For split stories,
 prove each existing parent against an explicit identity or its exact source
 mirror; missing or mismatched ancestry never authorizes inserting new parents
 above an existing human issue or epic.
+All supplied hierarchy, unit and source tracker identities must agree with that
+parent; one matching binding cannot mask another conflicting binding.
 Validate the terminal epic's owning repository as well. New mirror adoption
 reports unsupported cross-repository ancestry instead of treating a foreign
 issue number as local.

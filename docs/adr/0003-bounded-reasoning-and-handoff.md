@@ -108,6 +108,8 @@ Default-initiative resolution is captured in frozen source observations or the
 prepared source binding, with stable unit IDs and no live-policy fallback.
 Confirmed publication receipts cannot override a different mirror or bypass
 the native lineage checks.
+Supplied ancestor identities must agree across hierarchy bindings, unit bindings
+and source trackers before adoption.
 
 ### Approved route selection
 
