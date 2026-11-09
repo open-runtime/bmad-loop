@@ -531,6 +531,7 @@ def reflect(
         held=unit.hold is not None,
         title=title,
         group_title=navigation_title(**group_navigation(snapshot, unit, projection=projection)),
+        group_fields=group_navigation(snapshot, unit, projection=projection),
     )
     task = {"state": "off"}
     if snapshot.spec.paradev.tasks:

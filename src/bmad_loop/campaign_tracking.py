@@ -13,11 +13,22 @@ import hashlib
 import re
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Mapping
+from typing import Callable, Mapping
 
 from .campaign_completion_scope import retained_parent_reason
 from .campaign_github import GithubError, GithubGateway, JsonObject, MutationIntent, managed_marker
 from .campaign_model import CampaignSnapshot, CampaignUnit, UnitState
+from .fences import fenced_spans
+
+
+def _mirror_markers(body: str) -> set[str]:
+    """Only standalone legacy identity comments, never quoted code examples."""
+    spans = fenced_spans(body)
+    return {
+        match[1]
+        for match in re.finditer(r"(?m)^<!-- github-mirror:issue:([^\r\n<>]+) -->[ \t]*\r?$", body)
+        if not any(start <= match.start() < end for start, end in spans)
+    }
 
 
 def _settled_member(unit: CampaignUnit) -> bool:
@@ -85,12 +96,89 @@ class HierarchyCoordinator:
             current = snapshot.units[current.spec.parent]
         if len(ancestry) > 7:
             raise GithubError("Native subissue hierarchy exceeds GitHub's supported depth")
-        self._seed_imported_lineage(unit, ancestry, metadata, bindings, milestone_key, epic_key)
         parent_key = epic_key
         for story in reversed(ancestry):
             key = "story:" + story.id
             nodes.append((key, "issue", story.spec.title, parent_key, story))
             parent_key = key
+        issue_rows: list[JsonObject] | None = None
+
+        def issue_catalog() -> list[JsonObject]:
+            nonlocal issue_rows
+            if issue_rows is None:
+                issue_rows = self.gateway.issues(state="all")
+            return issue_rows
+
+        ancestor_keys = {"story:" + member.id for member in ancestry[1:]}
+        if any(key not in bindings for key in (milestone_key, epic_key, *ancestor_keys)):
+            pending = self._seed_shared_lineage(
+                snapshot,
+                unit,
+                metadata,
+                bindings,
+                unit_bindings,
+                saved,
+                issue_catalog,
+                ancestor_keys,
+            )
+            if pending is not None:
+                return pending
+        imported = None
+        if (
+            "story:" + unit.id not in bindings
+            and not unit.bindings.get("issue")
+            and not unit.bindings.get("tracker_id")
+            and not metadata.get(unit.id, {}).get("tracker_id")
+        ):
+            imported = self._legacy_mirror(snapshot, unit, metadata, issue_catalog=issue_catalog)
+        if imported is not None:
+            for key, kind, _, _, _ in nodes:
+                prior_key = self._action(snapshot, key, "create")
+                prior = saved.get(prior_key)
+                if prior:
+                    if prior.state == "confirmed" and prior.receipt:
+                        confirmed = self._binding(prior.receipt, kind)
+                        if key == "story:" + unit.id:
+                            expected = self._binding(imported, kind)
+                            if prior.kind != kind or any(
+                                confirmed[field] != expected[field]
+                                for field in ("kind", "database_id", "number")
+                            ):
+                                raise GithubError(
+                                    "Legacy mirror leaf conflicts with confirmed create receipt"
+                                )
+                            # A matching receipt proves identity, not current
+                            # lineage. Seed from the fresh native issue below.
+                            continue
+                        if key not in bindings:
+                            bindings[key] = confirmed
+                            return TrackingStep(prior_key, None, bindings, unit_bindings)
+                        if any(
+                            bindings[key].get(field) != confirmed[field]
+                            for field in ("kind", "database_id", "number")
+                        ):
+                            raise GithubError(
+                                "Legacy mirror binding conflicts with confirmed create receipt"
+                            )
+                        continue
+                    return TrackingStep(
+                        prior_key,
+                        None,
+                        bindings,
+                        unit_bindings,
+                        reason="Legacy mirror conflicts with prior hierarchy publication; reconcile the existing create first",
+                    )
+        self._seed_imported_lineage(
+            snapshot,
+            unit,
+            ancestry,
+            metadata,
+            bindings,
+            milestone_key,
+            epic_key,
+            imported_issue=imported,
+            issue_catalog=issue_catalog,
+        )
         for key, kind, title, _, story in nodes:
             if key in bindings:
                 continue
@@ -131,7 +219,7 @@ class HierarchyCoordinator:
             candidates = (
                 self.gateway.pages(f"{self.gateway.root}/milestones?state=all")
                 if kind == "milestone"
-                else self.gateway.issues(state="all")
+                else issue_catalog()
             )
             matches = [
                 row
@@ -143,6 +231,11 @@ class HierarchyCoordinator:
             if matches:
                 bindings[key] = self._binding(matches[0], kind)
                 return TrackingStep(action_key, None, bindings, unit_bindings)
+            pending = self._closed_parent_step(
+                snapshot, unit, metadata, nodes, bindings, unit_bindings, saved
+            )
+            if pending is not None:
+                return pending
             criteria = (
                 "\n".join(f"- {criterion}" for criterion in story.spec.acceptance) if story else ""
             )
@@ -165,11 +258,82 @@ class HierarchyCoordinator:
                 generation=snapshot.generation,
             )
             return TrackingStep(action_key, intent, bindings, unit_bindings)
+        pending = self._closed_parent_step(
+            snapshot, unit, metadata, nodes, bindings, unit_bindings, saved
+        )
+        if pending is not None:
+            return pending
+        # Creation is complete. Native relationships are separate durable actions.
+        milestone = bindings[milestone_key]["number"]
+        for key, kind, _, parent, story in nodes:
+            if kind != "issue":
+                continue
+            issue = bindings[key]
+            if not issue.get("milestone_confirmed"):
+                action_key = self._action(snapshot, key, "milestone")
+                existing = saved.get(action_key)
+                if existing and existing.state == "confirmed":
+                    issue["milestone_confirmed"] = True
+                    return TrackingStep(action_key, None, bindings, unit_bindings)
+                if existing:
+                    return TrackingStep(
+                        action_key,
+                        None,
+                        bindings,
+                        unit_bindings,
+                        reason=existing.error or "Milestone assignment pending",
+                    )
+                observed = self.gateway.issue(issue["number"])
+                membership = observed.get("milestone")
+                if membership and membership.get("number") == milestone:
+                    issue["milestone_confirmed"] = True
+                    return TrackingStep(action_key, None, bindings, unit_bindings)
+                intent = self.gateway.milestone_intent(
+                    issue["number"], milestone, action_id=action_key, generation=snapshot.generation
+                )
+                return TrackingStep(action_key, intent, bindings, unit_bindings)
+            if parent and not issue.get("parent_confirmed"):
+                action_key = self._action(snapshot, key, "parent")
+                existing = saved.get(action_key)
+                if existing and existing.state == "confirmed":
+                    issue["parent_confirmed"] = True
+                    return TrackingStep(action_key, None, bindings, unit_bindings)
+                if existing:
+                    return TrackingStep(
+                        action_key,
+                        None,
+                        bindings,
+                        unit_bindings,
+                        reason=existing.error or "Native parent relationship pending",
+                    )
+                intent = self.gateway.prepare_subissue(
+                    bindings[parent]["number"],
+                    issue["number"],
+                    action_id=action_key,
+                    child_database_id=issue["database_id"],
+                    generation=snapshot.generation,
+                )
+                return TrackingStep(action_key, intent, bindings, unit_bindings)
+        unit_bindings["issue"] = bindings["story:" + unit.id]
+        unit_bindings["milestone"] = bindings[milestone_key]
+        unit_bindings["epic_issue"] = bindings[epic_key]
+        return TrackingStep("", None, bindings, unit_bindings, complete=True)
+
+    def _closed_parent_step(
+        self,
+        snapshot: CampaignSnapshot,
+        unit: CampaignUnit,
+        metadata: JsonObject,
+        nodes: list[tuple[str, str, str, str | None, CampaignUnit | None]],
+        bindings: JsonObject,
+        unit_bindings: JsonObject,
+        saved: Mapping[str, MutationIntent],
+    ) -> TrackingStep | None:
         # A delivered reviewed plan can extend closed scope. New owner edits
         # after that review remain a hold rather than being reopened by a bot.
         planning = snapshot.units.get(str(unit.bindings.get("planning_unit", "")))
         for key, kind, _, parent, story in nodes:
-            if story is not None:
+            if story is not None or key not in bindings:
                 continue
             binding = bindings[key]
             observed = (
@@ -228,61 +392,7 @@ class HierarchyCoordinator:
                 },
             )
             return TrackingStep(action_key, intent, bindings, unit_bindings)
-        # Creation is complete. Native relationships are separate durable actions.
-        milestone = bindings[milestone_key]["number"]
-        for key, kind, _, parent, story in nodes:
-            if kind != "issue":
-                continue
-            issue = bindings[key]
-            if not issue.get("milestone_confirmed"):
-                action_key = self._action(snapshot, key, "milestone")
-                existing = saved.get(action_key)
-                if existing and existing.state == "confirmed":
-                    issue["milestone_confirmed"] = True
-                    return TrackingStep(action_key, None, bindings, unit_bindings)
-                if existing:
-                    return TrackingStep(
-                        action_key,
-                        None,
-                        bindings,
-                        unit_bindings,
-                        reason=existing.error or "Milestone assignment pending",
-                    )
-                observed = self.gateway.issue(issue["number"])
-                membership = observed.get("milestone")
-                if membership and membership.get("number") == milestone:
-                    issue["milestone_confirmed"] = True
-                    return TrackingStep(action_key, None, bindings, unit_bindings)
-                intent = self.gateway.milestone_intent(
-                    issue["number"], milestone, action_id=action_key, generation=snapshot.generation
-                )
-                return TrackingStep(action_key, intent, bindings, unit_bindings)
-            if parent and not issue.get("parent_confirmed"):
-                action_key = self._action(snapshot, key, "parent")
-                existing = saved.get(action_key)
-                if existing and existing.state == "confirmed":
-                    issue["parent_confirmed"] = True
-                    return TrackingStep(action_key, None, bindings, unit_bindings)
-                if existing:
-                    return TrackingStep(
-                        action_key,
-                        None,
-                        bindings,
-                        unit_bindings,
-                        reason=existing.error or "Native parent relationship pending",
-                    )
-                intent = self.gateway.prepare_subissue(
-                    bindings[parent]["number"],
-                    issue["number"],
-                    action_id=action_key,
-                    child_database_id=issue["database_id"],
-                    generation=snapshot.generation,
-                )
-                return TrackingStep(action_key, intent, bindings, unit_bindings)
-        unit_bindings["issue"] = bindings["story:" + unit.id]
-        unit_bindings["milestone"] = bindings[milestone_key]
-        unit_bindings["epic_issue"] = bindings[epic_key]
-        return TrackingStep("", None, bindings, unit_bindings, complete=True)
+        return None
 
     def refresh(self, snapshot: CampaignSnapshot, unit_id: str) -> JsonObject:
         """Refresh active mappings before/after planning, review and merge."""
@@ -482,57 +592,350 @@ class HierarchyCoordinator:
             return TrackingStep(action_key, intent, bindings, {})
         return TrackingStep("", None, bindings, {}, complete=True)
 
+    def _seed_shared_lineage(
+        self,
+        snapshot: CampaignSnapshot,
+        unit: CampaignUnit,
+        metadata: JsonObject,
+        bindings: JsonObject,
+        unit_bindings: JsonObject,
+        receipts: Mapping[str, MutationIntent],
+        issue_catalog: Callable[[], list[JsonObject]],
+        ancestor_keys: set[str],
+    ) -> TrackingStep | None:
+        """Resolve selected peers' shared parents before inventing parent objects.
+
+        All proposals remain local until every relevant lineage and prior write
+        agrees. Peer lifecycle is unchanged; only shared parents and the current
+        unit's declared ancestors are retained.
+        """
+        initiative = unit.spec.initiative or snapshot.spec.name
+        milestone_key = f"initiative:{unit.spec.source}:{initiative}"
+        proposals = copy.deepcopy(bindings)
+        for peer in snapshot.units.values():
+            if (
+                peer.id == unit.id
+                or peer.spec.kind != "story"
+                or peer.spec.source != unit.spec.source
+                or (peer.spec.initiative or snapshot.spec.name) != initiative
+            ):
+                continue
+            leaf_key = "story:" + peer.id
+            bound = bindings.get(leaf_key) or peer.bindings.get("issue")
+            tracker = peer.bindings.get("tracker_id") or metadata.get(peer.id, {}).get("tracker_id")
+            imported = None
+            observed_issue = None
+            if not bound and not tracker:
+                # Completed historical leaves are not new open-issue adoptions.
+                if peer.state in {UnitState.DELIVERED, UnitState.CANCELED}:
+                    continue
+                imported = self._legacy_mirror(
+                    snapshot, peer, metadata, issue_catalog=issue_catalog
+                )
+                if imported is None:
+                    continue
+            else:
+                number = (
+                    (bound["number"] if isinstance(bound, dict) else bound)
+                    if bound
+                    else self._tracker_number(str(tracker))
+                )
+                observed_issue = self.gateway.issue(int(number))
+                # Choosing a lookup coordinate must not hide another supplied
+                # native binding or tracker when borrowing this peer's parents.
+                self._prove_legacy_parent(
+                    snapshot, peer, metadata, bindings, observed_issue, issue_catalog=issue_catalog
+                )
+            observed = copy.copy(peer)
+            observed.bindings = dict(peer.bindings)
+            if bound:
+                observed.bindings["issue"] = bound
+            ancestry = [observed]
+            while ancestry[-1].spec.parent:
+                parent = snapshot.units[ancestry[-1].spec.parent]
+                if parent.id in {member.id for member in ancestry} or len(ancestry) >= 7:
+                    raise GithubError(
+                        "Imported peer story ancestry is cyclic or exceeds supported depth"
+                    )
+                ancestry.append(parent)
+            candidate = copy.deepcopy(proposals)
+            candidate.pop(leaf_key, None)
+            epic_key = f"epic:{peer.spec.source}:{initiative}:{peer.spec.epic}"
+            self._seed_imported_lineage(
+                snapshot,
+                observed,
+                ancestry,
+                metadata,
+                candidate,
+                milestone_key,
+                epic_key,
+                imported_issue=imported,
+                issue_catalog=issue_catalog,
+                observed_issue=observed_issue,
+                strict_lineage=True,
+            )
+            keys = [(milestone_key, "milestone"), (epic_key, "issue")]
+            if imported is not None:
+                keys.extend(("story:" + member.id, "issue") for member in ancestry)
+            keys.extend((key, "issue") for key in sorted(ancestor_keys) if key in candidate)
+            for key, kind in keys:
+                if key not in candidate:
+                    continue
+                action = self._action(snapshot, key, "create")
+                prior = receipts.get(action)
+                if prior is None:
+                    continue
+                if prior.state != "confirmed" or not prior.receipt:
+                    return TrackingStep(
+                        action,
+                        None,
+                        bindings,
+                        unit_bindings,
+                        reason="Imported shared lineage requires prior create reconciliation",
+                    )
+                confirmed = self._binding(prior.receipt, prior.kind)
+                if prior.kind != kind or any(
+                    confirmed[field] != candidate[key].get(field)
+                    for field in ("kind", "database_id", "number")
+                ):
+                    raise GithubError(
+                        "Imported shared lineage conflicts with confirmed create receipt"
+                    )
+            for key in (milestone_key, epic_key, *sorted(ancestor_keys)):
+                if key in candidate:
+                    proposals[key] = candidate[key]
+        bindings.update(proposals)
+        return None
+
+    def _legacy_mirror(
+        self,
+        snapshot: CampaignSnapshot,
+        unit: CampaignUnit,
+        metadata: JsonObject,
+        *,
+        issue_catalog: Callable[[], list[JsonObject]] | None = None,
+    ) -> JsonObject | None:
+        """Reuse exact native ticket mirrors before publishing a new hierarchy.
+
+        Intake runs concurrently with existing stories and cannot guarantee their
+        tracker IDs are populated first. A repository-scoped, unique mirror
+        comment is identity evidence; a matching title or selected issue order is
+        not. The fresh issue and its existing parents remain the native authority.
+        """
+        if (
+            unit.spec.kind != "story"
+            or metadata.get(unit.id, {}).get("kind") != "tickets"
+            or not unit.spec.selector
+        ):
+            return None
+        prepared = unit.bindings.get("effective_source")
+        if prepared is not None and (
+            not isinstance(prepared, dict)
+            or prepared.get("kind") != "tickets"
+            or prepared.get("id") != unit.spec.source
+        ):
+            raise GithubError("Imported ticket prepared source identity conflicts with this unit")
+        initiatives = (
+            unit.spec.initiative,
+            metadata.get(unit.id, {}).get("effective_initiative", ""),
+            prepared.get("initiative", "") if prepared is not None else "",
+        )
+        if any(not isinstance(value, str) for value in initiatives) or not any(initiatives):
+            raise GithubError(
+                "Imported ticket initiative is unavailable; source identity reconciliation required"
+            )
+        resolved = {value for value in initiatives if value}
+        if len(resolved) != 1:
+            raise GithubError(
+                "Imported ticket initiative disagrees with its frozen source identity"
+            )
+        initiative = next(value for value in initiatives if value)
+        identity = initiative + "/" + unit.spec.selector
+        matches = [
+            row
+            for row in (
+                issue_catalog() if issue_catalog is not None else self.gateway.issues(state="all")
+            )
+            if identity in _mirror_markers(str(row.get("body") or ""))
+        ]
+        if not matches:
+            return None
+        if len(matches) != 1:
+            raise GithubError("Conflicting legacy GitHub mirror matches")
+        expected_campaign_marker = managed_marker(snapshot.id, "story:" + unit.id, "issue")
+
+        def validate(row: JsonObject) -> None:
+            number = row.get("number")
+            body = str(row.get("body") or "")
+            if (
+                type(number) is not int
+                or number <= 0
+                or type(row.get("id")) is not int
+                or row["id"] <= 0
+                or "pull_request" in row
+                or str(row.get("html_url", "")).lower()
+                != f"https://github.com/{self.gateway.repository}/issues/{number}".lower()
+                or (
+                    row.get("repository_url") is not None
+                    and str(row["repository_url"]).lower()
+                    != f"https://api.github.com/repos/{self.gateway.repository}".lower()
+                )
+            ):
+                raise GithubError("Legacy mirror lacks exact same-repository native issue identity")
+            if row.get("state") != "open":
+                raise GithubError("Legacy mirror issue is not open; owner reconciliation required")
+            if _mirror_markers(body) != {identity}:
+                raise GithubError("Legacy mirror identity changed or has conflicting markers")
+            campaign_markers = re.findall(r"<!-- bmad-campaign:v1:[a-f0-9]{64} -->", body)
+            if any(marker != expected_campaign_marker for marker in campaign_markers):
+                raise GithubError("Legacy mirror has another campaign ownership marker")
+
+        found = matches[0]
+        validate(found)
+        current = self.gateway.issue(found["number"])
+        validate(current)
+        if any(current.get(key) != found.get(key) for key in ("id", "number", "node_id")):
+            raise GithubError("Legacy mirror native identity changed during observation")
+        return current
+
     def _seed_imported_lineage(
         self,
+        snapshot: CampaignSnapshot,
         unit: CampaignUnit,
         ancestry: list[CampaignUnit],
         metadata: JsonObject,
         bindings: JsonObject,
         milestone_key: str,
         epic_key: str,
+        *,
+        imported_issue: JsonObject | None = None,
+        issue_catalog: Callable[[], list[JsonObject]] | None = None,
+        observed_issue: JsonObject | None = None,
+        strict_lineage: bool = False,
     ) -> None:
         leaf_key = "story:" + unit.id
         if leaf_key in bindings:
             return
+        strict_lineage = strict_lineage or imported_issue is not None
         tracker = str(
             unit.bindings.get("tracker_id") or metadata.get(unit.id, {}).get("tracker_id") or ""
         )
         bound = unit.bindings.get("issue")
-        if not tracker and not bound:
+        if not tracker and not bound and imported_issue is None:
             return
-        number = (
-            (bound["number"] if isinstance(bound, dict) else bound)
-            if bound
-            else self._tracker_number(tracker)
-        )
-        issue = self.gateway.issue(int(number))
+        if imported_issue is not None and not tracker and not bound:
+            issue = imported_issue
+        else:
+            number = (
+                (bound["number"] if isinstance(bound, dict) else bound)
+                if bound
+                else self._tracker_number(tracker)
+            )
+            issue = (
+                observed_issue if observed_issue is not None else self.gateway.issue(int(number))
+            )
         bindings[leaf_key] = self._binding(issue, "issue")
-        milestone = issue.get("milestone")
-        if milestone:
-            existing = bindings.get(milestone_key)
-            if existing and existing["database_id"] != milestone["id"]:
-                raise GithubError(
-                    "Imported issue belongs to another milestone; explicit migration required"
-                )
-            bindings[milestone_key] = {**(existing or {}), **self._binding(milestone, "milestone")}
+        self._seed_native_milestone(issue, bindings, milestone_key)
         child = issue
         # A declared split-story parent maps to its actual parent before the epic.
         for parent_unit in ancestry[1:]:
             parent = self._parent(child["number"])
             if not parent:
+                if strict_lineage:
+                    raise GithubError("Legacy mirror declared story parent is missing")
                 return
             key = "story:" + parent_unit.id
             existing = bindings.get(key)
+            if strict_lineage:
+                self._prove_legacy_parent(
+                    snapshot, parent_unit, metadata, bindings, parent, issue_catalog=issue_catalog
+                )
             if existing and existing["database_id"] != parent["id"]:
                 raise GithubError("Imported story parent conflicts with existing lineage")
             bindings[key] = {**(existing or {}), **self._binding(parent, "issue")}
+            self._seed_native_milestone(parent, bindings, milestone_key)
             child = parent
         parent = self._parent(child["number"])
+        if strict_lineage and len(ancestry) > 1 and not parent:
+            raise GithubError("Legacy mirror split lineage has no terminal native epic")
         if parent:
+            if strict_lineage:
+                self._legacy_native_parent(parent)
             existing = bindings.get(epic_key)
             if existing and existing["database_id"] != parent["id"]:
                 raise GithubError("Imported epic parent conflicts with existing lineage")
             bindings[epic_key] = {**(existing or {}), **self._binding(parent, "issue")}
+            self._seed_native_milestone(parent, bindings, milestone_key)
+
+    def _seed_native_milestone(
+        self, issue: JsonObject, bindings: JsonObject, milestone_key: str
+    ) -> None:
+        milestone = issue.get("milestone")
+        if not milestone:
+            return
+        expected = self._binding(milestone, "milestone")
+        existing = bindings.get(milestone_key)
+        if existing and any(
+            existing.get(field) != expected[field] for field in ("database_id", "number")
+        ):
+            raise GithubError(
+                "Imported issue belongs to another milestone; explicit migration required"
+            )
+        bindings[milestone_key] = {**(existing or {}), **expected}
+
+    def _prove_legacy_parent(
+        self,
+        snapshot: CampaignSnapshot,
+        unit: CampaignUnit,
+        metadata: JsonObject,
+        bindings: JsonObject,
+        parent: JsonObject,
+        *,
+        issue_catalog: Callable[[], list[JsonObject]] | None = None,
+    ) -> None:
+        """Prove a declared split parent without inferring roles from tree depth."""
+        actual = self._legacy_native_parent(parent)
+        expected: list[JsonObject] = []
+        for bound in (bindings.get("story:" + unit.id), unit.bindings.get("issue")):
+            if not bound:
+                continue
+            if isinstance(bound, dict) and bound.get("database_id"):
+                expected.append({"kind": "issue", **bound})
+            else:
+                number = bound["number"] if isinstance(bound, dict) else bound
+                expected.append(self._binding(self.gateway.issue(int(number)), "issue"))
+        for tracker in (
+            unit.bindings.get("tracker_id"),
+            metadata.get(unit.id, {}).get("tracker_id"),
+        ):
+            if tracker:
+                number = self._tracker_number(str(tracker))
+                expected.append(self._binding(self.gateway.issue(number), "issue"))
+        if not expected:
+            mirrored = self._legacy_mirror(snapshot, unit, metadata, issue_catalog=issue_catalog)
+            if mirrored is None:
+                raise GithubError("Legacy mirror declared parent identity is unproven")
+            expected.append(self._binding(mirrored, "issue"))
+        if any(
+            binding.get(field) != actual[field]
+            for binding in expected
+            for field in ("kind", "database_id", "number")
+        ):
+            raise GithubError("Legacy mirror declared parent conflicts with native lineage")
+
+    def _legacy_native_parent(self, parent: JsonObject) -> JsonObject:
+        """A native relationship may cross repositories; this projection may not."""
+        number = parent.get("number")
+        if (
+            type(number) is not int
+            or number <= 0
+            or type(parent.get("id")) is not int
+            or parent["id"] <= 0
+            or str(parent.get("html_url", "")).lower()
+            != f"https://github.com/{self.gateway.repository}/issues/{number}".lower()
+        ):
+            raise GithubError("Legacy mirror parent lacks exact same-repository native identity")
+        return self._binding(parent, "issue")
 
     def _parent(self, number: int) -> JsonObject | None:
         try:

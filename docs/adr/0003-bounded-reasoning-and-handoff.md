@@ -99,6 +99,20 @@ future selections; it cannot recursively launch another router to select itself.
 If no routing recommendation is available, use that policy fallback or report a
 capacity wait. Do not fabricate availability or downgrade an explicit model rule.
 
+Existing ticket-mirror identity is reconciled deterministically before GitHub
+hierarchy creation. Concurrent triage may interpret new intent, but its timing
+cannot be relied on to populate a story's native issue binding before execution.
+Exact same-repository mirror comments preserve existing issue/parent identity;
+ambiguous evidence remains a visible reconciliation wait.
+Default-initiative resolution is captured in frozen source observations or the
+prepared source binding, with stable unit IDs and no live-policy fallback.
+Confirmed publication receipts cannot override a different mirror or bypass
+the native lineage checks.
+Supplied ancestor identities must agree across hierarchy bindings, unit bindings
+and source trackers before adoption.
+Shared parent discovery precedes creation across imported initiative members;
+native ancestor milestones participate even when a story has no milestone.
+
 ### Approved route selection
 
 The rollout planning, triage and decision pools retain Astra/Fable availability;
@@ -438,6 +452,9 @@ its parent worker's hcom identity; absent qualified enrollment remains pending.
 Presentation can refresh GitHub links while frozen job inputs, permissions and
 workspace identity remain unchanged. Campaign-created tabs inherit terminal
 labels; manual tab titles and operator folder precedence remain visible limits.
+Sidebar groups use compact navigation within the native 64-UTF-16-unit tag
+limit, including the stable ownership suffix. Compact labels preserve all four
+fields; full titles and campaign metadata retain their longer values.
 
 Build summaries incrementally while work proceeds. Hash sealed source ranges,
 prompt/schema versions, route identities and extraction settings for cache keys.

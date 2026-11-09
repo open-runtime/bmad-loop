@@ -1263,6 +1263,32 @@ Map initiative to milestone, epic to parent issue, story to child issue and
 split-story units to children beneath that story. Store both number and database
 ID: sub_issue_id is the database ID. Respect API hierarchy limits and existing
 parents; never silently reparent human work. Preserve existing tracker lineage.
+For imported ticket units without a tracker binding, recognize a unique standalone
+`github-mirror:issue:<initiative>/<selector>` comment in the owning repository.
+Re-read the native issue identity and its existing lineage before any hierarchy
+create. Conflicting markers, closed issues, foreign identity or prior unresolved
+publication remain visible reconciliation waits; title similarity and issue-list
+order never establish identity. Intake timing cannot substitute for this check.
+Capture a default initiative in frozen source observations without changing unit
+IDs or namespaces. Older prepared units may use their matching frozen effective
+ticket-source selector; conflicting or absent identities cannot authorize a new
+hierarchy. A confirmed story-create receipt must match the discovered mirror and
+still pass fresh lineage checks before binding the story. For split stories,
+prove each existing parent against an explicit identity or its exact source
+mirror; missing or mismatched ancestry never authorizes inserting new parents
+above an existing human issue or epic.
+All supplied hierarchy, unit and source tracker identities must agree with that
+parent; one matching binding cannot mask another conflicting binding.
+Before creating shared parents, reconcile imported members of the same initiative
+namespace, including other epics, so story ordering cannot create duplicate
+parents. Collect milestone facts from the native story and its proven ancestors;
+an absent milestone contributes no identity, while conflicting facts require
+reconciliation. Prior publication receipts remain authoritative debt to reconcile.
+Apply the existing reviewed-extension requirement to closed native parent scope
+before creating a new epic or story beneath it.
+Validate the terminal epic's owning repository as well. New mirror adoption
+reports unsupported cross-repository ancestry instead of treating a foreign
+issue number as local.
 For unsupported native hierarchy, expose the capability gap and link existing
 objects without claiming a native parent relationship.
 
@@ -1475,7 +1501,10 @@ independent of labels. Refresh labels after actor reassignment and GitHub discov
 including quiescent sibling workspaces. Use a separate display-title method so
 renaming cannot break window identity, and persist title-write intent before
 native mutation so lost acknowledgements cannot become operator suffixes.
-Keep genuine operator terminal text after the navigation prefix. Preserve focus
+Keep genuine operator terminal text after the navigation prefix. Normalize
+managed title text consistently with the native host's removal of
+replacement characters and Braille spinner glyphs before verifying readback.
+Preserve ordinary Unicode text, focus
 and user-customized layout; manually named tabs can still override their terminal's
 automatic tab label. Reflection tasks remain optional, preserve operator descriptions
 and labels, and update their native linked-PR field when its binding is available.
@@ -1490,7 +1519,12 @@ Headless titles show their own hcom binding as pending until observed; they neve
 borrow a parent coding worker's name. Their ephemeral display links can refresh
 without changing frozen job input, workspace binding or permissions.
 Managed tags use the host's lowercase representation while retaining full group
-identity in the campaign record.
+identity in the campaign record. Fit the complete managed tag, including its
+ownership suffix, within 64 UTF-16 units after normalization. Reserve all four
+navigation fields before shortening their values; compact tags use `?` for an
+unknown binding and an ellipsis for a shortened value. Full workspace, task and
+terminal titles retain the longer navigation labels. Preserve other tags and
+report an occupied 32-tag limit without dropping operator metadata.
 
 Wire task projection into normal runtime reconciliation when enabled, including
 held/blocked/merged-tracking-pending states. Expose nested transport, reflection

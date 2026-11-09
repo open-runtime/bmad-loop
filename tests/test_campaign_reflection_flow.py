@@ -338,6 +338,12 @@ def test_runtime_group_refreshes_quiescent_siblings_after_actor_and_pr_discovery
     result = runtime.perform(snapshot, action)
     assert isinstance(result, Observation) and result.state == "confirmed"
     assert captured[0]["group_title"].startswith("@tina · E:epic · I:#42 · PR:#18")
+    assert captured[0]["group_fields"] == {
+        "names": ("tina",),
+        "epics": ("epic",),
+        "issues": ("#42",),
+        "prs": ("#18",),
+    }
     assert captured[0]["title"].startswith("hcom:pending · E:epic · I:pending · PR:pending")
 
 
