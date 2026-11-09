@@ -618,6 +618,11 @@ the final slot while disjoint work waits. Preserve source hierarchy and GitHub
 mapping; add no calendar/date or sprint-capacity subsystem. Expire observations
 at admission for both native and custom capacity observers. Unknown concurrency
 uses configured limits; stale positive capacity is not fresh authorization.
+Match observation to the actual provider: TeamRouter may expose an already-enabled
+Codex credit route independently of ordinary subscription quota, while native
+Grok/Muse require their own current model and allowance observations. Preserve
+exact-model restrictions and custom observer overrides. The provider-specific
+admission contract is detailed in [ADR 0003](0003-bounded-reasoning-and-handoff.md).
 
 Separate active execution workers, review sessions, verification slots, active
 epics and total in-flight units/workspaces. CI waits, merge waits and tracking

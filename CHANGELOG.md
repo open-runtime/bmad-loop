@@ -10,6 +10,8 @@ breaking changes may land in a minor release.
 ### Fixed
 
 - Give Grok tool telemetry a finite wire allowance separate from model output limits.
+- Admit explicitly enabled TeamRouter credit routes using exact-model account evidence.
+- Observe native Grok and Muse allowance without inference; preserve unknown provider concurrency.
 
 ## [0.15.8] — 2026-11-08
 

@@ -234,8 +234,25 @@ effort = "high"
 
 A custom `capacity_command` is an argv array attached to a candidate or exact
 role. Its versioned JSON must identify the model and report known quota, model
-access and available slots. Missing or stale observations remain visible waits.
-Without a custom command, the capacity adapter reads TeamRouter status.
+access and fresh observation times. Missing or stale observations remain visible
+waits. A command may advertise an integer `slots` limit or explicitly report
+`concurrency_known = false` when its provider exposes no concurrency limit.
+Unknown concurrency does not imply unknown quota or permission to use a model.
+
+Without a custom command, Claude and Codex use TeamRouter status. Ordinary quota
+eligibility and explicitly enabled purchased-credit eligibility are separate
+observations. Credit admission must identify an eligible account for the exact
+model; a provider-wide credit toggle cannot override model, authentication,
+throttling or routing restrictions. This does not enable paid usage or change
+TeamRouter settings.
+
+Grok and Muse use their native, non-inference model and allowance queries. Grok
+uses ACP initialization and billing; Muse uses its allowance command and MSP
+model catalog. These probes create no conversation and submit no model prompt.
+An installed binary, a local model preset, past successful work or recorded spend
+alone does not establish current quota. Invalid or unavailable native telemetry
+remains a visible capacity wait.
+
 TeamRouter's eligible account count is not a concurrency ceiling. When route
 telemetry does not advertise slots, the configured campaign and role limits bound
 concurrency. Custom commands that advertise slots retain that explicit limit.

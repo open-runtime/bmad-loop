@@ -103,6 +103,24 @@ qualified merely because its binary exists. Use an eligible configured fallback
 or expose a capacity/capability wait; this work does not authorize new paid API
 accounts, subscriptions or undocumented authentication changes.
 
+Capacity admission must follow the provider actually serving the configured
+route. For TeamRouter, ordinary subscription quota and already-enabled purchased
+credits are distinct eligibility paths. A credit path needs fresh, positive
+account evidence for the exact model and must preserve non-quota restrictions;
+a global credit toggle cannot manufacture model access. Native Grok and Muse
+routes use their supported model-catalog and billing/allowance queries without
+creating a conversation or starting inference. Provider-process observation is
+bounded and cleans up its owned process on failures. These deterministic reads
+do not move model reasoning into the controller.
+
+Quota knowledge, model access and concurrency knowledge are separate facts.
+Providers and custom observers may report unknown concurrency while proving
+current quota and exact-model access; campaign and role limits then bound
+admission. Unknown, stale, malformed or exhausted quota remains a wait. Never
+substitute a prior canary, spend total or local model preset for current provider
+allowance. Preserve the original subscription-only behavior when no credit path
+has been explicitly enabled, and preserve custom observer overrides.
+
 ## Job identity, concurrency and persistence
 
 The existing unit claim and pending-action deduplication by unit/kind cannot
