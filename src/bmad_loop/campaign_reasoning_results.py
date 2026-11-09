@@ -208,11 +208,10 @@ def apply_result(runtime, snapshot, row: dict[str, Any]) -> None:
             "semantic result evidence changed; replan against current canonical state"
         )
     citations = result.get("citations")
-    if (
-        not citations
-        or len(set(citations)) != len(citations)
-        or not set(citations) <= _source_ids(evidence)
-    ):
+    # render_input advertises the whole context as a source alongside its
+    # inner unit/intake IDs. Only this freshly verified context alias is valid.
+    source_ids = _source_ids(evidence) | {"context:" + expected}
+    if not citations or len(set(citations)) != len(citations) or not set(citations) <= source_ids:
         raise CampaignError("semantic result cites missing, duplicate or invented evidence")
     decisions = snapshot.bindings.setdefault("reasoning_decisions", {})
     if request.purpose == "routing":

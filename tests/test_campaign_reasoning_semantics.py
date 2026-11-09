@@ -259,6 +259,105 @@ def test_reports_require_exact_completion_state_and_expose_advisory_text(tmp_pat
     )
 
 
+def context_citation_case(tmp_path, prepared, purpose):
+    from bmad_loop.campaign_headless import render_input
+    from bmad_loop.campaign_jobs import request_from_dict
+
+    snapshot, runtime, _ = case(tmp_path, prepared, [purpose])
+    first = next(iter(snapshot.units.values()))
+    first.spec = replace(first.spec, kind="planning")
+    prepare_jobs(snapshot, runtime)
+    row = next(iter(snapshot.jobs.values()))
+    request = request_from_dict(row["request"])
+    rendered, delivery = render_input(request, prepared[4])
+    evidence = plan.context(snapshot, purpose)
+    outer = request.inputs[0]["source_id"]
+    assert outer == "context:" + plan.fingerprint(snapshot, purpose)
+    assert delivery["sources"][0]["source_id"] == outer
+    assert ('"source_id": "' + outer + '"').encode() in rendered
+    payload = {
+        **result_for(snapshot, purpose),
+        "citations": [outer, *(unit["source_id"] for unit in evidence["units"])],
+    }
+    if purpose == "priority":
+        payload.update(
+            order=[unit.id for unit in snapshot.units.values() if unit.spec.kind != "planning"],
+            rationale="Preserve every unfinished execution unit and its dependencies.",
+        )
+    else:
+        payload.update(
+            summary="All recorded work remains unfinished.",
+            claims=[
+                {
+                    "unit": unit["id"],
+                    **{key: unit[key] for key in ("state", "head", "base", "source_id")},
+                }
+                for unit in evidence["units"]
+            ],
+        )
+    return snapshot, runtime, payload
+
+
+@pytest.mark.parametrize("purpose", ["priority", "report"])
+def test_semantic_result_accepts_the_context_source_advertised_by_real_renderer(
+    tmp_path, prepared, purpose
+):
+    """Native priority/report receipts cite the wrapper as well as valid unit IDs."""
+    snapshot, runtime, payload = context_citation_case(tmp_path, prepared, purpose)
+    before = {key: unit.state for key, unit in snapshot.units.items()}
+    apply(snapshot, runtime, purpose, payload)
+    assert purpose in snapshot.bindings["reasoning_decisions"]
+    assert {key: unit.state for key, unit in snapshot.units.items()} == before
+    if purpose == "report":
+        assert (
+            snapshot.bindings["reasoning_decisions"][purpose]["citations"] == payload["citations"]
+        )
+
+
+@pytest.mark.parametrize("purpose", ["priority", "report"])
+@pytest.mark.parametrize(
+    "fault", ["duplicate", "foreign-context", "invented-unit", "stale", "wrong-result-digest"]
+)
+def test_context_source_alias_preserves_citation_and_freshness_refusals(
+    tmp_path, prepared, purpose, fault
+):
+    snapshot, runtime, payload = context_citation_case(tmp_path, prepared, purpose)
+    message = "semantic result cites"
+    if fault == "duplicate":
+        payload["citations"].append(payload["citations"][0])
+    elif fault == "foreign-context":
+        payload["citations"][0] = "context:" + "0" * 64
+    elif fault == "invented-unit":
+        payload["citations"].append("unit:invented")
+    elif fault == "stale":
+        payload["citations"] = payload["citations"][:1]
+        if purpose == "report":
+            payload["claims"] = []
+        next(iter(snapshot.units.values())).evidence["local"] = {"head": "changed"}
+        message = "current validated result"
+    else:
+        payload["context_digest"] = "0" * 64
+        message = "evidence changed"
+    with pytest.raises(CampaignError, match=message):
+        apply(snapshot, runtime, purpose, payload)
+    assert purpose not in snapshot.bindings.get("reasoning_decisions", {})
+
+
+@pytest.mark.parametrize("purpose", ["priority", "report"])
+def test_context_source_alias_never_waives_purpose_validation(tmp_path, prepared, purpose):
+    snapshot, runtime, payload = context_citation_case(tmp_path, prepared, purpose)
+    if purpose == "priority":
+        # The real rejected priority receipt also included its planning control.
+        payload["order"].insert(0, next(iter(snapshot.units)))
+        message = "every unfinished execution unit"
+    else:
+        payload["claims"][0]["state"] = "delivered"
+        message = "completion/state evidence"
+    with pytest.raises(CampaignError, match=message):
+        apply(snapshot, runtime, purpose, payload)
+    assert purpose not in snapshot.bindings.get("reasoning_decisions", {})
+
+
 def test_unqualified_configuration_is_visible_and_does_not_repeat_each_tick(tmp_path, prepared):
     snapshot, runtime, _ = case(tmp_path, prepared, ["report"])
     snapshot.config_snapshot["reasoning_capabilities"] = {}

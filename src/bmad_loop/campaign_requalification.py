@@ -220,16 +220,72 @@ def _bootstrap_tracking(snapshot: CampaignSnapshot) -> set[str]:
                 seen.add(member.id)
                 keys["story:" + member.id] = "issue"
                 member = snapshot.units.get(member.spec.parent) if member.spec.parent else None
+            parents = {}
+            member = unit
+            while member is not None:
+                parents["story:" + member.id] = (
+                    "story:" + member.spec.parent
+                    if member.spec.parent
+                    else "epic:" + namespace + ":" + member.spec.epic
+                )
+                member = snapshot.units.get(member.spec.parent) if member.spec.parent else None
+            attachment = isinstance(intent, dict) and intent.get("kind") == "subissue"
             matching = [
                 key
-                for key in keys
-                if HierarchyCoordinator._action(snapshot, key, "create") == data["action_key"]
+                for key in (parents if attachment else keys)
+                if HierarchyCoordinator._action(snapshot, key, "parent" if attachment else "create")
+                == data["action_key"]
             ]
             if len(matching) != 1 or not isinstance(intent, dict):
                 refuse()
             key = matching[0]
             kind = keys[key]
-            if (
+            if attachment:
+                child = hierarchy.get(key, {})
+                parent = hierarchy.get(parents[key], {})
+                native_binding(child, "issue")
+                native_binding(parent, "issue")
+                existing = intent.get("state") == "confirmed"
+                if (
+                    intent.get("action_id") != data["action_key"]
+                    or intent.get("method") != "POST"
+                    or intent.get("generation") != action.generation
+                    or intent.get("marker") != ""
+                    or intent.get("error")
+                    or (
+                        existing
+                        and (
+                            intent.get("path") != ""
+                            or intent.get("payload") != {}
+                            or intent.get("coordinates") is not None
+                            or intent.get("receipt")
+                            != {"parent": parent["number"], "child_id": child["database_id"]}
+                        )
+                    )
+                    or (
+                        not existing
+                        and (
+                            intent.get("state") != "prepared"
+                            or intent.get("receipt") is not None
+                            or intent.get("path")
+                            != f"repos/{snapshot.repository}/issues/{parent['number']}/sub_issues"
+                            or intent.get("payload") != {"sub_issue_id": child["database_id"]}
+                            or not isinstance(intent.get("coordinates"), dict)
+                            or {
+                                k: v
+                                for k, v in intent["coordinates"].items()
+                                if k != "child_updated_at"
+                            }
+                            != {
+                                "parent_number": parent["number"],
+                                "child_number": child["number"],
+                                "child_id": child["database_id"],
+                            }
+                        )
+                    )
+                ):
+                    refuse()
+            elif (
                 intent.get("action_id") != data["action_key"]
                 or intent.get("kind") != kind
                 or intent.get("method") != "POST"
@@ -275,6 +331,15 @@ def _bootstrap_tracking(snapshot: CampaignSnapshot) -> set[str]:
             if result != {**intent, "state": "confirmed", "receipt": native} or native is None:
                 refuse()
             kind = intent["kind"]
+            if kind == "subissue":
+                child = hierarchy.get(key, {})
+                if intent["state"] == "confirmed":
+                    if native != intent["receipt"]:
+                        refuse()
+                elif native_binding(native, "issue", native=True) != native_binding(child, "issue"):
+                    refuse()
+                confirmed[action.id] = (key, native_binding(child, "issue"))
+                continue
             coords = native_binding(native, kind, native=True)
             text = native.get("description" if kind == "milestone" else "body", "")
             if not isinstance(text, str) or intent["marker"] not in text:
@@ -467,14 +532,266 @@ def _prepared_unit(
         raise CampaignError("unexpected native allocation in an unreflected campaign")
 
 
+def _job_records(snapshot):
+    """Read archived attempts as well as hot jobs, preferring current rows."""
+    rows = {}
+    if isinstance(snapshot.events, EventJournal):
+        after = ""
+        while batch := snapshot.events.database.jobs(after=after, limit=100):
+            rows.update((row["id"], row) for row in batch)
+            last = batch[-1]["id"]
+            if not isinstance(last, str) or last <= after:
+                raise CampaignError("stored reasoning inventory did not advance")
+            after = last
+    rows.update(snapshot.jobs)
+    return rows
+
+
+def _optional_reasoning(snapshot, directory, rows):
+    """Retain ended optional advice; never promote its output to authority.
+
+    Every historical attempt needs its own exact terminal observation, including
+    predecessors overwritten by retry. No process launch or observation is replayed.
+    """
+    from .campaign_action_history import actions
+    from .campaign_headless import capability_for, file_digest, read_json
+    from .campaign_jobs import EXECUTION_OUTCOMES
+    from .process_host import get_process_host
+
+    def refuse() -> NoReturn:
+        raise CampaignError(
+            "prepared startup renewal cannot invalidate or prove optional reasoning job history"
+        )
+
+    effects = actions(
+        snapshot, kinds=("reasoning-launch", "reasoning-observe", "reasoning-terminate")
+    )
+    launched = {}
+    routes_by_revision = {
+        snapshot.config_revision: snapshot.config_snapshot.get("reasoning_capabilities", {})
+    }
+    if snapshot.bindings.get("reasoning_decisions") or any(
+        a.state != "confirmed" or a.error for a in effects
+    ):
+        refuse()
+    for row in rows.values():
+        validate_record(row)
+        if row.get("application") == "applied" or row.get("applied_result"):
+            refuse()
+        if not row.get("attempt") and row.get("claim") is None:
+            continue
+        request = row["request"]
+        revision = request["coordinates"]["config_revision"]
+        if revision not in routes_by_revision:
+            preserved = [
+                record
+                for record in snapshot.bindings.get("capability_requalifications", [])
+                if record.get("previous_config_revision") == revision
+            ]
+            if len(preserved) != 1:
+                refuse()
+            record = preserved[0]
+            manifest = Path(record["previous_capabilities_path"])
+            if file_digest(manifest) != record.get("previous_capabilities_sha256"):
+                refuse()
+            routes = read_json(manifest).get("routes")
+            if not isinstance(routes, dict) or digest(routes) != record.get(
+                "previous_capabilities_digest"
+            ):
+                refuse()
+            routes_by_revision[revision] = routes
+        claim = row.get("claim") or {}
+        if (
+            row["attempt"] < 1
+            or request.get("required") is not False
+            or request.get("unit")
+            or request["purpose"]
+            not in {"routing", "triage", "semantic_sync", "priority", "graph_review", "report"}
+            or claim.get("quiescent") is not True
+            or row.get("application") not in {"pending", "rejected"}
+            or row["state"] not in {"failed", "stale", "canceled", "capacity_wait"}
+            or row.get("applied_result")
+        ):
+            refuse()
+        attempts = [
+            a
+            for a in effects
+            if a.kind == "reasoning-launch" and a.payload.get("job_id") == row["id"]
+        ]
+        if len(attempts) != row["attempt"]:
+            refuse()
+        for index, action in enumerate(attempts, 1):
+            binding = {
+                "attempt": index,
+                "generation": action.generation,
+                "launch_id": action.id,
+                "request_digest": row["request_digest"],
+            }
+            if (
+                action.state != "confirmed"
+                or action.error
+                or action.unit
+                or action.payload.get("job_binding") != binding
+            ):
+                refuse()
+            path = directory / "jobs" / row["id"] / str(index)
+            if is_link_like(path) or is_link_like(path.parent):
+                refuse()
+            candidate = action.payload.get("candidate") or {}
+            if candidate not in request["candidates"]:
+                refuse()
+            cap = capability_for(
+                routes_by_revision[revision],
+                candidate.get("profile", ""),
+                candidate.get("model", ""),
+                "reasoning",
+                effort=candidate.get("effort"),
+            )
+            if index == row["attempt"] and (
+                any(claim.get(k) != v for k, v in binding.items() if k != "request_digest")
+                or claim.get("run_dir") != str(path)
+                or row.get("selection") != candidate
+            ):
+                refuse()
+            if action.receipt.get("state") == "preparation_failed":
+                if (
+                    is_link_like(path / "launch-intent.json")
+                    or (path / "launch-intent.json").exists()
+                    or (index == row["attempt"] and row.get("receipt") is not None)
+                ):
+                    refuse()
+                launched[action.id] = binding
+                continue
+            envelope = read_json(path / "request.json")
+            grants = envelope.get("grants")
+            if (
+                envelope.get("request") != request
+                or envelope.get("request_digest") != row["request_digest"]
+                or envelope.get("launch_id") != action.id
+                or envelope.get("generation") != action.generation
+                or envelope.get("directory") != str(path)
+                or envelope.get("selection") != candidate
+                or envelope.get("capability") != cap
+                or envelope.get("capability_digest") != digest(cap)
+                or envelope.get("permissions") not in {"no-tools", "read-only-tools"}
+                or envelope.get("permissions") != cap["permissions"]
+                or not isinstance(grants, dict)
+                or envelope.get("grants_digest") != digest(grants)
+                or read_json(path / "grants.json") != grants
+                or (cap["permissions"] == "no-tools" and grants != {})
+                or (
+                    cap["permissions"] == "read-only-tools"
+                    and (
+                        grants.get("permissions") != "read-only-tools"
+                        or grants.get("scopes") != []
+                        or any(grants.get(key) for key in ("write_paths", "git_branch"))
+                        or grants.get("config_digest") != digest(request["coordinates"])
+                        or grants.get("generation") != action.generation
+                        or grants.get("runtime_write_paths") != cap.get("runtime_write_paths", [])
+                    )
+                )
+            ):
+                refuse()
+            finished = [
+                a.receipt.get("receipt")
+                for a in effects
+                if a.state == "confirmed"
+                and not a.error
+                and a.payload.get("job_id") == row["id"]
+                and a.payload.get("job_binding") == binding
+                and a.receipt.get("effect_binding") == binding
+                and a.receipt.get("state") == "finished"
+            ]
+            if not finished or any(value != finished[0] for value in finished):
+                refuse()
+            receipt = finished[0]
+            if not isinstance(receipt, dict) or (
+                any(
+                    receipt.get(k) != v
+                    for k, v in {
+                        "job_id": row["id"],
+                        "launch_id": action.id,
+                        "generation": action.generation,
+                        "request_digest": row["request_digest"],
+                    }.items()
+                )
+                or receipt.get("quiescent") is not True
+                or receipt.get("processes_quiescent") is not True
+                or receipt.get("outcome") not in EXECUTION_OUTCOMES
+                or receipt.get("completion_evidence") != "owned-window-death-and-process-readback"
+                or (index == row["attempt"] and row.get("receipt") != receipt)
+            ):
+                refuse()
+            native = read_json(path / "receipt.json")
+            # The observer adds these fields after exact window/process readback.
+            overlays = {"quiescent", "completion_evidence", "presentation_status"}
+            if {k: v for k, v in native.items() if k not in overlays} != {
+                k: v for k, v in receipt.items() if k not in overlays
+            }:
+                refuse()
+            startup = read_json(path / "startup.json")
+            if any(
+                startup.get(k) != envelope[k] for k in ("launch_id", "generation", "request_digest")
+            ):
+                refuse()
+            actors = [startup, *read_json(path / "processes.json").get("processes", [])]
+            if any(
+                type(actor.get("pid")) is not int
+                or not actor.get("identity")
+                or get_process_host().liveness_of(actor["pid"], actor["identity"]) != "dead"
+                for actor in actors
+            ):
+                refuse()
+            launched[action.id] = binding
+    if any(a.id not in launched for a in effects if a.kind == "reasoning-launch"):
+        refuse()
+    if any(
+        a.payload.get("job_binding")
+        != launched.get((a.payload.get("job_binding") or {}).get("launch_id"))
+        for a in effects
+    ):
+        refuse()
+    return set(launched)
+
+
+def _pending_observations(snapshot, rows):
+    """Unsent read/lifecycle proposals survive renewal with their original IDs."""
+    from .campaign_reasoning_flow import _binding
+
+    for action in snapshot.outbox:
+        if action.state in {"confirmed", "rejected"}:
+            continue
+        safe = (
+            not action.unit
+            and not action.receipt
+            and not action.error
+            and action.state == "prepared"
+        )
+        if action.kind in {"inventory", "communication"}:
+            safe = safe and not action.payload
+        elif action.kind == "reasoning-stale":
+            row = rows.get(action.payload.get("job_id"))
+            safe = (
+                safe
+                and row is not None
+                and action.payload == {"job_id": row["id"], "job_binding": _binding(row)}
+                and (row.get("claim") is None or row["claim"].get("quiescent") is True)
+            )
+        else:
+            safe = False
+        if not safe:
+            raise CampaignError("capability requalification requires settled outbound effects")
+
+
 def _startup_only(snapshot: CampaignSnapshot, directory: Path) -> bool:
     from .campaign_acceptance import ensure
 
     if snapshot.phase != "stopped":
         raise CampaignError("capability requalification requires a stopped campaign")
     prepared = False
-    if any(action.state not in {"confirmed", "rejected"} for action in snapshot.outbox):
-        raise CampaignError("capability requalification requires settled outbound effects")
+    rows = _job_records(snapshot)
+    _pending_observations(snapshot, rows)
+    _optional_reasoning(snapshot, directory, rows)
     tracking = (
         _bootstrap_tracking(snapshot)
         if any(unit.state == UnitState.DRAFT for unit in snapshot.units.values())
@@ -503,7 +820,7 @@ def _startup_only(snapshot: CampaignSnapshot, directory: Path) -> bool:
     if prepared:
         from .campaign_action_history import actions
 
-        if actions(snapshot, kinds=("launch", "reasoning-launch")):
+        if actions(snapshot, kinds=("launch",)):
             raise CampaignError("prepared-workspace renewal refuses any prior worker launch intent")
         workers = directory / "workers"
         if is_link_like(workers) or (
@@ -512,8 +829,8 @@ def _startup_only(snapshot: CampaignSnapshot, directory: Path) -> bool:
             raise CampaignError("prepared-workspace renewal refuses existing worker artifacts")
     for row in snapshot.jobs.values():
         claim = row.get("claim")
-        if prepared and (claim is not None or row.get("attempt") != 0):
-            raise CampaignError("prepared-workspace renewal refuses prior native job work")
+        if row.get("attempt"):
+            continue  # Every optional attempt was independently proved above.
         if claim and claim.get("quiescent") is not True:
             raise CampaignError("capability requalification requires quiescent reasoning jobs")
         if row["state"] not in TERMINAL and (
@@ -564,9 +881,10 @@ def requalify(
 ) -> CampaignSnapshot:
     """Renew startup-only native evidence under coordinator lock and revision CAS.
 
-    Refuse unit work beyond confirmed preparation, unsettled external effects, uncertain reasoning
-    owner or attempted nonterminal job. Never-launched optional jobs become stale
-    with their original requests retained. A crash before CAS can leave an inert
+    Refuse unit work beyond confirmed bootstrap, unsettled external writes and
+    uncertain reasoning owners. Proved ended optional advice remains unchanged;
+    never-launched optional jobs become stale with their requests retained.
+    A crash before CAS can leave an inert
     new template directory; it cannot replace the prior authoritative binding.
     """
     if (
@@ -583,8 +901,8 @@ def requalify(
             raise RevisionConflict(
                 f"campaign revision {snapshot.revision}, expected {expected_revision}"
             )
-        prepared = _startup_only(snapshot, store.directory(campaign_id))
-        _stored_jobs_quiescent(snapshot, never_attempted=prepared)
+        _startup_only(snapshot, store.directory(campaign_id))
+        _stored_jobs_quiescent(snapshot)
         provenance = installation()
         if (
             not provenance.get("qualified")
@@ -620,7 +938,7 @@ def requalify(
         snapshot.bindings["execution_template"] = {"path": str(path), "digest": template_digest}
         stale_jobs = []
         for row in snapshot.jobs.values():
-            if row["state"] not in TERMINAL:
+            if row["state"] not in TERMINAL and not row.get("attempt"):
                 row["state"] = "stale"
                 row["reason"] = "explicit startup capability requalification changed configuration"
                 stale_jobs.append(row["id"])

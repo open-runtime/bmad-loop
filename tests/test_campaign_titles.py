@@ -160,7 +160,8 @@ def test_shared_story_url_match_is_case_insensitive(pending_issue_navigation):
 
 
 @pytest.mark.parametrize(
-    "fault", ["other-unit", "foreign-repository", "no-native-id", "pr", "bool-number"]
+    "fault",
+    ["other-unit", "foreign-repository", "nonstring-url", "no-native-id", "pr", "bool-number"],
 )
 def test_shared_navigation_never_guesses_unconfirmed_or_foreign_identity(
     pending_issue_navigation, fault
@@ -170,6 +171,8 @@ def test_shared_navigation_never_guesses_unconfirmed_or_foreign_identity(
         snapshot.bindings["github_hierarchy"] = {"story:another": shared}
     elif fault == "foreign-repository":
         shared["url"] = "https://github.com/foreign/repo/issues/529"
+    elif fault == "nonstring-url":
+        shared["url"] = 529
     elif fault == "no-native-id":
         shared.pop("database_id")
     elif fault == "pr":

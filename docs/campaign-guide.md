@@ -662,7 +662,7 @@ does not authorize new work. Optional portfolio reasoning waits for an owned
 workspace when reflection is enabled; refreshing unchanged inventory does not
 create a new analysis merely because its observation time changed.
 
-If startup stopped before any worker launched, `requalify` can renew the frozen
+If startup stopped before any unit worker launched, `requalify` can renew the frozen
 native route proofs after an installation update. Supply freshly qualified routes
 with the same contracts and the current campaign revision. It preserves prior
 proofs and configuration templates, leaves the campaign stopped, and does not
@@ -674,8 +674,16 @@ preparation under the upgraded installation. Its recorded bootstrap commit must
 remain clean and unchanged, with the same native workspace and Git identity.
 The command preserves those bindings and their confirmed pre-worker reflection,
 plus exactly recorded bootstrap hierarchy observations and confirmed milestone
-or issue creations. It preserves their native IDs and receipts without recreating
-them. Unresolved allocation, unknown or rejected writes, unrelated GitHub
+or issue creations and exact confirmed native subissue attachments. It preserves
+their native IDs and receipts without recreating them.
+
+Ended optional portfolio
+reasoning is permitted only with unchanged read-only or no-tools authority, exact
+terminal process evidence, and no applied semantic decisions. Its requests, failed
+results, attempts and usage remain history; renewal does not accept them or reset
+their retry budget. Never-sent inventory, communication and exact reasoning-stale
+proposals retain their IDs and settle normally after resume. Unresolved allocation,
+unknown or rejected writes, unrelated GitHub
 mutations and other prior work still prevent renewal. Resume rechecks remote
 hierarchy state through the normal reconciliation path.
 

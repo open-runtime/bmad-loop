@@ -224,6 +224,11 @@ job through its transport. Required jobs gate their parent operation. Optional
 background reports may be explicitly canceled and journaled, but a campaign cannot
 report stopped or fully drained while a job remains live or ownership is unknown.
 Parent cancellation cannot leave untracked orphan workers.
+An exhausted semantic pipeline stops admitting its remaining siblings; existing
+claims still require normal observation and quiescence. A failed preparation
+records that no session launched. A pending observer can settle an older such
+claim only from its exact confirmed preparation-failure receipt and the absence
+of a native launch intent, never from the missing request file alone.
 
 Stop cancels a durably prepared reasoning launch only when no native launch intent
 exists. Sent or uncertain launches remain under observation. Operator holds block
@@ -307,6 +312,9 @@ schema-conforming result. An output-format flag alone may wrap free text in JSON
 require the provider's structured-result field when supported and validate it
 locally. Validate field types, object identities, source citations, purpose-specific
 semantics and current revisions, not only JSON syntax.
+Accept the whole-context source ID advertised by the prompt only after its exact
+context digest matches the request, result and current facts. This does not waive
+claim-level validation or permit priority proposals to schedule planning units.
 
 Reuse the adapter/profile seam and maintained TeamRouter launch path. Record
 supported stdin/file attachment mechanisms, schemas, tools, native IDs, effort
@@ -329,6 +337,9 @@ split or reject oversized chunks before launch. Never place large histories in
 shell argv. Stream parsing is bounded and retains diagnostics separately from
 the structured result. Missing output, limits reached or incomplete streams fail
 the job; bounded repair may retry with smaller chunks.
+Plan chunks against the same serialized source envelope used for delivery,
+including JSON escaping, source identifiers, prompt and schema overhead. Raw
+source-file size alone does not establish that the rendered request fits.
 
 Ordinary planning, implementation, review and repair stages also obey the earned
 route's input bound. Do not embed a complete repository inventory into every

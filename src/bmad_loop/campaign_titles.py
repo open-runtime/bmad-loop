@@ -134,15 +134,19 @@ def issue_reference(unit, *, snapshot=None) -> tuple[dict, str]:
     shared = snapshot.bindings.get("github_hierarchy", {}).get("story:" + unit.id)
     if not isinstance(shared, dict):
         return {}, ""
-    number, native_id = shared.get("number"), shared.get("database_id")
+    number, native_id, shared_url = (
+        shared.get("number"),
+        shared.get("database_id"),
+        shared.get("url"),
+    )
     if (
         shared.get("kind") != "issue"
         or type(number) is not int
         or number < 1
         or type(native_id) is not int
         or native_id < 1
-        or str(shared.get("url", "")).lower()
-        != f"https://github.com/{snapshot.repository}/issues/{number}".lower()
+        or not isinstance(shared_url, str)
+        or shared_url.lower() != f"https://github.com/{snapshot.repository}/issues/{number}".lower()
     ):
         return {}, ""
     return shared, shared["url"]
