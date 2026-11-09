@@ -7,6 +7,8 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+## [0.15.5] — 2026-11-08
+
 ### Fixed
 
 - Keep every bundled skill's source aligned with the fork's module record.
@@ -7021,7 +7023,8 @@ enforced in CI.
   implementation phase, driven by a Python control loop with hook-based session transport and
   resumable on-disk run state.
 
-[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.15.4...HEAD
+[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.15.5...HEAD
+[0.15.5]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.15.5
 [0.15.4]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.15.4
 [0.15.3]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.15.3
 [0.15.2]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.15.2
