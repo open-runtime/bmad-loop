@@ -7,6 +7,147 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+## [0.15.8] — 2026-11-08
+
+### Fixed
+
+- Enumerate macOS session descendants without repeatedly scanning every host process.
+
+## [0.15.7] — 2026-11-08
+
+### Fixed
+
+- Supply native PR identities in queue publication fixtures.
+- Synchronize process-cleanup tests on observed children and post-return barriers.
+
+## [0.15.6] — 2026-11-08
+
+### Fixed
+
+- Wait for managed messaging schema initialization before opening concurrent readers.
+- Reconcile queued PRs that merge during observation or before a pending dequeue.
+- Supply the immutable task context to Codex's native-review schema-mapping turn.
+
+## [0.15.5] — 2026-11-08
+
+### Fixed
+
+- Keep every bundled skill's source aligned with the fork's module record.
+- Preserve native Grok turn-limit classification through worker receipts and recovery.
+- Fit audited continuation history without omitting canonical obligations or discarding retained evidence.
+- Recheck continuation authority artifacts before launch and refresh unbound saved packets.
+
+## [0.15.4] — 2026-11-08
+
+### Fixed
+
+- Preserve pool fallback after capacity-command spawn failures and pass through suppressed stage receipts.
+- Align product ownership across admission, checkpoints, writer grants and final validation.
+- Confine operator hold reads and recheck selected native requirements before source publication.
+- Retain unknown contributor attribution, normalize qualified model IDs and journal campaign transition refusals.
+- Resolve campaign skill installation and module updates from the fork.
+
+## [0.15.3] — 2026-11-08
+
+### Fixed
+
+- Recheck optional history warmup eligibility at final native admission while retaining admitted work.
+
+## [0.15.2] — 2026-11-08
+
+### Added
+
+- Bind optional Claude native request-output and structured-output retry limits to qualified recipes.
+
+### Fixed
+
+- Serialize final headless admission with acknowledged campaign controls.
+- Present the exact enforced history schema in extraction and reduction prompts.
+- Bind map and reducer fidelity grants to the specialized output schema template.
+- Refresh obsolete handoff summary contracts before resuming a successor, retaining history and failure debt.
+- Include bounded-headless Grok and Muse profiles in project setup instructions.
+
+## [0.15.1] — 2026-11-08
+
+### Fixed
+
+- Apply contributor-family exclusions during review handoff and drain predecessors before replacement capacity waits.
+- Plan reducer windows from the exact projected input while retaining complete original summaries.
+
+## [0.15.0] — 2026-11-08
+
+### Added
+
+- Require optional native main/custom review pairs separately from independent publication review.
+- Deliver explicitly selected native tickets without closing their ongoing parent epics or milestones.
+- Add durable reasoning jobs, qualified headless adapters and portable transcript handoff contracts.
+- Prepare reusable native-history summaries during active work with bounded background jobs.
+- Bind required acceptance evidence to exact candidates and recruit configured GitHub reviewers.
+- Expose campaign job history, retained terminal history and scoped operator evidence.
+- Add managed hcom bridge addresses, durable advisory steering and paginated delivery receipts.
+- Partition oversized semantic inventories into bounded reasoning jobs before applying complete decisions.
+- Support explicit native administrative publication with actual-landing acceptance and linked repair PRs.
+
+### Changed
+
+- Store new campaign authority transactionally with an append-only event journal and explicit legacy migration.
+- Execute maintained project merge commands and produce both PR-head and merge-group checks.
+
+### Fixed
+
+- Preserve read-only stage permissions through quota fallback and successor handoff.
+- Honor stop and operator holds at reasoning admission and the final native launch boundary.
+- Select queued steering by exact target before paging so unrelated jobs cannot hide messages.
+- Bound summary input and total context separately without charging output twice against input capacity.
+- Refresh obsolete publication reviews after live intake changes the execution graph, retaining uncertain merge receipts.
+- Split output-limited handoff reducers at whole-child boundaries without discarding completed summaries or retry debt.
+- Permit Git's private AUTO_MERGE cleanup transaction after scoped commits.
+- Persist handoff retry cooldowns and bound reduced artifacts separately from native reasoning output.
+- Preserve BMAD stage result fields through Codex's closed native output schema.
+- Bound native stream and hook framing separately from model output, and preserve Grok terminal-result attribution.
+- Preserve native acceptance in landing-repair drafts without granting source lifecycle writes.
+- Keep native control records outside product workspaces and preserve owner staging during private Git publication recovery.
+- Isolate nested pytest temporary roots and wait for bounded landing-repair progress under parallel test load.
+- Lead managed Paradev labels with observed hcom names, epics, issues and PRs, refreshing discovered bindings.
+- Preserve the configured hcom room across headless launches without inheriting another agent's identity.
+- Resume temporary GitHub waits and reconsider owner decisions when their evidence changes.
+- Preserve contributor attribution and admit independent work fairly using fresh provider capacity.
+- Reflect native task status and observe bounded hcom context through normal campaign operation.
+- Resume closure after external prerequisites complete without reserving an idle writer.
+- Preserve native quota telemetry and refresh fallback routing before continuing interrupted work.
+- Recheck publication holds before releasing merge groups and resume suppressed queue effects.
+- Bind native and semantic qualifications to their earned model, thinking level, permissions and purpose.
+- Preserve reasoning-job identity through late acknowledgements and coordinator restart.
+- Share session admission across reasoning and coding workers without spending deferred attempts.
+- Reuse capability checks within admission passes while revalidating every native launch.
+- Reconcile independent parent closures concurrently and resume them after temporary intake waits.
+- Preserve complete owner-source spans through handoff audits and invalidate obsolete audit contracts.
+- Enforce native stream limits after process exit and retain telemetry for rejected structured results.
+- Preserve macOS worker identity across clock corrections and refuse uncertain legacy process ownership.
+- Reap owned campaign workers before checking process liveness and refuse duplicate uncertain launches.
+- Honor scoped holds before headless stages and check inherited developer and frozen launcher readiness at admission.
+- Require permission-specific headless qualification independently of handoff configuration.
+- Retain all required duplicate check results and reconcile native merge acknowledgements before replay.
+
+## [0.14.0] — 2026-11-05
+
+### Added
+
+- Add native development campaigns with parallel unit ownership, draft PR delivery and recoverable GitHub synchronization.
+- Add campaign planning roles, evidence-based decisions and bounded escalation resolution.
+- Bundle optional Paradev workspace and terminal reflection with scoped hcom observations.
+- Qualify existing work and installation provenance before campaign migration.
+
+### Changed
+
+- Preserve campaign checkpoint commits through append-only recovery and merge-only publication.
+- Apply qualified native reasoning effort to fresh and resumed Claude and Codex sessions.
+
+### Fixed
+
+- Retain frozen campaign policy and retry budgets across worker recovery.
+- Reconcile canonical source publication before closing delivered issues and dependencies.
+
 ## [0.13.15] — 2026-11-05
 
 ### Fixed
@@ -205,10 +346,19 @@ breaking changes may land in a minor release.
   `max_usage_relaunches` per story (default 3), then pauses as before. The relaunched
   session gets `BMAD_LOOP_USAGE_RELAUNCH` for account-rotation wrappers (#959).
 - Record the models a session actually ran on: session-end `models` (Claude, Codex,
-  Gemini, Copilot, OpenCode; `models_unresolved` when none was found), `status --json`
-  `adapters_used.<role>.models_used`, and the CLI-reported launch model (`session-model`
-  journal row) on the TUI agent line. `session-start` `model` still records the configured
-  model (#859).
+  Gemini, Copilot, OpenCode — on 2.x its subagent sessions' models too; `models_unresolved`
+  when none was found), `status --json` `adapters_used.<role>.models_used`, and the
+  CLI-reported launch model (`session-model` journal row) on the TUI agent line.
+  `session-start` `model` still records the configured model (#859).
+- Split each session's tokens per observed model: session-end `tokens_by_model` (summing
+  to `tokens`, `<unattributed>` for usage a parser cannot pin on a model), kept on the
+  state.json session record and summed per task in `status --json`.
+- Record Antigravity token usage from agy's per-step transcript counts (checked against
+  1.4.9), subagent conversations included, and show its model on the TUI agent line from
+  the first fully-idle Stop's `modelName`; session-end `models` stays untracked.
+- Add opt-in `[verify] reuse_unchanged`: a skip-review gate reuses an unchanged green
+  dev/fix verify pass instead of re-running `[verify] commands`; journalled as
+  `verify-pass-reused` / `verify-reuse-declined` (#1002).
 
 ### Changed
 
@@ -245,6 +395,8 @@ breaking changes may land in a minor release.
   the TUI settings screen (#496, #497).
 - Restructure the docs: FEATURES.md is a feature catalog, and configuration, CLI and
   run-state references live in `docs/reference/`.
+- With `[verify] reuse_unchanged` on, `post_review_verify` may carry the reused pass's
+  `dev`/`fix` stage and sequence, flagged by the new `verification_reused` (#1002).
 
 ### Removed
 
@@ -269,6 +421,37 @@ breaking changes may land in a minor release.
 - Preserve unfinished session-owned ledger edits when resuming dev or review conversations.
 - Keep StopFailure account and quota handling compatible with fork recovery, clear stale quota
   waits on new failures, and honor ignored errors in transcript classification.
+- Open agent task windows detached, so a tmux config `run` or `run-shell` that fails or
+  prints when bmad-loop starts the server lands in view-mode on the session's `shell`
+  window instead of the agent's pane, where it refused every wake nudge and TUI answer
+  until someone pressed `q`. `bmad-loop attach` and the TUI's `a` select the task window
+  before attaching, and a client already attached to the session still follows each new
+  task window.
+- Make `probe-adapter codex --probe` able to capture: Codex keys hook trust by config path,
+  so a fresh temp dir always read untrusted and the probe never launched. Its hook config
+  now lives in a stable per-user workspace under the state root; the untrusted report says
+  to open Codex there once and accept the trust prompts. Captures stay in the temp dir.
+- Keep email redaction and leak detection in `diagnose` and `probe-adapter` linear on a
+  long line: an 80k-character alphanumeric run with no `@` took seconds to scan, and now
+  takes milliseconds. What counts as an email is unchanged.
+- Match agy's workspace-trust entries the way agy does: a forward-slash spelling of the
+  project (`C:/Users/...`) now counts as trusted on Windows when seeding a worktree and
+  in `probe-adapter --workspace`; case and trailing-separator variants still do not.
+- Read hook stdin as bytes in `probe-adapter --probe` captures, so a UTF-8 payload with a
+  non-ASCII path no longer garbles or drops on a Windows code-page locale. The capture
+  also keeps each payload's raw bytes beside it.
+- Stop counting Copilot cache reads, cache writes and reasoning tokens twice: Copilot's
+  `inputTokens` already includes the cache tokens and `outputTokens` the reasoning tokens.
+- Read Copilot usage from each turn's `session.usage_checkpoint` (Copilot 1.0.105), so a
+  session that ends without a `session.shutdown` line still reports its tokens and models.
+  The post-session read still waits its grace for the shutdown totals.
+- Resume a dev attempt rejected for retry, after a manual-rollback pause or a host loss
+  before the next attempt, by re-deciding or restarting it instead of reviewing and
+  committing it.
+- Save an escalation before running its notify command, so a host loss during a slow
+  notify no longer resumes the escalated dev attempt into review and commit. Worktree
+  unit escalations, plugin `pause`/`defer` vetoes, the unknown `--story` pause, the
+  worktree-open defer and the sweep's intent and migration pauses save first too.
 - Commit the engine's own deferred-work ledger changes before review, repair and retry
   sessions and after an in-place defer, so a tracked ledger no longer pauses the run with
   `finalization left repository dirty`. The in-place defer notice now prints
@@ -359,6 +542,10 @@ breaking changes may land in a minor release.
 - Pin the run journal and `state.json` to the run dir's recorded identity: writes and
   re-reads refuse a run dir swapped for a link or another directory instead of acting
   outside the run, and Windows verify-stream logs refuse junctions.
+- Catch more credential shapes in the `diagnose` / `probe-adapter` egress guard: Stripe
+  `sk_`/`rk_` keys, Slack `xapp-`, SendGrid `SG.` and PyPI tokens, including inside URL
+  paths, and `user:password@` URL credentials under any scheme, not only http(s).
+  `scrub_text` now redacts a URL's whole userinfo, before emails.
 
 ## [0.13.2] — 2026-10-09
 
@@ -6857,7 +7044,17 @@ enforced in CI.
   implementation phase, driven by a Python control loop with hook-based session transport and
   resumable on-disk run state.
 
-[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.13.15...HEAD
+[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.15.8...HEAD
+[0.15.8]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.15.8
+[0.15.7]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.15.7
+[0.15.6]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.15.6
+[0.15.5]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.15.5
+[0.15.4]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.15.4
+[0.15.3]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.15.3
+[0.15.2]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.15.2
+[0.15.1]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.15.1
+[0.15.0]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.15.0
+[0.14.0]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.14.0
 [0.13.15]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.15
 [0.13.14]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.14
 [0.13.13]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.13.13

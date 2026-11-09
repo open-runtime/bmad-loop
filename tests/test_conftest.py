@@ -17,12 +17,15 @@ from __future__ import annotations
 import ast
 import errno
 import functools
+import getpass
 import hashlib
 import json
 import os
 import re
 import shlex
 import shutil
+import socket
+import stat
 import subprocess
 import sys
 import tomllib
@@ -1691,6 +1694,7 @@ _EXPECTED_E2E_DEF_COUNTS: dict[str, dict[str, int]] = {
     "test_generic_tmux.py": {"test_tmux_": 6},
     "test_tui_launch_tmux_e2e.py": {"test_e2e_": 2},
     "test_tmux_locale_e2e.py": {"test_e2e_": 1},
+    "test_tmux_server_config_e2e.py": {"test_e2e_": 1},
     "test_launch_probe.py": {"test_e2e_": 1},
     "test_stories_e2e.py": {
         "test_e2e_": 22,
@@ -1703,6 +1707,8 @@ _EXPECTED_E2E_DEF_COUNTS: dict[str, dict[str, int]] = {
     },
     "test_tickets_e2e.py": {"test_e2e_tickets_": 17},
     "test_conftest.py": {"test_private_tmux_": 1},
+    "test_campaign_workers.py": {"test_child_module_": 1},
+    "test_campaign_headless.py": {"test_real_mux_": 1},
 }
 
 
@@ -1968,12 +1974,28 @@ def _tmux_has_session(socket: Path, name: str) -> bool:
     return subprocess.run(argv, capture_output=True).returncode == 0
 
 
+@pytest.mark.skipif(os.name != "posix", reason="Unix socket paths are POSIX-only")
+def test_short_socket_directory_binds_independently_of_long_temp_root(tmp_path, monkeypatch):
+    long_root = tmp_path / ("long-temporary-root-" * 10)
+    long_root.mkdir()
+    monkeypatch.setenv("TMPDIR", str(long_root))
+    monkeypatch.setattr(conftest.tempfile, "tempdir", str(long_root))
+    with conftest.short_socket_directory("endpoint") as directory:
+        assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+        endpoint = directory / "endpoint"
+        assert len(os.fsencode(endpoint.resolve())) <= 96
+        with socket.socket(socket.AF_UNIX) as listener:
+            listener.bind(str(endpoint))
+            assert stat.S_ISSOCK(endpoint.lstat().st_mode)
+    assert not directory.exists()
+
+
 @pytest.mark.skipif(
-    not (sys.platform.startswith("linux") and shutil.which("tmux")),
-    reason="needs real tmux on Linux",
+    not (os.name == "posix" and shutil.which("tmux")),
+    reason="needs real tmux on POSIX",
 )
 @conftest.real_mux_e2e
-def test_private_tmux_socket_keeps_sessions_off_the_default_server(tmp_path_factory):
+def test_private_tmux_socket_keeps_sessions_off_the_default_server():
     """A session started inside `private_tmux_socket` lands on the private socket and
     not on the default one, and on exit the private server is gone.
 
@@ -1984,16 +2006,16 @@ def test_private_tmux_socket_keeps_sessions_off_the_default_server(tmp_path_fact
     own survivor check raises. Run either ablation under a throwaway server root:
     `env -u TMUX -u TMUX_PANE TMUX_TMPDIR=$(mktemp -d) uv run pytest ...`."""
     default = conftest.private_tmux_socket_path(Path(os.environ.get("TMUX_TMPDIR") or "/tmp"))
-    base = tmp_path_factory.mktemp("tmux")
-    name = f"dw561-{os.getpid()}-{base.name}"
-    with conftest.private_tmux_socket(base) as socket:
-        assert socket == conftest.private_tmux_socket_path(base)
-        subprocess.run(["tmux", "new-session", "-d", "-s", name, "sleep 30"], check=True)
-        assert _tmux_has_session(socket, name)
-        assert not _tmux_has_session(default, name)
-    assert not _tmux_has_session(socket, name)
-    listing = subprocess.run(["tmux", "-S", str(socket), "list-sessions"], capture_output=True)
-    assert listing.returncode != 0, listing
+    with conftest.short_socket_directory(f"tmux-{os.getuid()}/default") as base:
+        name = f"dw561-{os.getpid()}-{base.name}"
+        with conftest.private_tmux_socket(base) as socket:
+            assert socket == conftest.private_tmux_socket_path(base)
+            subprocess.run(["tmux", "new-session", "-d", "-s", name, "sleep 30"], check=True)
+            assert _tmux_has_session(socket, name)
+            assert not _tmux_has_session(default, name)
+        assert not _tmux_has_session(socket, name)
+        listing = subprocess.run(["tmux", "-S", str(socket), "list-sessions"], capture_output=True)
+        assert listing.returncode != 0, listing
 
 
 def test_live_e2e_scan_reads_shared_gates_once(monkeypatch):
@@ -2301,6 +2323,8 @@ def _run_grouping_probe(tmp_path, dist: str) -> dict[str, tuple[str, str]]:
             "2",
             "-o",
             "addopts=",
+            "--basetemp",
+            str(tmp_path / ("nested-pytest-" + dist)),
             "--dist",
             dist,
         ],
@@ -2321,6 +2345,20 @@ def _run_grouping_probe(tmp_path, dist: str) -> dict[str, tuple[str, str]]:
         reported[nodeid.split("::")[-1].split("@")[0]] = (worker, nodeid)
     assert len(reported) == 4, f"expected 4 reported tests under --dist {dist}, got {reported}"
     return reported
+
+
+def test_grouping_probe_does_not_clean_ambient_run_history(tmp_path, monkeypatch):
+    ambient = tmp_path / "ambient-temp"
+    history = ambient / ("pytest-of-" + getpass.getuser())
+    sentinels = []
+    for index in range(4):
+        path = history / f"pytest-{index}" / "retained.txt"
+        path.parent.mkdir(parents=True)
+        path.write_text("another run's retained evidence", encoding="utf-8")
+        sentinels.append(path)
+    monkeypatch.setenv("PYTEST_DEBUG_TEMPROOT", str(ambient))
+    _run_grouping_probe(tmp_path, "loadgroup")
+    assert all(path.is_file() for path in sentinels), "nested pytest cleaned unrelated history"
 
 
 def test_loadgroup_actually_schedules_the_group_onto_one_worker(tmp_path):

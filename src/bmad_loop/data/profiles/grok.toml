@@ -1,0 +1,13 @@
+# Grok Build uses native headless JSON with a qualified scoped-tools contract.
+# This profile alone does not grant native execution or claim compatibility.
+name = "grok"
+binary = "grok"
+adapter = "bounded-headless"
+prompt_template = "{prompt}"
+usage_parser = "none"
+first_run_note = "Qualify Grok Build's exact binary, native JSON transport, model limits and scoped tools in the campaign headless capability manifest. Interactive hcom ACP is a separate transport."
+skill_tree = ".agents/skills"
+[hooks]
+dialect = "none"
+config_path = ""
+events = {}

@@ -16,7 +16,9 @@ in :mod:`bmad_loop.adapters.multiplexer`.
 
 from __future__ import annotations
 
+import ctypes
 import functools
+import math
 import os
 import shlex
 import signal
@@ -104,6 +106,14 @@ class ProcessHost(ABC):
             return "unknown"
         return "dead"
 
+    def legacy_identity_unverifiable(self, pid: int, identity: float | None) -> bool:
+        """Whether a live legacy owner cannot be authenticated after migration.
+
+        This narrow distinction lets cleanup retain old macOS owners without
+        changing existing handling of other unknown identity observations.
+        """
+        return False
+
     def descendants(self, pid: int) -> dict[int, float | None]:
         """Transitive descendants of ``pid`` (children, grandchildren, …) as a
         pid → :meth:`identity` snapshot, for the teardown reap that must chase a
@@ -120,8 +130,8 @@ class ProcessHost(ABC):
         NEVER raises: ``{}`` on an unsupported platform, a missing psutil, a gone
         pid, or any read error — this feeds the kill escalation, which must never be
         the thing that raises. The default enumerates via psutil (macOS/Windows);
-        the Linux host overrides it with a psutil-free ``/proc`` scan so the core
-        stays dep-free there."""
+        the Linux host uses a psutil-free ``/proc`` scan; macOS uses kernel-filtered
+        direct children with the same psutil birth identities."""
         if pid <= 0:
             return {}
         return _psutil_descendants(pid)
@@ -147,7 +157,7 @@ class ProcessHost(ABC):
 
 class PosixProcessHost(ProcessHost):
     """Linux/macOS/WSL: ``os.kill`` for signalling and the read-only existence
-    probe; ``/proc`` start-time (Linux) or psutil create-time for identity."""
+    probe; ``/proc`` start-time (Linux) or stable psutil birth identity (macOS)."""
 
     def terminate(self, pid: int) -> None:
         if pid <= 0:
@@ -182,16 +192,46 @@ class PosixProcessHost(ProcessHost):
         # macOS (and any non-Linux POSIX): no /proc — fall back to psutil if the
         # optional extra is present, else give up (None → callers won't force-kill).
         try:
-            return _psutil().Process(pid).create_time()
+            return _psutil_identity(_psutil().Process(pid))
         except Exception:
             return None
+
+    def liveness_of(self, pid: int, identity: float | None) -> str:
+        """Interpret macOS's versioned stamp without guessing a legacy epoch.
+
+        New macOS stamps encode immutable kernel birth time as a negative float.
+        Positive stamps came from psutil's clock-adjusted epoch API; their original
+        offset cannot be recovered from the pid file. An existing legacy PID is
+        therefore unknown, never proof of death or authority to signal it. Missing
+        identity retains the separate legacy pid-only contract. -1/-2 remain the
+        invalid/unreadable pid-file sentinels, outside the valid stamp domain.
+        """
+        if sys.platform != "darwin" or identity is None:
+            return super().liveness_of(pid, identity)
+        if pid <= 0 or not math.isfinite(identity) or -2 <= identity <= 0:
+            return "dead"
+        if identity > 0:
+            return "unknown" if self.legacy_identity_unverifiable(pid, identity) else "dead"
+        return super().liveness_of(pid, identity)
+
+    def legacy_identity_unverifiable(self, pid: int, identity: float | None) -> bool:
+        return (
+            sys.platform == "darwin"
+            and pid > 0
+            and identity is not None
+            and math.isfinite(identity)
+            and identity > 0
+            and self.is_alive(pid)
+        )
 
     def descendants(self, pid: int) -> dict[int, float | None]:
         if pid <= 0:
             return {}
         if sys.platform.startswith("linux"):
             return _linux_descendants(pid)  # psutil-free: keeps the Linux core dep-free
-        return super().descendants(pid)  # macOS: psutil, guarded by the seam's never-raise
+        if sys.platform == "darwin":
+            return _macos_descendants(pid)
+        return super().descendants(pid)
 
     def hook_interpreter(self) -> str:
         return self.shell_quote(str(Path(sys.executable).absolute()))
@@ -343,24 +383,133 @@ def _linux_descendants(pid: int) -> dict[int, float | None]:
     return out
 
 
+def _psutil_identity(process) -> float:
+    """One same-object stamp for direct lookup and descendant enumeration.
+
+    On macOS psutil >= 7.2.2 binds ``_ident`` to the unadjusted kernel birth
+    value at Process construction, the same value its own PID-reuse guard uses.
+    Public ``create_time()`` instead adjusts for system-clock changes and can
+    disagree between observers imported before and after a clock correction.
+    Keep this private API assumption here and fail closed if its shape changes;
+    never silently fall back to the unstable epoch API.
+
+    The negative encoding versions macOS stamps within the persisted float
+    contract. Its domain is strictly below -2, preserving pid-file sentinels.
+    Other platforms keep their existing public create-time representation.
+    """
+    if sys.platform != "darwin":
+        return process.create_time()
+    ident = getattr(process, "_ident", None)
+    if not isinstance(ident, tuple) or len(ident) != 2 or ident[0] != process.pid:
+        raise ProcessHostError("macOS process identity is unavailable")
+    birth = ident[1]
+    if type(birth) not in (int, float) or not math.isfinite(birth) or birth <= 2:
+        raise ProcessHostError("macOS process birth identity is invalid")
+    return -float(birth)
+
+
+_MACOS_TREE_LIMIT = 4096
+
+
+@functools.lru_cache(maxsize=1)
+def _macos_child_reader():
+    """Bind the SDK libproc ABI lazily; no native calls on other platforms."""
+    library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    reader = library.proc_listchildpids
+    reader.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+    reader.restype = ctypes.c_int
+    return reader
+
+
+def _macos_child_pids(pid: int) -> tuple[int, ...]:
+    """Kernel-filter direct children, retrying a full buffer within a fixed bound.
+
+    proc_listchildpids returns PID count (not bytes). Never substitute psutil's
+    host-wide PPID census on failure: preserve the caller's never-raise seam.
+    """
+    reader = _macos_child_reader()
+    capacity = 64
+    for _ in range(5):
+        children = (ctypes.c_int * capacity)()
+        ctypes.set_errno(0)
+        count = reader(pid, children, ctypes.sizeof(children))
+        if count < 0 or (count == 0 and ctypes.get_errno()):
+            raise OSError(ctypes.get_errno(), "native child observation failed")
+        if count < capacity:
+            return tuple(value for value in children[:count] if value > 0)
+        capacity *= 4
+    raise OSError("native child observation exceeded its bounded snapshot capacity")
+
+
+def _macos_descendants(pid: int) -> dict[int, float | None]:
+    """Walk observed branches without querying every unrelated host PID.
+
+    Keep the existing clock-stable psutil birth stamp. A native PID is only a
+    candidate: verify parent, construction identity and parent generation before
+    recording it. Reparented, reused or unreadable candidates are omitted.
+    Stop after 4,096 candidate PIDs (including duplicates) so ongoing forks cannot
+    extend this best-effort snapshot forever. Retain authenticated results on
+    branch failure or budget exhaustion; neither implies complete quiescence.
+    Every returned stamp is still revalidated by callers before signalling.
+    """
+    out = {}
+    if pid <= 0:
+        return out
+    try:
+        psutil = _psutil()
+        root = psutil.Process(pid)
+        pending = [root]
+        seen = {pid}
+        remaining = _MACOS_TREE_LIMIT
+        while pending and remaining:
+            parent = pending.pop()
+            try:
+                parent_stamp = _psutil_identity(parent)
+                if not parent.is_running():
+                    continue
+                child_pids = _macos_child_pids(parent.pid)
+                if not parent.is_running():
+                    continue
+            except Exception:  # nosec B112 - retain stamped siblings when a branch is unreadable
+                # Retain other authenticated branches when one observation fails.
+                continue
+            for child_pid in child_pids:
+                if not remaining:
+                    break
+                remaining -= 1
+                if child_pid in seen:
+                    continue
+                seen.add(child_pid)
+                try:
+                    child = psutil.Process(child_pid)
+                    stamp = _psutil_identity(child)
+                    if (
+                        stamp > parent_stamp
+                        or child.ppid() != parent.pid
+                        or not child.is_running()
+                        or not parent.is_running()
+                    ):
+                        continue
+                    out[child_pid] = stamp
+                    pending.append(child)
+                except Exception:  # nosec B112 - unreadable/reused candidates remain omitted
+                    continue
+    except Exception:
+        return {}
+    return out
+
+
 def _psutil_descendants(pid: int) -> dict[int, float | None]:
     """Transitive descendants via psutil (non-Linux POSIX + Windows), each stamped
-    with the ``create_time()`` of the SAME enumerated ``Process`` object and then
+    with the platform identity of the SAME enumerated ``Process`` object and then
     REVALIDATED against that object's construction-bound identity before it is
     recorded.
 
-    The revalidation is load-bearing, not belt-and-braces — ``create_time()`` alone
-    is NOT reuse-safe here. Per ``psutil.Process._get_ident`` (7.2.2), only the
-    ``WINDOWS`` branch pre-populates the epoch cache (``self._create_time =
-    create_time(fast_only=True)``); the ``LINUX or NETBSD or OSX`` branch binds a
-    *monotonic* starttime and leaves ``self._create_time`` unset. So on macOS our
-    ``create_time()`` is the FIRST call — a raw call-time kernel read, and
-    ``create_time()`` does not consult ``_raise_if_pid_reused()``. A pid reaped and
-    reused between ``children()`` and the stamp would therefore hand back the
-    NEWCOMER's identity, which teardown would then authenticate successfully and
-    signal (#184 review). ``is_running()`` closes that window: it compares the
-    ident captured at construction against a freshly built ``Process``, so a
-    generation change reads as not-running and the member is omitted.
+    Revalidation excludes a process that exited or changed generation after
+    enumeration. The macOS helper uses the construction-bound raw identity; other
+    platforms retain their create-time path. A fresh lookup by child PID would
+    instead stamp a recycled newcomer. ``is_running()`` compares the enumerated
+    object's construction identity against a fresh Process and omits that race.
 
     Order matters — read the identity, THEN validate, THEN record; validating first
     would reopen the same TOCTOU gap. A member whose identity can't be confirmed is
@@ -371,7 +520,7 @@ def _psutil_descendants(pid: int) -> dict[int, float | None]:
     try:
         for child in _psutil().Process(pid).children(recursive=True):
             try:
-                identity = child.create_time()
+                identity = _psutil_identity(child)
                 if not child.is_running():  # generation changed under us — don't stamp it
                     continue
                 out[child.pid] = identity

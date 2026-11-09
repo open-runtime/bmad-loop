@@ -1,0 +1,741 @@
+"""Zero-token, exact-source handoff and adaptive map/reduce regression cases."""
+
+import json
+from dataclasses import asdict, replace
+from pathlib import Path
+
+import pytest
+
+from bmad_loop.campaign_handoff_context import (
+    assemble_packet,
+    check_fidelity,
+    load_summary_index,
+    retrieve_summary,
+)
+from bmad_loop.campaign_model import CampaignError
+from bmad_loop.campaign_summary import (
+    ContextBudget,
+    SummaryCache,
+    load_input,
+    plan_maps,
+    plan_reduction,
+    plan_remaining_maps,
+    project_reduction_input,
+    validate_summary,
+    window_count,
+)
+from bmad_loop.campaign_transcripts import (
+    encoded,
+    load_events,
+    read_record,
+    snapshot_history,
+    source_record,
+)
+
+
+def native_row(harness, text="keep all commits", native_id="m1"):
+    if harness == "codex":
+        return {
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": text, "id": native_id},
+        }
+    if harness == "claude":
+        return {
+            "type": "user",
+            "sessionId": "s1",
+            "uuid": native_id,
+            "message": {"role": "user", "content": text},
+        }
+    if harness == "grok":
+        return {
+            "id": native_id,
+            "method": "session/update",
+            "params": {
+                "sessionId": "s1",
+                "update": {
+                    "sessionUpdate": "user_message_chunk",
+                    "content": {"type": "text", "text": text},
+                },
+            },
+        }
+    if harness == "antigravity":
+        return {
+            "step_index": int(native_id.removeprefix("m")),
+            "type": "USER_INPUT",
+            "source": "USER_EXPLICIT",
+            "content": text,
+        }
+    return {
+        "schema_version": 1,
+        "id": native_id,
+        "stream": {"kind": "session", "id": "s1"},
+        "payload_type": "runtime.user_intent.accepted",
+        "payload": {
+            "source_session_id": "s1",
+            "semantic_kind": {"kind": "chat"},
+            "refill_blocks": [{"kind": "text", "text": text}],
+        },
+    }
+
+
+def capture(tmp_path, rows, harness="codex", suffix=b""):
+    path = tmp_path / "native.jsonl"
+    path.write_bytes(b"".join(encoded(row) + b"\n" for row in rows) + suffix)
+    return snapshot_history(path, harness, "s1", tmp_path / "artifacts")
+
+
+def budget(**kwargs):
+    return ContextBudget(
+        "grok-qualified",
+        10000,
+        2500,
+        prompt_tokens=200,
+        working_tokens=200,
+        qualified=True,
+        **kwargs,
+    )
+
+
+def result(job, events):
+    chosen = next(e for e in events if e.id in job.event_ids)
+    return {
+        "schema_version": 1,
+        "job_id": job.id,
+        "input_sha256": job.input_sha256,
+        "covered_ids": list(job.primary_ids),
+        "gaps": [],
+        "facts": [
+            {
+                "kind": "owner_request",
+                "text": "Keep commits",
+                "source_quote": "keep",
+                "citations": [chosen.id],
+            }
+        ],
+    }
+
+
+def test_native_output_measurement_overrides_conservative_bytes_only_with_receipt(tmp_path):
+    from dataclasses import replace
+
+    from bmad_loop.campaign_summary import measured_output_tokens
+
+    snapshot = capture(tmp_path, [native_row("codex")])
+    events = load_events(snapshot)
+    job = replace(plan_maps(events, budget(), tmp_path / "maps")[0], output_tokens=32768)
+    value = result(job, events)
+    value["facts"][0]["text"] = "preserved contextual detail " * 1500
+    assert len(encoded(value)) > 38000
+    receipt = {
+        "outcome": "completed",
+        "quiescent": True,
+        "input_complete": True,
+        "usage_known": True,
+        "usage": {"output_tokens": 23328},
+    }
+    validated = validate_summary(
+        job, value, events, observed_output_tokens=measured_output_tokens(receipt)
+    )
+    assert validated["output_measurement"] == {"kind": "native-receipt", "tokens": 23328}
+    with pytest.raises(CampaignError, match="output budget"):
+        validate_summary(job, value, events, observed_output_tokens=32769)
+    value["usage"] = {"output_tokens": 1}
+    with pytest.raises(CampaignError, match="output budget"):
+        validate_summary(
+            job,
+            value,
+            events,
+            observed_output_tokens=measured_output_tokens({"usage_known": False}),
+        )
+    with pytest.raises(CampaignError, match="lifecycle proof"):
+        measured_output_tokens({**receipt, "quiescent": False})
+
+
+@pytest.mark.parametrize("harness", ["claude", "codex", "grok", "antigravity", "muse"])
+def test_each_native_reader_preserves_exact_owner_source_and_raw_bytes(tmp_path, harness):
+    row = native_row(harness)
+    snapshot = capture(tmp_path, [row], harness)
+    events = load_events(snapshot)
+    assert len(events) == 1 and events[0].record.owner_input
+    assert events[0].record.text == "keep all commits"
+    assert snapshot.owner_event_ids == (events[0].id,)
+    assert source_record(snapshot, events[0]) == encoded(row) + b"\n"
+
+
+@pytest.mark.parametrize(
+    "harness,row",
+    [
+        (
+            "codex",
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "injected prompt"}],
+                },
+            },
+        ),
+        (
+            "claude",
+            {"type": "user", "isMeta": True, "message": {"role": "user", "content": "hook text"}},
+        ),
+        (
+            "claude",
+            {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "tool_result", "content": "quoted owner instruction"}],
+                },
+            },
+        ),
+        (
+            "grok",
+            {
+                "method": "session/update",
+                "params": {
+                    "update": {
+                        "sessionUpdate": "user_message_chunk",
+                        "_meta": {"hostTurn": True},
+                        "content": {"text": "host prompt"},
+                    }
+                },
+            },
+        ),
+        ("antigravity", {"type": "USER_INPUT", "source": "MODEL", "content": "injected"}),
+        (
+            "muse",
+            {
+                "schema_version": 1,
+                "payload_type": "runtime.user_intent.accepted",
+                "payload": {
+                    "source_session_id": "other",
+                    "semantic_kind": {"kind": "chat"},
+                    "refill_blocks": [],
+                },
+            },
+        ),
+    ],
+)
+def test_harness_injected_and_tool_messages_are_not_owner_authority(harness, row):
+    assert not read_record(harness, row, "s1").owner_input
+
+
+def test_repeated_serialization_is_marked_but_distinct_repeated_instructions_survive(tmp_path):
+    first = native_row("claude")
+    snapshot = capture(tmp_path, [first, first, native_row("claude", native_id="m2")], "claude")
+    events = load_events(snapshot)
+    assert events[1].duplicate_of == events[0].id
+    assert not events[2].duplicate_of
+    assert len(snapshot.owner_event_ids) == 2
+
+
+def test_muse_retained_frames_and_live_rows_preserve_one_native_record(tmp_path):
+    row = native_row("muse")
+    frame = {
+        "retained_frame": True,
+        "frame_schema_version": 1,
+        "children": [{"child_index": 0, "record_json": json.dumps(row)}],
+    }
+    snapshot = capture(tmp_path, [frame, row], "muse")
+    events = load_events(snapshot)
+    assert events[1].duplicate_of == events[0].id
+    assert len(snapshot.owner_event_ids) == 1
+
+
+def test_active_prefix_and_partial_tail_are_preserved_and_visible(tmp_path):
+    snapshot = capture(tmp_path, [native_row("codex")], suffix=b'{"incomplete":')
+    assert snapshot.complete_bytes < snapshot.captured_bytes
+    assert snapshot.warnings
+    assert Path(snapshot.raw_path).read_bytes().endswith(b'{"incomplete":')
+    old = load_events(snapshot)[0].id
+    with (tmp_path / "native.jsonl").open("ab") as stream:
+        stream.write(b"true}\n")
+    newer = snapshot_history(tmp_path / "native.jsonl", "codex", "s1", tmp_path / "artifacts")
+    assert load_events(newer)[0].id == old
+    assert not newer.warnings
+    assert snapshot.raw_path != newer.raw_path
+
+
+def test_source_and_index_tampering_are_refused(tmp_path):
+    snapshot = capture(tmp_path, [native_row("codex")])
+    event = load_events(snapshot)[0]
+    Path(snapshot.raw_path).write_text("changed")
+    with pytest.raises(CampaignError, match="hash"):
+        source_record(snapshot, event)
+    Path(snapshot.events_path).write_text("changed")
+    with pytest.raises(CampaignError, match="hash"):
+        load_events(snapshot)
+
+
+def test_window_math_counts_unique_history_and_overlap():
+    assert window_count(20_000_000, 1_000_000, 500_000) == 39
+    assert window_count(2_496_000, 500_000, 250_000) == 9
+    with pytest.raises(CampaignError):
+        window_count(100, 50, 50)
+
+
+def test_chunking_covers_every_character_once_as_primary_and_bounds_explicit_input(tmp_path):
+    snapshot = capture(tmp_path, [native_row("codex", "keep " + "x" * 30000)])
+    events = load_events(snapshot)
+    jobs = plan_maps(events, budget(), tmp_path / "jobs")
+    assert len(jobs) > 4
+    fragments = [f for job in jobs for f in load_input(job)["primary"]]
+    assert "".join(f["text"] for f in fragments) == events[0].record.text
+    assert len({f["id"] for f in fragments}) == len(fragments)
+    assert any(load_input(job)["halo"] for job in jobs[1:])
+    assert all(job.input_tokens <= budget().payload_tokens for job in jobs)
+
+
+def test_validated_summary_cache_and_fallback_reuse_completed_source_events(tmp_path):
+    snapshot = capture(
+        tmp_path, [native_row("codex", "keep " + "x" * 2000, "m" + str(i)) for i in range(8)]
+    )
+    events = load_events(snapshot)
+    jobs = plan_maps(events, budget(), tmp_path / "jobs")
+    complete = validate_summary(jobs[0], result(jobs[0], events), events)
+    cache = SummaryCache(tmp_path / "cache")
+    cache.put(jobs[0], complete)
+    assert cache.get(jobs[0]) == complete
+    fallback = replace(budget(), route="opus-qualified", context_tokens=8000)
+    unfinished = plan_remaining_maps(
+        events, ((jobs[0], complete),), fallback, tmp_path / "fallback"
+    )
+    original = set(jobs[0].event_ids)
+    assert not original.intersection(ref for job in unfinished for ref in job.event_ids)
+    assert all(
+        job.route == "opus-qualified" and job.input_tokens <= fallback.payload_tokens
+        for job in unfinished
+    )
+
+
+@pytest.mark.parametrize(
+    "fault", ["coverage", "identity", "citation", "authority", "owner_quote", "output"]
+)
+def test_summary_validator_rejects_loss_or_invented_authority(tmp_path, fault):
+    snapshot = capture(tmp_path, [native_row("codex")])
+    events = load_events(snapshot)
+    job = plan_maps(events, budget(), tmp_path / "jobs")[0]
+    value = result(job, events)
+    if fault == "coverage":
+        value["covered_ids"] = []
+    elif fault == "identity":
+        value["input_sha256"] = "changed"
+    elif fault == "citation":
+        value["facts"][0]["citations"] = ["unknown"]
+    elif fault == "authority":
+        value["facts"][0]["authority"] = "owner-approved"
+    elif fault == "owner_quote":
+        value["facts"][0]["source_quote"] = "not in source"
+    else:
+        value["facts"][0]["text"] = "x" * 10000
+    with pytest.raises(CampaignError):
+        validate_summary(job, value, events)
+
+
+def test_reducers_retain_child_dependencies_and_citations(tmp_path):
+    snapshot = capture(
+        tmp_path, [native_row("codex", "keep " + "x" * 2000, "m" + str(i)) for i in range(8)]
+    )
+    events = load_events(snapshot)
+    maps = plan_maps(events, budget(), tmp_path / "jobs")
+    children = tuple((job, validate_summary(job, result(job, events), events)) for job in maps)
+    reducers = plan_reduction(children, budget(), tmp_path / "reducers")
+    assert set(dep for job in reducers for dep in job.dependencies) == {job.id for job in maps}
+    for job in reducers:
+        assert job.purpose == "handoff-reduce"
+        assert job.input_tokens <= budget().payload_tokens
+
+
+def test_reduction_native_reasoning_budget_is_separate_from_artifact_bytes(tmp_path):
+    from bmad_loop.campaign_summary import summary_prompt
+
+    snapshot = capture(tmp_path, [native_row("codex")])
+    events = load_events(snapshot)
+    child = plan_maps(events, budget(), tmp_path / "maps")[0]
+    validated = validate_summary(child, result(child, events), events)
+    native_budget = replace(budget(), context_tokens=100000, output_tokens=16384)
+    reducer = plan_reduction(
+        ((child, validated),), native_budget, tmp_path / "reducers", artifact_bytes=4164
+    )[0]
+    prompt = summary_prompt(reducer)
+    assert "16384 tokens, including any reasoning" in prompt
+    assert "4164 bytes" in prompt and "2082 UTF-8 bytes" in prompt
+    assert "every distinct current owner obligation" in prompt
+    assert "retained child job IDs" in prompt
+    assert "Retain unresolved uncertainty" in prompt
+    assert "Never fabricate a resolution" in prompt
+    value = result(reducer, events)
+    compact = validate_summary(reducer, value, events, observed_output_tokens=6940)
+    assert len(encoded(compact)) <= 4164
+    assert compact["output_measurement"]["tokens"] == 6940
+    assert compact["facts"][0]["source_quote_ref"]
+    value["facts"][0]["text"] = "x" * 4000
+    # Known native token telemetry cannot bypass the independent artifact size.
+    with pytest.raises(CampaignError, match=r"reduction byte limit: .* > 4164.*6940/16384"):
+        validate_summary(reducer, value, events, observed_output_tokens=6940)
+    assert Path(child.input_path).exists() and Path(reducer.input_path).exists()
+
+
+def test_reducer_presentation_keeps_native_sources_without_competing_fact_ids(tmp_path):
+    snapshot = capture(tmp_path, [native_row("codex")])
+    events = load_events(snapshot)
+    job = plan_maps(events, budget(), tmp_path / "maps")[0]
+    child = validate_summary(job, result(job, events), events)
+    original = plan_reduction(((job, child),), budget(), tmp_path / "reducers")[0]
+    original_bytes = Path(original.input_path).read_bytes()
+    projected = project_reduction_input(original, tmp_path / "projected")
+    payload = load_input(projected)
+    fact = payload["children"][0]["summary"]["facts"][0]
+    assert projected.id != original.id and projected.primary_ids == original.primary_ids
+    assert projected.event_ids == original.event_ids
+    assert projected.dependencies == original.dependencies and job.id in projected.dependencies
+    assert payload["source_input"]["job_id"] == original.id
+    assert payload["source_input"]["sha256"] == original.input_sha256
+    assert Path(original.input_path).read_bytes() == original_bytes
+    assert fact["text"] == child["facts"][0]["text"]
+    assert fact["citations"] == child["facts"][0]["citations"]
+    assert fact["source_quote_ref"] == child["facts"][0]["source_quote_ref"]
+    assert "id" not in fact and "original_citations" not in fact
+    assert project_reduction_input(projected, tmp_path / "again") == projected
+    value = result(projected, events)
+    validate_summary(projected, value, events)
+    value["facts"][0]["citations"] = [child["facts"][0]["id"]]
+    with pytest.raises(CampaignError, match="citation"):
+        validate_summary(projected, value, events)
+
+
+def test_packet_prioritizes_obligations_and_keeps_complete_indexes_when_overflowing(tmp_path):
+    snapshot = capture(tmp_path, [native_row("codex", "keep " + "x" * 12000)])
+    obligations = (
+        {"id": "acceptance-1", "criterion": "merge preserving commits", "state": "not-run"},
+    )
+    packet = assemble_packet(
+        (snapshot,), obligations, {"head": "H", "pr": 18}, (), budget(), tmp_path / "packet"
+    )
+    value = json.loads(Path(packet.path).read_text())
+    assert value["obligations"] == list(obligations)
+    assert packet.read_only and packet.omitted_owner_ids
+    owners = json.loads(Path(packet.owner_index).read_text())
+    assert owners[0]["quote"].endswith("x" * 12000)
+    assert packet.tokens <= budget().payload_tokens
+
+
+def test_complete_small_packet_and_structural_fidelity_still_distinguish_semantic_review(tmp_path):
+    snapshot = capture(tmp_path, [native_row("codex")])
+    events = load_events(snapshot)
+    job = plan_maps(events, budget(), tmp_path / "jobs")[0]
+    summary = validate_summary(job, result(job, events), events)
+    packet = assemble_packet(
+        (snapshot,), (), {"head": "H"}, (summary,), budget(), tmp_path / "packet"
+    )
+    assert not packet.read_only
+    fidelity = check_fidelity(
+        (summary,), critical_source_ids=(events[0].id,), required_quotes=("keep",)
+    )
+    assert fidelity["structural_pass"]
+    assert fidelity["semantic_fidelity"] == "requires-independent-review"
+
+
+@pytest.mark.parametrize(
+    "fault", ["none", "index-change", "index-missing", "artifact-change", "artifact-missing"]
+)
+def test_omitted_summary_is_retrievable_only_through_unchanged_index_and_artifact(tmp_path, fault):
+    snapshot = capture(tmp_path, [native_row("codex")])
+    events = load_events(snapshot)
+    job = replace(plan_maps(events, budget(), tmp_path / "maps")[0], output_tokens=20000)
+    value = result(job, events)
+    value["facts"][0]["text"] = "Retained detailed work context. " * 250
+    summary = validate_summary(job, value, events)
+    packet = assemble_packet(
+        (snapshot,),
+        (),
+        {"head": "H"},
+        (summary,),
+        budget(),
+        tmp_path / "packet",
+        packet_ceiling=4000,
+    )
+    payload = json.loads(Path(packet.path).read_text())
+    assert payload["summaries"] == [] and packet.tokens <= 4000
+    assert packet.omitted_summary_ids == (job.id,)
+    omission = json.loads(Path(payload["omitted_summary_index"]["path"]).read_text())
+    assert omission["summary_ids"] == [job.id]
+    rows = load_summary_index(payload)
+    assert retrieve_summary(payload, job.id) == summary
+    if fault == "none":
+        return
+    target = Path(
+        payload["summary_index"]["path"] if fault.startswith("index") else rows[0]["path"]
+    )
+    if fault.endswith("missing"):
+        target.unlink()
+    elif fault == "artifact-change":
+        # Same byte length prevents the size guard from masking a broken hash check.
+        target.write_bytes(target.read_bytes().replace(b"Retained", b"Changed!", 1))
+    else:
+        target.write_bytes(target.read_bytes() + b" ")
+    with pytest.raises(CampaignError):
+        retrieve_summary(payload, job.id)
+
+
+def test_packet_retains_complete_summary_tree_but_inlines_only_final_nodes(tmp_path):
+    snapshot = capture(tmp_path, [native_row("codex")])
+    events = load_events(snapshot)
+    child = plan_maps(events, budget(), tmp_path / "maps")[0]
+    detail = validate_summary(child, result(child, events), events)
+    reducer = plan_reduction(((child, detail),), budget(), tmp_path / "reduce")[0]
+    final_result = result(reducer, events)
+    final_summary = validate_summary(reducer, final_result, events)
+    packet = assemble_packet(
+        (snapshot,),
+        (),
+        {},
+        (final_summary,),
+        budget(),
+        tmp_path / "packet",
+        summary_tree=((child, detail), (reducer, final_summary)),
+    )
+    payload = json.loads(Path(packet.path).read_text())
+    assert [node["job_id"] for node in payload["summaries"]] == [reducer.id]
+    rows = {row["id"]: row for row in load_summary_index(payload)}
+    assert rows[reducer.id]["dependencies"] == [child.id]
+    assert retrieve_summary(payload, reducer.id)["covered_ids"] == [child.id]
+    assert retrieve_summary(payload, child.id) == detail
+    assert rows[child.id]["input"]["sha256"] == child.input_sha256
+    omitted = json.loads(Path(payload["omitted_summary_index"]["path"]).read_text())
+    assert omitted["summary_ids"] == [child.id]
+    assert omitted["final_summary_ids"] == []
+    with pytest.raises(CampaignError, match="missing a retained child"):
+        assemble_packet(
+            (snapshot,),
+            (),
+            {},
+            (final_summary,),
+            budget(),
+            tmp_path / "bad",
+            summary_tree=((reducer, final_summary),),
+        )
+
+
+def test_summary_tree_distinguishes_corrective_predecessor_from_validated_children(tmp_path):
+    from bmad_loop.campaign_summary import corrective_spec
+
+    snapshot = capture(tmp_path, [native_row("codex")])
+    events = load_events(snapshot)
+    original = plan_maps(events, budget(), tmp_path / "maps")[0]
+    corrected = corrective_spec(
+        original, attempt=1, receipt_sha256="a" * 64, reason="invalid citation"
+    )
+    validated = validate_summary(corrected, result(corrected, events), events)
+    packet = assemble_packet(
+        (snapshot,),
+        (),
+        {},
+        (validated,),
+        budget(),
+        tmp_path / "packet",
+        summary_tree=((corrected, validated),),
+    )
+    payload = json.loads(Path(packet.path).read_text())
+    row = load_summary_index(payload)[0]
+    assert row["dependencies"] == []
+    assert original.id in row["execution_dependencies"]
+    assert retrieve_summary(payload, corrected.id) == validated
+
+
+def test_generic_job_schema_and_result_bind_native_source_manifest(tmp_path):
+    from bmad_loop.campaign_jobs import validate_result, validate_schema
+    from bmad_loop.campaign_summary import summary_schema, validate_job_result
+
+    snapshot = capture(tmp_path, [native_row("codex")])
+    events = load_events(snapshot)
+    job = plan_maps(events, budget(), tmp_path / "jobs")[0]
+    value = result(job, events)
+    schema = summary_schema()
+    validate_schema(schema)
+    validate_result(value, schema)
+    request = {
+        "id": job.id,
+        "coordinates": {"summary_spec": asdict(job), "history_snapshots": [asdict(snapshot)]},
+    }
+    observed = validate_job_result(request, value, tmp_path / "receipts")
+    assert observed["validated"]["structural_coverage"]
+    assert Path(observed["artifact_path"]).is_file()
+    request["id"] = "different-job"
+    with pytest.raises(CampaignError, match="identity"):
+        validate_job_result(request, value, tmp_path / "receipts")
+
+
+@pytest.mark.parametrize(
+    "provenance,kind,owner",
+    [
+        ("user", "user.text", True),
+        ("harness", "user.text", False),
+        ("user", "environments.environment_context", False),
+        ("", "unknown", False),
+    ],
+)
+def test_codex_response_item_uses_explicit_aligned_native_owner_provenance(provenance, kind, owner):
+    row = {
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "preserve history"}],
+            "internal_chat_message_metadata_passthrough": {
+                "content_item_kinds": [kind],
+                "content_item_metadata": [{"provenance": {"type": provenance}}],
+            },
+        },
+    }
+    assert read_record("codex", row, "s1").owner_input is owner
+    row["payload"]["content"].append({"type": "input_text", "text": "injected"})
+    assert not read_record("codex", row, "s1").owner_input
+
+
+def test_codex_fork_retains_ancestor_metadata_without_granting_parent_agent_owner_authority(
+    tmp_path,
+):
+    from bmad_loop.campaign_transcripts import merge_lineage_events
+
+    root_meta = {"type": "session_meta", "payload": {"id": "root", "source": "cli"}}
+    shared = {"timestamp": "2026-11-06T10:00:00Z", **native_row("codex")}
+    unnamed = {
+        "timestamp": "2026-11-06T10:00:01Z",
+        "type": "event_msg",
+        "payload": {"type": "user_message", "message": "retain unrun criterion"},
+    }
+    tool = {
+        "timestamp": "2026-11-06T10:00:02Z",
+        "type": "response_item",
+        "payload": {
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": "exact tool output",
+        },
+    }
+    root_path = tmp_path / "root.jsonl"
+    root_path.write_bytes(
+        b"".join(encoded(row) + b"\n" for row in (root_meta, shared, unnamed, tool))
+    )
+    root = snapshot_history(root_path, "codex", "root", tmp_path / "sealed")
+    child_meta = {
+        "type": "session_meta",
+        "payload": {
+            "id": "child",
+            "forked_from_id": "root",
+            "source": {"subagent": {"thread_spawn": {"parent_thread_id": "root", "depth": 1}}},
+        },
+    }
+    child_path = tmp_path / "child.jsonl"
+    child_path.write_bytes(
+        b"".join(
+            encoded(row) + b"\n"
+            for row in (
+                child_meta,
+                root_meta,
+                {**shared, "timestamp": "2026-11-06T11:00:00Z", "ordinal": 99},
+                unnamed,
+                {**tool, "timestamp": "2026-11-06T11:00:02Z", "ordinal": 100},
+                {**tool, "payload": {**tool["payload"], "output": "different tool output"}},
+                native_row("codex", "parent-agent task", "new"),
+            )
+        )
+    )
+    child = snapshot_history(child_path, "codex", "child", tmp_path / "sealed")
+    assert child.parent_session_id == "root" and child.lineage_verified
+    assert not child.owner_event_ids
+    assert not any(event.record.owner_input for event in load_events(child))
+    events = merge_lineage_events((root, child))
+    assert sum(bool(event.duplicate_of) for event in events if event.session_id == "child") == 4
+    changed = next(event for event in events if "different tool output" in event.record.text)
+    assert changed.duplicate_of == ""
+    assert sum(event.record.owner_input and not event.duplicate_of for event in events) == 2
+    assert next(event for event in events if event.record.native_id == "new").duplicate_of == ""
+    child_path.write_bytes(
+        encoded({"type": "session_meta", "payload": {"id": "unrelated"}}) + b"\n"
+    )
+    with pytest.raises(CampaignError, match="ancestor binding"):
+        snapshot_history(child_path, "codex", "child", tmp_path / "sealed")
+
+
+def test_summary_normalizes_only_verified_fragment_aliases(tmp_path):
+    snapshot = capture(tmp_path, [native_row("codex")])
+    events = load_events(snapshot)
+    job = plan_maps(events, budget(), tmp_path / "chunks")[0]
+    value = result(job, events)
+    original = [events[0].id, job.primary_ids[0]]
+    value["facts"][0]["citations"] = original
+    normalized = validate_summary(job, value, events)["facts"][0]
+    assert normalized["citations"] == [events[0].id]
+    assert normalized["original_citations"] == original
+    assert normalized["fragment_provenance"] == [
+        {
+            "id": job.primary_ids[0],
+            "event_id": events[0].id,
+            "start": 0,
+            "end": len(events[0].record.text),
+        }
+    ]
+    value["facts"][0]["citations"] = [events[0].id, "unknown-fragment"]
+    with pytest.raises(CampaignError, match="source citations"):
+        validate_summary(job, value, events)
+
+
+def test_summary_cannot_cite_fragment_from_another_chunk(tmp_path):
+    snapshot = capture(tmp_path, [native_row("codex", text="owner detail " * 1000)])
+    events = load_events(snapshot)
+    jobs = plan_maps(events, budget(), tmp_path / "chunks", overlap_tokens=0)
+    assert len(jobs) > 1
+    value = result(jobs[0], events)
+    value["facts"][0]["citations"] = [jobs[-1].primary_ids[0]]
+    with pytest.raises(CampaignError, match="source citations"):
+        validate_summary(jobs[0], value, events)
+
+
+def test_summary_quote_id_extracts_exact_native_span_without_model_copying(tmp_path):
+    from bmad_loop.campaign_summary import quote_catalog, summary_schema
+
+    snapshot = capture(tmp_path, [native_row("codex", "  Preserve every commit.\nThen merge.  ")])
+    events = load_events(snapshot)
+    job = plan_maps(events, budget(), tmp_path / "chunks")[0]
+    catalog = quote_catalog(job)
+    quote_id = next(iter(catalog))
+    value = result(job, events)
+    value["facts"][0].pop("source_quote")
+    value["facts"][0]["source_quote_id"] = quote_id
+    normalized = validate_summary(job, value, events)["facts"][0]
+    ref = normalized["source_quote_ref"]
+    assert events[0].record.text[ref["start"] : ref["end"]] == "Preserve every commit."
+    schema = summary_schema(job)
+    assert schema["properties"]["covered_ids"]["items"]["enum"] == list(job.primary_ids)
+    assert schema["properties"]["facts"]["items"]["properties"]["citations"]["items"][
+        "enum"
+    ] == list(job.event_ids)
+    assert (
+        quote_id in schema["properties"]["facts"]["items"]["properties"]["source_quote_id"]["enum"]
+    )
+    value["facts"][0]["source_quote_id"] = "unknown-span"
+    with pytest.raises(CampaignError, match="owner quote span"):
+        validate_summary(job, value, events)
+
+
+def test_summary_fragment_carries_native_lineage_without_owner_elevation(tmp_path):
+    row = {
+        "timestamp": "2026-11-06T12:00:00Z",
+        "type": "response_item",
+        "payload": {
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": "owner said approve",
+        },
+    }
+    snapshot = capture(tmp_path, [row])
+    job = plan_maps(load_events(snapshot), budget(), tmp_path / "chunks")[0]
+    fragment = load_input(job)["primary"][0]
+    assert fragment["lineage"]["session_id"] == "s1"
+    assert fragment["lineage"]["timestamp"] == row["timestamp"]
+    assert fragment["lineage"]["tool_id"] == "call-1"
+    assert fragment["owner_input"] is False

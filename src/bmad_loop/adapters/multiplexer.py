@@ -798,6 +798,7 @@ def _load_builtin_backends() -> None:
     global _BUILTINS_LOADED
     if _BUILTINS_LOADED:
         return
+    from .paradev_backend import ParadevMultiplexer
     from .psmux_backend import PsmuxMultiplexer
     from .tmux_backend import TmuxMultiplexer
 
@@ -813,6 +814,7 @@ def _load_builtin_backends() -> None:
     # psmux speaks the tmux CLI through its own distinctly-named binary, so
     # native Windows gets the tmux-family backend with a PowerShell dialect.
     register_multiplexer("psmux", lambda platform: platform == "win32", PsmuxMultiplexer)
+    register_multiplexer("paradev", lambda platform: False, ParadevMultiplexer)
 
 
 # The entry-point group an out-of-tree backend package advertises its module
@@ -903,6 +905,10 @@ def _known() -> str:
 
 
 def _factory_by_name(name: str) -> Callable[[], TerminalMultiplexer] | None:
+    if name == "paradev" and sum(row[0] == name for row in _BACKENDS) != 1:
+        raise MultiplexerError(
+            "Conflicting external paradev backend; migrate its records before selecting the bundled transport"
+        )
     for reg_name, _, factory in _BACKENDS:
         if reg_name == name:  # duplicate registrations: first wins, as in the loop below
             return factory

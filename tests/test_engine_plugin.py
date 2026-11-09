@@ -909,22 +909,61 @@ def test_unity_ready_grace_explicit_override(monkeypatch):
 # --------------------------------- unity_ready client-independent round-trip
 
 
-def _fake_cli(tmp_path, *, wait_rc=0, tool_rc=0):
-    """A fake unity-mcp-cli that logs argv and returns per-subcommand exit codes."""
-    log = tmp_path / "calls.log"
+@pytest.fixture(scope="session")
+def unity_ready_launcher(tmp_path_factory):
+    """Immutable executable; private recordings and outcomes ride each test's env.
+
+    Reusing it avoids repeatedly measuring macOS executable assessment inside
+    the readiness deadline. The CLI, pipes, encoding and argv stay real.
+    """
     body = (
-        "import sys\n"
-        f"open({str(log)!r}, 'a').write(' '.join(sys.argv[1:]) + chr(10))\n"
+        "import os, sys\n"
+        "log = os.environ.get('FAKE_UNITY_READY_LOG')\n"
+        "if log: open(log, 'a').write(' '.join(sys.argv[1:]) + chr(10))\n"
         "cmd = sys.argv[1] if len(sys.argv) > 1 else ''\n"
-        f"sys.exit({wait_rc} if cmd == 'wait-for-ready' "
-        f"else ({tool_rc} if cmd == 'run-tool' else 0))\n"
+        "mode = os.environ.get('FAKE_UNITY_READY_MODE')\n"
+        "if mode == 'undecodable':\n"
+        "    sys.stdout.buffer.write('エディタ準備完了'.encode('cp932'))\n"
+        "    sys.stdout.flush()\n"
+        "elif mode == 'error-marker':\n"
+        "    print('ERROR: Tool with Name not found' if cmd == 'run-tool' else 'ok')\n"
+        "key = 'FAKE_UNITY_READY_WAIT_RC' if cmd == 'wait-for-ready' else 'FAKE_UNITY_READY_TOOL_RC'\n"
+        "sys.exit(int(os.environ.get(key, '0')))\n"
     )
-    return write_script_launcher(tmp_path, "fake-unity-mcp-cli", body), log
+    return write_script_launcher(
+        tmp_path_factory.mktemp("fake-unity-ready-bin"), "fake-unity-mcp-cli", body
+    )
 
 
-def test_unity_ready_default_is_wait_for_ready_only(tmp_path, monkeypatch):
+def _fake_cli(tmp_path, monkeypatch, launcher, *, wait_rc=0, tool_rc=0):
+    """Bind the immutable CLI to this case's recording and exit-code contract."""
+    log = tmp_path / "calls.log"
+    monkeypatch.setenv("FAKE_UNITY_READY_LOG", str(log))
+    monkeypatch.setenv("FAKE_UNITY_READY_WAIT_RC", str(wait_rc))
+    monkeypatch.setenv("FAKE_UNITY_READY_TOOL_RC", str(tool_rc))
+    monkeypatch.delenv("FAKE_UNITY_READY_MODE", raising=False)
+    return launcher, log
+
+
+def _expire_ready_clock_on_retry(mod, monkeypatch):
+    """Finish after one failed real tool call, independently of host startup.
+
+    The case exercises failure classification, not elapsed-time accounting; an
+    actual subprocess timeout still bounds each CLI invocation.
+    """
+    from types import SimpleNamespace
+
+    clock = [0.0]
+
+    def retry(_seconds):
+        clock[0] = 11.0
+
+    monkeypatch.setattr(mod, "time", SimpleNamespace(monotonic=lambda: clock[0], sleep=retry))
+
+
+def test_unity_ready_default_is_wait_for_ready_only(tmp_path, monkeypatch, unity_ready_launcher):
     mod = _load_unity_ready()
-    script, log = _fake_cli(tmp_path)
+    script, log = _fake_cli(tmp_path, monkeypatch, unity_ready_launcher)
     monkeypatch.setenv("UNITY_MCP_CLI", str(script))
     monkeypatch.setenv("BMAD_LOOP_WORKTREE", str(tmp_path))
     monkeypatch.delenv("BMAD_LOOP_UNITY_READY_TOOL", raising=False)
@@ -935,9 +974,9 @@ def test_unity_ready_default_is_wait_for_ready_only(tmp_path, monkeypatch):
     assert "run-tool" not in calls  # round-trip is opt-in
 
 
-def test_unity_ready_optional_tool_roundtrip(tmp_path, monkeypatch):
+def test_unity_ready_optional_tool_roundtrip(tmp_path, monkeypatch, unity_ready_launcher):
     mod = _load_unity_ready()
-    script, log = _fake_cli(tmp_path)
+    script, log = _fake_cli(tmp_path, monkeypatch, unity_ready_launcher)
     monkeypatch.setenv("UNITY_MCP_CLI", str(script))
     monkeypatch.setenv("BMAD_LOOP_WORKTREE", str(tmp_path))
     monkeypatch.setenv("BMAD_LOOP_UNITY_READY_TOOL", "ping")  # opt in
@@ -945,44 +984,39 @@ def test_unity_ready_optional_tool_roundtrip(tmp_path, monkeypatch):
     assert "run-tool ping" in log.read_text()
 
 
-def test_unity_ready_tool_error_marker_means_not_ready(tmp_path, monkeypatch):
+def test_unity_ready_tool_error_marker_means_not_ready(tmp_path, monkeypatch, unity_ready_launcher):
     """A run-tool that exits 0 but prints an error marker (the CLI returns 0 on a
     connection-refused) is treated as not-ready, not a false pass."""
     mod = _load_unity_ready()
     # exit 0 but stdout carries an error marker
-    script = write_script_launcher(
-        tmp_path,
-        "fake-cli",
-        "import sys\n"
-        "cmd = sys.argv[1] if len(sys.argv) > 1 else ''\n"
-        "print('ERROR: Tool with Name not found' if cmd == 'run-tool' else 'ok')\n"
-        "sys.exit(0)\n",
-    )
+    script, log = _fake_cli(tmp_path, monkeypatch, unity_ready_launcher)
+    monkeypatch.setenv("FAKE_UNITY_READY_MODE", "error-marker")
     monkeypatch.setenv("UNITY_MCP_CLI", str(script))
     monkeypatch.setenv("BMAD_LOOP_WORKTREE", str(tmp_path))
     monkeypatch.setenv("BMAD_LOOP_UNITY_READY_TOOL", "ping")
-    monkeypatch.setattr(mod.time, "sleep", lambda *_: None)
-    assert mod._ready_ivanmurzak(time.monotonic() + 0.2) == 1
+    _expire_ready_clock_on_retry(mod, monkeypatch)
+    assert mod._ready_ivanmurzak(10.0) == 1
+    assert "run-tool ping" in log.read_text()
 
 
-def test_unity_ready_not_ready_when_tool_never_answers(tmp_path, monkeypatch):
+def test_unity_ready_not_ready_when_tool_never_answers(tmp_path, monkeypatch, unity_ready_launcher):
     mod = _load_unity_ready()
-    script, _ = _fake_cli(tmp_path, wait_rc=0, tool_rc=1)  # bridge up, tool failing
+    script, log = _fake_cli(tmp_path, monkeypatch, unity_ready_launcher, tool_rc=1)
     monkeypatch.setenv("UNITY_MCP_CLI", str(script))
     monkeypatch.setenv("BMAD_LOOP_WORKTREE", str(tmp_path))
     monkeypatch.setenv("BMAD_LOOP_UNITY_READY_TOOL", "ping")  # opt in to exercise the loop
-    monkeypatch.setattr(mod.time, "sleep", lambda *_: None)  # don't burn the retry pause
-    assert mod._ready_ivanmurzak(time.monotonic() + 0.2) == 1
+    _expire_ready_clock_on_retry(mod, monkeypatch)
+    assert mod._ready_ivanmurzak(10.0) == 1
+    assert "run-tool ping" in log.read_text()
 
 
-def test_unity_ready_tolerates_undecodable_cli_output(tmp_path, monkeypatch):
+def test_unity_ready_tolerates_undecodable_cli_output(tmp_path, monkeypatch, unity_ready_launcher):
     """A CLI emitting bytes that are not valid UTF-8 (cp932-encoded text, as on a
     Japanese Windows locale) degrades to U+FFFD instead of raising
     UnicodeDecodeError out of the strict decode."""
     mod = _load_unity_ready()
-    payload = "エディタ準備完了".encode("cp932")  # 0x83 lead bytes: invalid UTF-8
-    body = f"import sys\nsys.stdout.buffer.write({payload!r})\nsys.stdout.flush()\n"
-    script = write_script_launcher(tmp_path, "fake-unity-mcp-cli", body)
+    script, _ = _fake_cli(tmp_path, monkeypatch, unity_ready_launcher)
+    monkeypatch.setenv("FAKE_UNITY_READY_MODE", "undecodable")
     monkeypatch.setenv("BMAD_LOOP_WORKTREE", str(tmp_path))
     rc, out = mod._wait_for_ready(str(script), 10.0)
     assert rc == 0
@@ -1287,3 +1321,109 @@ def test_unity_setup_fails_loud_when_agent_config_leaks(tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_CODEX_FORCE_URL", "http://localhost:23191")
     # isolation check rejects -> non-zero so the engine defers the unit (no work)
     assert mod._setup_ivanmurzak(tmp_path) == 1
+
+
+# ------------------------------- [verify] reuse_unchanged vs plugin hooks (#1002)
+#
+# Only sessions void a reuse token; a plugin HOOK's writes are caught by the
+# gate-time fingerprint alone, and only where git can see them.
+
+
+def _reuse_hook_run(project, monkeypatch, write):
+    from conftest import dev_effect, scripted_verify_runner, write_sprint
+
+    from bmad_loop import verify
+    from bmad_loop.adapters.mock import MockAdapter
+    from bmad_loop.journal import Journal
+    from bmad_loop.model import RunState, TokenUsage
+    from bmad_loop.plugins import Plugin, PluginRegistry
+    from bmad_loop.plugins.model import LoadedPlugin
+    from bmad_loop.policy import GatesPolicy, ReviewPolicy, VerifyPolicy
+
+    class Writer(Plugin):
+        def on_post_dev_phase(self, c):
+            write(project.project)
+
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    manifest = PluginManifest(name="writer", api_version=1)
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    engine = Engine(
+        paths=project,
+        policy=Policy(
+            gates=GatesPolicy(mode="none"),
+            notify=QUIET,
+            review=ReviewPolicy(enabled=False),
+            verify=VerifyPolicy(commands=("pytest -q",), reuse_unchanged=True),
+        ),
+        adapter=MockAdapter(
+            [dev_effect(project, "1-1-a", followup_review=False)],
+            usage_per_session=TokenUsage(input_tokens=1, output_tokens=1),
+        ),
+        run_dir=run_dir,
+        journal=Journal(run_dir),
+        state=RunState(run_id="test-run", project=str(project.project), started_at="now"),
+        registry=PluginRegistry([LoadedPlugin(manifest=manifest, instance=Writer(manifest, {}))]),
+    )
+    ran = []
+    green = [verify.CommandResult("pytest -q", 0, "ok", "ok", "")]
+    monkeypatch.setattr(
+        verify,
+        "run_verify_commands",
+        scripted_verify_runner(project.repo_root, lambda: ran.append(1) or green),
+    )
+    summary = engine.run()
+    kinds = {
+        kind: [e for e in engine.journal.entries() if e["kind"] == kind]
+        for kind in ("verify-pass-reused", "verify-reuse-declined")
+    }
+    return summary, ran, kinds
+
+
+@pytest.mark.parametrize(
+    "write",
+    [
+        lambda root: (root / "src.txt").write_text("hook rewrote a tracked file\n"),
+        lambda root: (root / "hook-output.txt").write_text("untracked, not ignored\n"),
+    ],
+    ids=["tracked", "untracked"],
+)
+def test_verify_reuse_sees_a_post_dev_phase_hook_write(project, monkeypatch, write):
+    """A Python hook on `post_dev_phase` (between the dev pass and the skip
+    gate) writing a git-visible file forces a real run with `tree-mismatch` —
+    the fingerprint, not a hook-dispatch void, is what catches it.
+
+    Ablation: make `verify._decide_reuse` skip its tree comparison and the
+    gate reuses."""
+    summary, ran, kinds = _reuse_hook_run(project, monkeypatch, write)
+
+    assert summary.done == 1
+    assert len(ran) == 2
+    assert [e["decline"] for e in kinds["verify-reuse-declined"]] == ["tree-mismatch"]
+    assert not kinds["verify-pass-reused"]
+
+
+def test_verify_reuse_is_blind_to_a_hook_writing_an_ignored_file(project, monkeypatch):
+    """The documented blind spot: a hook that writes only an IGNORED file leaves
+    the fingerprint equal, and hook dispatch does not void the token (only
+    sessions do), so the gate still reuses the dev pass."""
+    gitignore = project.project / ".gitignore"
+    existing = gitignore.read_text() if gitignore.exists() else ""
+    gitignore.write_text(existing + "hook-cache/\n")
+    subprocess.run(["git", "add", ".gitignore"], cwd=project.project, check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "ignore"],
+        cwd=project.project,
+        check=True,
+    )
+
+    def write_ignored(root):
+        (root / "hook-cache").mkdir(exist_ok=True)
+        (root / "hook-cache" / "state.bin").write_text("ignored\n")
+
+    summary, ran, kinds = _reuse_hook_run(project, monkeypatch, write_ignored)
+
+    assert (project.project / "hook-cache" / "state.bin").exists()  # the hook ran
+    assert summary.done == 1
+    assert len(ran) == 1
+    assert [e["reused_stage"] for e in kinds["verify-pass-reused"]] == ["dev"]
+    assert not kinds["verify-reuse-declined"]

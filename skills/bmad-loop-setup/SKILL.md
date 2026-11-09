@@ -55,6 +55,46 @@ Skip this step entirely if `{project-root}/_bmad/` does not exist.
 
 ## Install the Orchestrator Tool
 
+For native campaigns, include the `paradev` extra only when the project requests
+Paradev reflection, then run `bmad-loop campaign preflight CAMPAIGN.toml --json`
+against the target project. A successful legacy `validate` does not qualify
+campaign publication, source stores or native workspace ownership. Preserve live
+worker environments during upgrades. For an exact fork rollout, install its full
+merged Git SHA and run `bmad-loop campaign provenance --expected-commit SHA --json`;
+a matching version string alone is insufficient.
+
+For unattended campaign setup, also read the installed campaign guide and report
+the following independently before recommending activation:
+
+- Exact installed commit, canonical checkout commit and project policy revision.
+- Preflight readiness for the inherited developer and every selected role pool,
+  including model/effort and permission-specific native qualification. A read-only
+  or no-tools capability is not a writer grant. Changed launchers, dependencies or
+  installation paths require the corresponding proof to be renewed.
+- The project's actual publication policy, required checks and reviews. Preserve
+  commit history and use `direct-authorized` only with explicit repository-bound
+  owner authority. Do not restore retired project-specific merge scripts.
+- When repository policy requires a native base comparison plus a complementary
+  native review, configure `roles.native_review_pair` with an exact paired-review
+  capability. Keep independent `publication_review` separately configured. A
+  schema-mapping turn does not count as a native review, and a contributing
+  writer's review cannot satisfy independence.
+- Configured execution, review, verification, reasoning and shared-session limits;
+  report the effective minimum rather than presenting `max_workers` as throughput.
+- When managed hcom is requested, configure its absolute project room and verify
+  `campaign endpoints`, an external status request and safe-boundary steering.
+  Public bridges identify factual controller replies; they do not impersonate a
+  model or reopen a completed writer. Paradev titles begin with hcom name, epic,
+  issue and PR, retaining pending/unbound labels until real identities exist.
+- Replacement automation responsibilities and a selected delivery reaching merged
+  and reconciled tracking. An installed executable or green preflight alone is
+  not evidence of a successful unattended rollout.
+
+Keep native qualification separate from zero-token repository tests. It sends
+real prompts, so use the owner's existing authorization and the documented bounded
+qualification commands; do not silently probe every model while initializing a
+project. Keep unsupported foreground/background lifecycle behavior explicit.
+
 The orchestrator is what spawns fresh coding CLI sessions through the selected adapter(s) to invoke `bmad-build-auto` (the upstream dev primitive; `bmad-dev-auto` on pre-rename releases) for the dev pass — then re-invokes it on the `done` spec for the follow-up review pass — and `bmad-loop-sweep`, watches their hook signals, and verifies their artifacts. Installing it is therefore part of setup, not an optional extra.
 
 > **Why from Git?** The BMAD installer copies only skill directories into a project — it does not carry sibling files, so the tool can't ride along in the skill folder. This skill installs the open-runtime fork from <https://github.com/open-runtime/bmad-loop>. (The reverse holds, though: the tool's wheel **bundles** the skills, so `bmad-loop init` lays them down into a project's skill trees on its own — see step 3.)
@@ -92,9 +132,9 @@ Unless the user explicitly asked to skip it (e.g. `skills only` / `--no-tool`), 
 
 3. **Bootstrap the project** — install the coding-CLI hooks, the bundled `bmad-loop-*` skills, the `.bmad-loop/policy.toml` template, and the gitignore entry (idempotent).
 
-   First decide **which coding CLI(s)** the orchestrator should drive. The supported adapters are `claude` (default), `codex`, `gemini`, `copilot`, and `antigravity` (Google's `agy`). Hooks are registered per CLI, so the choice matters — register every CLI you intend to use for dev/review/triage. Ask the user (unless they already specified it in their setup args, e.g. `cli: claude, codex`, or accepted defaults — then default to `claude` only):
+   First decide **which coding CLI(s)** the orchestrator should drive. The bundled profiles are `claude` (default), `codex`, `gemini`, `copilot`, `antigravity` (Google's `agy`), `grok`, `muse`, and `opencode-http` (alias `opencode`, requiring the `opencode` extra). Initialize every CLI selected for the project. Hook-based profiles register their hooks; the bounded-headless Grok and Muse profiles install skills without native hooks and require separate campaign capability qualification. Ask the user (unless they already specified it in their setup args, e.g. `cli: claude, codex`, or accepted defaults — then default to `claude` only):
 
-   > "Which coding CLI(s) should the orchestrator drive — `claude`, `codex`, `gemini`, `copilot`, and/or `antigravity`? You can pick more than one. [claude]"
+   > "Which coding CLI(s) should the orchestrator drive — `claude`, `codex`, `gemini`, `copilot`, `antigravity`, `grok`, `muse`, and/or `opencode`? You can pick more than one. [claude]"
 
    Build the command with one `--cli <name>` per selected CLI (the flag is repeatable). **On an upgrade, append `--force-skills`** so the per-project skill copies are actually refreshed — without it `init` skips every existing skill dir and the project keeps stale skills against the upgraded tool. On a fresh install, omit it.
 
@@ -109,9 +149,9 @@ Unless the user explicitly asked to skip it (e.g. `skills only` / `--no-tool`), 
    bmad-loop init --project "{project-root}" --cli claude --force-skills
    ```
 
-   Names must be exactly `claude`, `codex`, `gemini`, `copilot`, or `antigravity` — `init` errors on an unknown profile and lists the valid ones. `init` prints any one-time first-run notes per CLI (e.g. start `claude` once in the project and accept the workspace-trust + hooks-approval dialogs before `bmad-loop run` — spawned sessions can't answer first-run dialogs). Relay those notes to the user.
+   Use the exact profile names listed above; `init` errors on an unknown profile and lists the valid ones. Successful initialization does not grant headless execution permission or prove model availability. `init` prints any one-time first-run notes per CLI (e.g. start `claude` once in the project and accept the workspace-trust + hooks-approval dialogs before `bmad-loop run` — spawned sessions can't answer first-run dialogs). Relay those notes to the user.
 
-   **Skills are installed automatically:** `init` lays the bundled `bmad-loop-*` skills into the right tree for each selected CLI — `.claude/skills/` for `claude`, `.agents/skills/` for `codex`/`gemini`/`copilot`/`antigravity`. On a fresh install, existing skill dirs are left untouched; on an upgrade, `--force-skills` overwrites them with the bundled copies from the upgraded tool (use `--no-skills` to skip the step and manage skills yourself).
+   **Skills are installed automatically:** `init` lays the bundled `bmad-loop-*` skills into the right tree for each selected CLI — `.claude/skills/` for `claude`/`opencode-http`, `.agents/skills/` for `codex`/`gemini`/`copilot`/`antigravity`/`grok`/`muse`. On a fresh install, existing skill dirs are left untouched; on an upgrade, `--force-skills` overwrites them with the bundled copies from the upgraded tool (use `--no-skills` to skip the step and manage skills yourself).
 
    > **Note:** `--force-skills` also overwrites `bmad-loop-setup` itself (it ships in the same bundle). That's expected and safe — the freshly laid-down setup skill takes effect on the **next** invocation, and your `_bmad/custom/*.toml` overrides (keyed by skill directory name) are untouched.
 

@@ -1,7 +1,7 @@
 # BMAD Loop module (`bmad-loop`)
 
 A BMAD module pairing the automation skills with the
-[bmad-loop orchestrator tool](https://github.com/bmad-code-org/bmad-loop) (the
+[bmad-loop orchestrator tool](https://github.com/open-runtime/bmad-loop) (the
 Python program that drives the loop). The skills can be installed by the BMAD
 installer, or laid down by `bmad-loop init` (the orchestrator's wheel **bundles**
 them); either way `bmad-loop-setup` installs the `bmad-loop` package from its
@@ -10,13 +10,14 @@ plus the orchestrator that invokes them. Standard BMAD installs are never
 modified; the skills are bmad-loop-owned, standalone or bmad-loop-native (see
 the table below).
 
-| Component           | Forked from          | Role                                                                                                                                              |
-| ------------------- | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `bmad-loop`         | — (this repo, Git)   | the orchestrator: ralph-loop, hooks, tmux adapters, TUI. CLI `bmad-loop`. Installed by `bmad-loop-setup` from Git.                                |
-| `bmad-loop-resolve` | — (bmad-loop-native) | interactive CRITICAL-escalation resolution: a human disambiguates a frozen spec so a paused story can be re-driven (`/bmad-loop-resolve <story>`) |
-| `bmad-loop-sweep`   | — (bmad-loop-native) | read-only deferred-work ledger triage; owns the canonical `deferred-work-format.md`                                                               |
-| `bmad-loop-setup`   | — (scaffolded)       | **installs the orchestrator tool from Git**, runs `bmad-loop init` + `validate`, refreshes `_bmad/bmad-loop/module-help.csv`                      |
-| `bmod-bmad-loop`    | — (module record)    | the BMAD v7 module record (`bmod.toml`, `help/help.md`) that `bmad setup` discovers; metadata only, never invoked                                 |
+| Component                 | Forked from          | Role                                                                                                                                              |
+| ------------------------- | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `bmad-loop`               | — (this repo, Git)   | the orchestrator: ralph-loop, hooks, tmux adapters, TUI. CLI `bmad-loop`. Installed by `bmad-loop-setup` from Git.                                |
+| `bmad-loop-resolve`       | — (bmad-loop-native) | interactive CRITICAL-escalation resolution: a human disambiguates a frozen spec so a paused story can be re-driven (`/bmad-loop-resolve <story>`) |
+| `bmad-loop-sweep`         | — (bmad-loop-native) | read-only deferred-work ledger triage; owns the canonical `deferred-work-format.md`                                                               |
+| `bmad-loop-campaign-plan` | — (bmad-loop-native) | unattended campaign planning wrapper for explicitly mapped installed BMAD workflows; records unresolved product decisions                         |
+| `bmad-loop-setup`         | — (scaffolded)       | **installs the orchestrator tool from Git**, runs `bmad-loop init` + `validate`, refreshes `_bmad/bmad-loop/module-help.csv`                      |
+| `bmod-bmad-loop`          | — (module record)    | the BMAD v7 module record (`bmod.toml`, `help/help.md`) that `bmad setup` discovers; metadata only, never invoked                                 |
 
 The **inner dev primitive is the upstream `bmad-build-auto` skill** (BMAD-METHOD's
 generic unattended dev session; `bmad-dev-auto` on pre-rename releases, resolved
@@ -35,7 +36,7 @@ The orchestrator tool now bundles these skills, so `bmad-loop init` lays them
 down for you:
 
 ```bash
-uv tool install "bmad-loop[tui] @ git+https://github.com/bmad-code-org/bmad-loop.git"
+uv tool install "bmad-loop[tui] @ git+https://github.com/open-runtime/bmad-loop.git"
 bmad-loop init --project /path/to/project --cli claude   # add --cli codex/gemini as needed
 claude "/bmad-loop-setup accept all defaults"            # installs the tool + wires the project
 ```

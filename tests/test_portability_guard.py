@@ -258,6 +258,10 @@ REARM_ESCALATION_CALLERS = {
 # outer hold. Exact inventories make a newly added writer fail loudly instead of
 # relying on a reviewer to find it by grep.
 SAVE_STATE_CALLERS = {
+    # Fresh run publication under state_lock; predecessor remains immutable.
+    ("campaign_continuation.py", "compose_review"),
+    # Owned accepted-finalization continuation: both publications hold state_lock.
+    ("campaign_finalization.py", "resume"),
     ("accepted_review.py", "rearm_for_implemented_review"),
     ("commit_recovery.py", "arm"),
     ("cli.py", "_prepare_resume_locked"),
@@ -277,6 +281,8 @@ SAVE_STATE_CALLERS = {
     ("unitreplay.py", "abandon_replay_run"),
 }
 RUN_STATE_TRANSACTIONS = {
+    ("campaign_continuation.py", "compose_review"),
+    ("campaign_finalization.py", "resume"),
     ("accepted_review.py", "rearm_for_implemented_review"),
     ("commit_recovery.py", "arm"),
     ("cli.py", "_resume_paused_run"),
@@ -353,6 +359,9 @@ REFUSAL_HELPER_DEFS = {
     # test_engine_block_with_a_name_is_refused, test_engine_name_of_wrong_type_is_refused
     ("policy.py", "_refuse_removed_engine"),
     ("resolve.py", "_reject_json_constant"),
+    # Live/legacy engine ownership, including force; test_runs.py
+    # test_cleanup_protects_legacy_macos_engine_until_pid_exits
+    ("runs.py", "_refuse_live_engine_cleanup"),
     ("runs.py", "_refuse_live_session"),
     ("runs.py", "_refuse_uncontained_run_dir"),
     ("sweep.py", "_refuse_advanced_migration_head"),  # DW-427/428, test_sweep.py
@@ -553,6 +562,8 @@ for _routing_table in JOURNAL_KIND_ROUTING_TABLES:
 # which would also wave through a branch-carrying ``target`` on a kind nobody has
 # looked at — exactly the hole the flattening left.
 JOURNAL_KIND_BENIGN_FIELDS = {
+    "campaign-config-frozen": frozenset({"config_revision"}),
+    "campaign-retained-reverified": frozenset({"command_count"}),
     # `items` is the parser's own malformed-item notes on one harvest kind and the
     # stale DW ids on the other; on `spec-deferrals-severity-unrecognized` it carries
     # the dev session's summary text and is reduced to a count (#913).
@@ -743,6 +754,9 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "choice",
         "checkpoint",
         "code_root_changed",
+        # `verify-pass-reused` (#1002): how many command records the reused pass
+        # republished — an engine-computed count.
+        "command_count",
         "command_index",
         # `accepted-spec-write-unreachable`'s discriminator: whether the byte
         # comparison COMPLETED, not what it found. A bare boolean deliberately —
@@ -761,6 +775,13 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "cycles",
         "decision",
         "decisions",
+        # `verify-reuse-declined` (#1002): why a skip-review gate ran its commands
+        # instead of reusing a green pass. A closed engine-minted vocabulary
+        # (no-token, superseded, session-launched, rollback, worktree-discard,
+        # reset, paused, pass-mutated-tree, gitlinks, fingerprint-fault,
+        # policy-mismatch, tree-mismatch, hard-stop, mode-unsupported), never
+        # authored text; a fault's text rides the separately-dropped `detail`.
+        "decline",
         "deduped",
         # `sweep-migrated`'s completion identity (DW-317): a fresh `uuid4().hex`
         # minted per migration completion, and the dedup key a `post_migrate` hook
@@ -1056,6 +1077,10 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "reset_from",
         "restore",
         "returncode",
+        # `verify-pass-reused` (#1002): the reused pass's `verification_stage`
+        # (closed: dev/fix) and its `verification_sequence` ordinal.
+        "reused_sequence",
+        "reused_stage",
         "role",
         # The outcome of an aborted re-arm's spec rollback (`rearm-aborted`), one of
         # FOUR literal enum strings the producer chooses (`restored`, `unchanged`,
@@ -1493,6 +1518,10 @@ JOURNAL_DYNAMIC_KIND_SPELLINGS = {
 # the scan's, not the tree's.
 JOURNAL_KINDS = frozenset(
     {
+        # Frozen review continuation; predecessor/operation identifiers are
+        # kind-aliased. Actual records covered in test_campaign_continuation.
+        "campaign-review-continuation",
+        "campaign-review-handoff",
         # Finalization's publication boundary; SHA/branch fields use existing
         # diagnostic aliases. Native replay coverage: test_fork_finalize_target.
         "baseline-adopted-from-target",
@@ -1779,6 +1808,11 @@ JOURNAL_KINDS = frozenset(
         "session-resume",
         "policy-reloaded",
         "policy-reload-deferred",
+        "campaign-recovery-requested",
+        "campaign-hook-suppressed",
+        "campaign-config-frozen",
+        "campaign-retained-reverified",
+        "campaign-session-withheld",
         # DW-389: the headless epic-boundary retrospective
         # (`gates.retrospective = "auto"`). `epic`, `count` and the closed `reason`
         # / check-`errors` lines are benign or dropped; `paths` / `docs` are
@@ -1851,6 +1885,15 @@ JOURNAL_KINDS = frozenset(
         "sweep-auto-trigger",
         "token-budget-exceeded",
         "verify-command-result",
+        # #1002. A skip-review gate standing the story's unchanged green dev/fix
+        # pass in for its `[verify] commands`, from `Engine._review_reuse_request`'s
+        # decision callback: `reused_stage`/`reused_sequence` join back to that
+        # pass's `verify-command-result` rows; `head`/`tree` are the gate-time
+        # fingerprint. Allocates no sequence — a reuse is not a pass.
+        "verify-pass-reused",
+        # #1002. The same gate running its commands instead: `decline` names why,
+        # `detail` carries a fingerprint fault's text.
+        "verify-reuse-declined",
         "workflow-end",
         "workflow-start",
         # engine.py + runs.py (runs.py's writer is the constructor-inline spelling)

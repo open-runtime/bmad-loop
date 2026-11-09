@@ -177,6 +177,9 @@ _JOURNAL_ALIAS_FIELDS = {
     # fell through past (`attempt-preserve-fallthrough`, DW-481) — the sha a
     # reflog rescue starts from, so one HEAD gets one alias across both kinds.
     "head": "commit",
+    # The gate-time worktree tree hash `verify-pass-reused` records beside `head`
+    # (#1002) — a git object id, so the same `commit` alias namespace.
+    "tree": "commit",
     # The worktree snapshot `sweep._migration_reset` parked before a reset it then
     # refused (DW-435), on `ledger-snapshot-probe-failed` and
     # `sweep-migration-restore-diverged`. A REF NAME, not a sha —
@@ -278,6 +281,7 @@ _JOURNAL_ALIAS_FIELDS = {
 # a generic name (`state.source` is a run mode). The producers keep the name for the
 # same correlation reason too — `_replay_unlatched_ledger_carries` keys on it.
 _JOURNAL_KIND_ALIAS_FIELDS: dict[str, dict[str, str]] = {
+    "campaign-review-handoff": {"predecessor": "run", "handoff_id": "operation"},
     # Explicit native recovery correlates through opaque session/task aliases;
     # its profile digest and transcript-derived identity stay local below.
     "stopped-native-armed": {"session_id": "session", "artifact_task_id": "story"},

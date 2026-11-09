@@ -142,6 +142,7 @@ from .statemachine import (
 from .ticketmodel import Capability, FindResult, NextView, ParentView, StatusView
 
 if TYPE_CHECKING:
+    from .campaign_source_publication import AcceptedPlanPublication
     from .journal import Journal
 
 TICKETS_TIMEOUT_S = 60.0
@@ -564,6 +565,7 @@ class TicketTree:
         expected_plan: Path,
         blocked: str | None = None,
         journal: Journal,
+        publication: AcceptedPlanPublication | None = None,
     ) -> PlanMark:
         """Set ``ref``'s plan ``status`` to ``target`` (``blocked`` with the park
         reason ``blocked``) through ``tickets.py mark`` — bmad-loop's sole write
@@ -583,6 +585,93 @@ class TicketTree:
                 self._locate(ref, plan)
                 has_plan, before, blocked_now, blocked_at = _plan_fields(plan)
                 after = before
+                if reason in ("campaign-publish", "campaign-plan"):
+                    purpose = "planning" if reason == "campaign-plan" else "execution"
+                    if (
+                        publication is None
+                        or publication.purpose != purpose
+                        or publication.source_kind != "tickets"
+                        or (purpose == "execution" and target != "done")
+                        or blocked is not None
+                    ):
+                        raise TicketsTransitionRefused(
+                            ref,
+                            before,
+                            target,
+                            reason,
+                            "a trusted coordinator publication capability is required",
+                        )
+                    from .campaign_source_publication import SourcePublicationHold
+
+                    try:
+                        data = publication.validate(self._project_root, ref, plan)
+                        if (
+                            frontmatter.status_of(
+                                frontmatter.parse_frontmatter(data.decode("utf-8"))
+                            )
+                            != target
+                        ):
+                            raise SourcePublicationHold(
+                                "accepted artifact target differs from requested publication"
+                            )
+                        found = self.find(ref)
+                        artifact = frontmatter.parse_frontmatter(
+                            publication.artifact.decode("utf-8")
+                        )
+                        if str(artifact.get("ticket")) != str(
+                            found.row.id or Path(found.row.file or "").stem
+                        ):
+                            raise SourcePublicationHold(
+                                "accepted artifact names another native ticket"
+                            )
+                        preimage = plan.read_bytes() if plan.exists() else None
+                        write = publication.check_preimage(preimage, data)
+                        check_plan_transition(
+                            ref,
+                            before,
+                            target,
+                            reason,
+                            has_plan=True,
+                            blocked_reason=blocked_now,
+                            blocked=blocked,
+                            blocked_at=blocked_at,
+                        )
+                        if write:
+                            platform_util.atomic_write_bytes_confined(
+                                plan, data, confine_root=publication.source_root
+                            )
+                        if plan.read_bytes() != data or _plan_fields(plan)[1] != target:
+                            raise SourcePublicationHold("accepted canonical plan did not read back")
+                    except PlanTransitionRefused as exc:
+                        raise TicketsTransitionRefused(
+                            exc.ref, exc.current, exc.target, exc.reason, exc.why
+                        ) from exc
+                    except (SourcePublicationHold, OSError, ValueError) as exc:
+                        raise TicketsPlanIOError(
+                            f"{ref}: campaign source publication refused: {exc}"
+                        ) from exc
+                    result = PlanMark(
+                        ref, plan, before, target, "written" if write else "noop", not has_plan
+                    )
+                    _journal_mark(
+                        journal,
+                        ref=ref,
+                        reason=reason,
+                        before=before,
+                        after=target,
+                        outcome=result.outcome,
+                        plan=plan,
+                        created=result.created,
+                    )
+                    return result
+                if publication is not None:
+                    raise TicketsTransitionRefused(
+                        ref,
+                        before,
+                        target,
+                        reason,
+                        "publication capability requires campaign-publish reason",
+                    )
                 try:
                     write = check_plan_transition(
                         ref,

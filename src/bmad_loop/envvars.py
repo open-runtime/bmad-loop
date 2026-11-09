@@ -29,6 +29,7 @@ from __future__ import annotations
 import math
 import os
 from collections.abc import Mapping
+from pathlib import Path
 
 #: Overrides the per-session wall-clock budget, in seconds (test / E2E hook).
 SESSION_TIMEOUT_S = "BMAD_LOOP_SESSION_TIMEOUT_S"
@@ -112,3 +113,15 @@ def state_dir(env: Mapping[str, str] | None = None) -> str | None:
     whatever cwd the loop happened to be launched from.
     """
     return (os.environ if env is None else env).get(STATE_DIR) or None
+
+
+#: Explicit bundled Paradev registry root, separate from external transport records.
+PARADEV_STATE_DIR = "BMAD_LOOP_PARADEV_STATE_DIR"
+
+
+def paradev_state_dir() -> str | None:
+    """The optional absolute path to this package's Paradev registry."""
+    raw = os.environ.get(PARADEV_STATE_DIR)
+    if raw and not Path(raw).is_absolute():
+        raise ValueError("BMAD_LOOP_PARADEV_STATE_DIR must be absolute")
+    return raw or None

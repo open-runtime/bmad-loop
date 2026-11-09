@@ -309,12 +309,30 @@ def test_watcher_status_interrupted(tmp_path):
 def test_watcher_status_reused_pid_reads_interrupted(tmp_path):
     # A live pid whose recorded identity no longer matches (pid reuse — immediate on
     # Windows) must read as dead/INTERRUPTED, not a false RUNNING. Uses our own pid
-    # with a bogus identity token; identity() re-read never matches 0.5.
+    # with a different generation in the host's current stamp representation.
+    from bmad_loop.process_host import get_process_host
+
+    stamp = get_process_host().identity(os.getpid())
+    assert stamp is not None
+    mismatched = stamp - 1 if stamp < 0 else stamp + 1
     run_dir = make_run(tmp_path, "20260611-100000-aaaa")
-    (run_dir / "engine.pid").write_text(f"{os.getpid()} 0.5")
+    (run_dir / "engine.pid").write_text(f"{os.getpid()} {mismatched}")
     watcher = data.RunWatcher(run_dir)
     assert watcher.liveness() == "dead"
     assert watcher.status() == data.INTERRUPTED
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="legacy macOS process identity")
+def test_watcher_legacy_macos_identity_remains_unknown(tmp_path):
+    from bmad_loop.process_host import get_process_host
+
+    stamp = get_process_host().identity(os.getpid())
+    assert stamp is not None and stamp < -2
+    run_dir = make_run(tmp_path, "20260611-100000-aaaa")
+    (run_dir / "engine.pid").write_text(f"{os.getpid()} {-stamp}")
+    watcher = data.RunWatcher(run_dir)
+    assert watcher.liveness() == "unknown"
+    assert watcher.status() == data.UNKNOWN
 
 
 def test_watcher_status_crashed(tmp_path):

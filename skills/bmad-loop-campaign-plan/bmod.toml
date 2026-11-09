@@ -1,0 +1,3 @@
+[skill]
+bmod = "bmod-bmad-loop"
+source = "github:open-runtime/bmad-loop/skills"

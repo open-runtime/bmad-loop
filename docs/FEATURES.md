@@ -15,6 +15,25 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
 
 ## Core loop
 
+### Native development campaigns
+
+- **Stability:** experimental
+- **Description:** A repository coordinator supervises independent unit workers, planning and GitHub delivery with durable ownership, recovery and optional native Paradev reflection.
+- **Properties:**
+  - Versioned TOML validation is offline; preflight reports separate planning, execution, publication and reflection readiness.
+  - Independent units within and across epics can be admitted together, subject to explicit dependencies, ownership and separate execution/review/verification capacities.
+  - Dependencies release on delivered work; local completion and merged work with tracking debt remain distinct.
+  - Campaign snapshots commit transitions and outbound intents atomically, and uncertain launches retain ownership.
+  - Evidence review recognizes existing owner decisions and actual approvals without inventing authorization; bounded diagnosis and repair preserve lifetime budgets.
+  - Operator controls enqueue requests, while status projects units, holds and links without exposing private configuration or raw evidence.
+  - Bounded reasoning jobs propose routing, triage, priorities, graph changes and reports; validated proposals retain existing ownership and delivery gates.
+  - Transactional campaign storage keeps an append-only event journal and paginated job history, with explicit migration for legacy snapshots.
+  - Qualified headless routes and immutable transcript packets support fenced continuation while preserving acceptance and contributor identity.
+  - An optional native main/custom review pair retains both reviews before independent publication review, with candidate drift and findings entering the normal repair path.
+- **Config:** `bmad-loop campaign --help`; versioned campaign TOML; optional `[paradev] reflect`
+- **Tested by:** `tests/test_campaign_core.py`, `tests/test_campaign_cli.py`, `tests/test_campaign_decisions.py`, `tests/test_campaign_resolution.py`, `tests/test_campaign_publication.py`, `tests/test_campaign_paradev.py`
+- **Docs:** [Campaign guide](campaign-guide.md), [CLI reference: campaign](reference/cli.md#campaign)
+
 ### Deterministic story pipeline
 
 - **Stability:** stable
@@ -74,8 +93,9 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - With probes configured, a failing, timed-out or unstartable probe stops verification before any `[verify]` command runs.
   - `bmad-loop validate --probes` runs every probe, not stopping at the first failure, and fails validate if any probe fails.
   - A `repo_root` key in `_bmad/bmm/config.yaml` moves verify commands and git checks to a monorepo's code root.
-- **Config:** `[verify] commands`, `[verify] command_timeout_min`, `[verify] env_fault_rc`, `[environment] probes`, `[environment] probe_timeout_s`; `bmad-loop validate --probes`
-- **Tested by:** `tests/test_verify.py`, `tests/test_engine.py`, `tests/test_cli.py`, `tests/test_bmadconfig.py`
+  - With `[verify] reuse_unchanged`, a skip-review gate reuses an unchanged green dev/fix pass instead of re-running the commands (in-memory token + git fingerprint; never across a session, pause or restart; not sweeps). Status checks and probes still run at the gate.
+- **Config:** `[verify] commands`, `[verify] command_timeout_min`, `[verify] env_fault_rc`, `[verify] reuse_unchanged`, `[environment] probes`, `[environment] probe_timeout_s`; `bmad-loop validate --probes`
+- **Tested by:** `tests/test_verify.py`, `tests/test_engine.py`, `tests/test_stories_engine.py`, `tests/test_tickets_engine.py`, `tests/test_cli.py`, `tests/test_bmadconfig.py`
 - **Docs:** [Configuration: [verify]](reference/configuration.md#verify), [Configuration: [environment]](reference/configuration.md#environment), [Environment faults](escalations-guide.md#environment-faults), [Re-verify kept work](escalations-guide.md#resolve-reverify)
 
 ### Fresh-context review
@@ -519,7 +539,7 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - The configured `model` fields (`session-start`, the session record, `adapters_used.<role>.model`) are never overwritten by an observed one.
   - `status --json` reports a role's observed models as `adapters_used.<role>.models_used`, only when some were observed.
   - A tracked session's `session-end` entry carries `tokens_by_model`, its usage split per model (summing to the session's usage, with `<unattributed>` for usage the CLI's file does not tie to a model); `status --json` sums it per task as `tokens_by_model`. Neither appears when no split was read.
-  - The first SessionStart hook that names a model (Claude, Codex) journals one `session-model` row, and the TUI agent line shows that model in place of the configured one.
+  - The first SessionStart hook that names a model (Claude, Codex) journals one `session-model` row, and the TUI agent line shows that model in place of the configured one. Antigravity fires no SessionStart: its first fully-idle Stop that names a model (`modelName`) journals the row instead, usually as the session ends, so the agent line seldom shows it; its `models` stays untracked.
   - `diagnose` keeps model ids and redacts any element that is not shaped like one; `tokens_by_model` keeps only its integer counts.
 - **Config:** none
 - **Tested by:** `tests/test_tokens.py`, `tests/test_opencode_http.py`, `tests/test_engine.py`, `tests/test_model.py`, `tests/test_cli.py`, `tests/test_events.py`, `tests/test_generic_tmux.py`, `tests/test_diagnostics.py`, `tests/test_tui_data.py`, `tests/test_tui_app.py`

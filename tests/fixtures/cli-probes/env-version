@@ -1,0 +1,2 @@
+#!/bin/sh
+printf '%s\n' "${BMAD_LOOP_TEST_CLI_VERSION:-no version}"

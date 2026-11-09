@@ -245,6 +245,7 @@ class RecoveryFlow:
         spec_confine_root: Callable[[StoryTask], Path] | None = None,
         owned_plan: OwnedPlanWriter | None = None,
         ledger_rel: Callable[[], tuple[str | None, Exception | None]] | None = None,
+        campaign_recovery: Callable[..., NoReturn] | None = None,
     ) -> None:
         self.paths = paths
         self.policy = policy
@@ -271,6 +272,7 @@ class RecoveryFlow:
         self._dev_attempt_dispatched = dev_attempt_dispatched
         self._spec_confine_root_for = spec_confine_root
         self._owned_plan = owned_plan
+        self._campaign_recovery = campaign_recovery
 
     def _spec_confine_root(self, task: StoryTask) -> Path:
         """The root every attempt-owned spec write for ``task`` is confined to."""
@@ -1178,6 +1180,8 @@ class RecoveryFlow:
         preserve leg that fails still falls through to the reset, but the same
         post-reset notice then names the failed leg and the attempt HEAD, on any
         re-drive reset, restart or not (DW-481)."""
+        if self._campaign_recovery is not None:
+            self._campaign_recovery(task, cause=cause)
         workspace = self._workspace_get()
         resolved = cause == "resolved"
         # preserve the corrected spec for the whole re-drive, not just the first
@@ -1922,6 +1926,8 @@ class RecoveryFlow:
         reverted. Sweep passes no ``preserve`` — it wants the broken ledger gone.
         A cleanup-preflight refusal is journaled and routed through the injected
         pause before the re-drive can continue."""
+        if self._campaign_recovery is not None:
+            self._campaign_recovery(task, cause="destructive-reset-refused")
         workspace = self._workspace_get()
         try:
             verify.safe_rollback(

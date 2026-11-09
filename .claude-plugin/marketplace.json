@@ -12,11 +12,17 @@
       "name": "bmad-loop",
       "source": "./skills",
       "description": "Automation-mode skills driven by the bmad-loop orchestrator: project bootstrap (bmad-loop-setup), interactive escalation resolution (bmad-loop-resolve) and deferred-work sweep triage (bmad-loop-sweep) — the inner dev primitive (which self-reviews and commits) is the upstream bmad-dev-auto skill",
-      "version": "0.13.15",
+      "version": "0.15.8",
       "author": {
         "name": "pinkyd"
       },
-      "skills": ["./skills/bmad-loop-setup", "./skills/bmad-loop-resolve", "./skills/bmad-loop-sweep", "./skills/bmod-bmad-loop"]
+      "skills": [
+        "./skills/bmad-loop-setup",
+        "./skills/bmad-loop-resolve",
+        "./skills/bmad-loop-sweep",
+        "./skills/bmad-loop-campaign-plan",
+        "./skills/bmod-bmad-loop"
+      ]
     }
   ]
 }

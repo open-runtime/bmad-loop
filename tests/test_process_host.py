@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path, PureWindowsPath
+from types import SimpleNamespace
 
 import pytest
 
@@ -109,9 +110,9 @@ def test_alive_and_ours_none_identity_degrades_to_is_alive(host, monkeypatch):
 
 def test_alive_and_ours_matches_only_same_identity(host, monkeypatch):
     # Same identity → our process; a different value (reused pid) or None (gone) → not.
-    monkeypatch.setattr(host, "identity", lambda pid: 123.0)
-    assert host.alive_and_ours(4242, 123.0) is True
-    assert host.alive_and_ours(4242, 999.0) is False  # reused
+    monkeypatch.setattr(host, "identity", lambda pid: -123.0)
+    assert host.alive_and_ours(4242, -123.0) is True
+    assert host.alive_and_ours(4242, -999.0) is False  # reused
     # Unreadable identity is not-ours whether the pid is gone or still running —
     # 'unknown' must never read as ours on the strict/destructive path. Stub
     # is_alive too: alive_and_ours (via liveness_of) probes it on this branch, and
@@ -119,21 +120,21 @@ def test_alive_and_ours_matches_only_same_identity(host, monkeypatch):
     # runner (WinError 87).
     monkeypatch.setattr(host, "identity", lambda pid: None)
     monkeypatch.setattr(host, "is_alive", lambda pid: False)
-    assert host.alive_and_ours(4242, 123.0) is False  # gone
+    assert host.alive_and_ours(4242, -123.0) is False  # gone
     monkeypatch.setattr(host, "is_alive", lambda pid: True)
-    assert host.alive_and_ours(4242, 123.0) is False  # live but unreadable → unknown
+    assert host.alive_and_ours(4242, -123.0) is False  # live but unreadable → unknown
 
 
 def test_liveness_of_reads_alive_dead_and_unknown(host, monkeypatch):
-    monkeypatch.setattr(host, "identity", lambda pid: 123.0)
-    assert host.liveness_of(4242, 123.0) == "alive"  # identity matches → ours
-    assert host.liveness_of(4242, 999.0) == "dead"  # readable-but-different → reused
+    monkeypatch.setattr(host, "identity", lambda pid: -123.0)
+    assert host.liveness_of(4242, -123.0) == "alive"  # identity matches → ours
+    assert host.liveness_of(4242, -999.0) == "dead"  # readable-but-different → reused
 
     monkeypatch.setattr(host, "identity", lambda pid: None)
     monkeypatch.setattr(host, "is_alive", lambda pid: True)
-    assert host.liveness_of(4242, 123.0) == "unknown"
+    assert host.liveness_of(4242, -123.0) == "unknown"
     monkeypatch.setattr(host, "is_alive", lambda pid: False)
-    assert host.liveness_of(4242, 123.0) == "dead"
+    assert host.liveness_of(4242, -123.0) == "dead"
 
 
 def test_liveness_of_legacy_identity_degrades_to_is_alive(host, monkeypatch):
@@ -142,6 +143,101 @@ def test_liveness_of_legacy_identity_degrades_to_is_alive(host, monkeypatch):
     assert host.liveness_of(4242, None) == "alive"
     assert host.liveness_of(9999, None) == "dead"
     assert host.liveness_of(0, None) == "dead"
+
+
+@pytest.mark.parametrize("clock_offset", [-20.0, 20.0])
+def test_macos_birth_identity_survives_clock_and_observer_changes(monkeypatch, clock_offset):
+    monkeypatch.setattr(process_host.sys, "platform", "darwin")
+    births = {123: 1700000000.25, 456: 1700000001.5}
+    observer_offset = 0.0
+
+    class Process:
+        def __init__(self, pid):
+            self.pid = pid
+            self._ident = (pid, births[pid])
+
+        def create_time(self):
+            return births[self.pid] + observer_offset
+
+        def ppid(self):
+            return 123 if self.pid == 456 else 1
+
+        def is_running(self):
+            return self._ident == (self.pid, births[self.pid])
+
+    monkeypatch.setattr(process_host, "_psutil", lambda: SimpleNamespace(Process=Process))
+    monkeypatch.setattr(process_host, "_macos_child_pids", lambda pid: (456,) if pid == 123 else ())
+    host = PosixProcessHost()
+    monkeypatch.setattr(host, "is_alive", lambda pid: pid in births)
+    stamp = host.identity(456)
+    assert stamp == -1700000001.5
+    assert host.descendants(123) == {456: stamp}
+    observer_offset = clock_offset
+    assert host.identity(456) == stamp
+    assert host.liveness_of(456, stamp) == "alive"
+    assert host.descendants(123) == {456: stamp}
+    births[456] += 1  # real PID-generation change must still be rejected
+    assert host.liveness_of(456, stamp) == "dead"
+
+
+def test_macos_positive_legacy_stamp_is_unknown_while_pid_exists(monkeypatch):
+    monkeypatch.setattr(process_host.sys, "platform", "darwin")
+    host = PosixProcessHost()
+    monkeypatch.setattr(host, "is_alive", lambda pid: pid == 123)
+    # Even an apparent equality cannot establish which clock offset was persisted.
+    monkeypatch.setattr(host, "identity", lambda pid: 1700000000.0)
+    assert host.liveness_of(123, 1700000000.0) == "unknown"
+    assert host.legacy_identity_unverifiable(123, 1700000000.0)
+    assert not host.alive_and_ours(123, 1700000000.0)
+    assert host.liveness_of(456, 1700000000.0) == "dead"
+    assert not host.legacy_identity_unverifiable(456, 1700000000.0)
+    assert host.liveness_of(123, None) == "alive"
+    assert not host.legacy_identity_unverifiable(123, None)
+    for invalid in (0.0, -1.0, -2.0, float("nan"), float("inf")):
+        assert host.liveness_of(123, invalid) == "dead"
+
+
+@pytest.mark.parametrize("ident", [None, (123, None), (123, float("nan")), (456, 100.0)])
+def test_macos_missing_stable_identity_never_uses_epoch_fallback(monkeypatch, ident):
+    monkeypatch.setattr(process_host.sys, "platform", "darwin")
+    child = SimpleNamespace(pid=123, _ident=ident, create_time=lambda: 1700000000.0)
+    monkeypatch.setattr(process_host, "_psutil", lambda: SimpleNamespace(Process=lambda pid: child))
+    host = PosixProcessHost()
+    monkeypatch.setattr(host, "is_alive", lambda pid: True)
+    assert host.identity(123) is None
+    assert host.liveness_of(123, -1700000000.0) == "unknown"
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="real macOS psutil clock adjustment")
+def test_macos_native_stamp_matches_another_observer_across_clock_adjustment(monkeypatch):
+    psutil = pytest.importorskip("psutil")
+    native = pytest.importorskip("psutil._psosx")
+
+    host = PosixProcessHost()
+    pid = os.getpid()
+    monkeypatch.setattr(native, "boot_time", lambda: native.INIT_BOOT_TIME)
+    epoch_before = psutil.Process(pid).create_time()
+    before = host.identity(pid)
+    assert before is not None and before < -2
+    monkeypatch.setattr(native, "boot_time", lambda: native.INIT_BOOT_TIME + 8)
+    assert psutil.Process(pid).create_time() == epoch_before + 8
+    assert host.identity(pid) == before
+    assert host.liveness_of(pid, before) == "alive"
+    # Another interpreter has its own import-era boot epoch, while the raw kernel
+    # birth identity must agree. Neither observer changes the host clock.
+    child = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from bmad_loop.process_host import PosixProcessHost; "
+            f"print(PosixProcessHost().identity({pid}))",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert float(child.stdout) == before
 
 
 @pytest.mark.skipif(
@@ -204,6 +300,7 @@ def test_psutil_descendants_maps_children_and_never_raises(monkeypatch):
         def __init__(self, pid, created):
             self.pid = pid
             self._created = created
+            self._ident = (pid, created)
 
         def create_time(self):
             return self._created
@@ -223,7 +320,8 @@ def test_psutil_descendants_maps_children_and_never_raises(monkeypatch):
         Process = _FakeProc
 
     monkeypatch.setattr(process_host, "_psutil", lambda: _FakePsutil)
-    assert process_host._psutil_descendants(123) == {11: 111.0, 22: 222.0}
+    sign = -1 if sys.platform == "darwin" else 1
+    assert process_host._psutil_descendants(123) == {11: sign * 111.0, 22: sign * 222.0}
 
     class _BoomProc:
         def __init__(self, pid):
@@ -274,6 +372,7 @@ def test_psutil_descendants_omits_pid_reused_before_identity_capture(monkeypatch
         ``create_time()`` returns generation B's identity WITHOUT raising."""
 
         pid = 33
+        _ident = (33, 333.0)
 
         def create_time(self):
             return 999.0  # generation B's stamp — plausible, and utterly wrong
@@ -283,6 +382,7 @@ def test_psutil_descendants_omits_pid_reused_before_identity_capture(monkeypatch
 
     class _OkChild:
         pid = 22
+        _ident = (22, 222.0)
 
         def create_time(self):
             return 222.0
@@ -302,7 +402,7 @@ def test_psutil_descendants_omits_pid_reused_before_identity_capture(monkeypatch
 
     monkeypatch.setattr(process_host, "_psutil", lambda: _FakePsutil)
     snapshot = process_host._psutil_descendants(123)
-    assert snapshot == {22: 222.0}
+    assert snapshot == {22: -222.0 if sys.platform == "darwin" else 222.0}
     # The recycled pid must be absent outright, not stamped with the newcomer's
     # identity — a stamped entry authenticates at teardown and gets signalled.
     assert 33 not in snapshot

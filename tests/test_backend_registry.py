@@ -663,7 +663,7 @@ def test_builtin_seeding_is_reentrant_and_registers_each_builtin_once(fresh_regi
     fresh_registry.register_multiplexer("extra", lambda p: False, lambda: object())
     names = [name for name, _, _ in fresh_registry._BACKENDS]
     # Seeded once, in bundled order, with the caller's own entry appended last.
-    assert names == ["tmux", "psmux", "extra"]
+    assert names == ["tmux", "psmux", "paradev", "extra"]
 
 
 def test_a_failed_builtin_import_leaves_the_seeding_retryable(fresh_registry, monkeypatch):
@@ -701,4 +701,4 @@ def test_a_failed_builtin_import_leaves_the_seeding_retryable(fresh_registry, mo
     # Let the import succeed again and confirm the retry seeds both builtins.
     monkeypatch.delitem(sys.modules, key)
     fresh_registry._load_builtin_backends()
-    assert [name for name, _, _ in fresh_registry._BACKENDS] == ["tmux", "psmux"]
+    assert [name for name, _, _ in fresh_registry._BACKENDS] == ["tmux", "psmux", "paradev"]

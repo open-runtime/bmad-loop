@@ -433,18 +433,25 @@ def test_build_command_gemini_uses_interactive_flag(tmp_path):
 
 
 @pytest.mark.parametrize("profile_name", ["claude", "codex", "gemini"])
-def test_effort_never_reaches_the_generic_argv_or_env(tmp_path, profile_name):
-    """#643: the tmux generic family has no channel for a reasoning-effort value,
-    so `SessionSpec.effort` is ignored — argv and env are byte-identical to an
-    effort-less spec's (and `config_digest` therefore stays untouched). The
-    carrier is the opencode-http adapter; validate warns about this family."""
+def test_effort_uses_qualified_native_dialect_and_preserves_other_launch_flags(
+    tmp_path, profile_name
+):
+    """Reasoning arguments are additive; unqualified dialects keep their advisory behavior."""
     adapter = make_adapter(tmp_path, profile_name=profile_name)
     plain = make_spec(tmp_path)
     with_effort = dataclasses.replace(plain, effort="max")
     assert with_effort.effort == "max"  # the field landed (kept LAST on SessionSpec)
-    assert adapter.interactive_argv(with_effort) == adapter.interactive_argv(plain)
+    expected = {
+        "claude": ["--effort", "max"],
+        "codex": ["-c", 'model_reasoning_effort="max"'],
+        "gemini": [],
+    }[profile_name]
+    assert adapter.interactive_argv(with_effort) == adapter.interactive_argv(plain) + expected
     assert adapter.interactive_env(with_effort) == adapter.interactive_env(plain)
-    assert "max" not in adapter.build_command(with_effort)
+    if expected:
+        assert "max" in adapter.build_command(with_effort)
+    else:
+        assert "max" not in adapter.build_command(with_effort)
 
 
 def test_extra_args_replace_profile_bypass(tmp_path):
@@ -7412,6 +7419,26 @@ def test_tmux_timeout_with_flushed_spec_rescued_post_kill(tmp_path, private_tmux
         },
         timeout_s=6.0,
     )
+    real_start_session = adapter.start_session
+
+    def start_flushed_session(session_spec):
+        handle = real_start_session(session_spec)
+        # Establish this test's scenario before its deliberately short timeout:
+        # the scripted CLI really flushed successful work and rendered into the
+        # attached sink. Shell startup and scheduling are outside this assertion;
+        # the unchanged six-second wait still has to time out, kill the live
+        # window and rescue via the real post-kill read-back. A missing launch
+        # fails at the shared hang ceiling rather than pretending to test rescue.
+        deadline = time.monotonic() + REAL_MUX_HANG_CEILING_S
+        while time.monotonic() < deadline:
+            if (impl / "spec-3-1-foo.md").is_file() and (
+                adapter.logs_dir / "t-rescue.log"
+            ).stat().st_size > generic.PROOF_OF_WORK_MIN_LOG_BYTES:
+                return handle
+            time.sleep(0.01)
+        pytest.fail("scripted CLI never flushed its terminal spec and pane output")
+
+    adapter.start_session = start_flushed_session
     try:
         result = adapter.run(spec)
     finally:
@@ -15445,6 +15472,136 @@ def test_session_model_journal_failure_is_crumbed(tmp_path, monkeypatch):
     assert result.status == "timeout"
     (crumb,) = _lifecycle_events(adapter, "session-model-unjournaled", task_id="b-1")
     assert (crumb["model"], crumb["error"]) == ("claude-opus-5-5", "OSError: disk full")
+
+
+# agy fires no SessionStart and names its model only on Stop (`modelName`,
+# DW-634): the first fully-idle top-level Stop carrying one journals the row.
+
+
+def _agy_model_stop(fully_idle, model, session_id="agy-parent", transcript="/final.jsonl"):
+    return HookEvent(
+        ts=1,
+        event="Stop",
+        task_id="3-1-dev-1",
+        session_id=session_id,
+        transcript_path=transcript,
+        path=Path("x"),
+        fully_idle=fully_idle,
+        model=model,
+    )
+
+
+def _model_stop_adapter(tmp_path, profile_name="antigravity"):
+    adapter, impl = make_dev_adapter(tmp_path, profile_name=profile_name)
+    adapter.journal = _FakeJournal()
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+    )
+    return adapter
+
+
+def test_agy_fully_idle_stop_journals_the_session_model(tmp_path):
+    """The yield Stop's model is never the row's; the final fully-idle Stop's is.
+
+    ABLATION: drop the note in the Stop branch and no row is written; drop its
+    `fully_idle is True` test and move it above the `fully_idle is False` branch,
+    and the yield's model lands."""
+    parent_t, _ = _agy_brain(tmp_path)
+    adapter = _model_stop_adapter(tmp_path)
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _agy_model_stop(False, "gemini-yield", transcript=parent_t),
+            _agy_model_stop(True, "gemini-4-argon-medium", transcript=parent_t),
+        ]
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert result.status == "completed"
+    assert _session_model_entries(adapter) == [
+        {
+            "kind": "session-model",
+            "task_id": "3-1-dev-1",
+            "model": "gemini-4-argon-medium",
+            "cli": "antigravity",
+        }
+    ]
+
+
+def test_agy_child_stop_model_is_not_the_session_model(tmp_path):
+    """A subagent's fully-idle Stop (spawn marker in a sibling folder) is dropped
+    before the note, so only the parent's own final Stop names the model.
+
+    ABLATION: move the note above the spawn-marker filter and the child's model
+    lands as the row."""
+    parent_t, child_t = _agy_brain(tmp_path)
+    adapter = _model_stop_adapter(tmp_path)
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _agy_model_stop(True, "gemini-child", session_id="agy-child", transcript=child_t),
+            _agy_model_stop(True, "gemini-parent", transcript=parent_t),
+        ]
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert result.status == "completed"
+    assert result.session_id == "agy-parent"
+    assert [e["model"] for e in _session_model_entries(adapter)] == ["gemini-parent"]
+
+
+@pytest.mark.parametrize("fault", ["unjudged", "unreadable"])
+def test_agy_stop_admitted_unjudged_does_not_name_the_session_model(tmp_path, monkeypatch, fault):
+    """A Stop the spawn-marker filter admits without judging it own still
+    completes the session (fail open), but its model is not journaled: it may be
+    a child's.
+
+    ABLATION: drop `not stop_owner_unjudged` from the Stop note and both cases
+    journal the Stop's model."""
+    parent_t, _ = _agy_brain(tmp_path)
+    if fault == "unjudged":
+        transcript = "/final.jsonl"  # no ancestor named by the id: nowhere to look
+    else:
+        transcript = parent_t
+
+        def unreadable(*_args, **_kwargs):
+            raise PermissionError("brain listing denied")
+
+        monkeypatch.setattr(generic, "_spawn_marker_verdict", unreadable)
+    adapter = _model_stop_adapter(tmp_path)
+    adapter.watcher = _ScriptedWatcher([_agy_model_stop(True, "gemini-x", transcript=transcript)])
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert result.status == "completed"
+    assert _session_model_entries(adapter) == []
+    crumb = "subagent-marker-unjudged" if fault == "unjudged" else "subagent-marker-unreadable"
+    assert len(_lifecycle_events(adapter, crumb)) == 1  # the skip is visible
+
+
+def test_stop_model_without_fully_idle_is_not_journaled(tmp_path):
+    """Only agy sends `fully_idle`: another CLI's Stop carrying a model (a Codex
+    subagent's reuses the parent id) never labels the session.
+
+    ABLATION: drop the `fully_idle is True` test and the Stop journals a row."""
+    adapter = _model_stop_adapter(tmp_path, profile_name="claude")
+    adapter.watcher = _ScriptedWatcher([_agy_model_stop(None, "gpt-5.5-mini")])
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert result.status == "completed"
+    assert _session_model_entries(adapter) == []
+
+
+def test_session_start_model_wins_over_a_stop_model(tmp_path):
+    """A SessionStart that noted the model latches: a later fully-idle Stop
+    carrying one adds no second row.
+
+    ABLATION: drop the `not session_model_noted` test from the Stop note and the
+    Stop's model lands as a second row."""
+    adapter = _model_stop_adapter(tmp_path)
+    start = dataclasses.replace(_session_start("3-1-dev-1", None), session_id="agy-parent")
+    adapter.watcher = _ScriptedWatcher(
+        [
+            dataclasses.replace(start, model="gemini-start"),
+            _agy_model_stop(True, "gemini-stop"),
+        ]
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert result.status == "completed"
+    assert [e["model"] for e in _session_model_entries(adapter)] == ["gemini-start"]
 
 
 # --------------------------------------------- Claude Code StopFailure (#865)

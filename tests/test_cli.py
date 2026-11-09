@@ -3922,6 +3922,7 @@ def test_attach_warns_about_a_ctl_lookup_fault_and_still_attaches(project, monke
     _make_run_with_decision(project, run_id="20260101-000000-aaaa")
     monkeypatch.setattr(launch, "ctl_window_lookup", boom)
     monkeypatch.setattr(launch, "agent_session_exists", lambda s: True)
+    monkeypatch.setattr(launch, "select_agent_window", lambda p, r: None)
     monkeypatch.setattr(
         "bmad_loop.tui.launch.runs.attach_target_argv", lambda target: ["mux", "attach", target]
     )
@@ -13595,20 +13596,17 @@ def test_validate_model_warning_ignores_tmux_profiles(project, capsys):
     assert "is not 'provider/model'" not in _validate_output(capsys)
 
 
-def test_validate_warns_when_effort_is_set_on_a_tmux_profile(project, capsys):
-    """#643: only the opencode-http adapter carries a reasoning-effort value. A
-    stage that sets `effort` on the tmux generic family runs at the provider
-    default with nothing to show for it, so validate says so — advisory, naming
-    the role, profile and value."""
+def test_validate_warns_when_effort_is_set_on_an_unqualified_native_profile(project, capsys):
+    """Profiles without a qualified effort flag retain the explicit advisory."""
     install_bmad_config(project)
-    _write_policy(project.project, '[adapter]\nname = "claude"\n[adapter.dev]\neffort = "high"\n')
+    _write_policy(project.project, '[adapter]\nname = "gemini"\n[adapter.dev]\neffort = "high"\n')
     write_sprint(project, {"epic-1": "backlog"})
 
     doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
     findings = [f for f in doc["findings"] if f["check"] == "policy.effort-unsupported"]
     assert [f["severity"] for f in findings] == ["warning"]  # dev only: review/triage unset
-    assert findings[0]["detail"] == {"role": "dev", "effort": "high", "profile": "claude"}
-    assert "dev effort 'high' is ignored by claude" in findings[0]["message"]
+    assert findings[0]["detail"] == {"role": "dev", "effort": "high", "profile": "gemini"}
+    assert "dev effort 'high' is ignored by gemini" in findings[0]["message"]
 
 
 def test_validate_effort_warning_does_not_change_the_exit_code(project, capsys, monkeypatch):
@@ -13616,7 +13614,11 @@ def test_validate_effort_warning_does_not_change_the_exit_code(project, capsys, 
     stage still exits 0 (the same rc as `test_validate_json_clean_project_is_a_
     pure_document_at_rc_0`, whose fixture this shares minus the key)."""
     _make_validate_pass(
-        project, monkeypatch, capsys, policy=CLAUDE_ONLY_POLICY + 'effort = "high"\n'
+        project,
+        monkeypatch,
+        capsys,
+        policy='[adapter]\nname = "gemini"\nmodel = "gemini-pro"\neffort = "high"\n',
+        skills=lambda root: install_dev_base_skills(root, tree=".agents/skills", folder_id=True),
     )
 
     doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)

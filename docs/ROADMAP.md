@@ -37,6 +37,10 @@ on hosts other than psmux, and the Unity plugin's cache-path correctness on nati
 
 **Status:** planned · **Foundation:** landed with worktree isolation (v0.4.0)
 
+Native parallel execution is available through the separate [campaign supervisor](campaign-guide.md).
+This entry concerns lifting the clamp within the legacy serial engine; campaigns
+keep that engine contract and supervise isolated single-unit child processes.
+
 Worktree isolation (`[scm] isolation = "worktree"`) already gives each story/bundle its own
 worktree and branch, and the `max_parallel` knob is parsed and validated in
 `src/bmad_loop/policy.py` (`ScmPolicy`). But it is **clamped to `1` in `loads()`** — merge-back

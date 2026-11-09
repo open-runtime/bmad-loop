@@ -11,6 +11,7 @@ hand-written event files instead, which is cheaper and states the numbers.
 from __future__ import annotations
 
 import contextlib
+import getpass
 import json
 import os
 import shutil
@@ -87,7 +88,14 @@ def _run(argv: list[str], cwd: Path, **env: str) -> subprocess.CompletedProcess[
 
 
 def _pytest(suite: Path, *args: str, **env: str) -> subprocess.CompletedProcess[str]:
-    return _run([sys.executable, "-m", "pytest", *args], suite, **env)
+    return _run([sys.executable, "-m", "pytest", *_private_temp_args(suite), *args], suite, **env)
+
+
+def _private_temp_args(suite: Path) -> list[str]:
+    # A nested controller must not clean the host's numbered pytest history at
+    # session finish. That history may contain entire concurrent outer runs.
+    # Keep each invocation separate, even when a module fixture reuses a suite.
+    return ["--basetemp", str(suite.parent / ("nested-pytest-" + uuid.uuid4().hex))]
 
 
 def _wrapped(
@@ -100,6 +108,7 @@ def _wrapped(
         str(metrics),
         *wrapper_args,
         "--",
+        *_private_temp_args(suite),
         *pytest_args,
     ]
     return _run(argv, suite, **env)
@@ -120,6 +129,29 @@ def _events(metrics: Path) -> dict[str, list[dict[str, Any]]]:
 
 def _json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize("wrapped", [False, True], ids=["pytest", "benchmark-wrapper"])
+def test_nested_pytest_does_not_clean_ambient_run_history(tmp_path, wrapped):
+    ambient = tmp_path / "ambient-temp"
+    history = ambient / ("pytest-of-" + getpass.getuser())
+    sentinels = []
+    for index in range(4):
+        path = history / f"pytest-{index}" / "retained.txt"
+        path.parent.mkdir(parents=True)
+        path.write_text("another run's retained evidence", encoding="utf-8")
+        sentinels.append(path)
+    suite = _suite(
+        tmp_path / "suite",
+        {"test_one.py": "def test_one(tmp_path):\n    assert tmp_path.is_dir()\n"},
+    )
+    proc = (
+        _wrapped(suite, tmp_path / "metrics", "-q", PYTEST_DEBUG_TEMPROOT=str(ambient))
+        if wrapped
+        else _pytest(suite, "-q", PYTEST_DEBUG_TEMPROOT=str(ambient))
+    )
+    assert proc.returncode == 0, _output(proc)
+    assert all(path.is_file() for path in sentinels), "nested pytest cleaned unrelated history"
 
 
 # ------------------------------------------------ a real xdist run, shared read-only

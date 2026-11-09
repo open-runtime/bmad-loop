@@ -1468,6 +1468,17 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             ]
         if spec.model:
             argv += [self.profile.model_flag, spec.model]
+        if spec.effort:
+            # Additive to both fresh and resumed launches: extra_args replaces
+            # permission flags and is therefore the wrong channel for effort.
+            if self.profile.hooks.dialect == "codex-hooks-json":
+                if spec.effort not in {"minimal", "low", "medium", "high", "xhigh", "max", "ultra"}:
+                    raise ValueError(f"unsupported Codex reasoning effort: {spec.effort}")
+                argv += ["-c", f'model_reasoning_effort="{spec.effort}"']
+            elif self.profile.hooks.dialect == "claude-settings-json":
+                if spec.effort not in {"low", "medium", "high", "max"}:
+                    raise ValueError(f"unsupported Claude reasoning effort: {spec.effort}")
+                argv += ["--effort", spec.effort]
         return argv
 
     def _linked_worktree_grant(self, cwd: Path) -> tuple[str, ...]:
@@ -1584,6 +1595,10 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
     # --------------------------------------------------------------- adapter
 
     def start_session(self, spec: SessionSpec) -> SessionHandle:
+        from ..campaign_hold import held
+
+        if held():
+            raise MultiplexerError("campaign operator hold suppresses automatic session launch")
         # Refuse before touching prompt/artifact files or opening a window.
         # The engine performs the same check before a retry can reset the tree;
         # this boundary also protects callers outside Engine.
@@ -1652,7 +1667,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             self._note_resume_base(spec)
         window_id = self.mux.new_window(
             self.session_name,
-            spec.task_id[-40:],
+            runs.task_window_name(spec.task_id),
             spec.cwd,
             # Same merge as interactive_env, same pin chokepoint: the profile's
             # [env] table must not move the window off this process's state root.
@@ -2010,8 +2025,9 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         saw_session_start = False
         session_start_noted = False
         # The first admitted SessionStart carrying a hook `model` (on Codex, the
-        # first admitted SessionStart) was seen and its one `session-model` row
-        # attempted (#859); see `_note_session_model`.
+        # first admitted SessionStart) — or, with none, the first fully-idle
+        # top-level Stop carrying one (agy, DW-634) — was seen and its one
+        # `session-model` row attempted (#859); see `_note_session_model`.
         session_model_noted = False
 
         # A transcript can grow for an initial user prompt or the loop's own
@@ -2348,13 +2364,29 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 last_activity = self._log_activity_key(handle.task_id)
             return True
 
+        hold_noted = False
         while True:
+            from ..campaign_hold import held
+
+            operator_held = held()
+            if operator_held:
+                # Takeover never kills a live agent through a stall/budget timer.
+                # Continue consuming native hooks and detecting actual death.
+                deadline = max(deadline, time.monotonic() + 60)
+                wall_deadline = max(wall_deadline, time.time() + 60)
+                if stall_deadline is not None:
+                    stall_deadline = max(stall_deadline, time.monotonic() + 60)
+                if turn_error_due is not None:
+                    turn_error_due = max(turn_error_due, time.monotonic() + 60)
+                if not hold_noted:
+                    self._note_lifecycle(handle.task_id, "campaign-operator-held")
+                    hold_noted = True
             # Top-of-tick pane-frame sample for the no-work verdict (#727). Before
             # the timeout check so growth on the final tick still counts; before the
             # nudge arm so a tick that both sees growth and sends a nudge scores the
             # growth (the nudge cannot have caused what preceded it).
             sample_frame()
-            if quota.waiting:
+            if quota.waiting and not operator_held:
                 # Usage-limit quota wait (DW-396): the CLI sits behind a usage
                 # window it will continue from by itself, so the session clock
                 # stands still. The cap is checked first, on the longer of the
@@ -2749,7 +2781,8 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # transcript_path is unknown until the first hook event carries
                 # it (SessionStart for claude); until then the guard is inert.
                 if (
-                    not budget_tripped
+                    not operator_held
+                    and not budget_tripped
                     and spec.token_budget is not None
                     and spec.token_budget_mode in ("warn", "enforce")
                     and transcript_path
@@ -2854,9 +2887,13 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             # The token-budget grace is deliberately NOT frozen by a usage-limit
             # quota wait (DW-396): a crossed budget is real spend, and a session
             # waiting out a reset after crossing it has nothing left to earn.
-            if budget_deadline is not None and (
-                time.monotonic() >= budget_deadline
-                or (budget_wall_deadline is not None and time.time() >= budget_wall_deadline)
+            if (
+                not operator_held
+                and budget_deadline is not None
+                and (
+                    time.monotonic() >= budget_deadline
+                    or (budget_wall_deadline is not None and time.time() >= budget_wall_deadline)
+                )
             ):
                 # Grace expired with no completion (wall co-bound included: a
                 # suspend-frozen monotonic clock must not stretch the window,
@@ -2969,6 +3006,8 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         stop_seen=stop_seen,
                         produced_work=produced_work(),
                     )
+                if operator_held:
+                    continue
                 if stall_deadline is not None:
                     # No artifact shortcut here: the window is alive on this tick
                     # (a dead one returned "crashed" above), and a terminal
@@ -3260,6 +3299,11 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # real transcript is preserved for usage tallying.
                 continue
             spawn_marker = self.profile.subagent_spawn_marker
+            # Set when the filter below admits a Stop it could not judge as the
+            # session's own (a marker fault or an unjudgeable Stop): failing open
+            # lets it complete the session, but it never names the session's
+            # model (DW-634) — a missing row beats a child's model on it.
+            stop_owner_unjudged = False
             if event.event == "Stop" and spawn_marker:
                 # agy runs a subagent as a sibling conversation whose Stops reach
                 # this stream unannounced, so attribution admits them; its final
@@ -3288,6 +3332,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         settled=settled,
                     )
                 except OSError as e:
+                    stop_owner_unjudged = True
                     if not marker_unreadable_crumbed:
                         marker_unreadable_crumbed = True
                         self._note_lifecycle(
@@ -3306,6 +3351,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                             fully_idle=event.fully_idle,
                         )
                         continue
+                    stop_owner_unjudged = verdict == "unjudged"
                     if verdict == "unjudged" and not marker_unjudged_crumbed:
                         marker_unjudged_crumbed = True
                         self._note_lifecycle(
@@ -3386,6 +3432,11 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         self._end_quota_wait(handle, quota, "latch")
                 continue
             if event.event == "StopFailure":
+                if operator_held:
+                    self._note_lifecycle(
+                        handle.task_id, "stop-nudge-withheld", reason="campaign-operator-hold"
+                    )
+                    continue
                 # An API error ended the turn (#865): Claude Code fires this
                 # INSTEAD of `Stop`, so it is never a completion — no
                 # `stop_seen`, no result read, no grace re-arm, no restored
@@ -3592,6 +3643,20 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # Latched after the subagent filter above, which rejects a stop that
                 # is not the main session's turn-end. Never cleared.
                 stop_seen = True
+                if (
+                    not session_model_noted
+                    and event.fully_idle is True
+                    and event.model
+                    and not stop_owner_unjudged
+                ):
+                    # agy fires no SessionStart and names its model only on Stop
+                    # (`modelName`, DW-634). Only a fully-idle Stop the spawn-marker
+                    # filter above judged the session's own, so never an identified
+                    # child's nor one it admitted unjudged (crumbed there); a
+                    # child's Stop that beats its marker still reads as own.
+                    # `fully_idle` is agy-only, so no other CLI's Stop does.
+                    session_model_noted = True
+                    self._note_session_model(handle, event.model)
                 if resolvable and not unresolved_crumbed and not _is_regular_file(transcript_path):
                     # Not gated on session_id: a Stop whose payloads all came
                     # through as `{}` has none, and that miss must show too.
@@ -3617,6 +3682,11 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         budget_weighted=budget_weighted,
                         stop_seen=stop_seen,
                     )
+                if operator_held:
+                    self._note_lifecycle(
+                        handle.task_id, "stop-nudge-withheld", reason="campaign-operator-hold"
+                    )
+                    continue
                 if quota.waiting:
                     # A result-less Stop while the CLI waits out a usage-window
                     # reset (DW-396): typing the stop nudge into it can only
@@ -4032,7 +4102,11 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
 
     def _note_session_model(self, handle: SessionHandle, model: str) -> None:
         """Journal one `session-model` (`task_id`, `model`, `cli`): the model the
-        CLI reported on the session's first admitted SessionStart hook (#859).
+        CLI reported on the session's first admitted SessionStart hook (#859),
+        or — for agy, which fires no SessionStart — on its first fully-idle
+        top-level Stop (the payload's `modelName`, agy 1.5.0; DW-634). That row
+        is the only place an agy model lands: session-end `models` stays
+        transcript-only, and agy's transcript names none.
 
         This is the CLI's own launch model (Codex sends it on every hook), unlike
         `session-start`'s configured `model`, where `""` means "CLI default".
@@ -4536,6 +4610,11 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         tries an hcom request into the same session (the instance its relay
         reported, when hcom shows it listening) and falls back to tmux keystrokes
         on any miss; upstream, and by default, it types into the pane."""
+        from ..campaign_hold import held
+
+        if held():
+            self._note_lifecycle(handle.task_id, "nudge-withheld", reason="campaign-operator-hold")
+            return
         if self.policy.recovery.nudge_via == "hcom" and self._send_via_hcom(handle, text):
             return
         self.mux.send_text(handle.pane_target or handle.native_id, text)

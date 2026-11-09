@@ -33,8 +33,10 @@ bmad-loop runs BMAD stories unattended. It reads your sprint board (or a v6 `bma
 ## Why bmad-loop
 
 This is the **open-runtime fork**. See the [fork guide](docs/fork-guide.md) for
-its recovery extensions, factory dashboard, TeamRouter integration and the
-distinction between parallel epic runs and sequential stories within one run.
+its recovery extensions, TeamRouter integration and native
+[campaigns](docs/campaign-guide.md) for parallel stories/epics, draft PR delivery,
+GitHub synchronization and optional Paradev workspace reflection. Legacy runs
+retain sequential story execution.
 
 - 🧠 **No LLM in the control loop.** Story selection, retry budgets, gates and completion checks are plain Python: deterministic, debuggable, and free. A session counts as complete only on a completion event from the coding agent or the death of its session, never on model prose; timeouts, stalls and budget caps end it as a failure.
 - 🔍 **Trust nothing, verify everything.** After each session the orchestrator checks the spec status, the baseline commit, that code actually changed, and that the board matches, then runs _your_ `[verify]` commands before it commits.
