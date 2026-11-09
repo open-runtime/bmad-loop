@@ -303,6 +303,49 @@ def test_inventory_poll_clocks_do_not_trigger_duplicate_reasoning(tmp_path, prep
     assert not current(snapshot, request)
 
 
+@pytest.mark.parametrize("purpose", ["graph_review", "semantic_sync", "triage"])
+def test_successful_pr_clock_diagnostic_does_not_change_semantic_facts(purpose):
+    import copy
+
+    snapshot = make_snapshot()
+    inventory = {
+        "complete": True,
+        "pulls": [{"number": 2, "head": {"sha": "head"}, "labels": ["hold"]}],
+        "github_coverage": {"details": {"complete": True}},
+    }
+    snapshot.bindings["inventory"] = copy.deepcopy(inventory)
+    baseline = plan.fingerprint(snapshot, purpose)
+    refreshed = {
+        "number": 2,
+        "phase": "before_detail",
+        "fields": ["updated_at"],
+        "refreshed": True,
+    }
+    snapshot.bindings["inventory"]["github_coverage"]["identity_observations"] = [refreshed]
+    raw = copy.deepcopy(snapshot.bindings["inventory"])
+    assert plan.fingerprint(snapshot, purpose) == baseline
+    assert snapshot.bindings["inventory"] == raw  # Evidence and diagnostics remain immutable.
+    for failed in (
+        {**refreshed, "fields": ["body"]},
+        {**refreshed, "phase": "during_detail", "refreshed": False},
+        {**refreshed, "refreshed": False},
+    ):
+        snapshot.bindings["inventory"]["github_coverage"]["identity_observations"] = [
+            refreshed,
+            failed,
+        ]
+        assert plan.fingerprint(snapshot, purpose) != baseline
+        assert plan.context(snapshot, purpose)["inventory"]["github_coverage"][
+            "identity_observations"
+        ] == [failed]
+    snapshot.bindings["inventory"] = copy.deepcopy(raw)
+    snapshot.bindings["inventory"]["pulls"][0]["labels"] = ["ready"]
+    assert plan.fingerprint(snapshot, purpose) != baseline
+    snapshot.bindings["inventory"] = copy.deepcopy(raw)
+    snapshot.bindings["inventory"]["pulls"][0]["identity_observations"] = [refreshed]
+    assert plan.fingerprint(snapshot, purpose) != baseline  # No generic remote-key stripping.
+
+
 @pytest.mark.parametrize(
     "inventory", [None, {"complete": False, "unavailable": ["github:offline"]}]
 )

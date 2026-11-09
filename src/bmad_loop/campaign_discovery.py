@@ -357,13 +357,16 @@ class RepositoryDiscovery:
         }
 
     @staticmethod
-    def _same_pull_identity(before: JsonObject, after: JsonObject) -> bool:
-        """Bind scoped evidence to the observed native object and intent revision."""
-        return all(
-            before.get(field) == after.get(field)
+    def _pull_identity_changes(before: JsonObject, after: JsonObject) -> tuple[str, ...]:
+        """Return field names only, never remote bodies or credential-bearing values."""
+        changed = [
+            field
             for field in (
                 "id",
+                "node_id",
                 "number",
+                "url",
+                "html_url",
                 "body",
                 "updated_at",
                 "state",
@@ -371,11 +374,36 @@ class RepositoryDiscovery:
                 "merged_at",
                 "merged",
             )
-            if field in before
-        ) and all(
-            before.get(role, {}).get("sha") == after.get(role, {}).get("sha")
-            for role in ("head", "base")
-        )
+            if field in before and before.get(field) != after.get(field)
+        ]
+        # Unlike optional full-only decorations, a newly supplied native parent
+        # changes the already-expanded link frontier and cannot be absorbed.
+        if before.get("parent_issue_url") != after.get("parent_issue_url"):
+            changed.append("parent_issue_url")
+        for role in ("head", "base"):
+            prior, current = before.get(role, {}), after.get(role, {})
+            for coordinate in ("sha", "ref"):
+                if (coordinate == "sha" or coordinate in prior) and prior.get(
+                    coordinate
+                ) != current.get(coordinate):
+                    changed.append(f"{role}.{coordinate}")
+            if "repo" not in prior:
+                continue
+            prior_repo, current_repo = prior["repo"], current.get("repo")
+            if isinstance(prior_repo, dict) and isinstance(current_repo, dict):
+                changed.extend(
+                    f"{role}.repo.{field}"
+                    for field in ("id", "node_id", "full_name")
+                    if field in prior_repo and prior_repo[field] != current_repo.get(field)
+                )
+            elif prior_repo != current_repo:
+                changed.append(f"{role}.repo")
+        return tuple(changed)
+
+    @staticmethod
+    def _same_pull_identity(before: JsonObject, after: JsonObject) -> bool:
+        """Bind scoped evidence to the observed native object and intent revision."""
+        return not RepositoryDiscovery._pull_identity_changes(before, after)
 
     def _pull_paths(self, row: JsonObject) -> JsonObject:
         """Bind changed paths to exact Git objects or a stable native PR readback."""
@@ -754,7 +782,21 @@ class RepositoryDiscovery:
                     detail_count += 1
                     number = int(row["number"])
                     full = self.gateway.pull(number)
-                    if not self._same_pull_identity(row, full):
+                    changed = self._pull_identity_changes(row, full)
+                    if changed:
+                        github_coverage.setdefault("identity_observations", []).append(
+                            {
+                                "number": number,
+                                "phase": "before_detail",
+                                "fields": list(changed),
+                                "refreshed": changed == ("updated_at",),
+                            }
+                        )
+                    # A newer observation clock alone does not change exact
+                    # paths or body/native-parent linkage. Read all mutable
+                    # metadata/reviews/checks from this fresh detail boundary;
+                    # its final readback below remains strictly version-bound.
+                    if changed and changed != ("updated_at",):
                         raise GithubError("PR identity moved before detail observation")
                     head, base = str(full.get("head", {}).get("sha", "")), str(
                         full.get("base", {}).get("sha", "")
@@ -820,7 +862,16 @@ class RepositoryDiscovery:
                     }
                     detail = {**row, **full, **facts}
                     fresh = self.gateway.pull(number)
-                    if not self._same_pull_identity(full, fresh):
+                    changed = self._pull_identity_changes(full, fresh)
+                    if changed:
+                        github_coverage.setdefault("identity_observations", []).append(
+                            {
+                                "number": number,
+                                "phase": "during_detail",
+                                "fields": list(changed),
+                                "refreshed": False,
+                            }
+                        )
                         raise GithubError("PR identity moved during discovery detail observation")
                     content = facts
                     if scoped:

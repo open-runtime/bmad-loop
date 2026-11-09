@@ -281,6 +281,11 @@ ownership. These immutable ref IDs guide overlap inspection, without checking
 out or running branch code. Canonical target heads are reported separately and
 still pass the ordinary fresh-main integration and publication gates.
 
+Discovery refreshes detailed PR metadata when only its update timestamp has
+changed since path and link classification. Commit, body or lifecycle changes
+still invalidate that classification. Reviews and checks are collected afresh,
+and any identity change during their observation still makes discovery incomplete.
+
 Execution drafts include concrete acceptance criteria and, when available, the
 exact selected native plan or story text with its source hash. An unplanned
 ticket includes only its native product entry; an unplanned sprint story can use

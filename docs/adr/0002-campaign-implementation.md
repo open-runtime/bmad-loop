@@ -846,6 +846,15 @@ GitHub. Keep review bodies, threads and checks complete. This scoped inventory
 supports admission and overlap reasoning; it is not a claim that the whole PR
 received a code review. Required relevant evidence still obeys the detail bounds.
 
+Distinguish a PR's path/link identity from its detailed observation interval.
+Before collecting details, an updated timestamp alone can retain the already
+classified paths and link closure when the native identity, head/base, body and
+lifecycle facts still match. Use the fresh PR metadata and collect fresh review
+and check evidence, accounting for its actual metadata size. Changes during that
+detail interval, including timestamp changes, still invalidate the observation.
+Structural movement remains incomplete and identifies the PR and changed fields;
+never silently narrow scope or substitute stale details.
+
 An inferred body mention such as `audit #22626` is not a native issue identity.
 Record optional unresolved references with their source and target; a 404 means
 not found or inaccessible, not proof of absence or authorization to discard an

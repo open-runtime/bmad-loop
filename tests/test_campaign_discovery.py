@@ -1111,7 +1111,8 @@ def test_legacy_receipt_digest_survives_optional_coverage_extension(project):
 
 
 @pytest.mark.parametrize(
-    "field", ["head", "base", "id", "number", "body", "updated_at", "state", "draft", "merged_at"]
+    "field",
+    ["head", "base", "id", "number", "body", "state", "draft", "merged_at", "parent_issue_url"],
 )
 def test_pr_moving_after_path_classification_cannot_mix_old_and_new_evidence(
     semantic_inventory, field
@@ -1134,10 +1135,10 @@ def test_pr_moving_after_path_classification_cannot_mix_old_and_new_evidence(
                 "id": 999,
                 "number": 999,
                 "body": "New owner intent #900",
-                "updated_at": "2026-11-10T00:00:00Z",
                 "state": "closed",
                 "draft": True,
                 "merged_at": "2026-11-10T00:00:00Z",
+                "parent_issue_url": "https://api.github.com/repos/org/repo/issues/900",
             }[field]
         return result
 
@@ -1149,6 +1150,131 @@ def test_pr_moving_after_path_classification_cannot_mix_old_and_new_evidence(
     assert "github:PR identity moved before detail observation" in receipt.unavailable
     assert calls == [2, 2, 2]
     assert "reviews" not in receipt.pulls[0]
+    assert receipt.github_coverage["identity_observations"] == [
+        {
+            "number": 2,
+            "phase": "before_detail",
+            "fields": [field + ".sha" if field in {"head", "base"} else field],
+            "refreshed": False,
+        }
+    ]
+
+
+@pytest.mark.parametrize("metadata_limit", [64 * 1024 * 1024, 8000])
+def test_pre_detail_clock_refresh_reads_fresh_metadata_and_review_facts(
+    semantic_inventory, metadata_limit
+):
+    repo, _, _, head, gateway = semantic_inventory
+    gateway.items[1]["body"] = ""
+    gateway.prs[2]["body"] = ""
+    original = gateway.pull
+    calls = []
+    labels = [{"id": 17, "name": "hold", "description": "Current owner context " * 1500}]
+
+    def refreshed(number):
+        result = original(number)
+        calls.append(number)
+        if len(calls) >= 3:
+            result.update(updated_at="2026-11-10T00:00:00Z", labels=labels, title="Current title")
+        return result
+
+    gateway.pull = refreshed
+    gateway.reviews = lambda number: [{"id": 11, "state": "CHANGES_REQUESTED", "commit_id": head}]
+    gateway.review_threads = lambda number: [
+        {"id": "T", "isResolved": False, "comments": [{"body": "Fix this"}]}
+    ]
+    gateway.conclusion = "failure"
+    receipt = RepositoryDiscovery(gateway, repo, max_metadata_bytes=metadata_limit).collect(
+        remote="inventory", relevant_paths=("src/shared.py",), detailed_prs=None
+    )
+    assert receipt.github_coverage["identity_observations"] == [
+        {"number": 2, "phase": "before_detail", "fields": ["updated_at"], "refreshed": True}
+    ]
+    metadata = receipt.github_coverage["metadata"]
+    assert metadata["observed_bytes"]["pr_enrichment"] > 30_000
+    if metadata_limit == 8000:
+        assert not receipt.complete and "pr:2:metadata_byte_limit" in receipt.truncated
+        assert metadata["retained_bytes"] <= metadata_limit < metadata["observed_total_bytes"]
+        assert "reviews" not in receipt.pulls[0]
+        assert calls == [2, 2, 2]
+    else:
+        assert receipt.complete, (receipt.unavailable, receipt.truncated)
+        full = receipt.pulls[0]
+        assert full["updated_at"] == "2026-11-10T00:00:00Z"
+        assert full["labels"] == labels and full["title"] == "Current title"
+        assert full["reviews"] == gateway.reviews(2)
+        assert full["review_threads"] == gateway.review_threads(2)
+        assert full["check_runs"][0]["conclusion"] == "failure"
+        assert full["head"]["sha"] == head
+        assert calls == [2, 2, 2, 2]  # One classification and one fresh detail boundary, no retry.
+
+
+def test_pr_clock_change_during_details_still_refuses_mixed_facts(semantic_inventory):
+    repo, _, _, _, gateway = semantic_inventory
+    gateway.items[1]["body"] = ""
+    gateway.prs[2]["body"] = ""
+    original = gateway.pull
+    calls = []
+
+    def moved(number):
+        result = original(number)
+        calls.append(number)
+        if len(calls) >= 4:
+            result["updated_at"] = "2026-11-10T00:00:00Z"
+        return result
+
+    gateway.pull = moved
+    receipt = RepositoryDiscovery(gateway, repo).collect(
+        remote="inventory", relevant_paths=("src/shared.py",), detailed_prs=None
+    )
+    assert calls == [2, 2, 2, 2]
+    assert not receipt.complete
+    assert "github:PR identity moved during discovery detail observation" in receipt.unavailable
+    assert "reviews" not in receipt.pulls[0]
+    assert receipt.github_coverage["identity_observations"] == [
+        {"number": 2, "phase": "during_detail", "fields": ["updated_at"], "refreshed": False}
+    ]
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "node_id",
+        "url",
+        "html_url",
+        "head.ref",
+        "base.ref",
+        "head.repo.id",
+        "base.repo.node_id",
+        "head.repo.full_name",
+    ],
+)
+def test_native_pull_identity_preserves_available_repository_and_ref_coordinates(
+    semantic_inventory, field
+):
+    import copy
+
+    repo, _, _, _, gateway = semantic_inventory
+    before = copy.deepcopy(gateway.prs[2])
+    before.update(
+        node_id="PR_202",
+        url="https://api.github.com/repos/org/repo/pulls/2",
+        html_url="https://github.com/org/repo/pull/2",
+    )
+    for role in ("head", "base"):
+        before[role].update(
+            ref="work" if role == "head" else "main",
+            repo={"id": 1, "node_id": "R_1", "full_name": "org/repo"},
+        )
+    after = copy.deepcopy(before)
+    target = after
+    *parents, leaf = field.split(".")
+    for parent in parents:
+        target = target[parent]
+    target[leaf] = 999 if leaf == "id" else "other identity"
+    discovery = RepositoryDiscovery(gateway, repo)
+    assert discovery._pull_identity_changes(before, after) == (field,)
+    assert not discovery._same_pull_identity(before, after)
 
 
 @pytest.mark.parametrize("value", ["head", "A" * 40, "g" * 40, "a" * 39, "a" * 41])

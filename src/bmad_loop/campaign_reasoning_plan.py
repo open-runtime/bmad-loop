@@ -95,13 +95,32 @@ def context(snapshot, purpose: str) -> dict[str, Any]:
     # The coverage receipt digest includes its observation time. Semantic advice
     # follows the observed facts, not that receipt identity: otherwise each poll
     # invalidates an unchanged, possibly partitioned graph review.
-    inventory = _stable(
-        {
-            key: value
-            for key, value in snapshot.bindings.get("inventory", {}).items()
-            if key != "digest"
-        }
-    )
+    inventory = {
+        key: value
+        for key, value in snapshot.bindings.get("inventory", {}).items()
+        if key != "digest"
+    }
+    coverage = inventory.get("github_coverage")
+    if isinstance(coverage, dict) and isinstance(coverage.get("identity_observations"), list):
+        # A successful clock-only refresh is an observation diagnostic, not a
+        # changed fact. Keep all failures and the fresh PR metadata themselves.
+        coverage = dict(coverage)
+        changes = [
+            row
+            for row in coverage["identity_observations"]
+            if not (
+                isinstance(row, dict)
+                and row.get("phase") == "before_detail"
+                and row.get("fields") == ["updated_at"]
+                and row.get("refreshed") is True
+            )
+        ]
+        if changes:
+            coverage["identity_observations"] = changes
+        else:
+            coverage.pop("identity_observations")
+        inventory["github_coverage"] = coverage
+    inventory = _stable(inventory)
     result = {
         "schema_version": 1,
         "campaign": snapshot.id,

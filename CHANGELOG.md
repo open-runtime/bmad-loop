@@ -17,6 +17,7 @@ breaking changes may land in a minor release.
 
 - Reuse current semantic context within a partition batch while rechecking freshness on each application.
 - Preserve confirmed bootstrap hierarchy records when renewing routes before the first worker.
+- Refresh PR details after timestamp-only metadata changes while retaining structural and observation freshness checks.
 - Fit Paradev sidebar navigation and ownership markers within native tag limits.
 - Normalize managed terminal titles before comparing their native readback.
 - Reuse exact legacy ticket-mirror issues and existing parents before creating campaign hierarchy.
