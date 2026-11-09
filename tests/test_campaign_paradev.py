@@ -63,6 +63,11 @@ class Host:
         if args[:2] == ["workspaces", "update"]:
             row = next(r for r in self.workspaces if r["id"] == args[2])
             tags = [args[i + 1] for i, arg in enumerate(args) if arg == "--tag"]
+            if any(not tag for tag in tags):
+                raise ValueError("Empty --tag is not --clear-tags")
+            if "--clear-tags" in args:
+                assert not tags
+                row["tags"] = ""
             if tags:
                 row["tags"] = ",".join(tags)
             if "--task-id" in args:
@@ -397,13 +402,98 @@ def test_native_registration_window_expires_without_duplicate_actor(provider):
 def test_confirmed_allocation_drops_internal_folder_and_reconciles_pinned_uuid(provider):
     p, host = provider
     binding = p.allocate("unit", "campaign-unit", "Story", "action")
-    assert not any(
-        tag.startswith("zz-bmad-action-") for tag in host.workspaces[0]["tags"].split(",")
-    )
+    assert host.workspaces[0]["tags"] == ""
+    assert host.calls[-1] == [
+        "workspaces",
+        "update",
+        binding.workspace_id,
+        "--local",
+        "--clear-tags",
+    ]
     host.workspaces[0].update(name="Owner rename", tags="factory-desk-side-tasks,owner-folder")
     assert p.reconcile("action") == binding
     assert host.workspaces[0]["name"] == "Owner rename"
     assert host.workspaces[0]["tags"] == "factory-desk-side-tasks,owner-folder"
+
+
+def test_lost_clear_ack_is_confirmed_by_readback_without_duplicate(provider, monkeypatch):
+    """A cleared marker loses search identity, so retries must use the saved UUID."""
+    from bmad_loop.adapters.paradev_runtime import read_private_json
+
+    p, host = provider
+    original = host.cli
+
+    def lose_clear_ack(args):
+        result = original(args)
+        if args[:2] == ["workspaces", "update"]:
+            raise TimeoutError("clear applied, response lost")
+        return result
+
+    monkeypatch.setattr(host, "cli", lose_clear_ack)
+    binding = p.allocate("unit", "campaign-unit", "Story", "action")
+    assert host.workspaces[0]["tags"] == ""
+    assert read_private_json(p._path("action"))["binding"]["workspace_id"] == binding.workspace_id
+    calls = copy.deepcopy(host.calls)
+    assert p.allocate("unit", "campaign-unit", "Story", "action") == binding
+    assert host.calls == calls
+    assert sum(call[:2] == ["workspaces", "create"] for call in host.calls) == 1
+
+
+@pytest.mark.parametrize("lost_reply", [False, True])
+def test_unconfirmed_clear_recovers_pinned_workspace_without_duplicate(
+    provider, monkeypatch, lost_reply
+):
+    """Neither success prose nor timeout proves a clear; reobserve the same workspace."""
+    from bmad_loop.adapters.paradev_runtime import read_private_json
+
+    p, host = provider
+    original = host.cli
+
+    def no_clear(args):
+        if args[:2] == ["workspaces", "update"]:
+            host.calls.append(args)
+            if lost_reply:
+                raise TimeoutError("clear did not apply")
+            return {"id": args[2]}
+        return original(args)
+
+    monkeypatch.setattr(host, "cli", no_clear)
+    with pytest.raises(ReflectionError, match="Temporary create marker removal unconfirmed"):
+        p.allocate("unit", "campaign-unit", "Story", "action")
+    intent = read_private_json(p._path("action"))
+    assert intent["state"] == "confirmed"
+    assert intent["tag"] in host.workspaces[0]["tags"]
+    monkeypatch.setattr(host, "cli", original)
+    binding = p.allocate("unit", "campaign-unit", "Story", "action")
+    assert binding.workspace_id == intent["binding"]["workspace_id"]
+    assert host.workspaces[0]["tags"] == ""
+    assert sum(call[:2] == ["workspaces", "create"] for call in host.calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("code", "detail"),
+    [
+        ("CLI_FAILED", "HostError (CLI_FAILED)"),
+        ("CLI_FAILED credential=private", "HostError"),
+        ("CLI_" + "X" * 100, "HostError"),
+        (None, "HostError"),
+    ],
+)
+def test_marker_failure_retains_only_bounded_public_host_code(provider, monkeypatch, code, detail):
+    from bmad_loop.adapters.paradev_host import HostError
+
+    p, host = provider
+    original = host.cli
+
+    def refuse_clear(args):
+        if args[:2] == ["workspaces", "update"]:
+            raise HostError(code)
+        return original(args)
+
+    monkeypatch.setattr(host, "cli", refuse_clear)
+    with pytest.raises(ReflectionError) as caught:
+        p.allocate("unit", "campaign-unit", "Story", "action")
+    assert str(caught.value) == "Temporary create marker removal unconfirmed: " + detail
 
 
 def test_lost_ack_keeps_marker_until_exact_identity_is_saved(provider):
@@ -417,6 +507,16 @@ def test_lost_ack_keeps_marker_until_exact_identity_is_saved(provider):
     binding = p.reconcile("action")
     assert binding.workspace_id == host.workspaces[0]["id"]
     assert host.workspaces[0]["tags"] == "factory-desk-side-tasks,owner-folder"
+    assert host.calls[-1] == [
+        "workspaces",
+        "update",
+        binding.workspace_id,
+        "--local",
+        "--tag",
+        "factory-desk-side-tasks",
+        "--tag",
+        "owner-folder",
+    ]
 
 
 def test_pinned_uuid_cannot_be_replaced_by_foreign_row_with_old_marker(provider):

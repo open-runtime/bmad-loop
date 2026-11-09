@@ -1443,6 +1443,12 @@ Before allocation, validate the project's configured worktree base against the
 owner's allowed root. The standalone provider also uses an explicit worktree
 root; neither provider silently allocates beneath a run folder or temporary path.
 
+Remove temporary allocation tags only after the workspace UUID and Git identity
+are durable. Preserve remaining operator tags; use the host's explicit
+`--clear-tags` command when no tags remain, rather than an empty `--tag` value.
+Read back the resulting set after success or an uncertain acknowledgement, and
+recover through the pinned workspace identity without creating a replacement.
+
 One actual worker PTY is attached once. Persist workspace/terminal/pane/tab and
 native provider session mappings independently; hook read-back, not a terminal
 title, proves native agent attribution. Pending/unknown attribution is visible.
