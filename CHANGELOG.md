@@ -7,6 +7,8 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+## [0.15.4] — 2026-11-08
+
 ### Fixed
 
 - Preserve pool fallback after capacity-command spawn failures and pass through suppressed stage receipts.
@@ -7012,7 +7014,8 @@ enforced in CI.
   implementation phase, driven by a Python control loop with hook-based session transport and
   resumable on-disk run state.
 
-[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.15.3...HEAD
+[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.15.4...HEAD
+[0.15.4]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.15.4
 [0.15.3]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.15.3
 [0.15.2]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.15.2
 [0.15.1]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.15.1
