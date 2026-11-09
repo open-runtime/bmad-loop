@@ -7,6 +7,8 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+## [0.15.6] — 2026-11-08
+
 ### Fixed
 
 - Wait for managed messaging schema initialization before opening concurrent readers.
@@ -7029,7 +7031,8 @@ enforced in CI.
   implementation phase, driven by a Python control loop with hook-based session transport and
   resumable on-disk run state.
 
-[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.15.5...HEAD
+[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.15.6...HEAD
+[0.15.6]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.15.6
 [0.15.5]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.15.5
 [0.15.4]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.15.4
 [0.15.3]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.15.3
