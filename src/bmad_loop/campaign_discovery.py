@@ -3,6 +3,11 @@
 Worktree/ref observations are evidence, never leases. No inspected branch is
 checked out or executed, and archived roots must be explicitly supplied. Missing
 or truncated coverage is carried in the receipt and prevents a 'new work' claim.
+
+Finite ownership scopes retain global issue/PR intent and every changed-file
+identity, while patch text covers selected paths (either side of a rename).
+Scoped patch omission is explicit; this inventory is not a full code review.
+Reviews, threads and check observations remain complete for expanded PRs.
 """
 
 from __future__ import annotations
@@ -12,7 +17,7 @@ import json
 import os
 import re
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal
 
@@ -36,9 +41,14 @@ class CoverageReceipt:
     local_refs: tuple[JsonObject, ...]
     worktrees: tuple[JsonObject, ...]
     archives: tuple[JsonObject, ...] = ()
+    github_coverage: JsonObject = field(default_factory=dict)
 
     def to_dict(self) -> JsonObject:
-        return asdict(self)
+        result = asdict(self)
+        if not self.github_coverage:
+            # Preserve the digest of receipts saved before this optional field.
+            result.pop("github_coverage")
+        return result
 
     @property
     def digest(self) -> str:
@@ -135,6 +145,7 @@ class RepositoryDiscovery:
         *,
         clock: Callable[[], float] = time.time,
         max_detail_bytes: int = 1_000_000,
+        max_metadata_bytes: int = 64 * 1024 * 1024,
         cache: dict[str, str] | None = None,
         max_cache_entries: int = 64,
         max_cache_bytes: int = 8_000_000,
@@ -143,6 +154,9 @@ class RepositoryDiscovery:
         self.repo = repo.resolve()
         self.clock = clock
         self.max_detail_bytes = max_detail_bytes
+        if type(max_metadata_bytes) is not int or max_metadata_bytes < 1:
+            raise ValueError("GitHub metadata byte limit must be a positive integer")
+        self.max_metadata_bytes = max_metadata_bytes
         self.cache = cache if cache is not None else {}
         self.max_cache_entries = max_cache_entries
         self.max_cache_bytes = max_cache_bytes
@@ -180,46 +194,291 @@ class RepositoryDiscovery:
         )
 
     def _bounded_metadata(
-        self, rows: list[JsonObject], label: str, truncated: list[str]
+        self, rows: list[JsonObject], label: str, truncated: list[str], *, limit: int | None = None
     ) -> list[JsonObject]:
         selected: list[JsonObject] = []
         size = 0
         for row in rows:
             size += len(json.dumps(row).encode())
-            if size > self.max_detail_bytes * 4:
+            if size > (self.max_metadata_bytes if limit is None else limit):
                 truncated.append(label + ":metadata_byte_limit")
                 break
             selected.append(row)
         return selected
 
+    def _metadata(self, issues, pulls, truncated):
+        """Apply one visible bound without rewriting any public object fields."""
+        original = {"issues": len(issues), "pulls": len(pulls)}
+        sizes = {
+            "issues": sum(len(json.dumps(row).encode()) for row in issues),
+            "pulls": sum(len(json.dumps(row).encode()) for row in pulls),
+        }
+        issues = self._bounded_metadata(issues, "issues", truncated)
+        remaining = self.max_metadata_bytes - sum(len(json.dumps(row).encode()) for row in issues)
+        pulls = self._bounded_metadata(pulls, "pulls", truncated, limit=remaining)
+        return (
+            issues,
+            pulls,
+            {
+                "limit_bytes": self.max_metadata_bytes,
+                "observed_rows": original,
+                "observed_bytes": sizes,
+                "retained_rows": {"issues": len(issues), "pulls": len(pulls)},
+            },
+        )
+
     def _linked(
-        self, issues: list[JsonObject], pulls: list[JsonObject], truncated: list[str]
-    ) -> None:
-        """Expand exact repository references, including closed work outside the window."""
+        self,
+        issues: list[JsonObject],
+        pulls: list[JsonObject],
+        truncated: list[str],
+        *,
+        seeds: set[int] | None = None,
+    ) -> JsonObject:
+        """Observe a declared closure; inferred missing references never imply absence.
+
+        The caller first obtains complete fresh repository issue/PR collections.
+        Explicit selected/mapped objects and native parents remain required;
+        only inferred body references may record an ambiguous HTTP404.
+        """
         known = {row["number"]: row for row in (*issues, *pulls)}
         scanned: set[int] = set()
-        fetched = 0
-        while pending := [row for number, row in known.items() if number not in scanned]:
+        reachable = set(known) if seeds is None else set(seeds)
+        if seeds is not None:
+            reachable.update(
+                number for number, row in known.items() if seeds.intersection(self._references(row))
+            )
+        attempted: set[int] = set()
+        missing: set[int] = set()
+        coverage: JsonObject = {
+            "mode": "all_observed_bodies" if seeds is None else "selected_frontier",
+            "seeds": sorted(known if seeds is None else seeds),
+            "attempt_limit": 64,
+            "attempted": 0,
+            "not_found_or_inaccessible": 0,
+        }
+        while pending := [
+            row for number, row in known.items() if number in reachable and number not in scanned
+        ]:
             for row in pending:
                 scanned.add(row["number"])
-                for number in self._references(row):
+                row["discovery_link_coverage"] = "expanded_body_and_native_parent_references"
+                references = {number: "inferred_body" for number in self._references(row)}
+                if row.get("parent_issue_url"):
+                    match = re.fullmatch(
+                        rf"https://api\.github\.com/{re.escape(self.gateway.root)}/issues/([1-9][0-9]*)",
+                        row["parent_issue_url"],
+                    )
+                    if match is None:
+                        raise GithubError("Native parent issue identity is outside the repository")
+                    references[int(match[1])] = "native_parent"
+                for number, kind in references.items():
                     if number in known:
                         known[number]["discovery_linked"] = True
+                        reachable.add(number)
                         continue
-                    if fetched >= 64:
+                    if number in missing:
+                        if kind == "native_parent":
+                            raise GithubError(
+                                "Required native parent issue is inaccessible", status=404
+                            )
+                        row.setdefault("discovery_reference_observations", []).append(
+                            {
+                                "source": row["number"],
+                                "number": number,
+                                "kind": kind,
+                                "status": "not_found_or_inaccessible",
+                                "http_status": 404,
+                            }
+                        )
+                        continue
+                    if len(attempted) >= 64:
                         truncated.append("github:linked_object_limit")
-                        return
-                    item = self.gateway.issue(number)
+                        return {
+                            **coverage,
+                            "attempted": len(attempted),
+                            "scanned": len(scanned),
+                            "not_found_or_inaccessible": len(missing),
+                            "unexpanded": len(known) - len(scanned),
+                        }
+                    attempted.add(number)
+                    try:
+                        item = self.gateway.issue(number)
+                    except GithubError as exc:
+                        if exc.status != 404 or kind != "inferred_body":
+                            raise
+                        missing.add(number)
+                        row.setdefault("discovery_reference_observations", []).append(
+                            {
+                                "source": row["number"],
+                                "number": number,
+                                "kind": kind,
+                                "status": "not_found_or_inaccessible",
+                                "http_status": 404,
+                            }
+                        )
+                        continue
                     if item.get("number") != number or not item.get("id"):
                         raise GithubError("Linked issue/PR native identity is unavailable")
-                    fetched += 1
                     if "pull_request" in item:
                         item = self.gateway.pull(number)
+                        if item.get("number") != number or not item.get("id"):
+                            raise GithubError("Linked PR native identity is unavailable")
                         pulls.append(item)
                     else:
                         issues.append(item)
                     item["discovery_linked"] = True
                     known[number] = item
+                    reachable.add(number)
+        for number, row in known.items():
+            if number not in scanned:
+                row["discovery_link_coverage"] = "not_expanded_outside_selected_frontier"
+        return {
+            **coverage,
+            "attempted": len(attempted),
+            "scanned": len(scanned),
+            "not_found_or_inaccessible": len(missing),
+            "unexpanded": len(known) - len(scanned),
+        }
+
+    @staticmethod
+    def _same_pull_identity(before: JsonObject, after: JsonObject) -> bool:
+        """Bind scoped evidence to the observed native object and intent revision."""
+        return all(
+            before.get(field) == after.get(field)
+            for field in (
+                "id",
+                "number",
+                "body",
+                "updated_at",
+                "state",
+                "draft",
+                "merged_at",
+                "merged",
+            )
+            if field in before
+        ) and all(
+            before.get(role, {}).get("sha") == after.get(role, {}).get("sha")
+            for role in ("head", "base")
+        )
+
+    def _pull_paths(self, row: JsonObject) -> JsonObject:
+        """Bind changed paths to exact Git objects or a stable native PR readback."""
+        number = row["number"]
+        head, base = row.get("head", {}).get("sha", ""), row.get("base", {}).get("sha", "")
+        if not all(
+            isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha)
+            for sha in (head, base)
+        ):
+            raise GithubError("PR path inventory lacks exact head/base identity")
+
+        def observe():
+            if all(
+                re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha)
+                and git_bytes(self.repo, "cat-file", "-e", sha + "^{commit}").returncode == 0
+                for sha in (base, head)
+            ):
+                bases = self._git(["merge-base", "--all", base, head]).splitlines()
+                if not bases:
+                    raise GithubError("PR paths lack a merge base")
+                names = set()
+                for ancestor in bases:
+                    names.update(
+                        path
+                        for path in self._git(
+                            [
+                                "diff",
+                                "--no-renames",
+                                "--name-only",
+                                "-z",
+                                "--no-ext-diff",
+                                "--no-textconv",
+                                ancestor,
+                                head,
+                                "--",
+                            ]
+                        ).split("\0")
+                        if path
+                    )
+                return {
+                    "head": head,
+                    "base": base,
+                    "merge_bases": sorted(bases),
+                    "changed_paths": sorted(names),
+                    "source": "exact_local_git_objects",
+                }
+            full = self.gateway.pull(number)
+            if not self._same_pull_identity(row, full):
+                raise GithubError("PR identity moved before file classification")
+            files = self.gateway.files(number)
+            if len(files) >= 3000 or len(files) < full.get("changed_files", len(files)):
+                raise GithubError("PR file classification is incomplete")
+            names = set()
+            for item in files:
+                if not isinstance(item.get("filename"), str) or not item["filename"]:
+                    raise GithubError("PR file classification has no filename")
+                names.add(item["filename"])
+                if item.get("status") == "renamed":
+                    if (
+                        not isinstance(item.get("previous_filename"), str)
+                        or not item["previous_filename"]
+                    ):
+                        raise GithubError("PR rename classification lacks its source path")
+                    names.add(item["previous_filename"])
+            fresh = self.gateway.pull(number)
+            if not self._same_pull_identity(full, fresh):
+                raise GithubError("PR identity moved during file classification")
+            return {
+                "head": head,
+                "base": base,
+                "changed_paths": sorted(names),
+                "source": "github_files_with_identity_readback",
+            }
+
+        result = self._cached("pr-changed-paths", (str(number), head, base), observe)
+        if len(json.dumps(result).encode()) > self.max_detail_bytes:
+            raise GithubError("PR path classification exceeds its byte bound")
+        return result
+
+    @staticmethod
+    def _scoped_file_patches(
+        files: list[JsonObject], paths: tuple[str, ...]
+    ) -> tuple[list[JsonObject], JsonObject]:
+        """Keep file identities intact and disclose patches outside ownership."""
+        projected, retained, omitted, unavailable = [], [], [], []
+        omitted_bytes = 0
+        for item in files:
+            name = item.get("filename")
+            previous = item.get("previous_filename")
+            if not isinstance(name, str) or not name:
+                raise GithubError("PR file details lack a filename")
+            if item.get("status") == "renamed" and (not isinstance(previous, str) or not previous):
+                raise GithubError("PR file details lack a rename source path")
+            relevant = any(
+                changed == path or changed.startswith(path + "/")
+                for changed in (name, previous)
+                if isinstance(changed, str)
+                for path in paths
+            )
+            result = dict(item)
+            if "patch" not in item:
+                unavailable.append(name)
+            elif relevant:
+                retained.append(name)
+            else:
+                omitted.append(name)
+                omitted_bytes += len(str(result.pop("patch")).encode())
+            projected.append(result)
+        return projected, {
+            "mode": "selected_owned_paths",
+            "selected_paths": list(paths),
+            "changed_file_count": len(files),
+            "retained_patch_files": retained,
+            "omitted_patch_files": omitted,
+            "omitted_patch_bytes": omitted_bytes,
+            "native_patch_unavailable_files": unavailable,
+            "full_code_review": False,
+        }
 
     def _observe_ref(self, remote: str, ref: str, sha: str) -> str:
         if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha) or not ref.startswith("refs/heads/"):
@@ -350,6 +609,7 @@ class RepositoryDiscovery:
         remote: str = "origin",
         recent_since: str = "",
         mapped_prs: tuple[int, ...] = (),
+        selected_issues: tuple[int, ...] = (),
         detailed_prs: tuple[int, ...] | None = (),
         archive_roots: tuple[Path, ...] = (),
         target: str = "main",
@@ -362,6 +622,13 @@ class RepositoryDiscovery:
         common = (self.repo / self._git(["rev-parse", "--git-common-dir"]).strip()).resolve()
         issues: list[JsonObject] = []
         pulls: list[JsonObject] = []
+        github_coverage: JsonObject = {}
+        paths = tuple(sorted({path.rstrip("/") for path in relevant_paths}))
+        scoped = (
+            detailed_prs is None
+            and bool(paths)
+            and not any(path in {"*", ".", ""} for path in paths)
+        )
         try:
             issues = self.gateway.issues()
             pulls = self.gateway.pulls()
@@ -372,23 +639,108 @@ class RepositoryDiscovery:
             for number in mapped_prs:
                 if number not in known:
                     pulls.append(self.gateway.pull(number))
-            self._linked(issues, pulls, truncated)
-            issues = self._bounded_metadata(issues, "issues", truncated)
-            pulls = self._bounded_metadata(pulls, "pulls", truncated)
+                    known.add(number)
+            known_issues = {int(row["number"]) for row in issues}
+            for number in selected_issues:
+                if number not in known_issues:
+                    item = self.gateway.issue(number)
+                    if item.get("number") != number or not item.get("id") or "pull_request" in item:
+                        raise GithubError("Selected issue native identity is unavailable")
+                    issues.append(item)
+                    known_issues.add(number)
+            issues, pulls, github_coverage["metadata"] = self._metadata(issues, pulls, truncated)
+            if truncated:
+                raise GithubError("Global GitHub metadata coverage exceeds its byte bound")
+            seeds = set(selected_issues) | set(mapped_prs)
+            if scoped:
+                overlap = 0
+                historical_overlap = 0
+                for row in pulls:
+                    classified = self._pull_paths(row)
+                    relevant = any(
+                        changed == path or changed.startswith(path + "/")
+                        for changed in classified["changed_paths"]
+                        for path in paths
+                    )
+                    row["discovery_path_coverage"] = {
+                        **classified,
+                        "selected_paths": list(paths),
+                        "overlaps": relevant,
+                    }
+                    if relevant:
+                        overlap += 1
+                        if row.get("state") == "closed" and (
+                            row.get("merged") is True or row.get("merged_at")
+                        ):
+                            historical_overlap += 1
+                        else:
+                            seeds.add(row["number"])
+                github_coverage["pr_paths"] = {
+                    "mode": "all_open_and_recent_exact_changed_paths",
+                    "classified": len(pulls),
+                    "overlapping": overlap,
+                    "historical_merged_overlapping": historical_overlap,
+                    "outside_selected_paths": len(pulls) - overlap,
+                }
+            github_coverage["links"] = self._linked(
+                issues,
+                pulls,
+                truncated,
+                seeds=seeds if scoped else None,
+            )
+            if scoped:
+                # A selected link can discover a PR outside the recent window.
+                for row in pulls:
+                    if "discovery_path_coverage" not in row:
+                        classified = self._pull_paths(row)
+                        row["discovery_path_coverage"] = {
+                            **classified,
+                            "selected_paths": list(paths),
+                            "overlaps": any(
+                                changed == path or changed.startswith(path + "/")
+                                for changed in classified["changed_paths"]
+                                for path in paths
+                            ),
+                        }
+                github_coverage["pr_paths"]["linked_outside_initial_collection"] = (
+                    len(pulls) - github_coverage["pr_paths"]["classified"]
+                )
+            issues, pulls, github_coverage["metadata"] = self._metadata(issues, pulls, truncated)
+            metadata = github_coverage["metadata"]
+            retained_metadata_bytes = sum(
+                len(json.dumps(row).encode()) for row in (*issues, *pulls)
+            )
+            if scoped:
+                metadata.update(retained_bytes=retained_metadata_bytes, file_metadata_rows=0)
+                metadata["observed_bytes"].update(pr_enrichment=0, file_metadata=0)
             issues_by_number = {row["number"]: row for row in issues}
             detailed: list[JsonObject] = []
             detail_bytes = 0
+            detail_count = 0
             for row in pulls:
                 if (
                     detailed_prs is None
                     and (
-                        row.get("state", "open") == "open"
-                        or row["number"] in mapped_prs
-                        or row.get("discovery_linked")
+                        (
+                            scoped
+                            and row.get("discovery_link_coverage")
+                            == "expanded_body_and_native_parent_references"
+                        )
+                        or (
+                            not scoped
+                            and (
+                                row.get("state", "open") == "open"
+                                or row["number"] in mapped_prs
+                                or row.get("discovery_linked")
+                            )
+                        )
                     )
                 ) or (detailed_prs is not None and row["number"] in detailed_prs):
+                    detail_count += 1
                     number = int(row["number"])
                     full = self.gateway.pull(number)
+                    if not self._same_pull_identity(row, full):
+                        raise GithubError("PR identity moved before detail observation")
                     head, base = str(full.get("head", {}).get("sha", "")), str(
                         full.get("base", {}).get("sha", "")
                     )
@@ -401,8 +753,38 @@ class RepositoryDiscovery:
                     )
                     if len(files) < full.get("changed_files", len(files)) or len(files) >= 3000:
                         truncated.append(f"pr:{row['number']}:files")
-                    detail = {
-                        **full,
+                    patch_coverage = None
+                    file_metadata = []
+                    if scoped:
+                        files, patch_coverage = self._scoped_file_patches(files, paths)
+                        file_metadata = [
+                            {key: value for key, value in item.items() if key != "patch"}
+                            for item in files
+                        ]
+                        enrichment_bytes = len(json.dumps({**row, **full}).encode()) - len(
+                            json.dumps(row).encode()
+                        )
+                        file_metadata_bytes = len(json.dumps(file_metadata).encode())
+                        metadata["observed_bytes"]["pr_enrichment"] += enrichment_bytes
+                        metadata["observed_bytes"]["file_metadata"] += file_metadata_bytes
+                        metadata["observed_total_bytes"] = sum(metadata["observed_bytes"].values())
+                        metadata["file_metadata_rows"] += len(file_metadata)
+                        if (
+                            retained_metadata_bytes + enrichment_bytes + file_metadata_bytes
+                            > self.max_metadata_bytes
+                        ):
+                            truncated.append(f"pr:{number}:metadata_byte_limit")
+                            detailed.append(
+                                {
+                                    **row,
+                                    "details_truncated": True,
+                                    "discovery_detail_coverage": "metadata_byte_limit",
+                                }
+                            )
+                            continue
+                        retained_metadata_bytes += enrichment_bytes + file_metadata_bytes
+                        metadata["retained_bytes"] = retained_metadata_bytes
+                    facts = {
                         "changed_files_detail": files,
                         "reviews": self.gateway.reviews(row["number"]),
                         "review_threads": self.gateway.review_threads(row["number"]),
@@ -419,29 +801,91 @@ class RepositoryDiscovery:
                             if number in issues_by_number
                         ],
                         "link_coverage": "explicit_repository_body_references",
+                        **({"patch_coverage": patch_coverage} if patch_coverage else {}),
                     }
+                    detail = {**row, **full, **facts}
                     fresh = self.gateway.pull(number)
-                    if any(
-                        fresh.get(field) != full.get(field)
-                        for field in ("head", "base", "updated_at", "state", "draft", "merged")
-                    ):
+                    if not self._same_pull_identity(full, fresh):
                         raise GithubError("PR identity moved during discovery detail observation")
-                    if len(json.dumps(detail).encode()) > self.max_detail_bytes:
+                    content = facts
+                    if scoped:
+                        # Public file metadata and linked issue rows are already
+                        # indexed in the shared metadata budget. Charge their
+                        # references and selected patches as expansion content.
+                        content = {
+                            **facts,
+                            "changed_files_detail": [
+                                {"filename": item["filename"], "patch": item["patch"]}
+                                for item in files
+                                if "patch" in item
+                            ],
+                            "linked_issues": [
+                                {"id": item["id"], "number": item["number"]}
+                                for item in facts["linked_issues"]
+                            ],
+                        }
+                    observed_bytes = len(json.dumps(content).encode())
+                    metadata_detail = {
+                        **row,
+                        **full,
+                        **(
+                            {
+                                "changed_files_detail": file_metadata,
+                                "patch_coverage": patch_coverage,
+                            }
+                            if scoped
+                            else {}
+                        ),
+                    }
+                    if observed_bytes > self.max_detail_bytes:
                         truncated.append(f"pr:{row['number']}:detail")
                         # Metadata remains useful; oversized content is visibly unavailable.
                         detail = {
-                            **full,
+                            **metadata_detail,
                             "details_truncated": True,
-                            "changed_paths": [f["filename"] for f in files],
+                            "changed_paths": sorted(
+                                {
+                                    name
+                                    for item in files
+                                    for name in (item["filename"], item.get("previous_filename"))
+                                    if name
+                                }
+                            ),
                         }
-                    detail_bytes += len(json.dumps(detail).encode())
+                    detail_bytes += observed_bytes
                     if detail_bytes > self.max_detail_bytes * 4:
-                        truncated.append("github:pr_detail_byte_limit")
-                        detail = {**full, "details_truncated": True}
+                        if "github:pr_detail_byte_limit" not in truncated:
+                            truncated.append("github:pr_detail_byte_limit")
+                        detail = {**metadata_detail, "details_truncated": True}
                     detailed.append(detail)
                 else:
-                    detailed.append(row)
+                    detailed.append(
+                        {
+                            **row,
+                            "discovery_detail_coverage": (
+                                "metadata_paths_ancestry_only_historical_merged"
+                                if scoped
+                                and row.get("state") == "closed"
+                                and (row.get("merged") is True or row.get("merged_at"))
+                                else "metadata_only_outside_selected_frontier"
+                            ),
+                        }
+                        if scoped
+                        else row
+                    )
             pulls = detailed
+            github_coverage["details"] = {
+                "mode": "selected_and_path_related" if scoped else "broad_or_explicit",
+                "detailed": detail_count,
+                "metadata_only": len(pulls) - detail_count,
+                "observed_bytes": detail_bytes,
+                "limit_bytes": self.max_detail_bytes * 4,
+                "byte_scope": (
+                    "selected_patches_reviews_threads_checks_and_references"
+                    if scoped
+                    else "expanded_facts"
+                ),
+            }
         except GithubError as exc:
             unavailable.append(f"github:{exc}")
         remote_refs: list[JsonObject] = []
@@ -533,10 +977,15 @@ class RepositoryDiscovery:
                 "common_dir_refs_worktrees",
                 "explicit_archive_manifests",
                 "relevant_branch_diffs_commits",
-                "explicit_linked_objects",
+                "selected_linked_objects" if scoped else "explicit_linked_objects",
+                *(
+                    ("all_pr_changed_paths", "unrelated_body_closures_not_expanded")
+                    if scoped
+                    else ()
+                ),
                 *(("recent_closed_prs",) if recent_since else ()),
                 *(
-                    ("active_pr_diffs_reviews",)
+                    (("relevant_pr_diffs_reviews",) if scoped else ("active_pr_diffs_reviews",))
                     if detailed_prs is None
                     else ("selected_pr_details",) if detailed_prs else ()
                 ),
@@ -550,6 +999,7 @@ class RepositoryDiscovery:
             tuple(local_refs),
             tuple(worktrees),
             tuple(archives),
+            github_coverage,
         )
 
     def inspect_branch(

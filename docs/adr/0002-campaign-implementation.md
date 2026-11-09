@@ -1,9 +1,9 @@
 # ADR 0002 implementation contract
 
-- **Status:** Source qualification complete; installation and target-project activation required
+- **Status:** Implemented; release-specific qualification and target-project delivery remain gated
 - **Date:** 2026-11-05
 - **Parent:** [Native SDLC campaign](0002-native-sdlc-campaign.md)
-- **Delivery:** One bmad-loop PR, including code, tests, documentation and local deployment tooling
+- **Delivery:** Initial campaign PR and reviewed follow-up releases preserve the same delivery contract
 
 This contract resolves implementation choices in ADR 0002. The experimental
 campaign implements these boundaries above the existing serial engines; integrated
@@ -15,24 +15,29 @@ extends this work without weakening its acceptance or publication gates.
 
 ## Implementation goals and traceability
 
-The prior review-ready candidate established the historical G0–G8 foundation below. The
-accepted delivery extension additionally requires the following concrete work.
+The initial implementation and released follow-ups established the historical
+G0–G8 foundation below. The delivery goals distinguish established qualification
+from checks that each changed release and target-project pilot must still satisfy.
 The owner's administrative-publication decision supersedes this ADR's strict-only
 REM activation requirement; strict and queue modes retain their existing contracts.
 
-| Delivery goal                                | Implementation and acceptance                                                                                                                                                                                              | Status                                                                                               |
-| -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| D1 — Hold and route admission                | Headless hold before preparation/launch; inherited developer; shared frozen launcher/permission readiness; standalone writer capabilities; no attempt charge while unavailable; old snapshot compatibility                 | Implemented; focused regressions and ablations passed                                                |
-| D2 — Owner-authorized publication            | Repository-bound opt-in; ordinary exact-head GitHub merge with authorized administrative fallback; no independent GitHub approver requirement; durable uncertain execution and landing verification/repair before tracking | Implemented and regression tested; real target delivery pending                                      |
-| D3 — Native routes and writable continuation | Qualify enabled Claude/Codex/Grok/AGY/Muse model/effort/permission recipes; real writable Claude↔Codex continuation; installation-bound proofs                                                                             | Eight route recipes and both native writable continuation stages qualified; installed proofs pending |
-| D4 — Managed communication                   | Own actor per unit/job; factual bridge status; durable safe-boundary steering; accepting/closing/closed generations; no identity borrowing or reopened writers; Paradev bindings                                           | Implemented; actual isolated hcom and scripted managed-load qualification passed                     |
-| D5 — Final candidate qualification           | Full suite, type/lint/package checks, 48 stories/24 epics/eight verification slots with managed communication, two independent candidate-bound reviews                                                                     | Frozen managed load, package and scoped reviews passed; final regression fixture repairs pending     |
-| D6 — Deployment and REM delivery             | History-preserving PR merge, exact fork installation and canonical base, refreshed fork setup skill, controlled two-epic real delivery, verified automation responsibility and concurrency configuration                   | Pending qualification                                                                                |
+| Delivery goal                                | Implementation and acceptance                                                                                                                                                                                              | Status                                                                                                                                                                      |
+| -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| D1 — Hold and route admission                | Headless hold before preparation/launch; inherited developer; shared frozen launcher/permission readiness; standalone writer capabilities; no attempt charge while unavailable; old snapshot compatibility                 | Implemented; focused regressions and ablations passed                                                                                                                       |
+| D2 — Owner-authorized publication            | Repository-bound opt-in; ordinary exact-head GitHub merge with authorized administrative fallback; no independent GitHub approver requirement; durable uncertain execution and landing verification/repair before tracking | Implemented and regression tested; real target delivery requires separate activation evidence                                                                               |
+| D3 — Native routes and writable continuation | Qualify enabled Claude/Codex/Grok/AGY/Muse model/effort/permission recipes; real writable Claude↔Codex continuation; installation-bound proofs                                                                             | Nine installed tool grants and retained no-tools semantic routes qualified; both native writable directions demonstrated; changed installation-bound grants require renewal |
+| D4 — Managed communication                   | Own actor per unit/job; factual bridge status; durable safe-boundary steering; accepting/closing/closed generations; no identity borrowing or reopened writers; Paradev bindings                                           | Implemented; actual isolated hcom and scripted managed-load qualification passed                                                                                            |
+| D5 — Final candidate qualification           | Full suite, type/lint/package checks, 48 stories/24 epics/eight verification slots with managed communication, two independent candidate-bound reviews                                                                     | Prior suite, load, package and review checkpoints passed; every follow-up candidate requires applicable affected checks and independent review                              |
+| D6 — Deployment and REM delivery             | History-preserving PR merge, exact fork installation and canonical base, refreshed fork setup skill, controlled two-epic real delivery, verified automation responsibility and concurrency configuration                   | Merged installation and generic onboarding demonstrated; each release and target require applicable renewal and selected delivery evidence                                  |
 
 The completion contract includes
 accepted reviews, synchronization with main, history-preserving merge, exact-commit
 installation, canonical-base update and qualified REM activation. Do not mark the
 ultimate objective complete at the review-ready boundary.
+Renew only proofs invalidated by an installed path, dependency or contract change;
+validate unchanged retained semantic evidence without repeating its inference.
+Installed startup readiness does not establish actual parallel target delivery,
+identity reflection, outside-peer communication or live-worker drain/resume.
 
 ### Accepted completion extension — 2026-11-08
 
@@ -808,6 +813,39 @@ selected renames. Empty or repository-wide planning scopes retain full inspectio
 genuinely oversized relevant evidence remains explicitly incomplete. GitHub may
 paginate through numeric repository URLs: bind that ID to the selected repository
 metadata and preserve the original endpoint and query scope on every page.
+
+Repository metadata and selected detail have separate budgets. Preserve complete
+issue and PR identities, bodies and public object shapes within the frozen
+`github.inventory_metadata_bytes` allowance (64 MiB by default), counting the
+combined issue/PR inventory and linked additions. Finite selected-path discovery
+also counts complete patchless PR file metadata after detail enrichment here,
+while selected patches, review bodies, threads and checks consume the unchanged
+per-PR and aggregate detail bounds. Broad or explicitly listed-PR discovery keeps
+its complete expanded file facts in the detail budget.
+Record observed bytes and the allowance. This is a finite observation budget, not a model context allowance or
+a bound on process memory. Exceeding it remains an explicit incomplete observation;
+do not silently clip bodies or report omitted rows as complete coverage.
+
+For finite selected paths, classify open and recent PRs by exact changed paths,
+including both sides of renames and conservative merge-base coverage. Retain
+global metadata while expanding links and review/check details for selected
+issues, mapped PRs, path-related PRs and links connecting that work. A title alone
+cannot exclude a candidate. Broad planning retains broad inspection. The receipt
+states which unrelated link closures were not expanded, so scoped completeness
+does not imply an exhaustive recursive audit of every historical conversation.
+Retain every detailed PR file identity, status and rename source, but expand patch
+text only for the declared paths (including either endpoint of a rename). Record
+the selected paths, omitted patch paths and bytes, and patches unavailable from
+GitHub. Keep review bodies, threads and checks complete. This scoped inventory
+supports admission and overlap reasoning; it is not a claim that the whole PR
+received a code review. Required relevant evidence still obeys the detail bounds.
+
+An inferred body mention such as `audit #22626` is not a native issue identity.
+Record optional unresolved references with their source and target; a 404 means
+not found or inaccessible, not proof of absence or authorization to discard an
+obligation. Deduplicate these observations and count failed lookups toward the
+request budget. Required selected/mapped objects, native hierarchy links and
+authentication, transport or other observation failures retain their holds.
 Bound commit-ID retrieval with an overflow sentinel and measure immutable object
 sizes before loading formatted history. A limit on retained JSON alone does not
 bound Git's captured output; oversized histories or individual commits must remain
@@ -868,6 +906,50 @@ External publishers do not participate in local claims; a new competing PR can
 appear after discovery. Periodic reconciliation catches that overlap and holds
 affected publication. Do not promise global duplicate exclusion across humans,
 other hosts and independent schedulers.
+
+Commits pushed by a bot or collaborator to an already-owned PR are new candidate
+inputs, not permission to overwrite either history. Bind the observation to the
+exact repository, PR/node identity, branch, authenticated remote checkpoint,
+local/remote heads and graph/config/source revisions. Reconcile pending push
+effects and wait for the affected writer to settle before scoped integration.
+Preserve local, remote and target heads; validate newly imported paths, including both sides of
+renames, before treating remote history as an allowed conflict-resolution source.
+Use append-only integration and the configured Astra conflict-repair route. A
+changed combined candidate owes fresh verification, native reviews when enabled,
+independent publication review and server checks. Another remote change makes
+that candidate evidence stale; unrelated units may continue.
+Stage boundaries perform the same owned-head observation before allowing another
+writing stage. A quiescent planning or admission stage resumes its unfinished work
+after scoped integration and backup; integration alone does not finish that work.
+
+Keep this debt distinct from an uncertain push. A proved no-submission remote
+change can schedule reconciliation; a sent-unknown write must first reconcile
+its original journal. Active rollback/recovery fences remain holds under their
+original preimage authority; external changes do not authorize clearing them. Count distinct
+remote heads durably against `github.max_remote_head_refreshes` (default eight),
+deduplicate repeat observations and expose an operator hold on exhaustion.
+Unapproved paths or protected source/config changes remain ownership failures,
+not permission to widen a repair. Releasing a hold never restores stale reviews.
+
+Keep external commit provenance separate from campaign session attribution.
+Record exact imported commit/parent IDs, byte-preserved author and committer
+headers, content digests and the observation's coordinates. Enumeration includes
+remote history absent from both the first observation's local candidate and accepted target, with
+explicit refusal above 4,096 commits or 8 MiB of cumulative raw commit objects.
+Do not truncate a provenance ledger or infer models from Git names, signatures
+or commit messages. External model attribution remains `unobserved_external`;
+Git authorship does not prove human-only authorship either.
+Preserve that first-observation checkpoint when a live writer incorporates the
+remote commits itself; an eventual no-op integration still owes their provenance.
+
+The family-independence gate retains every authenticated campaign contributor
+family and any family established by trusted imported session evidence. Missing
+campaign-writer telemetry remains blocking debt; integration, later known writers,
+handoff and existing-source verification cannot clear it. A repair adds only its
+own observed writer family. Full-diff review includes the imported code, while
+independence from an unobserved external model remains explicitly unproven. This
+does not create a generic `verify-existing` exemption: its built/done-source and
+no-development-session proof requirements remain unchanged.
 
 ## Intake and triage
 

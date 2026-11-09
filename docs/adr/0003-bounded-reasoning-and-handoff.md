@@ -1,9 +1,9 @@
 # ADR 0003: Bounded reasoning jobs and portable session handoff
 
-- **Status:** Source qualification complete; installation and target-project activation required
+- **Status:** Implemented; release-specific qualification and target-project delivery remain gated
 - **Date:** 2026-11-06
 - **Extends:** [ADR 0002](0002-native-sdlc-campaign.md) and its [implementation contract](0002-campaign-implementation.md)
-- **Delivery:** The same campaign implementation PR, before autonomous project activation
+- **Delivery:** Initial campaign PR and reviewed follow-up releases, before qualified target-project activation
 
 ## Problem and decision
 
@@ -27,17 +27,22 @@ replaces the accepted contract, actual repository state or publication receipts.
 This decision extends the original campaign work; it does not defer its unresolved
 correctness, GitHub, Paradev or activation requirements.
 
-Implement this extension in PR 18 alongside the original audit repairs. Follow
+The initial extension landed in PR 18 alongside the original audit repairs. Follow
 the [G0–G8 traceability matrix](0002-campaign-implementation.md#implementation-goals-and-traceability)
 and keep implementation, normal-runtime coverage, native qualification and
-activation separate. The immediate milestone is readiness for the next reviews;
-merge, exact installation and qualified REM delivery remain subsequent gates.
+activation separate. Native qualification, both writable continuation directions,
+full-history semantic evidence, merged installation and generic onboarding have
+been demonstrated. Each follow-up candidate requires applicable affected checks and
+independent reviews; real selected REM delivery is a separate acceptance gate.
 
 The accepted completion extension in ADR 0002 includes these subsequent gates in
 the current work. Its native route proofs, managed hcom communication, writable
 cross-harness continuation and 32-shared-session qualification are required before
-claiming unattended readiness. Earlier candidate results below remain historical;
-every affected route and final candidate must earn fresh evidence.
+claiming unattended readiness. Earlier candidate results below remain historical.
+Every changed candidate requires applicable qualification, and installation-bound
+routes require renewal when their paths or dependencies change. Unchanged semantic
+proofs may be retained after validation. Real target delivery and live operator checks
+remain separate from scripted load, canary and onboarding proofs.
 
 Oversized semantic inventories use a durable bounded map/reduce job graph. Maps
 retain source identities and cross-partition dependency/ownership facts. Reducers
@@ -293,6 +298,43 @@ shell argv. Stream parsing is bounded and retains diagnostics separately from
 the structured result. Missing output, limits reached or incomplete streams fail
 the job; bounded repair may retry with smaller chunks.
 
+Ordinary planning, implementation, review and repair stages also obey the earned
+route's input bound. Do not embed a complete repository inventory into every
+stage packet. Materialize immutable full-source artifacts before rendering the
+prompt, sharding large collections within the existing per-file bound. Supply a
+bounded selected-work view with explicit coverage, counts and retrieval references.
+Keep the unit's acceptance, owner decisions and required findings intact; a
+required obligation that cannot fit must not disappear in a summary or clipped
+string. Verify artifact integrity before and after the stage and grant only the
+exact required read-only paths through the existing tool boundary.
+
+Availability for retrieval is not evidence that the model read the complete
+inventory. Jobs requiring exhaustive interpretation still use explicit partitioned
+input and coverage validation. A no-tools route cannot silently accept unresolved
+file references. Qualification must construct the real production request from
+a representative large inventory without inference, verify its input size and
+required obligations, and exercise retrieval, tampering and permission failures.
+An isolated discovery test or small scripted stage does not prove this connection.
+
+Apply the same distinction to GitHub boundary snapshots and accumulated planning
+history: repository-wide pull lists, intake metadata and prior-stage artifacts
+belong in indexed source records. Preserve the current selected issue/PR comments,
+reviews, intake observations, authority, acceptance and required findings exactly.
+Nested records retain their original JSON paths and keyed mapping layout so the
+complete input can be reconstructed. Qualification includes the normal boundary
+and intake/planning producers for a large campaign, not just a large `inventory`
+field in an otherwise small synthetic context.
+
+A typed preparation refusal before the native request is persisted is a distinct
+outcome from an uncertain launch. Seal it against the action, claim, attempt,
+generation and configuration; settle that claim as not launched and expose a
+`launch_preparation` hold. An explicit supported reconcile or resume may rearm
+only that proved refusal, preserving its history and requiring a fresh stage
+boundary and new launch identity. Repeated active ticks do not retry it. Existing
+request/startup/completion evidence, conflicting ownership, and owner or operator
+holds cannot be cleared by this path. Never infer a safe retry solely from a
+missing launch acknowledgement.
+
 Turns, time, output tokens, reasoning tokens and total spend are different limits.
 Enforce a whole-job bound even if a CLI resets its turn limit on each queued input.
 Do not enqueue unlimited follow-ups. Pure extraction gets no repository mutation
@@ -432,6 +474,15 @@ Quota waits do not consume semantic repair attempts or reset lifetime counters.
 After Claude and Codex both write a candidate, neither family becomes independent
 because the other was the latest writer. Select another qualified review family
 or expose the review-capacity wait; never erase earlier contributions.
+
+Remote contributions to an owned PR retain a separate immutable Git-provenance
+ledger through integration and handoff. An unknown external model stays unknown;
+neither a bot name nor an Astra conflict-resolution receipt supplies its identity.
+Record Astra's own writing separately and preserve every already-authenticated
+writer family. Missing campaign session telemetry still blocks publication and
+cannot be converted into an external-origin exception. Review the full combined
+candidate afresh, with the external attribution limitation visible; do not claim
+provider independence from model identities that were never observed.
 
 The successor retains campaign/unit/worktree/branch/PR and gets a new native
 session identity with predecessor and handoff-digest links. Apply only current

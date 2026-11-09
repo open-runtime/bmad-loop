@@ -566,7 +566,7 @@ class CampaignRuntime:
         )
         return tuple(proposals)
 
-    def prepare_resume(self, snapshot: CampaignSnapshot) -> bool:
+    def prepare_resume(self, snapshot: CampaignSnapshot, *, rearm_preparation: bool = True) -> bool:
         from .campaign_attribution import restore
         from .campaign_native_review_flow import current, required
         from .campaign_review_freshness import invalidate, stale
@@ -580,6 +580,54 @@ class CampaignRuntime:
             ):
                 changed = invalidate(snapshot, unit) or changed
             hold = unit.hold
+            if (
+                rearm_preparation
+                and hold
+                and hold.kind == "launch_preparation"
+                and unit.claim
+                and unit.claim.quiescent
+            ):
+                from .campaign_action_history import action as historical_action
+
+                prior = historical_action(snapshot, hold.id)
+                if prior is not None and prior.state == "confirmed":
+                    refusal = self._launch_preparation_refusal(snapshot, prior)
+                    if (
+                        refusal is not None
+                        and refusal.state == "confirmed"
+                        and refusal.data.get("preparation_refused")
+                        == unit.evidence.get("launch_preparation_refusal")
+                    ):
+                        reason = refusal.data["preparation_refused"]["reason"]
+                        if prior.payload.get("result_contract") == "intake-triage-v1":
+                            from .campaign_runtime_intake import fail_stage
+
+                            fail_stage(snapshot, unit.id, {"error": reason}, launch_id=prior.id)
+                        if (
+                            unit.spec.kind == "planning"
+                            and prior.payload.get("stage") in snapshot.spec.planning.stages
+                        ):
+                            from .campaign_planning_flow import fail_stage as fail_planning
+
+                            fail_planning(
+                                snapshot,
+                                unit.id,
+                                prior.payload["stage"],
+                                launch_id=prior.id,
+                                reason=reason,
+                            )
+                        if unit.hold != hold:
+                            changed = True  # Existing lifetime attempt limits remain authoritative.
+                            continue
+                        unit.evidence.setdefault("launch_preparation_history", []).append(
+                            unit.evidence.pop("launch_preparation_refusal")
+                        )
+                        unit.evidence.pop("stage_boundary_ready", None)
+                        unit.hold = None
+                        add_event(
+                            snapshot, "launch-preparation-rearmed", unit=unit.id, action=prior.id
+                        )
+                        changed = True
             if (
                 hold
                 and hold.kind == "approval"
@@ -843,6 +891,29 @@ class CampaignRuntime:
                 or (unit.claim and not unit.claim.quiescent)
             ):
                 continue
+            if unit.evidence.get("remote_head_check_needed"):
+                proposals.append(Proposal("remote-head", key))
+                continue
+            if unit.evidence.get("remote_head_sync") and unit.state in {
+                UnitState.READY,
+                UnitState.RUNNING,
+            }:
+                if reserve("execution"):
+                    from .campaign_remote_head import request as remote_request
+
+                    proposals.append(
+                        Proposal(
+                            "launch",
+                            key,
+                            {"kind": "integrate", **remote_request(unit, snapshot=snapshot)},
+                        )
+                    )
+                continue
+            if unit.evidence.get("remote_head_continuation") and unit.evidence.get("integrated"):
+                proposals.append(
+                    Proposal("push", key, {"head": unit.evidence["integrated"]["head"]})
+                )
+                continue
             from .campaign_handoff_flow import resume_proposal
 
             continuation = resume_proposal(snapshot, unit, runtime=self)
@@ -1003,7 +1074,15 @@ class CampaignRuntime:
                             )
             elif unit.state == UnitState.LOCALLY_COMPLETE:
                 if reserve("execution"):
-                    proposals.append(Proposal("launch", key, {"kind": "integrate"}))
+                    from .campaign_remote_head import request as remote_request
+
+                    proposals.append(
+                        Proposal(
+                            "launch",
+                            key,
+                            {"kind": "integrate", **remote_request(unit, snapshot=snapshot)},
+                        )
+                    )
             elif unit.state == UnitState.SYNCING and unit.evidence.get("integrated"):
                 if unit.evidence.get("pushed") != unit.evidence["integrated"]["head"]:
                     proposals.append(
@@ -1013,7 +1092,15 @@ class CampaignRuntime:
                     proposals.append(Proposal("launch", key, {"kind": "verify"}))
             elif unit.state == UnitState.SYNCING and not unit.evidence.get("integrated"):
                 if reserve("execution"):
-                    proposals.append(Proposal("launch", key, {"kind": "integrate"}))
+                    from .campaign_remote_head import request as remote_request
+
+                    proposals.append(
+                        Proposal(
+                            "launch",
+                            key,
+                            {"kind": "integrate", **remote_request(unit, snapshot=snapshot)},
+                        )
+                    )
             elif unit.state == UnitState.REVIEWING:
                 from .campaign_native_review_flow import accepted as pair_accepted
 
@@ -1324,6 +1411,7 @@ class CampaignRuntime:
             if (
                 snapshot.spec.checkpoints.push
                 and not unit.hold
+                and not unit.evidence.get("remote_head_sync")
                 and writable_session
                 and progress.get("state") == "observed"
                 and progress.get("launch_id") == claim.launch_id
@@ -1436,6 +1524,14 @@ class CampaignRuntime:
                     current.error = "another actual writer owns overlapping scope"
                     self._set_hold(unit, Hold("ownership_uncertain", current.error, id=current.id))
                     return
+                if payload.get("kind") == "integrate" and payload.get("remote_resume_state"):
+                    if payload["remote_resume_state"] not in {"ready", "running"}:
+                        raise CampaignError(
+                            "remote-head integration has invalid unfinished-stage continuation"
+                        )
+                    unit.evidence.setdefault(
+                        "remote_head_continuation", {"state": payload["remote_resume_state"]}
+                    )
                 from .campaign_usage import admission_reason
 
                 reason = admission_reason(snapshot, unit, payload)
@@ -1781,6 +1877,9 @@ class CampaignRuntime:
                 result.error,
             )
         if action.kind == "launch":
+            refused = self._launch_preparation_refusal(snapshot, action)
+            if refused is not None:
+                return refused
             claim = snapshot.units[action.unit].claim
             if claim is None:
                 return Observation("unknown", reason="launch ownership missing")
@@ -1799,14 +1898,17 @@ class CampaignRuntime:
             pusher = self._pusher(snapshot, unit)
             if action.kind == "checkpoint":
                 return self._reconcile_checkpoint(snapshot, action)
+            if not any(row.action_id == action.id for row in pusher.observations()):
+                # Re-enter the original immutable input, through the same
+                # journal-before-write branch guard; absence is not success.
+                return self._perform_push(snapshot, action)
             row = pusher.reconcile(action.id)
-            return Observation(
-                "confirmed" if row.state == "confirmed" else "unknown", dataclasses.asdict(row)
-            )
+            return self._push_observation(snapshot, action, row)
         # These effects are read-only, pure local state observations, or have
         # action-bound create/adopt logic. Re-running them does not launch twice.
         if action.kind in {
             "inventory",
+            "remote-head",
             "source-observation",
             "reconcile-existing",
             "capacity",
@@ -2145,6 +2247,41 @@ class CampaignRuntime:
         return Journal(directory, pin=pin)
 
     def _perform_inventory(self, snapshot, action) -> Observation:
+        gateway = self.gateway(snapshot)
+        hierarchy = HierarchyCoordinator(gateway)
+        selected_issues = set(snapshot.spec.intake.issue_numbers)
+        issue_bindings = [
+            unit.bindings[name]
+            for unit in snapshot.units.values()
+            for name in ("issue", "epic_issue")
+            if unit.bindings.get(name)
+        ]
+        issue_bindings.extend(
+            binding
+            for binding in snapshot.bindings.get("github_hierarchy", {}).values()
+            if binding.get("kind") == "issue"
+        )
+        for binding in issue_bindings:
+            number = binding.get("number") if isinstance(binding, dict) else binding
+            if isinstance(number, str) and number.isdigit():
+                number = int(number)
+            if type(number) is not int or number <= 0:
+                raise CampaignError("Inventory mapped issue must have a positive native number")
+            selected_issues.add(number)
+        for unit in snapshot.units.values():
+            if (
+                unit.bindings.get("issue")
+                or snapshot.bindings.get("github_hierarchy", {})
+                .get("story:" + unit.id, {})
+                .get("kind")
+                == "issue"
+            ):
+                continue
+            tracker = unit.bindings.get("tracker_id") or snapshot.bindings.get(
+                "source_observations", {}
+            ).get(unit.id, {}).get("tracker_id")
+            if tracker:
+                selected_issues.add(hierarchy._tracker_number(str(tracker)))
         mapped = tuple(
             sorted(
                 {
@@ -2176,13 +2313,15 @@ class CampaignRuntime:
             else ()
         )
         receipt = RepositoryDiscovery(
-            self.gateway(snapshot),
+            gateway,
             self.project,
             cache=self.__dict__.setdefault("_discovery_objects", {}),
+            max_metadata_bytes=snapshot.spec.github.inventory_metadata_bytes,
         ).collect(
             remote=snapshot.spec.remote,
             recent_since=since,
             mapped_prs=mapped,
+            selected_issues=tuple(sorted(selected_issues)),
             detailed_prs=None,
             archive_roots=tuple(Path(path) for path in snapshot.spec.archive_roots),
             target=snapshot.spec.target,
@@ -2931,8 +3070,51 @@ class CampaignRuntime:
             Path(unit.bindings["workspace"]), action.payload["head"], unit.bindings.get("base", "")
         )
         row = self._pusher(snapshot, unit).push(action.id, action.payload["head"])
+        return self._push_observation(snapshot, action, row)
+
+    def _perform_remote_head(self, snapshot, action) -> Observation:
+        from .campaign_remote_head import observe
+
+        try:
+            return Observation("confirmed", observe(self, snapshot, snapshot.units[action.unit]))
+        except CampaignError as exc:
+            return Observation("confirmed", {"remote_head_error": str(exc)})
+
+    def _push_observation(self, snapshot, action, row) -> Observation:
+        data = dataclasses.asdict(row)
+        unit = snapshot.units[action.unit]
+        if row.state == "remote_changed" or (
+            row.state == "confirmed" and row.remote_head and row.remote_head != row.head
+        ):
+            from .campaign_remote_head import observe
+
+            if not unit.bindings.get("pr"):
+                return Observation(
+                    "confirmed",
+                    {
+                        **data,
+                        "remote_head_error": "unowned remote branch cannot authorize recovery",
+                    },
+                )
+            try:
+                data.update(observe(self, snapshot, unit))
+            except CampaignError as exc:
+                data["remote_head_error"] = str(exc)
+            data["backup_pending"] = row.state == "remote_changed"
+        if row.state == "confirmed":
+            settled = []
+            for prior in unit.evidence.get("external_backup_debt", {}):
+                result = self._pusher(snapshot, unit).reconcile(prior)
+                if result.state != "confirmed":
+                    return Observation(
+                        "unknown",
+                        data,
+                        "preserved external backup debt awaits exact descendant readback",
+                    )
+                settled.append(prior)
+            data["settled_backup_debt"] = settled
         return Observation(
-            "confirmed" if row.state == "confirmed" else "unknown", dataclasses.asdict(row)
+            "confirmed" if row.state in {"confirmed", "remote_changed"} else "unknown", data
         )
 
     def _perform_checkpoint(self, snapshot, action) -> Observation:
@@ -3014,9 +3196,10 @@ class CampaignRuntime:
             return self._checkpoint_wait(
                 snapshot, action, str(exc), {"head": head, "coalescing": coalescing}
             )
+        observed = self._push_observation(snapshot, action, row)
         return (
-            self._checkpoint_done(action, {**dataclasses.asdict(row), "coalescing": coalescing})
-            if row.state == "confirmed"
+            self._checkpoint_done(action, {**observed.data, "coalescing": coalescing})
+            if observed.state == "confirmed"
             else self._checkpoint_wait(
                 snapshot,
                 action,
@@ -3105,7 +3288,10 @@ class CampaignRuntime:
                         snapshot, action, "exhausted backup readback unavailable: " + str(exc)
                     )
                 if observed.state == "confirmed":
-                    return self._checkpoint_done(action, dataclasses.asdict(observed))
+                    result = self._push_observation(snapshot, action, observed)
+                    if result.state == "confirmed":
+                        return self._checkpoint_done(action, result.data)
+                    return self._checkpoint_wait(snapshot, action, result.reason, result.data)
                 return self._checkpoint_wait(
                     snapshot,
                     action,
@@ -3117,8 +3303,11 @@ class CampaignRuntime:
             row = pusher.reconcile(action.id)
         except Exception as exc:
             return self._checkpoint_wait(snapshot, action, str(exc))
-        if row.state == "confirmed":
-            return self._checkpoint_done(action, dataclasses.asdict(row))
+        if row.state in {"confirmed", "remote_changed"}:
+            result = self._push_observation(snapshot, action, row)
+            if result.state == "confirmed":
+                return self._checkpoint_done(action, result.data)
+            return self._checkpoint_wait(snapshot, action, result.reason, result.data)
         if prior.state == "prepared":
             if (
                 action.receipt.get("backup_failures", 0)
@@ -3159,7 +3348,126 @@ class CampaignRuntime:
             unit.bindings.get("source_revision", ""),
         )
 
+    def _launch_preparation_refusal(self, snapshot, action) -> Observation | None:
+        """Reconcile only an explicit refusal sealed before a native request existed."""
+        directory = self.store.directory(snapshot.id) / "workers" / action.id
+        path = directory / "preparation-refused.json"
+        from .campaign_headless import read_json
+        from .platform_util import is_link_like
+
+        if not path.exists() and not is_link_like(path):
+            return None
+        claim = snapshot.units[action.unit].claim
+        if (
+            not claim
+            or claim.launch_id != action.id
+            or claim.generation != action.generation
+            or any(
+                (directory / name).exists() or is_link_like(directory / name)
+                for name in ("request.json", "startup.json", "receipt.json")
+            )
+        ):
+            return Observation(
+                "unknown", reason="preparation refusal conflicts with launch ownership"
+            )
+        if is_link_like(directory):
+            return Observation("unknown", reason="preparation refusal directory is redirected")
+        value = read_json(path, limit=65536)
+        expected = {
+            "schema_version": 1,
+            "campaign_id": snapshot.id,
+            "unit_id": action.unit,
+            "launch_id": action.id,
+            "generation": action.generation,
+            "attempt": claim.attempt,
+            "config_revision": snapshot.config_revision,
+            "phase": "before_request",
+        }
+        if (
+            not isinstance(value, dict)
+            or any(
+                type(value.get(key)) is not type(item) or value.get(key) != item
+                for key, item in expected.items()
+            )
+            or not isinstance(value.get("reason"), str)
+            or not value["reason"]
+        ):
+            return Observation("unknown", reason="preparation refusal binding mismatch")
+        return Observation("confirmed", {"not_launched": True, "preparation_refused": value})
+
     def _perform_launch(self, snapshot, action) -> Observation:
+        from . import campaign_hold
+        from .campaign_execution import CampaignExecutionError
+        from .platform_util import is_link_like
+
+        prior = self._launch_preparation_refusal(snapshot, action)
+        if prior is not None:
+            return prior
+        try:
+            prepared = self._prepare_launch(snapshot, action)
+        except (CampaignError, CampaignExecutionError) as exc:
+            # This helper cannot spawn. Once a request exists, however, absence
+            # of startup is not proof of absence: preserve uncertain launches.
+            directory = self.store.directory(snapshot.id) / "workers" / action.id
+            claim = snapshot.units[action.unit].claim
+            if (
+                not claim
+                or claim.launch_id != action.id
+                or claim.generation != action.generation
+                or is_link_like(directory)
+                or any(
+                    (directory / name).exists() or is_link_like(directory / name)
+                    for name in ("request.json", "startup.json", "receipt.json")
+                )
+            ):
+                raise
+            value = {
+                "schema_version": 1,
+                "campaign_id": snapshot.id,
+                "unit_id": action.unit,
+                "launch_id": action.id,
+                "generation": action.generation,
+                "attempt": claim.attempt,
+                "config_revision": snapshot.config_revision,
+                "phase": "before_request",
+                "reason": f"{type(exc).__name__}: {exc}",
+            }
+            directory.mkdir(parents=True, exist_ok=True)
+            encoded = json.dumps(value, sort_keys=True)
+            if len(encoded.encode("utf-8")) > 65536:
+                raise CampaignError("launch preparation refusal exceeds its byte bound") from exc
+            atomic_write_text(
+                directory / "preparation-refused.json", encoded, follow_symlinks=False
+            )
+            refusal = self._launch_preparation_refusal(snapshot, action)
+            if refusal is None:
+                raise CampaignError("launch preparation refusal was not durably recorded")
+            return refusal
+        if isinstance(prepared, Observation):
+            return prepared
+        envelope, request, launch_env = prepared
+        path = prepare_launch(envelope, request)
+        unit = snapshot.units[action.unit]
+        if campaign_hold.active(
+            campaign_hold.channel(self.store.directory(snapshot.id), unit.id),
+            campaign=snapshot.id,
+            unit=unit.id,
+        ):
+            return Observation("confirmed", {"not_launched": True})
+        process = spawn(path, env=launch_env)
+        return Observation(
+            "confirmed",
+            {
+                "launched": True,
+                "pid": process.pid,
+                "directory": str(envelope.directory),
+                "request": str(path),
+                "managed_communication": request.get("managed_communication"),
+            },
+        )
+
+    def _prepare_launch(self, snapshot, action):
+        """Prepare immutable inputs without persisting a request or spawning a child."""
         unit = snapshot.units[action.unit]
         from . import campaign_hold
 
@@ -3175,7 +3483,21 @@ class CampaignRuntime:
         from .campaign_adoption import AdoptionError, guard_owned
 
         try:
-            guard_owned(self, snapshot, unit.id)
+            external = (
+                action.payload.get("remote_head_sync")
+                if action.payload.get("kind") == "integrate"
+                else None
+            )
+            if (
+                action.payload.get("result_contract") == "repair-v1"
+                and action.payload.get("role") == "conflict_repair"
+                and unit.evidence.get("integration_conflict", {}).get("remote_head_sync")
+            ):
+                external = unit.evidence["integration_conflict"]["remote_head_sync"]
+            if external:
+                guard_owned(self, snapshot, unit.id, remote_head_sync=external)
+            else:
+                guard_owned(self, snapshot, unit.id)
         except AdoptionError as exc:
             return Observation("confirmed", {"not_launched": True, "adoption_refused": str(exc)})
         if action.payload.get("result_contract") == "repair-v1" and unit.evidence.get(
@@ -3294,6 +3616,8 @@ class CampaignRuntime:
             "private_paths": unit.bindings.get("private_paths", []),
             "checkpoint_interval_s": snapshot.spec.checkpoints.target_interval_s,
         }
+        if request["kind"] == "integrate":
+            request["source_artifacts"] = unit.evidence.get("source_artifacts", [])
         if request.get("landing"):
             landing = unit.evidence["landing_acceptance"]
             request.update(
@@ -3444,6 +3768,19 @@ class CampaignRuntime:
                 "source_artifact_digest": unit.bindings.get("source_revision", ""),
                 "feedback": unit.evidence.get("required_findings", []),
             }
+            if unit.evidence.get("external_contributions"):
+                context["prior_artifacts"] = [
+                    *context["prior_artifacts"],
+                    *(
+                        {"external_contribution": entry}
+                        for entry in unit.evidence["external_contributions"]
+                    ),
+                ]
+                context["external_contribution_notice"] = {
+                    "count": len(unit.evidence["external_contributions"]),
+                    "model_attribution": "unobserved external contributors; independence is established against authenticated campaign/imported families only",
+                    "requirement": "Review the full combined diff, including external contributions; no historical review satisfies the changed candidate.",
+                }
             if request.get("landing"):
                 context["verification"] = unit.evidence["landing_acceptance"]["verification"]
                 context["actual_landing"] = unit.evidence["landing_acceptance"]["merge_commit"]
@@ -3543,10 +3880,42 @@ class CampaignRuntime:
                     "admission_review",
                 },
             )
+            from .campaign_stage_prompt import attach_context, prepare_context
+
+            mapped_issue_numbers = set()
+            story_binding = snapshot.bindings.get("github_hierarchy", {}).get(
+                "story:" + unit.id, {}
+            )
+            mapped_story = story_binding if story_binding.get("kind") == "issue" else None
+            for row in (unit.bindings.get("issue"), unit.bindings.get("epic_issue"), mapped_story):
+                number = row.get("number") if isinstance(row, dict) else row
+                if number is not None:
+                    mapped_issue_numbers.add(int(number))
+            tracker = unit.bindings.get("tracker_id") or context["source"].get("tracker_id")
+            if tracker and not unit.bindings.get("issue") and not mapped_story:
+                mapped_issue_numbers.add(
+                    HierarchyCoordinator(self.gateway(snapshot))._tracker_number(str(tracker))
+                )
+            intake_issue_numbers = set(snapshot.spec.intake.issue_numbers)
+            # Mapped unit identities lead so the selected view reserves them
+            # before intake numbers and path-overlapping portfolio rows.
+            context, context_files = prepare_context(
+                directory,
+                context,
+                issue_numbers=(
+                    tuple(sorted(mapped_issue_numbers))
+                    + tuple(sorted(intake_issue_numbers - mapped_issue_numbers))
+                ),
+                pr_numbers=((unit.bindings.get("pr") or {}).get("number"),),
+            )
+            if context_files:
+                request["context_artifacts"] = context_files
+                request["headless_grants"].setdefault("read_only_paths", []).extend(context_files)
             request["prompt"] = request.get("custom_prompt") or stage_packet(
                 coordinates,
                 context=context,
                 skill=dict(snapshot.spec.planning.skills).get(stage, ""),
+                compact=bool(context_files),
             )
             if request.get("custom_prompt"):
                 from .campaign_boundary_sync import custom_prompt
@@ -3554,6 +3923,8 @@ class CampaignRuntime:
                 request["prompt"] = custom_prompt(
                     request["custom_prompt"], context["github_stage_inputs"]
                 )
+                if context_files:
+                    request["prompt"] = attach_context(request["prompt"], context)
             if unit.spec.kind == "planning" and stage in snapshot.spec.planning.stages:
                 from .campaign_planning_skill import packet as planning_packet
 
@@ -3580,7 +3951,6 @@ class CampaignRuntime:
             binding = prepare_communication(self, snapshot, unit=unit)
             if binding:
                 request["managed_communication"] = binding
-        path = prepare_launch(envelope, request)
         launch_env = sanitized_actor_env(os.environ, communication=snapshot.spec.communication)
         if snapshot.spec.paradev.reflect:
             from .campaign_reflection_flow import sanitized_worker_env, workspace_binding
@@ -3591,23 +3961,7 @@ class CampaignRuntime:
                 state_dir=self.store.directory(snapshot.id) / "native-transport",
                 communication=snapshot.spec.communication,
             )
-        if campaign_hold.active(
-            campaign_hold.channel(self.store.directory(snapshot.id), unit.id),
-            campaign=snapshot.id,
-            unit=unit.id,
-        ):
-            return Observation("confirmed", {"not_launched": True})
-        process = spawn(path, env=launch_env)
-        return Observation(
-            "confirmed",
-            {
-                "launched": True,
-                "pid": process.pid,
-                "directory": str(directory),
-                "request": str(path),
-                "managed_communication": request.get("managed_communication"),
-            },
-        )
+        return envelope, request, launch_env
 
     def _perform_observe_worker(self, snapshot, action) -> Observation:
         unit = snapshot.units[action.unit]
@@ -3687,6 +4041,14 @@ class CampaignRuntime:
             else:
                 return Observation("confirmed", result)
         receipt = result["receipt"]
+        receipt.pop("confirmed_owned_checkpoint", None)
+        if request["kind"] == "recovery":
+            try:
+                checkpoint = self._confirmed_worker_checkpoint(snapshot, unit, request, receipt)
+                if checkpoint is not None:
+                    receipt["confirmed_owned_checkpoint"] = checkpoint
+            except CampaignError as exc:
+                receipt.update(outcome="ownership_uncertain", error=str(exc))
         if request.get("steering") and receipt.get("outcome") in {
             "completed",
             "locally_complete",
@@ -3723,6 +4085,37 @@ class CampaignRuntime:
                 receipt["outcome"] = "invalid_stage_result"
                 receipt["error"] = str(exc)
         return Observation("confirmed", result)
+
+    def _confirmed_worker_checkpoint(self, snapshot, unit, request, receipt):
+        """Authenticate an internal recovery's own push before restoring its anchor."""
+        recovery = receipt.get("recovery") or {}
+        published = receipt.get("retained_checkpoint") or {}
+        if receipt.get("outcome") in {"recovered", "locally_complete"}:
+            if recovery.get("state") != "complete" or recovery.get("action_id") != request.get(
+                "recovery_action"
+            ):
+                raise CampaignError("recovery checkpoint differs from its owning recovery action")
+            identity, head = "recovery:" + recovery["action_id"], recovery.get("head")
+        elif receipt.get("outcome") == "retained_verification_failed":
+            identity = "retained-verification:" + request["recovery_action"] + ":" + receipt["head"]
+            head = published.get("head")
+            if published.get("action_id") != identity or published.get("state") != "confirmed":
+                raise CampaignError("retained verification lacks its confirmed checkpoint receipt")
+        else:
+            return None
+        if not head or head != receipt["head"]:
+            raise CampaignError("recovery checkpoint differs from its terminal candidate")
+        row = next(
+            (
+                row
+                for row in self._pusher(snapshot, unit).observations()
+                if row.action_id == identity
+            ),
+            None,
+        )
+        if row is None or row.state != "confirmed" or row.head != head:
+            raise CampaignError("recovery checkpoint lacks its exact confirmed publication journal")
+        return dataclasses.asdict(row)
 
     def _validate_stage_receipt(self, snapshot, unit, request, receipt) -> None:
         coordinates = StageCoordinates(**request["coordinates"])
@@ -3897,6 +4290,10 @@ class CampaignRuntime:
             return Observation("confirmed", {"acceptance_stale": True})
         require_pair(snapshot, unit)
         pr = self.gateway(snapshot).pull(unit.bindings["pr"]["number"])
+        if pr.get("head", {}).get("sha") != unit.evidence["integrated"]["head"]:
+            from .campaign_remote_head import checked
+
+            return Observation("confirmed", checked(self, snapshot, unit, pr=pr))
         intent = self.gateway(snapshot).prepare_ready(
             pr["node_id"],
             action_id=action.id + "-ready",
@@ -3970,6 +4367,10 @@ class CampaignRuntime:
             from .campaign_external_merge import inspect as inspect_external_merge
 
             return inspect_external_merge(self, snapshot, unit, observation)
+        if observation.pr.get("head", {}).get("sha") != candidate.head:
+            from .campaign_remote_head import checked
+
+            return Observation("confirmed", checked(self, snapshot, unit, pr=observation.pr))
         from .campaign_remote_feedback import collect as collect_remote_feedback
 
         remote_defects = collect_remote_feedback(
@@ -4523,6 +4924,23 @@ class CampaignRuntime:
         data = observation.data
         unit = snapshot.units.get(action.unit)
         kind = action.kind
+        if action.unit in snapshot.units and data.get("remote_head_error"):
+            if data.get("head"):
+                unit.evidence.setdefault("external_backup_debt", {})[action.id] = data["head"]
+            self._set_hold(
+                unit, Hold("ownership_uncertain", data["remote_head_error"], id=action.id)
+            )
+            add_event(
+                snapshot, "remote-head-refused", unit=unit.id, reason=data["remote_head_error"]
+            )
+            return
+        if kind == "prepare-ready" and (
+            data.get("remote_head_sync") or data.get("remote_head_current")
+        ):
+            from .campaign_remote_head import apply as apply_remote
+
+            apply_remote(self, snapshot, unit, data)
+            return
         if kind in {"prepare-ready", "prepare-merge"} and data.get("acceptance_stale"):
             from .campaign_review_freshness import invalidate
 
@@ -4876,9 +5294,14 @@ class CampaignRuntime:
 
             apply_backoff(snapshot, unit.id, now=self.clock())
         elif kind == "resolution-finish":
-            from .campaign_resolution_delivery import apply as apply_resolution
+            if data.get("resolution_remote_changed"):
+                from .campaign_remote_head import interrupt_resolution
 
-            apply_resolution(snapshot, unit, data)
+                interrupt_resolution(self, snapshot, unit, action, data)
+            else:
+                from .campaign_resolution_delivery import apply as apply_resolution
+
+                apply_resolution(snapshot, unit, data)
         elif kind == "resolution-exhausted":
             unit.hold = Hold(
                 "resolution_attempts_exhausted",
@@ -4895,6 +5318,10 @@ class CampaignRuntime:
             unit.bindings["stop_requested_for"] = data["launch_id"]
         elif kind == "github":
             if data.get("canceled_before_write"):
+                if data.get("remote_head_sync") or data.get("remote_head_current"):
+                    from .campaign_remote_head import apply as apply_remote
+
+                    apply_remote(self, snapshot, unit, data)
                 add_event(
                     snapshot,
                     "metadata-write-canceled",
@@ -4931,6 +5358,10 @@ class CampaignRuntime:
                     "url": receipt.get("html_url", ""),
                     "node_id": receipt.get("node_id", ""),
                 }
+                unit.bindings.setdefault(
+                    "remote_head_anchor",
+                    unit.bindings.get("last_pushed_head", unit.bindings["head"]),
+                )
             elif purpose == "ready":
                 unit.bindings["ready_for_review"] = True
             elif purpose == "review-requests":
@@ -5041,10 +5472,27 @@ class CampaignRuntime:
                     self._set_hold(
                         unit, Hold("adoption_fence", data["adoption_refused"], id=action.id)
                     )
-                if unit.state == UnitState.CLAIMED:
+                if unit.state == UnitState.CLAIMED and not (
+                    data.get("preparation_refused")
+                    and action.payload.get("result_contract") == "intake-triage-v1"
+                ):
                     transition(snapshot, unit.id, UnitState.READY)
                 elif unit.state == UnitState.VERIFYING:
                     transition(snapshot, unit.id, UnitState.SYNCING)
+                if data.get("preparation_refused"):
+                    refusal = data["preparation_refused"]
+                    unit.evidence["launch_preparation_refusal"] = refusal
+                    self._set_hold(
+                        unit, Hold("launch_preparation", refusal["reason"], id=action.id)
+                    )
+                    add_event(
+                        snapshot,
+                        "launch-preparation-refused",
+                        unit=unit.id,
+                        action=action.id,
+                        reason=refusal["reason"],
+                    )
+                    return
                 add_event(snapshot, "operator-held-launch-suppressed", unit=unit.id)
                 return
             if data.get("not_launched") and data.get("remote_feedback_changed"):
@@ -5075,19 +5523,41 @@ class CampaignRuntime:
         elif kind == "checkpoint-progress":
             unit.evidence["checkpoint_progress"] = data
             unit.bindings["checkpoint_observed_at"] = self.clock()
+        elif kind == "remote-head":
+            from .campaign_remote_head import apply as apply_remote
+
+            apply_remote(self, snapshot, unit, data)
         elif kind in {"push", "checkpoint"}:
             unit.bindings["last_checkpoint_at"] = self.clock()
+            for settled in data.get("settled_backup_debt", []):
+                unit.evidence.get("external_backup_debt", {}).pop(settled, None)
+            if data.get("remote_head_sync") or data.get("remote_head_current"):
+                from .campaign_remote_head import apply as apply_remote
+
+                apply_remote(self, snapshot, unit, data)
+            if data.get("backup_pending"):
+                unit.evidence.setdefault("external_backup_debt", {})[action.id] = data["head"]
+                return
             if not data.get("skipped"):
                 unit.bindings["last_pushed_head"] = data["head"]
                 unit.bindings["last_pushed_at"] = time.time()
-            if kind == "push":
+            if data.get("remote_head") == data.get("head"):
+                unit.bindings["remote_head_anchor"] = data["head"]
+            if kind == "push" and not data.get("remote_head_sync"):
                 unit.evidence["pushed"] = data["head"]
+                from .campaign_remote_head import resume_unfinished
+
+                resume_unfinished(snapshot, unit)
         elif kind in {"queue-observe", "queue-checkout", "queue-publish", "queue-dequeue"}:
             from .campaign_runtime_queue import apply_effect
 
             apply_effect(self, snapshot, unit, action, data)
         elif kind in {"pr-head-checkout", "pr-head-publish"}:
-            if data.get("needs_integration"):
+            if data.get("remote_head_sync") or data.get("remote_head_current"):
+                from .campaign_remote_head import apply as apply_remote
+
+                apply_remote(self, snapshot, unit, data)
+            elif data.get("needs_integration"):
                 from .campaign_publication_retry import invalidate
 
                 held = invalidate(snapshot, unit.id, action.id, data.get("base", ""))
@@ -5100,7 +5570,11 @@ class CampaignRuntime:
             else:
                 self._queue_intent(snapshot, unit, data)
         elif kind == "prepare-merge":
-            if data.get("remote_feedback"):
+            if data.get("remote_head_sync") or data.get("remote_head_current"):
+                from .campaign_remote_head import apply as apply_remote
+
+                apply_remote(self, snapshot, unit, data)
+            elif data.get("remote_feedback"):
                 from .campaign_remote_feedback import RemoteFeedback
                 from .campaign_remote_feedback import apply as apply_remote_feedback
 
@@ -5266,6 +5740,18 @@ class CampaignRuntime:
         claim.quiescent = True
         claim.status = "finished"
         receipt = data["receipt"]
+        checkpoint = receipt.get("confirmed_owned_checkpoint")
+        if checkpoint is not None:
+            if checkpoint.get("state") != "confirmed" or checkpoint.get("head") != receipt["head"]:
+                raise CampaignError(
+                    "worker checkpoint anchor lacks exact confirmed candidate proof"
+                )
+            unit.bindings["last_pushed_head"] = checkpoint["head"]
+            unit.bindings["remote_head_anchor"] = checkpoint["head"]
+        from .campaign_attribution import record_stage_writer, writing_stage
+
+        if claim.writes and writing_stage(snapshot, unit, receipt):
+            record_stage_writer(unit, receipt)
         if receipt.get("landing"):
             from .campaign_landing_acceptance import apply_worker as apply_landing
             from .campaign_usage import apply as apply_usage
@@ -5390,11 +5876,17 @@ class CampaignRuntime:
                     id=claim.launch_id,
                 )
         elif outcome == "integrated":
+            from .campaign_remote_head import accept as accept_remote
+
+            accept_remote(snapshot, unit, receipt)
             unit.evidence["integrated"] = receipt
             for key in ("verification", "review", "native_review_pair"):
                 unit.evidence.pop(key, None)
             if unit.evidence.get("pushed") != receipt["head"]:
                 unit.evidence.pop("pushed", None)
+        elif outcome == "remote_head_changed":
+            unit.evidence["remote_head_check_needed"] = receipt
+            unit.evidence.pop("integrated", None)
         elif outcome == "verified":
             if receipt.get("stage") == "resolution_verify":
                 receipt["resolution_id"] = unit.evidence["accepted_resolution"]["id"]
@@ -5436,6 +5928,9 @@ class CampaignRuntime:
             else:
                 unit.resume_state = UnitState.READY
             if outcome == "integration_conflict":
+                from .campaign_remote_head import accept as accept_remote
+
+                accept_remote(snapshot, unit, receipt)
                 unit.evidence["preserved_refs"] = receipt.get("preserved_refs", [])
                 unit.evidence["preserved_heads"] = receipt.get("preserved_heads", [])
                 unit.evidence["integration_conflict"] = receipt
@@ -5580,7 +6075,7 @@ class CampaignRuntime:
         # A resumed review may have been live when startup attribution repair
         # ran. Repair only after accepting its result, including deferred
         # stage-boundary results, so a same-family review is invalidated too.
-        self.prepare_resume(snapshot)
+        self.prepare_resume(snapshot, rearm_preparation=False)
 
     def attach(self, campaign_id: str, unit_id: str, role: str = "execution") -> int:
         from .campaign_operator import attach

@@ -107,6 +107,8 @@ def test_real_child_retry_after_pushed_checkpoint_recovers_rearms_and_pushes_fas
     recovery = next(row for row in history if row["outcome"] == "recovered")
     assert recovery["recovery"]["state"] == "complete"
     assert recovery["recovery"]["head"] == rearmed["head"]
+    assert recovery["confirmed_owned_checkpoint"]["head"] == rearmed["head"]
+    assert recovery["confirmed_owned_checkpoint"]["state"] == "confirmed"
     assert rejected["run_id"] != rearmed["run_id"]
     canonical = git(case.remote, "rev-parse", "refs/heads/main")
     assert verify.is_ancestor(case.remote, rejected["head"], rearmed["head"])

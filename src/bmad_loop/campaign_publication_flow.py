@@ -20,16 +20,9 @@ from .campaign_supervisor import Observation, Proposal
 
 def record_stage_writer(unit, receipt):
     """A repair, planning or closure writer does not erase earlier authors."""
-    family = receipt.get("provider_family", "")
-    previous = unit.evidence.get("developer_family", "")
-    unit.evidence["developer_families"] = sorted(
-        set(unit.evidence.get("developer_families", ()))
-        | {value for value in (previous, family) if value}
-    )
-    unit.evidence["developer_family"] = family
-    unit.evidence["developer_attribution_incomplete"] = bool(
-        unit.evidence.get("developer_attribution_incomplete") or not family
-    )
+    from .campaign_attribution import record_stage_writer as record
+
+    record(unit, receipt)
 
 
 def controller(runtime, snapshot):
@@ -98,7 +91,11 @@ def head_checkout_effect(runtime, snapshot, action):
     unit = snapshot.units[action.unit]
     candidate = runtime._candidate(snapshot, unit)
     remote = controller(runtime, snapshot).inspect(candidate.pr_number)
-    if remote.pr.get("head", {}).get("sha") != candidate.head or remote.base_head != candidate.base:
+    if remote.pr.get("head", {}).get("sha") != candidate.head:
+        from .campaign_remote_head import checked as observe
+
+        return Observation("confirmed", observe(runtime, snapshot, unit, pr=remote.pr))
+    if remote.base_head != candidate.base:
         return Observation("confirmed", {"needs_integration": True, "base": remote.base_head})
     group = head_candidate(candidate, observed_at=runtime.clock())
     root = Path(
@@ -129,6 +126,10 @@ def head_publish_effect(runtime, snapshot, action):
     state = unit.evidence["pr_head_check"]
     candidate = runtime._candidate(snapshot, unit)
     remote = controller(runtime, snapshot).inspect(candidate.pr_number)
+    if remote.pr.get("head", {}).get("sha") != candidate.head:
+        from .campaign_remote_head import checked as observe
+
+        return Observation("confirmed", observe(runtime, snapshot, unit, pr=remote.pr))
     if (
         state["candidate"] != asdict(candidate)
         or remote.pr.get("head", {}).get("sha") != candidate.head
@@ -233,6 +234,11 @@ def execute_special(runtime, snapshot, action, intent, *, reconcile=False):
             and result.receipt.get("submission") == "not-submitted"
             and result.receipt.get("definitive") is True
         ):
+            remote = {}
+            if result.receipt.get("remote_head_changed"):
+                from .campaign_remote_head import checked as observe
+
+                remote = observe(runtime, snapshot, snapshot.units[action.unit])
             return Observation(
                 "confirmed",
                 {
@@ -240,6 +246,7 @@ def execute_special(runtime, snapshot, action, intent, *, reconcile=False):
                     "needs_integration": True,
                     "base": result.receipt["base"],
                     "retired_native_intent": result.to_dict(),
+                    **remote,
                 },
             )
     elif intent.kind == "review_request":

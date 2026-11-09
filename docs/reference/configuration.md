@@ -15,6 +15,26 @@ Where a key can be set in more than one place, the first of these wins:
 
 Plugin activation (`[plugins] enabled`) and plugin settings (`[plugins.<name>]`) are not listed here; see the [plugin authoring guide](../plugin-authoring-guide.md#settings) and each plugin's own guide.
 
+## Campaign inventory budget
+
+Campaign specifications use their own `[github]` table, separate from the project
+policy below. `inventory_metadata_bytes` defaults to `67108864` (64 MiB) and must
+be a positive integer. It bounds the combined serialized issue and PR metadata,
+including linked objects, and is frozen with the campaign specification. Finite
+selected-path discovery also counts complete patchless PR file metadata and PR
+enrichment here. Broad or explicitly listed-PR discovery keeps expanded file
+facts in its existing detail budget.
+Older saved specifications without the field load this default; their worker
+policy, model limits and immutable execution templates remain unchanged. A later
+snapshot save records the default explicitly.
+Exceeding it leaves discovery explicitly incomplete and prevents admission;
+metadata rows and issue bodies are never silently clipped to make them fit.
+
+This aggregate observation budget is independent of the per-object detail limits
+and the input limits of coding sessions. It does not increase model context or
+promise that the complete inventory fits in a session prompt. See the
+[campaign guide](../campaign-guide.md) for campaign configuration and operation.
+
 ## Environment variables
 
 `BMAD_LOOP_PARADEV_STATE_DIR` selects the absolute external registry directory

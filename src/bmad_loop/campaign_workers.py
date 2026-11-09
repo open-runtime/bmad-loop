@@ -711,8 +711,17 @@ def _stage(request: dict[str, Any], envelope: CampaignExecution) -> dict[str, An
         from .campaign_checkpoint import instruction as checkpoint_instruction
 
         prompt += checkpoint_instruction(envelope.checkpoint_interval_s)
-    from .campaign_stage_prompt import instruction, materialize
+    from .campaign_stage_prompt import context_artifacts, instruction, materialize
 
+    source_packets = context_artifacts(envelope.directory, request.get("context_artifacts", []))
+    if source_packets and getattr(adapter, "requires_inline_context", False):
+        capability = getattr(adapter, "capability", None) or {}
+        grants = getattr(adapter, "grants", None) or {}
+        if capability.get("permissions") not in {"workspace-tools", "read-only-tools"}:
+            raise CampaignError("file-backed campaign context requires a qualified tool route")
+        granted = grants.get("read_only_paths", [])
+        if any(packet.descriptor() not in granted for packet in source_packets):
+            raise CampaignError("campaign context lacks its exact read-only retrieval grant")
     input_packet = materialize(envelope.directory, prompt)
     spec = SessionSpec(
         task_id=task_id,
@@ -753,6 +762,8 @@ def _stage(request: dict[str, Any], envelope: CampaignExecution) -> dict[str, An
 
     save_stage_usage(request, envelope.directory, usage, result)
     input_packet.verify()
+    for packet in source_packets:
+        packet.verify()
     models = tuple(usage.models or ()) if usage else ()
     observed = models[0] if models else ""
     model_source = "transcript_primary" if observed else ""
@@ -847,6 +858,7 @@ def _stage(request: dict[str, Any], envelope: CampaignExecution) -> dict[str, An
             "sha256": input_packet.sha256,
             "size_bytes": input_packet.size_bytes,
         },
+        "context_artifacts": [packet.descriptor() for packet in source_packets],
         "transcript_path": result.transcript_path,
         "usage": dataclasses.asdict(usage) if usage else None,
         "base": before,
@@ -915,60 +927,18 @@ def _verify(request: dict[str, Any], envelope: CampaignExecution) -> dict[str, A
 
 
 def _integrate(request: dict[str, Any], envelope: CampaignExecution) -> dict[str, Any]:
+    from .campaign_branch_integration import integrate
+
     workspace = Path(request["workspace"])
-    if not verify.worktree_clean(workspace):
-        raise CampaignError("integration requires a clean quiescent candidate")
-    before = verify.rev_parse_head(workspace)
-    # Worktrees share refs. Each launch must retain its own fresh target, and
-    # fetching it must not opportunistically race on origin/main or FETCH_HEAD.
-    prefix = f"refs/bmad-campaign/{envelope.campaign_id}/integration/{request['launch_id']}"
-    observation_ref = f"{prefix}/observed-target"
-    git(
-        workspace,
-        "fetch",
-        "--no-tags",
-        "--no-write-fetch-head",
-        "--refmap=",
-        request["remote"],
-        f"refs/heads/{request['target']}:{observation_ref}",
+    protected = (
+        tuple(
+            path.relative_to(workspace).as_posix()
+            for path in _protected_sources(workspace, request)
+        )
+        if request.get("remote_head_sync")
+        else ()
     )
-    target = verify.rev_parse_revision(workspace, observation_ref)
-    git(workspace, "update-ref", f"{prefix}/candidate", before)
-    git(workspace, "update-ref", f"{prefix}/target", target)
-    base = git(workspace, "merge-base", before, target)
-    if verify.is_ancestor(workspace, target, before):
-        return {
-            "outcome": "integrated",
-            "base": target,
-            "head": before,
-            "preserved_heads": [before, target],
-            "merge_base": base,
-        }
-    result = verify.git_bytes(workspace, "merge", "--no-edit", target)
-    if result.returncode:
-        conflicts = git(workspace, "diff", "--name-only", "--diff-filter=U").splitlines()
-        if conflicts:
-            return {
-                "outcome": "integration_conflict",
-                "base": target,
-                "preserved_heads": [before, target],
-                "merge_base": base,
-                "conflicts": conflicts,
-                "preserved_refs": [f"{prefix}/candidate", f"{prefix}/target"],
-            }
-        raise CampaignError("integration failed without a resolvable conflict")
-    head = verify.rev_parse_head(workspace)
-    if not verify.is_ancestor(workspace, before, head) or not verify.is_ancestor(
-        workspace, target, head
-    ):
-        raise CampaignError("integration lost one of its preserved heads")
-    return {
-        "outcome": "integrated",
-        "base": target,
-        "head": head,
-        "preserved_heads": [before, target],
-        "merge_base": base,
-    }
+    return integrate(request, envelope, git=git, protected_paths=protected)
 
 
 def _queue_verify(request: dict[str, Any], envelope: CampaignExecution) -> dict[str, Any]:

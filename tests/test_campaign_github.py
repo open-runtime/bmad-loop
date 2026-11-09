@@ -35,6 +35,16 @@ class FakeTransport:
         return response
 
 
+@pytest.mark.parametrize("status", [404, 403, 500])
+def test_get_preserves_native_error_status_for_read_observation(status):
+    transport = FakeTransport()
+    transport.responses["GET", "repos/a/b/issues/7"] = ApiResponse(status, {}, {})
+    with pytest.raises(GithubError) as error:
+        GithubGateway(transport, "a/b").issue(7)
+    assert error.value.status == status
+    assert transport.calls == [("GET", "repos/a/b/issues/7", None)]
+
+
 def test_optional_intake_issue_cancellation_uses_owned_native_identity_and_not_planned():
     transport = FakeTransport()
     gateway = GithubGateway(transport, "a/b")

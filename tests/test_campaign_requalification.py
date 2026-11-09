@@ -202,6 +202,42 @@ def test_renewal_preserves_configuration_authority_and_history_without_resuming(
 
 
 @pytest.mark.parametrize(
+    "field,default",
+    [("inventory_metadata_bytes", 64 * 1024 * 1024), ("max_remote_head_refreshes", 8)],
+)
+def test_legacy_inventory_budget_default_preserves_template_and_renews_normally(
+    campaign, field, default
+):
+    store, before, template, _ = campaign
+    database = CampaignDatabase(store.directory(before.id))
+    with database.connect(write=True) as connection:
+        with connection:
+            connection.execute(
+                "UPDATE authority SET payload=json_remove(payload, ?) WHERE id=1",
+                ("$.spec.github." + field,),
+            )
+    raw, _ = database.read()
+    assert field not in raw["spec"]["github"]
+    loaded = store.load(before.id)
+    assert getattr(loaded.spec.github, field) == default
+    assert loaded.spec == before.spec
+    assert digest(loaded.config_snapshot) == digest(raw["config_snapshot"])
+    binding = loaded.bindings["execution_template"]
+    assert CampaignExecution.load(Path(binding["path"]), binding["digest"]) == template
+    old_template = Path(binding["path"]).read_bytes()
+    after = apply(campaign)
+    assert after.phase == "stopped" and after.config_revision == before.config_revision + 1
+    assert after.spec == loaded.spec and after.units == loaded.units
+    assert after.config_snapshot["policy"] == loaded.config_snapshot["policy"]
+    renewed = after.bindings["execution_template"]
+    restored = CampaignExecution.load(Path(renewed["path"]), renewed["digest"])
+    assert replace(restored, directory=template.directory, config_revision=1) == template
+    assert Path(binding["path"]).read_bytes() == old_template
+    saved, _ = database.read()
+    assert saved["spec"]["github"][field] == default
+
+
+@pytest.mark.parametrize(
     "fault",
     [
         "active",

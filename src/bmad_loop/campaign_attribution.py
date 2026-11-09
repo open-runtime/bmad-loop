@@ -107,6 +107,73 @@ def record(snapshot: CampaignSnapshot, unit: CampaignUnit, receipt: dict[str, An
         )
 
 
+def _stage_sample(receipt: dict[str, Any]) -> dict[str, Any]:
+    sample = receipt.get("accounting") or {}
+    return (
+        sample
+        if receipt.get("launch_id")
+        and sample.get("kind") == "stage"
+        and sample.get("stream_id") == "stage:" + receipt["launch_id"]
+        and sample.get("session_observed") is True
+        else {}
+    )
+
+
+def writing_stage(snapshot: CampaignSnapshot, unit: CampaignUnit, receipt: dict[str, Any]) -> bool:
+    """Separate a retained writing session from accepted stage semantics."""
+    writer = (
+        receipt.get("result_contract") == "repair-v1"
+        or receipt.get("stage") in {"closure", "landing_repair"}
+        or (
+            unit.spec.kind == "planning"
+            and receipt.get("stage") in snapshot.spec.planning.stages
+            and receipt.get("stage") != "planning_review"
+        )
+    )
+    retained_commits = bool(
+        receipt.get("base") and receipt.get("head") and receipt["base"] != receipt["head"]
+    )
+    return writer and bool(
+        receipt.get("outcome") == "stage_complete" or _stage_sample(receipt) or retained_commits
+    )
+
+
+def stage_contributors(receipt: dict[str, Any]) -> tuple[str, set[str], bool]:
+    """Use native observations, including auxiliary models; never selected routes."""
+    sample = _stage_sample(receipt)
+    native = "observed_models" in receipt or "observed_model" in receipt or bool(sample)
+    raw = receipt.get("observed_models", sample.get("models", []))
+    models = list(raw) if isinstance(raw, (list, tuple)) else []
+    observed = receipt.get("observed_model")
+    if observed and observed not in models:
+        models.append(observed)
+    primary = provider_family(observed) if observed else receipt.get("provider_family", "")
+    if not isinstance(primary, str):
+        primary = ""
+    if not native:
+        # Historical completed-stage receipts already stored the observed family.
+        return primary, {primary} if primary else set(), not primary
+    families = {provider_family(model) for model in models if provider_family(model)}
+    unknown = not models or any(not provider_family(model) for model in models)
+    if primary and primary not in families:
+        primary, unknown = "", True
+    return primary, families, unknown
+
+
+def record_stage_writer(unit: CampaignUnit, receipt: dict[str, Any]) -> None:
+    primary, families, unknown = stage_contributors(receipt)
+    previous = unit.evidence.get("developer_family", "")
+    unit.evidence["developer_families"] = sorted(
+        set(unit.evidence.get("developer_families", ()))
+        | families
+        | ({previous} if previous else set())
+    )
+    unit.evidence["developer_family"] = primary
+    unit.evidence["developer_attribution_incomplete"] = bool(
+        unit.evidence.get("developer_attribution_incomplete") or unknown
+    )
+
+
 def _invalidate_review(snapshot: CampaignSnapshot, unit: CampaignUnit) -> None:
     review = unit.evidence.get("review", {})
     writers = set(unit.evidence.get("developer_families", ()))
@@ -114,9 +181,11 @@ def _invalidate_review(snapshot: CampaignSnapshot, unit: CampaignUnit) -> None:
         writers.add(unit.evidence["developer_family"])
     if (
         snapshot.spec.github.require_independent_review
-        and writers
         and review
-        and review.get("provider_family", "") in {"", *writers}
+        and (
+            unit.evidence.get("developer_attribution_incomplete")
+            or (writers and review.get("provider_family", "") in {"", *writers})
+        )
     ):
         unit.evidence.pop("review", None)
         if unit.state in {UnitState.REVIEWING, UnitState.READY_TO_PUBLISH}:
@@ -139,19 +208,7 @@ def _restore_qualified(snapshot: CampaignSnapshot, unit: CampaignUnit) -> bool:
     ):
         return False
     history = unit.evidence.get("worker_history", [])
-    if any(
-        row.get("outcome") == "stage_complete"
-        and (
-            row.get("result_contract") == "repair-v1"
-            or row.get("stage") in {"closure", "landing_repair"}
-            or (
-                unit.spec.kind == "planning"
-                and row.get("stage") in snapshot.spec.planning.stages
-                and row.get("stage") != "planning_review"
-            )
-        )
-        for row in history
-    ):
+    if any(writing_stage(snapshot, unit, row) for row in history):
         return False
     matching = [row for row in history if row.get("launch_id") == prior["launch_id"]]
     if len(matching) != 1:
@@ -211,6 +268,24 @@ def restore(snapshot: CampaignSnapshot) -> bool:
             continue
         if _restore_qualified(snapshot, unit):
             changed = True
+        retained = [
+            stage_contributors(row)
+            for row in unit.evidence.get("worker_history", [])
+            if writing_stage(snapshot, unit, row)
+        ]
+        families = set(unit.evidence.get("developer_families", ()))
+        restored = families | {family for _, seen, _ in retained for family in seen}
+        unknown = any(incomplete_stage for _, _, incomplete_stage in retained)
+        if restored != families or (
+            unknown and not unit.evidence.get("developer_attribution_incomplete")
+        ):
+            unit.evidence["developer_families"] = sorted(restored)
+            unit.evidence["developer_attribution_incomplete"] = bool(
+                unit.evidence.get("developer_attribution_incomplete") or unknown
+            )
+            _invalidate_review(snapshot, unit)
+            add_event(snapshot, "retained-stage-attribution-restored", unit=unit.id)
+            changed = True
         # Older receipts could discard unknown IDs when a known helper was also
         # present. Restore the conservative gate without replacing a later writer.
         prior = unit.evidence.get("developer_attribution")
@@ -246,15 +321,7 @@ def restore(snapshot: CampaignSnapshot) -> bool:
         if unit.evidence.get("developer_family") or prior:
             continue
         for receipt in reversed(unit.evidence.get("worker_history", [])):
-            if receipt.get("outcome") == "stage_complete" and (
-                receipt.get("result_contract") == "repair-v1"
-                or receipt.get("stage") == "closure"
-                or (
-                    unit.spec.kind == "planning"
-                    and receipt.get("stage") in snapshot.spec.planning.stages
-                    and receipt.get("stage") != "planning_review"
-                )
-            ):
+            if writing_stage(snapshot, unit, receipt):
                 break
             if receipt.get("outcome") != "locally_complete":
                 continue

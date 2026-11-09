@@ -142,6 +142,28 @@ def test_spec_snapshot_roundtrip_freezes_roles_and_settings():
     assert restored.spec.planning.skills == (("decomposition", "tickets-refine"),)
 
 
+def test_inventory_metadata_budget_default_and_frozen_override():
+    snapshot = make_snapshot()
+    assert snapshot.spec.github.inventory_metadata_bytes == 64 * 1024 * 1024
+    raw = spec_to_dict(snapshot.spec)
+    raw["github"]["inventory_metadata_bytes"] = 1234567
+    snapshot.spec = spec_from_dict(raw)
+    raw["github"]["inventory_metadata_bytes"] = 7654321
+    restored = snapshot_from_dict(snapshot_to_dict(snapshot))
+    assert restored.spec.github.inventory_metadata_bytes == 1234567
+    assert spec_to_dict(restored.spec)["github"]["inventory_metadata_bytes"] == 1234567
+    del raw["github"]["inventory_metadata_bytes"]
+    assert spec_from_dict(raw).github.inventory_metadata_bytes == 64 * 1024 * 1024
+
+
+@pytest.mark.parametrize("value", [None, True, False, 0, -1, 1.5, "67108864", [], {}])
+def test_inventory_metadata_budget_requires_positive_integer(value):
+    raw = spec_to_dict(make_snapshot().spec)
+    raw["github"]["inventory_metadata_bytes"] = value
+    with pytest.raises(CampaignError, match="github.inventory_metadata_bytes.*positive integer"):
+        spec_from_dict(raw)
+
+
 @pytest.mark.parametrize(
     "change,match",
     [

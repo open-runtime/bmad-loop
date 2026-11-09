@@ -325,6 +325,9 @@ their action IDs, prepared SHAs and prior failure history. Issued uncertain push
 continue exact-head readback. `campaign reconcile ID` can recognize an operator's
 already-pushed sealed commit without re-arming writes.
 Published history stays append-only during campaign recovery.
+Approved amendments and recovery publications advance the campaign's branch
+baseline only to their exact confirmed checkpoint. Later remote commits remain
+separate contributions requiring reconciliation.
 
 Final delivery updates the branch from current main, resolves conflicts with the
 configured conflict-repair role, verifies the resulting candidate and reviews
@@ -373,11 +376,42 @@ and is followed by independent GitHub readback. There is no native merge fallbac
 Development attribution comes from the latest completed primary dev/fix session's
 observed main model. Clean follow-up reviews and plugin telemetry do not replace
 that identity; explicit planning and repair writers retain their own attribution.
-Every prior writer family, including interrupted contributors, remains in the
-candidate's attribution. A reviewer from any contributing family is ineligible.
+Every authenticated campaign writer family, including interrupted contributors,
+remains in the candidate's attribution. A reviewer from any known contributing
+family is ineligible.
 Missing observed development identity remains visible and prevents independent
 publication acceptance. Resume can recover the identity from saved native
 receipts and invalidates a publication review that is no longer independent.
+
+Bot or collaborator commits pushed to an already-owned PR retain their exact Git
+history and a separate external-contribution ledger. Git author/committer bytes,
+commit/parent IDs and content digests are provenance, not model observations.
+Unknown external models remain visibly unobserved; they are never renamed after
+the campaign agent that integrates them. Existing campaign attribution debt stays
+blocking. Fresh full-diff reviews cover the complete combined candidate, but do
+not claim provider independence from unknown external models.
+
+Invalidated or unsuccessful writing stages retain their observed contributors
+and any missing model identity. Resume restores those exclusions without replacing
+a later writer's identity. This records authorship; it grants no stage acceptance.
+
+Remote-head reconciliation waits for the owned writer to settle, validates the
+new paths against the approved scope, preserves local/remote/target history and
+uses append-only integration. Conflicts use the configured conflict-repair route.
+The resulting head requires fresh verification and reviews. Provenance collection
+refuses more than 4,096 new commits or 8 MiB of raw commit objects rather than
+silently omitting authors. Other PRs still require the explicit adoption contract.
+
+`github.max_remote_head_refreshes` bounds distinct remote-head changes separately
+from main refreshes (default eight); repeat observations do not consume another
+attempt. Exhaustion leaves an operator hold. Uncertain push acknowledgements and
+active recovery fences must reconcile before integration; an out-of-scope change
+does not expand the campaign's ownership.
+
+Status reports pending remote-head debt, distinct imported commit counts, missing
+campaign attribution and the latest sixteen provenance observations. Explicit
+omission counts and worker receipt links retain access to the complete ledger;
+public summaries do not expose raw author bytes or private commit bodies.
 
 `github.max_base_refreshes` bounds repeated acceptance restarts when main moves
 (default eight). Exhaustion leaves a visible operator hold on that unit and
@@ -404,6 +438,9 @@ configured checks, selected local reviews, verification and history preservation
 It does not claim server-enforced atomic freshness of the base. The actual landed
 commit must pass acceptance before delivery; failed landing proof creates one
 linked repair PR and keeps original tracking pending until the repair is accepted.
+Landing reviews use the confirmed canonical merge identity; closing or deleting
+the merged PR branch does not block that review or waive landing acceptance.
+
 Repair drafts retain the original accepted product specification from its exact
 reviewed Git head, including embedded native plan text and source hashes. This
 also works when ticket acceptance lives in the native plan rather than duplicated
@@ -634,6 +671,15 @@ Stop closes admissions and drains current bounded stages by default. Explicit
 termination uses owned process controls and retains unresolved claims. Release
 removes an operator hold; it does not approve missing checks or waive another
 kind of hold. Reconcile refreshes observations without launching new workers.
+
+A `launch_preparation` hold means the controller proved that input preparation
+failed before a native request was persisted. Its claim is quiescent and its
+reason remains visible. After correcting that cause, an explicit reconcile or
+resume can rearm the recorded refusal; the next launch requires a fresh stage
+boundary and a new identity. Ordinary ticks do not repeatedly retry it, and
+existing owner holds and lifetime attempt limits remain in force. An uncertain
+launch acknowledgement does not qualify for this recovery.
+
 Hold also reaches the existing worker's automatic input and retry boundaries;
 it permits real completion through the usual Stop/death path. Release first
 observes exact process quiescence, source and Git identity. Changed acceptance

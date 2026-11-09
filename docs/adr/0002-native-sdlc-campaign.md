@@ -1,6 +1,6 @@
 # ADR 0002: A deterministic SDLC campaign with GitHub delivery
 
-- **Status:** Source qualification complete; installation and target-project activation required
+- **Status:** Implemented; release-specific qualification and target-project delivery remain gated
 - **Date:** 2026-11-05
 - **Scope:** An opt-in campaign supervisor, isolated workers, planning, GitHub synchronization and native Paradev reflection
 
@@ -22,7 +22,8 @@ queued merge, local commit or successful worker exit is insufficient.
 The detailed [implementation contract](0002-campaign-implementation.md) resolves
 the command surface, persistence, worker/source isolation, publication, terminal
 retention and activation decisions below. Both documents define the contract for
-one implementation PR; current usage is in the [campaign guide](../campaign-guide.md).
+the initial implementation and reviewed follow-up releases; current usage is in
+the [campaign guide](../campaign-guide.md).
 Capability and repository-policy prerequisites remain explicit; implementation
 tests do not establish that a target project has been activated.
 
@@ -32,18 +33,21 @@ It preserves this record's delivery contract and does not replace outstanding re
 
 ### Implementation and delivery milestones
 
-This milestone is a review-ready PR containing the audited repairs and the
-reasoning/handoff extension. The implementation contract's
+The initial campaign and reasoning/handoff implementation has been merged and
+installed. Follow-up repairs retain the implementation contract's
 [G0–G8 traceability matrix](0002-campaign-implementation.md#implementation-goals-and-traceability)
-is the shared acceptance map. A helper test is not evidence that the normal
+as the shared acceptance map. A helper test is not evidence that the normal
 campaign path invokes that helper. Record implementation, runtime coverage,
 native qualification, review readiness and activation separately.
 
-Review readiness requires the integrated candidate, updated documentation,
-production-path regression coverage, native qualification and independent reviews.
-Merge, exact-commit installation, canonical-base update and qualified REM delivery
-remain later gates of the original objective. A green suite, disabled automations
-or a locally completed story cannot substitute for those gates.
+Each changed release requires the integrated candidate, updated documentation,
+affected production-path regression coverage and independent reviews. Renew native
+proofs when their installed paths, dependencies or contracts change; retain valid
+unchanged evidence. Merge, exact-commit installation and canonical-base update have
+been demonstrated and remain requirements for later releases. The selected REM
+pilot must prove real parallel delivery, operator reflection and communication,
+and live-worker drain/resume. A green suite, disabled automations or a locally
+completed story cannot substitute for those target-project gates.
 
 The earlier `276daa62` implementation passed its integrated regression suite,
 packaging and static checks, and two independent reviews found no open findings.

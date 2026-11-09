@@ -410,6 +410,7 @@ def resume(
                 "reason": outcome.reason,
                 "head": verify.rev_parse_head(workspace),
                 "retained_finalization": True,
+                "retained_checkpoint": dataclasses.asdict(published),
                 "preserved_head": head,
                 "retained_finalization_pending": {
                     "recovery_request": str(original),

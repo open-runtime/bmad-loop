@@ -290,7 +290,10 @@ def test_manifest_cannot_select_code_or_skip_exact_source_binding(case, tmp_path
         adoption.read_manifest(path)
 
 
-def test_explicit_prepare_converts_draft_preserves_history_and_pushes_same_branch(case, tmp_path):
+@pytest.mark.parametrize("legacy", [False, True])
+def test_explicit_prepare_converts_draft_preserves_history_and_pushes_same_branch(
+    case, tmp_path, legacy
+):
     from bmad_loop.campaign_runtime import CampaignRuntime
     from bmad_loop.campaign_store import CampaignStore, add_action
 
@@ -317,6 +320,7 @@ def test_explicit_prepare_converts_draft_preserves_history_and_pushes_same_branc
     action = add_action(snapshot, "prepare-unit", case.unit.id, {"adoption": True})
     result = adoption.prepare(runtime, snapshot, action)
     assert result["pr"]["number"] == 7 and result["workspace"] == str(case.workspace)
+    assert result["last_pushed_head"] == result["remote_head_anchor"] == result["head"]
     assert git(case.remote, "rev-parse", "refs/heads/legacy") == result["head"]
     assert (
         git(case.workspace, "merge-base", case.manifest.head, result["head"]) == case.manifest.head
@@ -324,6 +328,28 @@ def test_explicit_prepare_converts_draft_preserves_history_and_pushes_same_branc
     assert (case.workspace / "src.txt").read_text(encoding="utf-8") == "partial preserved work\n"
     case.pr["head"]["sha"] = result["head"]
     assert adoption.prepare(runtime, snapshot, action) == result
+    if legacy:
+        # The real confirmed push already exists. Serialize the historical
+        # pre-anchor result, archive that action, then exercise normal discovery.
+        from bmad_loop import campaign_remote_head
+        from bmad_loop.campaign_supervisor import Observation
+
+        old = {
+            k: v for k, v in result.items() if k not in {"last_pushed_head", "remote_head_anchor"}
+        }
+        action.state, action.receipt = "confirmed", old
+        runtime.apply(snapshot, action, Observation("confirmed", old))
+        snapshot = store.save(snapshot, snapshot.revision)
+        later = add_action(snapshot, "prepare-unit", case.unit.id, {})
+        later.state = "rejected"
+        snapshot = store.save(snapshot, snapshot.revision)
+        assert action.id not in {row.id for row in snapshot.outbox}
+        unit = snapshot.units[case.unit.id]
+        assert "remote_head_anchor" not in unit.bindings
+        observed = campaign_remote_head.observe(runtime, snapshot, unit)
+        assert observed["recovered_remote_head_anchor"] == result["head"]
+        campaign_remote_head.apply(runtime, snapshot, unit, observed)
+        assert unit.bindings["remote_head_anchor"] == result["head"]
 
 
 def test_authenticated_remote_adoption_creates_worktree_under_shared_metadata_lock(

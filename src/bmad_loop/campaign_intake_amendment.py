@@ -465,6 +465,8 @@ def apply(snapshot, target, data) -> None:
         raise CampaignError("amendment refresh receipt no longer owns the retained candidate")
     target.bindings.update(
         head=data["head"],
+        last_pushed_head=data["head"],
+        remote_head_anchor=data["head"],
         effective_source=data["effective_source"],
         canonical_source=data["canonical_source"],
         source_revision=data["source_revision"],

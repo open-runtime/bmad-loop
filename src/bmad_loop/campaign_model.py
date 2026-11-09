@@ -106,7 +106,9 @@ class GitHubSpec:
     review_users: tuple[str, ...] = ()
     review_teams: tuple[str, ...] = ()
     recent_days: int = 30
+    inventory_metadata_bytes: int = 64 * 1024 * 1024
     max_base_refreshes: int = 8
+    max_remote_head_refreshes: int = 8
     allow_publication_wait: bool = False
     allow_admin_merge: bool = False
 
@@ -410,6 +412,8 @@ def _construct(cls: Any, value: Any, name: str) -> Any:
             "purposes",
         }:
             out[key] = _strings(item, f"{name}.{key}")
+        elif key == "inventory_metadata_bytes":
+            _positive(item, f"{name}.{key}")
         elif key == "candidate_check_app_id":
             if type(item) is not int or item < 0:
                 raise CampaignError("github.candidate_check_app_id must be a nonnegative integer")
@@ -423,6 +427,7 @@ def _construct(cls: Any, value: Any, name: str) -> Any:
             "max_context_events",
             "recent_days",
             "max_base_refreshes",
+            "max_remote_head_refreshes",
             "max_backup_failures",
             "max_new_units",
             "max_triage_attempts",

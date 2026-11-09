@@ -176,7 +176,10 @@ def execute(
             merge_mode="direct-authorized",
             independent_families=independent_families,
         )
-        if observation.base_head != candidate.base:
+        if (
+            observation.base_head != candidate.base
+            or observation.pr.get("head", {}).get("sha") != candidate.head
+        ):
             # Both phases are positively unsent (or definitively refused).
             # Retire this candidate so normal integration/review can resume.
             return dataclasses.replace(
@@ -188,6 +191,8 @@ def execute(
                     "definitive": True,
                     "needs_integration": True,
                     "base": observation.base_head,
+                    "remote_head_changed": observation.pr.get("head", {}).get("sha")
+                    != candidate.head,
                     "execution": record,
                 },
             )

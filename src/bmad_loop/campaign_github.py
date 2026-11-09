@@ -178,7 +178,9 @@ class GithubGateway:
     def get(self, path: str) -> Any:
         response = self.transport.request("GET", path)
         if response.status != 200:
-            raise GithubError(f"Incomplete GitHub observation: HTTP {response.status}")
+            raise GithubError(
+                f"Incomplete GitHub observation: HTTP {response.status}", status=response.status
+            )
         return response.data
 
     def iter_pages(self, path: str, *, collection: str | None = None) -> Iterator[list[JsonObject]]:

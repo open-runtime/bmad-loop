@@ -190,8 +190,13 @@ def test_resume_preserves_explicit_later_writer_or_missing_writer_observation(
             "provider_family": "anthropic" if later_writer else "",
         }
     )
-    assert not runtime.prepare_resume(snapshot)
+    assert runtime.prepare_resume(snapshot)
     assert unit.evidence["developer_family"] == ("anthropic" if later_writer else "")
+    assert unit.evidence["developer_families"] == (
+        ["anthropic", "openai"] if later_writer else ["openai"]
+    )
+    assert unit.evidence["developer_attribution_incomplete"] is (not later_writer)
+    assert not runtime.prepare_resume(snapshot)
 
 
 def test_resume_does_not_rewrite_issued_merge_state(project, tmp_path):

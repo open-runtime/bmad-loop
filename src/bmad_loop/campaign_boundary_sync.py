@@ -5,6 +5,9 @@ After effects run only after independent actor quiescence: failed observations
 retain a completed receipt as sync debt, never a live session or a second model
 launch. Own acknowledged metadata/comments and the exact worker checkpoint do
 not masquerade as new owner intent; every other changed input is retained.
+Owned PR heads also pass the native/Git ownership check before a writing stage;
+an append-only external contribution becomes integration debt, not prompt-only
+context that could leave the worker on an obsolete local branch.
 """
 
 from __future__ import annotations
@@ -71,7 +74,8 @@ def before_proposal(runtime, snapshot, proposal):
     expected = key(snapshot, unit, proposal.payload)
     ready = unit.evidence.get("stage_boundary_ready", {})
     if (
-        ready.get("key") == expected
+        not unit.evidence.get("remote_head_sync")
+        and ready.get("key") == expected
         and 0 <= runtime.boundary_clock() - ready.get("observed_wall", 0) <= 30
     ):
         return dataclasses.replace(proposal, payload={**proposal.payload, "stage_boundary": ready})
@@ -314,8 +318,56 @@ def before_effect(runtime, snapshot, action):
         )
     return Observation(
         "confirmed",
-        {"inputs": value, "key": action.payload["key"], "launch": action.payload["launch"]},
+        {
+            "inputs": value,
+            "key": action.payload["key"],
+            "launch": action.payload["launch"],
+            **_remote_observation(
+                runtime, snapshot, unit, value, landing=action.payload["launch"].get("landing")
+            ),
+        },
     )
+
+
+def _remote_observation(runtime, snapshot, unit, inputs, *, landing=False):
+    """Reuse the fresh native row; independently authenticate its exact Git head."""
+    if not unit.bindings.get("pr"):
+        return {}
+    from .campaign_remote_head import checked
+
+    number = unit.bindings["pr"]["number"]
+    pr = inputs["github"]["pulls"][str(number)]["pr"]
+    merged = unit.evidence.get("merge", {})
+    accepted = unit.evidence.get("landing_acceptance", {})
+    if (
+        landing is True
+        and unit.state == UnitState.MERGED_PENDING_SYNC
+        and merged.get("state") == "merged_pending_sync"
+        and merged.get("canonical_head")
+        and merged.get("merge_commit")
+        and merged["merge_commit"] == accepted.get("merge_commit") == pr.get("merge_commit_sha")
+        and pr.get("number") == number
+        and unit.bindings["pr"].get("node_id")
+        and pr.get("node_id") == unit.bindings["pr"].get("node_id")
+        and pr.get("merged") is True
+        and pr.get("state") == "closed"
+    ):
+        # The canonical landing is already confirmed. Its separate checkout and
+        # verification/review debt remain authoritative; the PR branch may be
+        # closed or deleted without authorizing another pre-merge writer.
+        return {}
+    return checked(runtime, snapshot, unit, pr=pr)
+
+
+def _apply_remote(runtime, snapshot, unit, data):
+    if data.get("remote_head_error"):
+        runtime._set_hold(unit, Hold("ownership_uncertain", data["remote_head_error"]))
+        return False
+    if data.get("remote_head_sync") or data.get("remote_head_current"):
+        from .campaign_remote_head import apply
+
+        apply(runtime, snapshot, unit, data)
+    return not unit.evidence.get("remote_head_sync")
 
 
 def _apply_intake(snapshot, value):
@@ -362,6 +414,8 @@ def before_apply(runtime, snapshot, action, data):
     )
     if not value["complete"]:
         return
+    if not _apply_remote(runtime, snapshot, unit, data):
+        return
     unit.evidence["stage_boundary_ready"] = {
         "key": data["key"],
         "inputs": value,
@@ -399,11 +453,15 @@ def after_effect(runtime, snapshot, action):
             runtime.clock() + 5,
         )
     before = debt["request"]["stage_boundary"]["inputs"]
+    remote = _remote_observation(
+        runtime, snapshot, unit, inputs, landing=debt["request"].get("landing")
+    )
     allowed = {debt["receipt"]["head"], debt["request"]["coordinates"]["head"]} | {
         row["pr"].get("head", {}).get("sha") for row in before["github"]["pulls"].values()
     }
     changed = (
-        before["graph_revision"] != snapshot.graph_revision
+        bool(remote.get("remote_head_sync") or remote.get("remote_head_error"))
+        or before["graph_revision"] != snapshot.graph_revision
         or before["config_revision"] != snapshot.config_revision
         or verify.rev_parse_head(Path(debt["request"].get("workspace", unit.bindings["workspace"])))
         != debt["receipt"]["head"]
@@ -430,6 +488,7 @@ def after_effect(runtime, snapshot, action):
             "validated": validated,
             "receipt": receipt,
             "launch_id": unit.claim.launch_id,
+            **remote,
         },
     )
 
@@ -452,12 +511,17 @@ def after_apply(runtime, snapshot, action, data):
     )
     if not data["inputs"]["complete"]:
         return
+    if data.get("remote_head_error"):
+        _apply_remote(runtime, snapshot, unit, data)
+        return
+    remote_current = _apply_remote(runtime, snapshot, unit, data)
     before = debt["request"]["stage_boundary"]["inputs"]
     allowed = {debt["receipt"]["head"], debt["request"]["coordinates"]["head"]} | {
         row["pr"].get("head", {}).get("sha") for row in before["github"]["pulls"].values()
     }
     changed = (
-        before["graph_revision"] != snapshot.graph_revision
+        not remote_current
+        or before["graph_revision"] != snapshot.graph_revision
         or before["config_revision"] != snapshot.config_revision
         or verify.rev_parse_head(Path(debt["request"].get("workspace", unit.bindings["workspace"])))
         != debt["receipt"]["head"]
