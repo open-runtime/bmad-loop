@@ -50,7 +50,7 @@ def register(subparsers: Any) -> None:
         ("migrate-state", "migrate quiescent campaign storage with a preserved backup"),
         (
             "requalify",
-            "renew installed route proofs for a stopped campaign before its first worker",
+            "renew installed route proofs for a stopped campaign before its first unit worker",
         ),
         ("stop", "close admissions and drain existing bounded stages"),
         ("hold", "hold one unit at a safe stage boundary"),

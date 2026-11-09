@@ -399,15 +399,23 @@ def readonly_grants(workspace, coordinates, capability, *, generation=1, read_on
     }
 
 
-def render_input(
-    request: JobRequest, capability: dict[str, Any], *, steering=()
-) -> tuple[bytes, dict[str, Any]]:
-    """Deliver source bytes inline, with explicit identities and no tool reads."""
-    pieces = [request.prompt, "\nReturn only the requested JSON result.\n"]
+def input_text(prompt: str, output_schema: dict[str, Any], sources, *, steering=()) -> str:
+    """Pure canonical text shared by input sizing and native delivery."""
+    pieces = [prompt, "\nReturn only the requested JSON result.\n"]
     if steering:
         from .campaign_messages import context
 
         pieces.append(context(steering))
+    pieces.extend(json.dumps(source, ensure_ascii=False) for source in sources)
+    pieces.append("\nOUTPUT SCHEMA:\n" + json.dumps(output_schema, ensure_ascii=False))
+    return "\n".join(pieces)
+
+
+def render_input(
+    request: JobRequest, capability: dict[str, Any], *, steering=()
+) -> tuple[bytes, dict[str, Any]]:
+    """Deliver source bytes inline, with explicit identities and no tool reads."""
+    sources = []
     identities = []
     for source in request.inputs:
         path = Path(source["path"])
@@ -423,17 +431,13 @@ def render_input(
         if hashlib.sha256(raw).hexdigest() != source["sha256"]:
             raise CampaignError("Reasoning source changed after request creation")
         content = raw.decode("utf-8", errors="strict")
-        pieces.append(
-            json.dumps(
-                {"source_id": source["source_id"], "sha256": source["sha256"], "content": content},
-                ensure_ascii=False,
-            )
+        sources.append(
+            {"source_id": source["source_id"], "sha256": source["sha256"], "content": content}
         )
         identities.append(
             {"source_id": source["source_id"], "sha256": source["sha256"], "bytes": len(raw)}
         )
-    pieces.append("\nOUTPUT SCHEMA:\n" + json.dumps(request.output_schema, ensure_ascii=False))
-    text = "\n".join(pieces)
+    text = input_text(request.prompt, request.output_schema, sources, steering=steering)
     canonical = text.encode("utf-8")
     # Every UTF-8 byte is conservatively charged as a token. This is an upper
     # bound, not an invented chars/4 tokenizer or provider usage measurement.

@@ -15,6 +15,11 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Renew startup routes after proved ended optional reasoning without resetting failures, attempts or usage.
+- Budget escaped semantic input, recognize verified whole-context citations, and preserve priority eligibility.
+- Stop blocked semantic pipeline siblings and settle observers of proven failed preparations.
+- Show confirmed shared story issues in Paradev navigation before hierarchy completion.
+- Skip unused repository inventory in reasoning contexts and reuse fingerprints within proposal evaluation.
 - Reuse current semantic context within a partition batch while rechecking freshness on each application.
 - Preserve confirmed bootstrap hierarchy records when renewing routes before the first worker.
 - Refresh PR details after timestamp-only metadata changes while retaining structural and observation freshness checks.

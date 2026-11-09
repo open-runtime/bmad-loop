@@ -120,7 +120,39 @@ def _number(binding: object, url: str = "") -> tuple[str, ...]:
     return ("#" + match[1],) if match else ()
 
 
-def unit_navigation(unit, projection: dict | None = None) -> dict:
+def issue_reference(unit, *, snapshot=None) -> tuple[dict, str]:
+    """Prefer unit identity, then its exact applied shared hierarchy binding.
+
+    Hierarchy reconciliation can confirm a native story before all links are
+    ready. That is sufficient for navigation, but never completion or ownership.
+    Source hints and prepared intents are not native issue identities.
+    """
+    bound = unit.bindings.get("issue")
+    url = unit.bindings.get("issue_url", "")
+    if bound or url or snapshot is None:
+        return (bound if isinstance(bound, dict) else {}), url
+    shared = snapshot.bindings.get("github_hierarchy", {}).get("story:" + unit.id)
+    if not isinstance(shared, dict):
+        return {}, ""
+    number, native_id, shared_url = (
+        shared.get("number"),
+        shared.get("database_id"),
+        shared.get("url"),
+    )
+    if (
+        shared.get("kind") != "issue"
+        or type(number) is not int
+        or number < 1
+        or type(native_id) is not int
+        or native_id < 1
+        or not isinstance(shared_url, str)
+        or shared_url.lower() != f"https://github.com/{snapshot.repository}/issues/{number}".lower()
+    ):
+        return {}, ""
+    return shared, shared["url"]
+
+
+def unit_navigation(unit, projection: dict | None = None, *, snapshot=None) -> dict:
     """Use only this launch's observed hooks, never inherited names or CLI brands."""
     stage = (
         projection
@@ -145,10 +177,11 @@ def unit_navigation(unit, projection: dict | None = None) -> dict:
             name = (window.get("hook") or {}).get("hcom_name")
             if isinstance(name, str) and re.fullmatch(r"[a-z][a-z0-9_-]{2,31}", name):
                 names.add(name)
+    issue, issue_url = issue_reference(unit, snapshot=snapshot)
     return {
         "names": tuple(sorted(names)),
         "epics": (unit.spec.epic,) if unit.spec.epic else (),
-        "issues": _number(unit.bindings.get("issue"), unit.bindings.get("issue_url", "")),
+        "issues": _number(issue, issue_url),
         "prs": _number(unit.bindings.get("pr")),
     }
 
@@ -165,7 +198,9 @@ def group_navigation(snapshot, unit, *, projection: dict | None = None) -> dict:
     for member in snapshot.units.values():
         if key(member) != key(unit) or not member.bindings.get("native"):
             continue
-        values = unit_navigation(member, projection if member.id == unit.id else None)
+        values = unit_navigation(
+            member, projection if member.id == unit.id else None, snapshot=snapshot
+        )
         for name, items in values.items():
             fields[name].update(items)
     return {name: tuple(sorted(values)) for name, values in fields.items()}

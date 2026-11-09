@@ -12,7 +12,7 @@ import json
 from dataclasses import asdict
 from pathlib import Path
 
-from .campaign_headless import file_digest, read_json, write_json
+from .campaign_headless import file_digest, input_text, read_json, write_json
 from .campaign_jobs import JobLimits, JobRequest, digest, request_from_dict
 from .campaign_model import CampaignError, RoleCandidate
 
@@ -129,9 +129,22 @@ def _fits(pipeline, packet, prompt, schema):
         minimal["groups"] = [{"input_versions": pipeline["decision_ids"], "suggestion": "x"}]
     else:
         minimal["summary"] = "x"
+    # JSON source text is itself quoted in the native input envelope. Raw
+    # packet length misses escaped quotes, backslashes and control characters.
+    # Reserve the longest bounded job suffix, including reducer depth/index.
+    rendered = input_text(
+        prompt,
+        schema,
+        [
+            {
+                "source_id": f"partition:{pipeline['id']}-reduce-{MAX_LEVELS}-{MAX_PARTITIONS - 1}",
+                "sha256": "0" * 64,
+                "content": _bytes(packet).decode("ascii"),
+            }
+        ],
+    )
     return (
-        len(_bytes(packet)) + len(prompt.encode()) + len(_bytes(schema)) + 2048
-        <= pipeline["ceiling"]
+        len(rendered.encode()) + 2048 <= pipeline["ceiling"]
         and len(_bytes(minimal)) <= pipeline["output"]
     )
 

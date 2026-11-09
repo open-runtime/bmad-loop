@@ -214,6 +214,18 @@ def current(
         return False
     if coordinates["config_revision"] != snapshot.config_revision:
         return False
+    partition = coordinates.get("semantic_partition")
+    if partition:
+        pipeline = (
+            snapshot.bindings.get("semantic_jobs", {})
+            .get("pipelines", {})
+            .get(partition["pipeline"])
+        )
+        # An exhausted frontier cannot produce complete evidence. Stop admitting
+        # its remaining siblings, while existing claims still follow observation
+        # and quiescence through the ordinary reasoning lifecycle.
+        if not pipeline or pipeline.get("state") == "blocked":
+            return False
     if coordinates.get("history_warmup"):
         from .campaign_history_warmup import current as prefix_current
 

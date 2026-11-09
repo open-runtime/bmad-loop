@@ -2106,7 +2106,7 @@ class CampaignRuntime:
                     "hold": dataclasses.asdict(unit.hold) if unit.hold else None,
                     "claim": dataclasses.asdict(unit.claim) if unit.claim else None,
                     "pr": unit.bindings.get("pr"),
-                    "navigation": unit_navigation(unit),
+                    "navigation": unit_navigation(unit, snapshot=snapshot),
                     "group_navigation": group_navigation(snapshot, unit) if snapshot else None,
                     "title": unit.spec.title,
                 },

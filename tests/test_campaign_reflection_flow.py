@@ -177,6 +177,74 @@ def test_reflection_projects_enabled_tasks_through_normal_flow(flow):
     assert calls[0]["state"] == unit.state.value
 
 
+@pytest.mark.parametrize("active", [False, True])
+def test_reflection_uses_shared_native_issue_for_all_navigation_and_task_links(flow, active):
+    from bmad_loop.campaign_reflection_flow import reflect
+    from bmad_loop.campaign_runtime import CampaignRuntime
+
+    snapshot, unit, claim, _, run_dir, mux = flow
+    unit.claim = claim if active else None
+    unit.bindings["hierarchy_ready"] = False
+    snapshot.spec = dataclasses.replace(
+        snapshot.spec, paradev=dataclasses.replace(snapshot.spec.paradev, tasks=True)
+    )
+    before = CampaignRuntime._reflection_fingerprint(unit, snapshot)
+    snapshot.bindings["github_hierarchy"] = {
+        "story:"
+        + unit.id: {
+            "kind": "issue",
+            "number": 1582,
+            "database_id": 6128563360,
+            "url": "https://github.com/owner/repo/issues/1582",
+        }
+    }
+    assert CampaignRuntime._reflection_fingerprint(unit, snapshot) != before
+    workspaces, tasks, terminals = [], [], []
+    provider = SimpleNamespace(
+        reflect=lambda *args, **kwargs: workspaces.append(kwargs) or {"state": "observed"},
+        reflect_task=lambda *args, **kwargs: tasks.append(kwargs) or "task-id",
+        bind_terminal=lambda *args, **kwargs: terminals.append(kwargs) or {},
+    )
+    result = reflect(
+        snapshot, unit, unit.claim, provider=provider, mux=mux, run_directories=(run_dir,)
+    )
+    prefix = "hcom:pending · E:epic · I:#1582 · PR:pending"
+    assert workspaces[0]["title"] == prefix + " · Story"
+    assert workspaces[0]["group_title"] == prefix
+    assert workspaces[0]["group_fields"]["issues"] == ("#1582",)
+    assert tasks[0]["title"] == prefix + " · Story"
+    assert tasks[0]["links"] == ("https://github.com/owner/repo/issues/1582",)
+    assert len(terminals) == (1 if active else 0)
+    if active:
+        assert terminals[0]["navigation_prefix"] == prefix
+        assert terminals[0]["title"].startswith(prefix + " · Story")
+    assert result["task"] == {"state": "confirmed", "task_id": "task-id"}
+    assert unit.bindings["hierarchy_ready"] is False and "issue" not in unit.bindings
+
+
+def test_reasoning_terminal_presentation_uses_shared_story_without_borrowing_actor(flow):
+    from bmad_loop.campaign_reasoning_flow import presentation
+
+    snapshot, unit, *_ = flow
+    snapshot.bindings["github_hierarchy"] = {
+        "story:"
+        + unit.id: {
+            "kind": "issue",
+            "number": 529,
+            "database_id": 6090790724,
+            "url": "https://github.com/owner/repo/issues/529",
+        }
+    }
+    unit.bindings["reflection"] = {
+        "stage": {
+            "launch_id": unit.claim.launch_id,
+            "windows": [{"state": "active", "hook": {"hcom_name": "tina"}}],
+        }
+    }
+    view = presentation(snapshot, SimpleNamespace(unit=unit.id))
+    assert view["navigation_prefix"] == "hcom:pending · E:epic · I:#529 · PR:pending"
+
+
 def test_sibling_prompt_is_scoped_and_bounded(flow):
     from bmad_loop.campaign_model import UnitState
 

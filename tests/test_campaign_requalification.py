@@ -833,7 +833,9 @@ def test_started_or_unsettled_work_is_refused_without_replacing_snapshot(campaig
     elif fault == "proof":
         unit.evidence["verification"] = {"ok": True}
     elif fault in {"pending-effect", "uncertain-effect"}:
-        action = add_action(snapshot, "inventory", "", {})
+        action = add_action(
+            snapshot, "github" if fault == "pending-effect" else "inventory", "", {}
+        )
         if fault == "uncertain-effect":
             action.state = "sent_unknown"
     elif fault == "job-claim":
@@ -1106,3 +1108,308 @@ def test_changed_old_declaration_cannot_authorize_narrowed_replacement(campaign,
     with pytest.raises(CampaignError, match="declaration changed"):
         apply(case)
     assert case[0].load(case[1].id).revision == case[1].revision
+
+
+def _portfolio_attempt(case, prepared, *, failed_prepare=False, previous=False):
+    """Use real claim/receipt producers and a scripted zero-token subprocess."""
+    from test_campaign_headless import finish
+
+    from bmad_loop.campaign_reasoning_flow import apply as apply_reasoning
+    from bmad_loop.campaign_reasoning_flow import prepare_effect
+    from bmad_loop.campaign_runtime import CampaignRuntime
+    from bmad_loop.campaign_supervisor import Observation
+
+    store, state, template, manifest = case
+    runner, _, original, candidate, cap = prepared
+    state.phase = "active"
+    state.generation = max(1, state.generation)
+    request = replace(
+        original,
+        id="portfolio",
+        purpose="report",
+        required=False,
+        unit="",
+        coordinates={
+            **original.coordinates,
+            "config_revision": state.config_revision,
+            "graph_revision": state.graph_revision,
+        },
+    )
+    row = state.jobs[request.id] if previous else prepare(state, request)
+    runtime = CampaignRuntime(Path(state.root), store)
+    action = add_action(
+        state,
+        "reasoning-launch",
+        "",
+        {"job_id": row["id"], "candidate": json.loads(json.dumps(asdict(candidate)))},
+    )
+    prepare_effect(runtime, state, action)
+    directory = Path(row["claim"]["run_dir"])
+    if failed_prepare:
+        result = Observation(
+            "confirmed", {"state": "preparation_failed", "reason": "Bounded preparation refused"}
+        )
+        apply_reasoning(runtime, state, action, result)
+        action.state, action.receipt = result.state, result.data
+    else:
+        path = runner.prepare(
+            directory, request, candidate, cap, launch_id=action.id, generation=action.generation
+        )
+        observed = runner.launch(path)
+        action.state, action.receipt = "confirmed", {
+            **observed,
+            "effect_binding": action.payload["job_binding"],
+        }
+        receipt = finish(runner, path)
+        observer = add_action(state, "reasoning-observe", "", {"job_id": row["id"]})
+        prepare_effect(runtime, state, observer)
+        result = Observation(
+            "confirmed",
+            {
+                "state": "finished",
+                "receipt": receipt,
+                "effect_binding": observer.payload["job_binding"],
+            },
+        )
+        apply_reasoning(runtime, state, observer, result)
+        observer.state, observer.receipt = result.state, result.data
+        # The fixture output is valid transport JSON but not a semantic report;
+        # the actual semantic application rejects it and earns no authority.
+        application = add_action(state, "reasoning-apply", "", {"job_id": row["id"]})
+        prepare_effect(runtime, state, application)
+        apply_reasoning(runtime, state, application, Observation("confirmed", {}))
+        application.state, application.receipt = "confirmed", {}
+        assert row["state"] == "failed" and row["application"] == "rejected"
+    state.phase = "stopped"
+    state = store.save(state, state.revision)
+    return (store, state, template, manifest), directory
+
+
+@pytest.mark.parametrize("failed_prepare", [False, True])
+def test_renewal_retains_ended_optional_attempts_and_unsent_read_debt(
+    allocated_campaign, prepared, failed_prepare
+):
+    from bmad_loop.campaign_action_history import actions
+    from bmad_loop.campaign_reasoning_flow import _binding
+
+    case, _, _, _ = allocated_campaign
+    case, _ = _portfolio_attempt(case, prepared, failed_prepare=failed_prepare)
+    if not failed_prepare:
+        case, _ = _portfolio_attempt(case, prepared, previous=True)
+    store, state, template, manifest = case
+    for kind in ("inventory", "communication"):
+        add_action(state, kind, "", {})
+    job = state.jobs["portfolio"]
+    add_action(state, "reasoning-stale", "", {"job_id": job["id"], "job_binding": _binding(job)})
+    state = store.save(state, state.revision)
+    before = copy.deepcopy(state.jobs["portfolio"])
+    history = [asdict(a) for a in actions(state)]
+    after = apply((store, state, template, manifest))
+    assert after.jobs["portfolio"] == before  # Failure counters, result, cost and claim retained.
+    assert [asdict(a) for a in actions(after)] == history
+    assert after.phase == "stopped" and after.config_revision == state.config_revision + 1
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "required",
+        "unit",
+        "applied",
+        "live",
+        "missing-predecessor",
+        "permission",
+        "request",
+        "receipt",
+        "empty-receipt",
+        "missing-receipt-field",
+        "grant-file",
+        "actor",
+        "unknown-effect",
+        "pending-binding",
+        "semantic-authority",
+        "cold-applied",
+    ],
+)
+def test_optional_attempt_renewal_requires_exact_readonly_ended_history(
+    allocated_campaign, prepared, monkeypatch, fault
+):
+    from bmad_loop.campaign_action_history import actions
+    from bmad_loop.campaign_headless import read_json, write_json
+    from bmad_loop.campaign_reasoning_flow import _binding
+
+    case, _, _, _ = allocated_campaign
+    case, directory = _portfolio_attempt(case, prepared)
+    store, state, _, _ = case
+    row = state.jobs["portfolio"]
+    history = actions(state)
+    for action in history:
+        if not any(hot.id == action.id for hot in state.outbox):
+            state.outbox.append(action)
+    if fault in {"required", "unit"}:
+        row["request"][fault] = True if fault == "required" else next(iter(state.units))
+        row["request_digest"] = digest(row["request"])
+    elif fault == "applied":
+        row["application"], row["state"] = "applied", "applied"
+    elif fault == "semantic-authority":
+        state.bindings["reasoning_decisions"] = {"priority": {"unit_order": list(state.units)}}
+    elif fault == "cold-applied":
+        row["application"], row["state"] = "applied", "applied"
+        state = store.save(state, state.revision)
+        assert "portfolio" not in state.jobs
+    elif fault == "live":
+        row["claim"]["quiescent"] = False
+    elif fault == "missing-predecessor":
+        row["attempt"] += 1
+    elif fault in {"permission", "request"}:
+        envelope = read_json(directory / "request.json")
+        if fault == "permission":
+            envelope["permissions"] = "workspace-tools"
+        else:
+            envelope["request"]["prompt"] += "changed"
+        write_json(directory / "request.json", envelope)
+    elif fault in {"receipt", "empty-receipt", "missing-receipt-field"}:
+        native = read_json(directory / "receipt.json")
+        if fault == "empty-receipt":
+            native = {}
+        elif fault == "missing-receipt-field":
+            native.pop("processes_quiescent")
+        else:
+            native["processes_quiescent"] = False
+        write_json(directory / "receipt.json", native)
+    elif fault == "grant-file":
+        write_json(directory / "grants.json", {"scopes": ["**"]})
+    elif fault == "actor":
+        from bmad_loop import process_host
+
+        monkeypatch.setattr(process_host.get_process_host(), "liveness_of", lambda *_: "unknown")
+    elif fault == "unknown-effect":
+        next(a for a in state.outbox if a.kind == "reasoning-launch").state = "sent_unknown"
+    else:
+        add_action(
+            state,
+            "reasoning-stale",
+            "",
+            {"job_id": row["id"], "job_binding": {**_binding(row), "request_digest": "bad"}},
+        )
+    with pytest.raises(CampaignError, match="reasoning|settled"):
+        renewal._startup_only(state, store.directory(state.id))
+
+
+@pytest.mark.parametrize("link", [False, True])
+def test_preparation_failure_does_not_hide_launch_intent(allocated_campaign, prepared, link):
+    case, _, _, _ = allocated_campaign
+    case, directory = _portfolio_attempt(case, prepared, failed_prepare=True)
+    store, state, _, _ = case
+    directory.mkdir(parents=True, exist_ok=True)
+    if link:
+        try:
+            (directory / "launch-intent.json").symlink_to(directory / "absent")
+        except OSError:
+            pytest.skip("symlinks unavailable")
+    else:
+        (directory / "launch-intent.json").write_text("{}")
+    with pytest.raises(CampaignError, match="optional reasoning"):
+        renewal._startup_only(state, store.directory(state.id))
+
+
+@pytest.fixture
+def bootstrap_attachment(bootstrap_tracking, request):
+    from bmad_loop.campaign_github import MutationIntent
+    from bmad_loop.campaign_supervisor import Observation
+
+    case, key, runtime, transport = bootstrap_tracking
+    store, state, template, manifest = case
+    existing = getattr(request, "param", False)
+    for _ in range(10):
+        if existing and len(transport.issues) == 2:
+            transport.parents[2] = 1
+        action = add_action(state, "hierarchy", key, {})
+        result = runtime._perform_hierarchy(state, action)
+        runtime.apply(state, action, result)
+        action.state, action.receipt = result.state, copy.deepcopy(result.data)
+        if not result.data["intent"]:
+            continue
+        effect = next(a for a in state.outbox if a.id == result.data["action_key"])
+        intent = MutationIntent.from_dict(effect.payload["intent"])
+        confirmed = (
+            intent
+            if intent.state == "confirmed"
+            else runtime.gateway(state).execute(
+                replace(intent, state="sent_unknown"), generation=state.generation
+            )
+        )
+        observed = Observation("confirmed", {"intent": confirmed.to_dict()})
+        runtime.apply(state, effect, observed)
+        effect.state, effect.receipt = observed.state, copy.deepcopy(observed.data)
+        if intent.kind == "subissue":
+            state = store.save(state, state.revision)
+            return (store, state, template, manifest), effect.id, transport
+    pytest.fail("normal hierarchy never reached attachment")
+
+
+@pytest.mark.parametrize("bootstrap_attachment", [False, True], indirect=True)
+def test_confirmed_bootstrap_attachment_is_preserved_without_replay(bootstrap_attachment):
+    from bmad_loop.campaign_action_history import actions
+
+    case, _, transport = bootstrap_attachment
+    _, state, _, _ = case
+    history = [asdict(a) for a in actions(state)]
+    effects = copy.deepcopy(transport.effects)
+    after = apply(case)
+    assert [asdict(a) for a in actions(after)] == history
+    assert after.bindings["github_hierarchy"] == state.bindings["github_hierarchy"]
+    assert transport.effects == effects
+
+
+@pytest.mark.parametrize("fault", ["parent", "child", "path", "unconfirmed", "receipt"])
+def test_bootstrap_attachment_refuses_changed_relationship_or_receipt(bootstrap_attachment, fault):
+    from bmad_loop.campaign_action_history import actions
+
+    case, effect_id, _ = bootstrap_attachment
+    store, state, _, _ = case
+    history = actions(state)
+    for action in history:
+        if not any(a.id == action.id for a in state.outbox):
+            state.outbox.append(action)
+    proposal = next(
+        a
+        for a in history
+        if a.kind == "hierarchy"
+        and a.receipt.get("action_key") == effect_id
+        and a.receipt.get("intent")
+    )
+    effect = next(a for a in history if a.id == effect_id)
+    if fault in {"parent", "child", "path"}:
+        field = {"parent": "parent_number", "child": "child_id"}.get(fault)
+        if field:
+            proposal.receipt["intent"]["coordinates"][field] += 1
+        else:
+            proposal.receipt["intent"]["path"] += "/foreign"
+        # Preserve internal journal agreement; only native relationship proof is wrong.
+        intent = copy.deepcopy(proposal.receipt["intent"])
+        native = effect.receipt["intent"]["receipt"]
+        effect.payload["intent"] = intent
+        effect.receipt["intent"] = {**intent, "state": "confirmed", "receipt": native}
+    elif fault == "unconfirmed":
+        effect.state = "sent_unknown"
+    else:
+        effect.receipt["intent"]["receipt"]["id"] += 1
+    with pytest.raises(CampaignError, match="bootstrap|settled"):
+        renewal._startup_only(state, store.directory(state.id))
+
+
+def test_retained_optional_attempt_binds_its_original_route_on_later_renewal(
+    allocated_campaign, prepared
+):
+    case, _, _, _ = allocated_campaign
+    case, _ = _portfolio_attempt(case, prepared)
+    store, before, template, manifest = case
+    first = apply(case)
+    second = apply((store, first, template, manifest))
+    assert second.config_revision == before.config_revision + 2
+    assert second.jobs["portfolio"] == before.jobs["portfolio"]
+    original = Path(first.bindings["capability_requalifications"][0]["previous_capabilities_path"])
+    original.write_text(original.read_text() + "\n")
+    with pytest.raises(CampaignError, match="optional reasoning"):
+        renewal._startup_only(second, store.directory(second.id))

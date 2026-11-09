@@ -148,6 +148,144 @@ def test_terminal_jobs_leave_hot_authority_but_remain_queryable(tmp_path, prepar
         driver.store.save(restored, restored.revision)
 
 
+def _partition_first_job(snapshot):
+    from bmad_loop.campaign_jobs import request_from_dict
+    from bmad_loop.campaign_reasoning_plan import fingerprint
+
+    snapshot.spec = replace(
+        snapshot.spec,
+        reasoning=replace(
+            snapshot.spec.reasoning, purposes=(*snapshot.spec.reasoning.purposes, "graph_review")
+        ),
+    )
+    request = request_from_dict(snapshot.jobs.pop("job-0")["request"])
+    prepare(
+        snapshot,
+        replace(
+            request,
+            purpose="graph_review",
+            coordinates={
+                **request.coordinates,
+                "context_digest": fingerprint(snapshot, "graph_review"),
+                "semantic_partition": {"pipeline": "pipeline-a", "stage": "map"},
+            },
+        ),
+    )
+    snapshot.bindings["semantic_jobs"] = {"pipelines": {"pipeline-a": {"state": "mapping"}}}
+
+
+@pytest.mark.parametrize("parent", ["blocked", "missing"])
+def test_unusable_semantic_pipeline_stales_siblings_without_blocking_other_jobs(
+    tmp_path, prepared, parent
+):
+    from bmad_loop.campaign_reasoning_flow import proposals
+
+    snapshot, driver, _, _ = case(tmp_path, prepared, configure=_partition_first_job)
+    pipelines = snapshot.bindings["semantic_jobs"]["pipelines"]
+    assert [(p.kind, p.payload["job_id"]) for p in proposals(driver, snapshot)] == [
+        ("reasoning-launch", "job-0"),
+        ("reasoning-launch", "job-1"),
+    ]
+
+    if parent == "missing":
+        pipelines.clear()
+    else:
+        pipelines["pipeline-a"]["state"] = "blocked"
+    assert [(p.kind, p.payload["job_id"]) for p in proposals(driver, snapshot)] == [
+        ("reasoning-stale", "job-0"),
+        ("reasoning-launch", "job-1"),
+    ]
+
+
+def test_blocked_semantic_pipeline_keeps_observing_existing_claim(tmp_path, prepared):
+    from bmad_loop.campaign_reasoning_flow import proposals
+
+    snapshot, driver, supervisor, _ = case(
+        tmp_path, prepared, count=1, configure=_partition_first_job
+    )
+    snapshot = supervisor._queue(snapshot, proposals(driver, snapshot))
+    claim = copy.deepcopy(snapshot.jobs["job-0"]["claim"])
+    snapshot.bindings["semantic_jobs"]["pipelines"]["pipeline-a"]["state"] = "blocked"
+    assert [(p.kind, p.payload["job_id"]) for p in proposals(driver, snapshot)] == [
+        ("reasoning-observe", "job-0")
+    ]
+    assert snapshot.jobs["job-0"]["claim"] == claim
+    assert not claim["quiescent"]
+
+
+def _preparation_failure(tmp_path, prepared, monkeypatch):
+    from bmad_loop.campaign_reasoning_flow import apply, perform, proposals
+    from bmad_loop.campaign_supervisor import Proposal
+
+    snapshot, driver, supervisor, _ = case(tmp_path, prepared, count=1)
+    snapshot = supervisor._queue(snapshot, proposals(driver, snapshot))
+    snapshot = supervisor._queue(
+        snapshot, (Proposal("reasoning-observe", next(iter(snapshot.units)), {"job_id": "job-0"}),)
+    )
+    launch, observe = snapshot.outbox
+
+    def fail_prepare(*args, **kwargs):
+        raise CampaignError("Rendered prompt/source/schema exceeds its input token bound")
+
+    monkeypatch.setattr(prepared[0], "prepare", fail_prepare)
+    result = perform(driver, snapshot, launch)
+    assert result.state == "confirmed" and result.data["state"] == "preparation_failed"
+    apply(driver, snapshot, launch, result)
+    launch.state, launch.receipt = "confirmed", result.data
+    return snapshot, driver, launch, observe
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_preparation_failure_settles_pending_observation(tmp_path, prepared, monkeypatch, legacy):
+    from bmad_loop.campaign_reasoning_flow import perform
+
+    snapshot, driver, _, observe = _preparation_failure(tmp_path, prepared, monkeypatch)
+    row = snapshot.jobs["job-0"]
+    assert row["claim"]["quiescent"] and row["claim"]["status"] == "not_launched"
+    assert row["failure_attempts"] == snapshot.spec.reasoning.max_attempts
+    if legacy:
+        row["claim"]["status"] = "prepared"
+    result = perform(driver, snapshot, observe, reconcile=True)
+    assert result.state == "confirmed" and result.data["state"] == "settled"
+    assert not prepared[0].mux.processes
+
+
+@pytest.mark.parametrize(
+    "fault", ["intent", "intent-link", "binding", "generation", "unconfirmed", "live"]
+)
+def test_preparation_recovery_requires_exact_unlaunched_proof(
+    tmp_path, prepared, monkeypatch, fault
+):
+    from bmad_loop.campaign_reasoning_flow import perform
+
+    snapshot, driver, launch, observe = _preparation_failure(tmp_path, prepared, monkeypatch)
+    claim = snapshot.jobs["job-0"]["claim"]
+    claim["status"] = "prepared"  # A retained record from before the status correction.
+    assert perform(driver, snapshot, observe).data["state"] == "settled"
+    if fault in {"intent", "intent-link"}:
+        directory = Path(claim["run_dir"])
+        directory.mkdir(parents=True, exist_ok=True)
+        intent = directory / "launch-intent.json"
+        if fault == "intent-link":
+            try:
+                intent.symlink_to(directory / "missing-native-intent")
+            except (NotImplementedError, PermissionError):
+                pytest.skip("Host cannot create a symlink")
+            assert intent.is_symlink() and not intent.exists()
+        else:
+            intent.write_text("{}")
+    elif fault == "binding":
+        launch.payload["job_binding"]["request_digest"] = "another-request"
+    elif fault == "generation":
+        launch.generation += 1
+    elif fault == "unconfirmed":
+        launch.state = "sent_unknown"
+    else:
+        claim["quiescent"] = False
+    result = perform(driver, snapshot, observe, reconcile=True)
+    assert result.state == "unknown" and "not yet bound" in result.reason
+
+
 def test_reasoning_launch_preserves_configured_room_without_forwarding_actor_identity(
     tmp_path, prepared
 ):

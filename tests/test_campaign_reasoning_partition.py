@@ -12,7 +12,8 @@ from test_campaign_reasoning_semantics import case, prepare_jobs, result_for
 
 from bmad_loop import campaign_reasoning_plan as plan
 from bmad_loop import campaign_reasoning_results as results
-from bmad_loop.campaign_jobs import validate_result
+from bmad_loop.campaign_headless import capability_for, render_input
+from bmad_loop.campaign_jobs import request_from_dict, validate_result
 from bmad_loop.campaign_model import CampaignError
 from bmad_loop.campaign_store import add_action
 
@@ -58,6 +59,20 @@ def summary(row):
     }
 
 
+def assert_native_input_fits(snapshot, row):
+    request = request_from_dict(row["request"])
+    candidate = request.candidates[0]
+    capability = capability_for(
+        snapshot.config_snapshot["reasoning_capabilities"],
+        candidate.profile,
+        candidate.model,
+        "reasoning",
+        effort=candidate.effort,
+    )
+    _, delivery = render_input(request, capability)
+    assert delivery["token_upper_bound"] <= request.limits.input_tokens
+
+
 def apply_job(runtime, snapshot, identity, value):
     row = snapshot.jobs[identity]
     validate_result(value, row["request"]["output_schema"])
@@ -77,16 +92,11 @@ def through_final(snapshot, runtime, pipeline, *, dense_summaries=False):
     for _ in range(10):
         pipeline = snapshot.bindings["semantic_jobs"]["pipelines"][identity]
         if pipeline["state"] == "final":
+            assert_native_input_fits(snapshot, snapshot.jobs[pipeline["frontier"][0]])
             return snapshot, snapshot.jobs[pipeline["frontier"][0]]
         for job in pipeline["frontier"]:
             row = snapshot.jobs[job]
-            bound = len(Path(row["request"]["inputs"][0]["path"]).read_bytes())
-            bound += (
-                len(row["request"]["prompt"].encode())
-                + len(json.dumps(row["request"]["output_schema"], sort_keys=True).encode())
-                + 2048
-            )
-            assert bound <= row["request"]["limits"]["input_tokens"]
+            assert_native_input_fits(snapshot, row)
             value = summary(row)
             if dense_summaries:
                 value["summary"] = (
@@ -100,6 +110,39 @@ def through_final(snapshot, runtime, pipeline, *, dense_summaries=False):
         assert not snapshot.jobs
         prepare_jobs(snapshot, runtime)
     pytest.fail("partition DAG did not converge")
+
+
+@pytest.mark.parametrize("count", [3000, 12000])
+def test_escaped_semantic_sources_fit_actual_inline_delivery(tmp_path, prepared, count):
+    snapshot, runtime, candidate = case(tmp_path, prepared, ["priority"])
+    capability = prepared[4]
+    snapshot.config_snapshot["reasoning_capabilities"][
+        candidate.profile + ":" + candidate.model
+    ] = fixture_capability(tmp_path, {**capability, "input_tokens": 16000}, candidate)
+    first = next(iter(snapshot.units.values()))
+    first.spec = replace(first.spec, title="\\" * count)
+    snapshot.config_revision += 1
+    snapshot.graph_revision += 1
+    prepare_jobs(snapshot, runtime)
+    assert snapshot.jobs
+    for row in snapshot.jobs.values():
+        assert_native_input_fits(snapshot, row)
+        assert row["request"]["limits"]["input_tokens"] <= 16000
+    pipelines = snapshot.bindings["semantic_jobs"].get("pipelines", {})
+    if count == 12000:
+        assert len(snapshot.jobs) > 1 and pipelines
+    if pipelines:
+        snapshot, final = through_final(snapshot, runtime, next(iter(pipelines.values())))
+        assert_native_input_fits(snapshot, final)
+        assert (
+            "Priority orders only unfinished non-planning execution units"
+            in final["request"]["prompt"]
+        )
+    else:
+        assert (
+            "Priority orders only unfinished non-planning execution units"
+            in next(iter(snapshot.jobs.values()))["request"]["prompt"]
+        )
 
 
 def test_oversized_priority_restarts_between_maps_and_applies_one_complete_decision(

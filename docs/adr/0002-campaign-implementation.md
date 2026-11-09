@@ -898,11 +898,12 @@ After the upgraded coordinator reconciles all allocation effects while stopped,
 renewal may retain a draft unit with an exact confirmed preparation receipt,
 unchanged clean bootstrap commit and matching workspace/Git identity. Preserve
 its source bindings, never-started intake control and confirmed reflection of the
-same draft workspace before any session. Refuse unknown allocations,
-PR publication, worker or reasoning attempts, unrelated bindings and earned stage
+same draft workspace before any unit worker. Refuse unknown allocations,
+PR publication, writing attempts, unrelated bindings and earned stage
 evidence; renewing proofs never adopts arbitrary work or rewrites its branch.
-Confirmed bootstrap hierarchy observations and milestone/issue creations can also
-survive this renewal when their exact intents, receipts and native bindings agree.
+Confirmed bootstrap hierarchy observations, milestone/issue creations and exact
+native subissue attachments can also survive this renewal when their exact
+intents, receipts and native parent/child bindings agree.
 Preserve the creations and unfinished hierarchy work without replaying them.
 Concurrent units may propose one identical shared create. Retain every proposing
 unit, deduplicate by the exact tracking key and intent, and require the one
@@ -910,6 +911,14 @@ confirmed GitHub action to belong to that proposing set.
 Unknown or rejected writes, unrelated GitHub mutations and PR history remain
 outside this pre-first-worker recovery contract. Ordinary hierarchy reconciliation
 still checks current remote state before admitting work after resume.
+Optional portfolio reasoning attempts may be retained only when every historical
+attempt is proven ended under its exact read-only or no-tools request, or has a
+confirmed preparation failure without any launch intent. No applied semantic
+decision, required job or unit work is admitted through this exception. Preserve
+failed results, attempt counters, usage, claims and receipts unchanged. Never-sent
+inventory/communication observations and exact quiescent reasoning-stale proposals
+keep their original IDs and remain pending for normal reconciliation; uncertain
+native effects and external writes still refuse renewal.
 Semantic renewal compares the declared purposes and contracts in hash-bound proof
 metadata, then validates the complete replacement proof for every purpose. Proof
 coordinates may change; lost corpus or review evidence must not silently narrow
@@ -1522,6 +1531,10 @@ independent of labels. Refresh labels after actor reassignment and GitHub discov
 including quiescent sibling workspaces. Use a separate display-title method so
 renaming cannot break window identity, and persist title-write intent before
 native mutation so lost acknowledgements cannot become operator suffixes.
+Before hierarchy reconciliation finishes, use an exact confirmed campaign story
+issue binding for navigation when the unit has no local issue reference. This
+display fallback does not mark hierarchy reconciliation complete or authorize
+work. Newly confirmed shared bindings also invalidate the reflection projection.
 Keep genuine operator terminal text after the navigation prefix. Normalize
 managed title text consistently with the native host's removal of
 replacement characters and Braille spinner glyphs before verifying readback.

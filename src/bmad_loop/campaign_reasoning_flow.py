@@ -14,6 +14,7 @@ from .campaign_jobs import TERMINAL, accept_receipt, current, live, request_from
 from .campaign_model import CampaignError, RoleCandidate
 from .campaign_store import add_event
 from .campaign_supervisor import Observation, Proposal
+from .platform_util import is_link_like
 
 PREFIX = "reasoning-"
 WORKSPACE_WAIT = "Waiting for an owned Paradev workspace; unit allocation will resume this job"
@@ -140,7 +141,7 @@ def presentation(snapshot, request=None):
         if unit.bindings.get("native"):
             binding = workspace_binding(unit)
             navigation = (
-                {**unit_navigation(unit), "names": ()}
+                {**unit_navigation(unit, snapshot=snapshot), "names": ()}
                 if unit_id in snapshot.units
                 else {"epics": ("unbound",), "issues": ("none",), "prs": ("none",)}
             )
@@ -402,6 +403,21 @@ def _superseded(row, action, data=None):
     )
 
 
+def _confirmed_preparation_failure(snapshot, row):
+    """Recover old quiescent claims that did not record not_launched status."""
+    claim = row.get("claim") or {}
+    return any(
+        effect.id == claim.get("launch_id")
+        and effect.generation == claim.get("generation")
+        and effect.kind == "reasoning-launch"
+        and effect.state == "confirmed"
+        and effect.payload.get("job_id") == row["id"]
+        and effect.payload.get("job_binding") == _binding(row)
+        and effect.receipt.get("state") == "preparation_failed"
+        for effect in snapshot.outbox
+    )
+
+
 def perform(runtime, snapshot, action, *, reconcile: bool = False) -> Observation:
     from .campaign_headless import capability_for, readonly_grants
 
@@ -415,8 +431,9 @@ def perform(runtime, snapshot, action, *, reconcile: bool = False) -> Observatio
     path = Path(claim["run_dir"]) / "request.json"
     if (
         claim.get("quiescent")
-        and claim.get("status") == "not_launched"
         and not (path.parent / "launch-intent.json").exists()
+        and not is_link_like(path.parent / "launch-intent.json")
+        and (claim.get("status") == "not_launched" or _confirmed_preparation_failure(snapshot, row))
     ):
         return Observation("confirmed", {"state": "settled", "effect_binding": _binding(row)})
     runner = _runner(runtime, snapshot)
@@ -479,7 +496,7 @@ def perform(runtime, snapshot, action, *, reconcile: bool = False) -> Observatio
                     from .campaign_titles import navigation_title, unit_navigation
 
                     nav = (
-                        unit_navigation(snapshot.units[request.unit])
+                        unit_navigation(snapshot.units[request.unit], snapshot=snapshot)
                         if request.unit in snapshot.units
                         else {}
                     )
@@ -567,7 +584,7 @@ def perform(runtime, snapshot, action, *, reconcile: bool = False) -> Observatio
                 from .campaign_titles import navigation_title, unit_navigation
 
                 nav = (
-                    unit_navigation(snapshot.units[request.unit])
+                    unit_navigation(snapshot.units[request.unit], snapshot=snapshot)
                     if request.unit in snapshot.units
                     else {}
                 )
@@ -660,7 +677,7 @@ def apply(runtime, snapshot, action, observation) -> None:
                 claim.update(quiescent=True, status="not_launched")
             row["state"], row["reason"], row["retry_at"] = "proposed", data["reason"], None
     elif data.get("state") == "preparation_failed":
-        row["claim"]["quiescent"] = True
+        row["claim"].update(quiescent=True, status="not_launched")
         row["state"], row["reason"] = "failed", data["reason"]
         row["failure_attempts"] = snapshot.spec.reasoning.max_attempts
     elif data.get("state") == "finished":
