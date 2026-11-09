@@ -538,7 +538,9 @@ class CampaignRuntime:
             "hierarchy_finalized_graph"
         ) == snapshot.graph_revision and snapshot.bindings.get("intake", {}).get(
             "observed_at", 0
-        ) >= snapshot.bindings.get("last_delivery_at", 0)
+        ) >= snapshot.bindings.get(
+            "last_delivery_at", 0
+        )
 
     def communication_settled(self, snapshot) -> bool:
         if snapshot.spec.communication.mode != "managed":

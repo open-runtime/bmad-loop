@@ -68,6 +68,57 @@ def test_confirmed_native_mapping_wins_over_stale_tracker_in_stage_navigation(
     assert any(row.get("number") == 529 for row in packet["context"]["inventory"]["selected"])
 
 
+def test_stage_runtime_prioritizes_mapped_issues_before_lower_intake_numbers(
+    checkpoint_case, monkeypatch
+):
+    from bmad_loop import campaign_stage_prompt
+
+    case = checkpoint_case
+    case.snapshot.bindings["inventory"] = large_context()["inventory"]
+    case.snapshot.spec = dataclasses.replace(
+        case.snapshot.spec,
+        intake=dataclasses.replace(case.snapshot.spec.intake, issue_numbers=(2, 1, 900)),
+    )
+    case.unit.bindings.update(issue={"number": 900}, epic_issue={"number": 901}, pr={"number": 42})
+    action = OutboxAction(
+        case.unit.claim.launch_id,
+        "launch",
+        case.unit.id,
+        {
+            "kind": "stage",
+            "role": "admission_review",
+            "stage": "admission_review",
+            "candidate": {"profile": "claude", "model": "fixture"},
+            "read_only": True,
+            "stage_boundary": {"inputs": {}},
+        },
+        case.unit.claim.generation,
+    )
+    navigation = []
+    requests = []
+    prepare = campaign_stage_prompt.prepare_context
+
+    def capture_context(directory, context, *, issue_numbers=(), pr_numbers=()):
+        navigation.append((issue_numbers, pr_numbers))
+        return prepare(directory, context, issue_numbers=issue_numbers, pr_numbers=pr_numbers)
+
+    class Prepared(Exception):
+        pass
+
+    def capture_request(envelope, request):
+        requests.append(request)
+        raise Prepared
+
+    monkeypatch.setattr(campaign_stage_prompt, "prepare_context", capture_context)
+    monkeypatch.setattr(campaign_runtime, "prepare_launch", capture_request)
+    with pytest.raises(Prepared):
+        case.runtime._perform_launch(case.snapshot, action)
+    # A globally sorted union would put 1 and 2 first and consume the selected
+    # window before this unit's own identities. Duplicate intake 900 stays unique.
+    assert navigation == [((900, 901, 1, 2), (42,))]
+    assert len(requests) == 1 and requests[0]["stage"] == "admission_review"
+
+
 @pytest.mark.skipif(sys.platform != "darwin", reason="scripted native read-only qualification")
 def test_production_admission_request_keeps_27mb_inventory_out_of_qualified_input(
     checkpoint_case, readonly, tmp_path, monkeypatch
