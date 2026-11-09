@@ -20,16 +20,9 @@ from .campaign_supervisor import Observation, Proposal
 
 def record_stage_writer(unit, receipt):
     """A repair, planning or closure writer does not erase earlier authors."""
-    family = receipt.get("provider_family", "")
-    previous = unit.evidence.get("developer_family", "")
-    unit.evidence["developer_families"] = sorted(
-        set(unit.evidence.get("developer_families", ()))
-        | {value for value in (previous, family) if value}
-    )
-    unit.evidence["developer_family"] = family
-    unit.evidence["developer_attribution_incomplete"] = bool(
-        unit.evidence.get("developer_attribution_incomplete") or not family
-    )
+    from .campaign_attribution import record_stage_writer as record
+
+    record(unit, receipt)
 
 
 def controller(runtime, snapshot):

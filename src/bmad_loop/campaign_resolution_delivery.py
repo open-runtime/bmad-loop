@@ -201,6 +201,11 @@ def apply(snapshot: Any, unit: Any, data: dict[str, Any]) -> None:
     if unit.evidence.get("retained_finalization_pending") and unit.claim:
         unit.evidence["retained_finalization_pending"]["quiescence_receipt"] = unit.claim.launch_id
     finish_repair(snapshot, unit.id, ResolutionResult(**raw))
+    # The validated result binds the exact candidate whose push was confirmed;
+    # a later remote descendant is not itself campaign-owned publication proof.
+    if raw["recovery_push_confirmed"]:
+        unit.bindings["last_pushed_head"] = raw["head"]
+        unit.bindings["remote_head_anchor"] = raw["head"]
     for key in (
         "accepted_resolution",
         "repair_candidate",

@@ -4041,6 +4041,14 @@ class CampaignRuntime:
             else:
                 return Observation("confirmed", result)
         receipt = result["receipt"]
+        receipt.pop("confirmed_owned_checkpoint", None)
+        if request["kind"] == "recovery":
+            try:
+                checkpoint = self._confirmed_worker_checkpoint(snapshot, unit, request, receipt)
+                if checkpoint is not None:
+                    receipt["confirmed_owned_checkpoint"] = checkpoint
+            except CampaignError as exc:
+                receipt.update(outcome="ownership_uncertain", error=str(exc))
         if request.get("steering") and receipt.get("outcome") in {
             "completed",
             "locally_complete",
@@ -4077,6 +4085,37 @@ class CampaignRuntime:
                 receipt["outcome"] = "invalid_stage_result"
                 receipt["error"] = str(exc)
         return Observation("confirmed", result)
+
+    def _confirmed_worker_checkpoint(self, snapshot, unit, request, receipt):
+        """Authenticate an internal recovery's own push before restoring its anchor."""
+        recovery = receipt.get("recovery") or {}
+        published = receipt.get("retained_checkpoint") or {}
+        if receipt.get("outcome") in {"recovered", "locally_complete"}:
+            if recovery.get("state") != "complete" or recovery.get("action_id") != request.get(
+                "recovery_action"
+            ):
+                raise CampaignError("recovery checkpoint differs from its owning recovery action")
+            identity, head = "recovery:" + recovery["action_id"], recovery.get("head")
+        elif receipt.get("outcome") == "retained_verification_failed":
+            identity = "retained-verification:" + request["recovery_action"] + ":" + receipt["head"]
+            head = published.get("head")
+            if published.get("action_id") != identity or published.get("state") != "confirmed":
+                raise CampaignError("retained verification lacks its confirmed checkpoint receipt")
+        else:
+            return None
+        if not head or head != receipt["head"]:
+            raise CampaignError("recovery checkpoint differs from its terminal candidate")
+        row = next(
+            (
+                row
+                for row in self._pusher(snapshot, unit).observations()
+                if row.action_id == identity
+            ),
+            None,
+        )
+        if row is None or row.state != "confirmed" or row.head != head:
+            raise CampaignError("recovery checkpoint lacks its exact confirmed publication journal")
+        return dataclasses.asdict(row)
 
     def _validate_stage_receipt(self, snapshot, unit, request, receipt) -> None:
         coordinates = StageCoordinates(**request["coordinates"])
@@ -5701,6 +5740,18 @@ class CampaignRuntime:
         claim.quiescent = True
         claim.status = "finished"
         receipt = data["receipt"]
+        checkpoint = receipt.get("confirmed_owned_checkpoint")
+        if checkpoint is not None:
+            if checkpoint.get("state") != "confirmed" or checkpoint.get("head") != receipt["head"]:
+                raise CampaignError(
+                    "worker checkpoint anchor lacks exact confirmed candidate proof"
+                )
+            unit.bindings["last_pushed_head"] = checkpoint["head"]
+            unit.bindings["remote_head_anchor"] = checkpoint["head"]
+        from .campaign_attribution import record_stage_writer, writing_stage
+
+        if claim.writes and writing_stage(snapshot, unit, receipt):
+            record_stage_writer(unit, receipt)
         if receipt.get("landing"):
             from .campaign_landing_acceptance import apply_worker as apply_landing
             from .campaign_usage import apply as apply_usage

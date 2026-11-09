@@ -322,19 +322,41 @@ def before_effect(runtime, snapshot, action):
             "inputs": value,
             "key": action.payload["key"],
             "launch": action.payload["launch"],
-            **_remote_observation(runtime, snapshot, unit, value),
+            **_remote_observation(
+                runtime, snapshot, unit, value, landing=action.payload["launch"].get("landing")
+            ),
         },
     )
 
 
-def _remote_observation(runtime, snapshot, unit, inputs):
+def _remote_observation(runtime, snapshot, unit, inputs, *, landing=False):
     """Reuse the fresh native row; independently authenticate its exact Git head."""
     if not unit.bindings.get("pr"):
         return {}
     from .campaign_remote_head import checked
 
     number = unit.bindings["pr"]["number"]
-    return checked(runtime, snapshot, unit, pr=inputs["github"]["pulls"][str(number)]["pr"])
+    pr = inputs["github"]["pulls"][str(number)]["pr"]
+    merged = unit.evidence.get("merge", {})
+    accepted = unit.evidence.get("landing_acceptance", {})
+    if (
+        landing is True
+        and unit.state == UnitState.MERGED_PENDING_SYNC
+        and merged.get("state") == "merged_pending_sync"
+        and merged.get("canonical_head")
+        and merged.get("merge_commit")
+        and merged["merge_commit"] == accepted.get("merge_commit") == pr.get("merge_commit_sha")
+        and pr.get("number") == number
+        and unit.bindings["pr"].get("node_id")
+        and pr.get("node_id") == unit.bindings["pr"].get("node_id")
+        and pr.get("merged") is True
+        and pr.get("state") == "closed"
+    ):
+        # The canonical landing is already confirmed. Its separate checkout and
+        # verification/review debt remain authoritative; the PR branch may be
+        # closed or deleted without authorizing another pre-merge writer.
+        return {}
+    return checked(runtime, snapshot, unit, pr=pr)
 
 
 def _apply_remote(runtime, snapshot, unit, data):
@@ -431,7 +453,9 @@ def after_effect(runtime, snapshot, action):
             runtime.clock() + 5,
         )
     before = debt["request"]["stage_boundary"]["inputs"]
-    remote = _remote_observation(runtime, snapshot, unit, inputs)
+    remote = _remote_observation(
+        runtime, snapshot, unit, inputs, landing=debt["request"].get("landing")
+    )
     allowed = {debt["receipt"]["head"], debt["request"]["coordinates"]["head"]} | {
         row["pr"].get("head", {}).get("sha") for row in before["github"]["pulls"].values()
     }

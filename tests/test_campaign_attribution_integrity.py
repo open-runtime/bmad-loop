@@ -92,6 +92,132 @@ def test_known_provider_qualified_contributors_remain_publishable(project, tmp_p
     assert controller.evaluate(candidate, evidence, observation, independent_families=True).ready
 
 
+def test_restore_retained_writer_unions_families_without_changing_later_author(project, tmp_path):
+    _, snapshot, unit = finished(project, tmp_path, [session("dev", ["gpt-main"])])
+    unit.state = UnitState.READY_TO_PUBLISH
+    unit.evidence["review"] = {"provider_family": "anthropic", "launch_id": "review"}
+    retained = {
+        "outcome": "stage_complete",
+        "result_contract": "repair-v1",
+        "launch_id": "old-repair",
+        "provider_family": "anthropic",
+        "observed_model": "claude-fable-5-1",
+        "observed_models": ["claude-fable-5-1"],
+    }
+    unit.evidence["worker_history"].insert(0, retained)
+    unit.evidence["stage_input_invalidations"] = [{"receipt": retained}]
+    assert restore(snapshot)
+    assert unit.evidence["developer_families"] == ["anthropic", "openai"]
+    assert unit.evidence["developer_family"] == "openai"
+    assert "review" not in unit.evidence and unit.state == UnitState.SYNCING
+    assert unit.evidence["stage_input_invalidations"][0]["receipt"] == retained
+    assert not restore(snapshot)
+
+
+@pytest.mark.parametrize(
+    "models,unknown",
+    [(["claude-fable-5-1", "grok-code"], False), (["claude-fable-5-1", "unknown-helper"], True)],
+)
+def test_stage_writer_auxiliary_models_are_counted_and_unknown_is_sticky(
+    project, tmp_path, models, unknown
+):
+    from bmad_loop.campaign_attribution import record_stage_writer
+
+    _, snapshot, unit = finished(project, tmp_path, [session("dev", ["gpt-main"])])
+    receipt = {
+        "observed_model": models[0],
+        "observed_models": models,
+        "provider_family": "anthropic",
+    }
+    record_stage_writer(unit, receipt)
+    assert unit.evidence["developer_families"] == (
+        ["anthropic", "openai"] if unknown else ["anthropic", "openai", "xai"]
+    )
+    assert unit.evidence["developer_attribution_incomplete"] is unknown
+    record_stage_writer(unit, {"provider_family": "google"})
+    assert unit.evidence["developer_attribution_incomplete"] is unknown
+
+
+@pytest.mark.parametrize(
+    "case", ["known", "unknown", "not_launched", "readonly", "retained_commits"]
+)
+def test_failed_stage_contributor_requires_native_session_or_retained_changes(
+    project, tmp_path, case
+):
+    from bmad_loop.campaign_model import OutboxAction, WorkerClaim
+
+    runtime, snapshot, unit = finished(project, tmp_path, [session("dev", ["gpt-main"])])
+    unit.state = UnitState.RUNNING
+    unit.claim = WorkerClaim(
+        unit.id, 2, 0, "failed-stage", role="conflict_repair", writes=case != "readonly"
+    )
+    receipt = {
+        "launch_id": "failed-stage",
+        "outcome": "operator_held" if case == "not_launched" else "failed",
+        "stage": "publication_review" if case == "readonly" else "conflict_repair",
+        "result_contract": "review-v1" if case == "readonly" else "repair-v1",
+        "base": "h" * 40,
+        "head": ("c" if case == "retained_commits" else "h") * 40,
+        "accounting": {
+            "schema_version": 1,
+            "kind": "stage",
+            "stream_id": "stage:failed-stage",
+            "tokens": {},
+            "models": ["claude-fable-5-1"] if case in {"known", "readonly"} else [],
+            "session_observed": case not in {"not_launched", "retained_commits"},
+        },
+    }
+    action = OutboxAction("observe", "observe-worker", unit.id, {"launch_id": "failed-stage"}, 0)
+    runtime._apply_worker(snapshot, unit, action, {"state": "finished", "receipt": receipt})
+    assert unit.evidence["developer_families"] == (
+        ["anthropic", "openai"] if case == "known" else ["openai"]
+    )
+    assert unit.evidence["developer_attribution_incomplete"] is (
+        case in {"unknown", "retained_commits"}
+    )
+    assert receipt in unit.evidence["worker_history"]
+    # Legacy reconstruction uses retained telemetry, not the current writer label.
+    unit.state = UnitState.READY_TO_PUBLISH
+    unit.evidence.update(
+        developer_family="openai",
+        developer_families=["openai"],
+        developer_attribution_incomplete=False,
+    )
+    unit.evidence["review"] = {"provider_family": "anthropic"}
+    changed = restore(snapshot)
+    assert changed is (case in {"known", "unknown", "retained_commits"})
+    assert unit.evidence["developer_family"] == "openai"
+    assert ("review" in unit.evidence) is (case in {"not_launched", "readonly"})
+
+
+@pytest.mark.parametrize(
+    "stage",
+    [
+        "planning_review",
+        "publication_review",
+        "native_review_pair",
+        "admission_review",
+        "decision_review",
+        "escalation",
+    ],
+)
+def test_readonly_stage_history_never_becomes_writer_attribution(project, tmp_path, stage):
+    _, snapshot, unit = finished(project, tmp_path, [session("dev", ["gpt-main"])])
+    unit.spec = dataclasses.replace(unit.spec, kind="planning")
+    unit.state = UnitState.READY_TO_PUBLISH
+    unit.evidence["worker_history"].append(
+        {
+            "outcome": "stage_complete",
+            "stage": stage,
+            "provider_family": "anthropic",
+            "observed_model": "claude-fable-5-1",
+            "observed_models": ["claude-fable-5-1"],
+        }
+    )
+    assert not restore(snapshot)
+    assert unit.evidence["developer_families"] == ["openai"]
+
+
 def test_resume_repairs_historical_mixed_unknown_flag_without_rewriting_later_author(
     project, tmp_path
 ):

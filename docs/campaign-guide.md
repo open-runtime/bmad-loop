@@ -325,6 +325,9 @@ their action IDs, prepared SHAs and prior failure history. Issued uncertain push
 continue exact-head readback. `campaign reconcile ID` can recognize an operator's
 already-pushed sealed commit without re-arming writes.
 Published history stays append-only during campaign recovery.
+Approved amendments and recovery publications advance the campaign's branch
+baseline only to their exact confirmed checkpoint. Later remote commits remain
+separate contributions requiring reconciliation.
 
 Final delivery updates the branch from current main, resolves conflicts with the
 configured conflict-repair role, verifies the resulting candidate and reviews
@@ -388,6 +391,10 @@ the campaign agent that integrates them. Existing campaign attribution debt stay
 blocking. Fresh full-diff reviews cover the complete combined candidate, but do
 not claim provider independence from unknown external models.
 
+Invalidated or unsuccessful writing stages retain their observed contributors
+and any missing model identity. Resume restores those exclusions without replacing
+a later writer's identity. This records authorship; it grants no stage acceptance.
+
 Remote-head reconciliation waits for the owned writer to settle, validates the
 new paths against the approved scope, preserves local/remote/target history and
 uses append-only integration. Conflicts use the configured conflict-repair route.
@@ -431,6 +438,9 @@ configured checks, selected local reviews, verification and history preservation
 It does not claim server-enforced atomic freshness of the base. The actual landed
 commit must pass acceptance before delivery; failed landing proof creates one
 linked repair PR and keeps original tracking pending until the repair is accepted.
+Landing reviews use the confirmed canonical merge identity; closing or deleting
+the merged PR branch does not block that review or waive landing acceptance.
+
 Repair drafts retain the original accepted product specification from its exact
 reviewed Git head, including embedded native plan text and source hashes. This
 also works when ticket acceptance lives in the native plan rather than duplicated

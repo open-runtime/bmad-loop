@@ -212,6 +212,45 @@ def test_after_boundary_retains_completed_receipt_and_rearms_stage_after_externa
     assert unit.evidence["planning_flow"]["attempts"]["requirements"] == 0
 
 
+def test_retained_writer_is_attributed_before_boundary_acceptance(project, tmp_path):
+    runtime, snapshot, unit = setup(project, tmp_path)
+    _, before = prepared(runtime, snapshot, unit)
+    unit.state = UnitState.RUNNING
+    unit.evidence.update(developer_family="openai", developer_families=["openai"])
+    unit.claim = WorkerClaim(
+        unit.id, 1, snapshot.generation, "writer", role="planning", writes=True
+    )
+    directory = runtime.store.directory(snapshot.id) / "workers" / "writer"
+    directory.mkdir(parents=True)
+    request = {"stage_boundary": {"inputs": before}, "coordinates": {"head": unit.bindings["head"]}}
+    (directory / "request.json").write_text(json.dumps(request), encoding="utf-8")
+    receipt = {
+        "outcome": "stage_complete",
+        "launch_id": "writer",
+        "stage": "requirements",
+        "head": unit.bindings["head"],
+        "provider_family": "anthropic",
+        "observed_model": "claude-fable-5-1",
+        "observed_models": ["claude-fable-5-1"],
+    }
+    action = OutboxAction(
+        "observe", "observe-worker", unit.id, {"launch_id": "writer"}, snapshot.generation
+    )
+    runtime._apply_worker(snapshot, unit, action, {"state": "finished", "receipt": receipt})
+    assert unit.evidence["developer_families"] == ["anthropic", "openai"]
+    assert unit.evidence["stage_sync_debt"]["receipt"] == receipt
+    assert "planning_results" not in unit.evidence
+    runtime._validate_stage_receipt = lambda *args: pytest.fail("accepted stale writer result")
+    runtime._apply_stage_result = lambda *args: pytest.fail("granted stale stage completion")
+    advance_owned_remote(project, tmp_path, runtime)
+    after = OutboxAction("after-writer", "stage-boundary-after", unit.id, {}, snapshot.generation)
+    result = boundary.after_effect(runtime, snapshot, after)
+    boundary.after_apply(runtime, snapshot, after, result.data)
+    assert unit.evidence["stage_input_invalidations"][-1]["receipt"] == receipt
+    assert unit.evidence["developer_families"] == ["anthropic", "openai"]
+    assert unit.state == UnitState.RUNNING
+
+
 def test_unpushed_local_descendant_is_not_external_debt(project, tmp_path):
     runtime, snapshot, unit = setup(project, tmp_path)
     git(project.project, "commit", "--allow-empty", "-m", "owned unpublished work")
@@ -222,6 +261,84 @@ def test_unpushed_local_descendant_is_not_external_debt(project, tmp_path):
         boundary.before_proposal(runtime, snapshot, Proposal("launch", unit.id, payload)).kind
         == "launch"
     )
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [None, "ordinary-stage", "state", "canonical", "merge", "unmerged", "node", "missing-node"],
+)
+def test_landing_boundary_preserves_confirmed_postmerge_review_only(project, tmp_path, fault):
+    runtime, snapshot, unit = setup(project, tmp_path)
+    head = unit.bindings["head"]
+    unit.state = UnitState.MERGED_PENDING_SYNC
+    unit.evidence["merge"] = {
+        "state": "merged_pending_sync",
+        "merge_commit": head,
+        "canonical_head": head,
+    }
+    unit.evidence["landing_acceptance"] = {"merge_commit": head, "state": "reviewing"}
+    runtime._gateway.pr.update(merged=True, state="closed", merge_commit_sha=head)
+    payload = {
+        "kind": "stage",
+        "stage": "publication_review",
+        "role": "publication_review",
+        "landing": True,
+        "read_only": True,
+    }
+    if fault == "ordinary-stage":
+        payload.pop("landing")
+    elif fault == "state":
+        unit.state = UnitState.READY_TO_PUBLISH
+    elif fault == "canonical":
+        unit.evidence["merge"].pop("canonical_head")
+    elif fault == "merge":
+        runtime._gateway.pr["merge_commit_sha"] = "f" * 40
+    elif fault == "unmerged":
+        runtime._gateway.pr["merged"] = False
+    elif fault == "node":
+        runtime._gateway.pr["node_id"] = "different-pr"
+    elif fault == "missing-node":
+        unit.bindings["pr"].pop("node_id")
+        runtime._gateway.pr.pop("node_id")
+    proposal = boundary.before_proposal(runtime, snapshot, Proposal("launch", unit.id, payload))
+    action = OutboxAction(
+        "landing-before", proposal.kind, unit.id, proposal.payload, snapshot.generation
+    )
+    result = boundary.before_effect(runtime, snapshot, action)
+    boundary.before_apply(runtime, snapshot, action, result.data)
+    if fault:
+        assert result.data["remote_head_error"] and unit.hold.kind == "ownership_uncertain"
+        assert "stage_boundary_ready" not in unit.evidence
+        return
+    assert unit.hold is None and "remote_head_sync" not in unit.evidence
+    assert (
+        boundary.before_proposal(runtime, snapshot, Proposal("launch", unit.id, payload)).kind
+        == "launch"
+    )
+    unit.claim = WorkerClaim(unit.id, 1, snapshot.generation, "landing-review", quiescent=True)
+    unit.evidence["stage_sync_debt"] = {
+        "request": {
+            **payload,
+            "stage_boundary": {"inputs": result.data["inputs"]},
+            "coordinates": {"head": head},
+        },
+        "receipt": {
+            "outcome": "stage_complete",
+            "stage": "publication_review",
+            "landing": True,
+            "head": head,
+            "launch_id": "landing-review",
+        },
+    }
+    calls = []
+    runtime._validate_stage_receipt = lambda *args: calls.append("validate-landing")
+    runtime._apply_stage_result = lambda *args: calls.append("accept-landing")
+    after = OutboxAction("landing-after", "stage-boundary-after", unit.id, {}, snapshot.generation)
+    observed = boundary.after_effect(runtime, snapshot, after)
+    boundary.after_apply(runtime, snapshot, after, observed.data)
+    assert calls == ["validate-landing", "accept-landing"]
+    assert unit.hold is None and unit.state == UnitState.MERGED_PENDING_SYNC
+    assert "stage_sync_debt" not in unit.evidence
 
 
 @pytest.mark.parametrize("fault", ["identity", "lag"])
