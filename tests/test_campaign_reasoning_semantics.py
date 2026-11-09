@@ -347,6 +347,79 @@ def test_successful_pr_clock_diagnostic_does_not_change_semantic_facts(purpose):
 
 
 @pytest.mark.parametrize(
+    "purpose", ["routing", "priority", "report", "graph_review", "semantic_sync", "triage"]
+)
+def test_semantic_context_traverses_inventory_only_for_purposes_that_consume_it(
+    monkeypatch, purpose
+):
+    snapshot = make_snapshot()
+    empty = plan.context(snapshot, purpose)
+    rows = [{"number": i, "body": "Required evidence " * 100} for i in range(128)]
+    snapshot.bindings["inventory"] = {"complete": True, "pulls": rows}
+    stable = plan._stable
+    traversals = []
+
+    def counted(value):
+        if value is rows:
+            traversals.append(value)
+        return stable(value)
+
+    monkeypatch.setattr(plan, "_stable", counted)
+    actual = plan.context(snapshot, purpose)
+    if purpose in {"routing", "priority", "report"}:
+        assert actual == empty
+        assert traversals == []
+    else:
+        assert actual["inventory"]["pulls"] == rows
+        assert actual["inventory_source_id"] != empty["inventory_source_id"]
+        assert len(traversals) == 1
+
+
+@pytest.mark.parametrize("mutation", ["inventory", "head", "config"])
+def test_semantic_proposals_share_current_fingerprints_without_cross_call_cache(
+    tmp_path, prepared, monkeypatch, mutation
+):
+    purposes = ("graph_review", "semantic_sync", "priority")
+    snapshot, runtime, _ = case(tmp_path, prepared, purposes)
+    fingerprint = plan.fingerprint
+    expected = {purpose: fingerprint(snapshot, purpose) for purpose in purposes}
+    pipelines = {
+        f"{purpose}-{index}": {
+            "purpose": purpose,
+            "context_digest": expected[purpose],
+            "state": "mapping",
+            "frontier": ["retained-map"],
+            "completed": ["retained-map"],
+        }
+        for purpose in purposes[:2]
+        for index in range(4)
+    }
+    snapshot.bindings["semantic_jobs"] = {"triggers": {}, "pipelines": pipelines}
+    calls = Counter()
+
+    def counted(current, purpose):
+        calls[purpose] += 1
+        return fingerprint(current, purpose)
+
+    monkeypatch.setattr(plan, "fingerprint", counted)
+    (proposal,) = plan.proposals(runtime, snapshot)
+    assert proposal.payload["triggers"] == expected
+    assert proposal.payload["advance"] == list(pipelines)
+    assert calls == Counter({purpose: 1 for purpose in purposes})
+    if mutation == "inventory":
+        snapshot.bindings["inventory"]["pulls"] = [{"number": 2, "body": "New owner direction"}]
+    elif mutation == "head":
+        next(iter(snapshot.units.values())).evidence["local"] = {"head": "new-head"}
+    else:
+        snapshot.config_revision += 1
+    expected = {purpose: fingerprint(snapshot, purpose) for purpose in purposes}
+    (proposal,) = plan.proposals(runtime, snapshot)
+    assert proposal.payload["triggers"] == expected
+    assert proposal.payload["advance"] == []
+    assert calls == Counter({purpose: 2 for purpose in purposes})
+
+
+@pytest.mark.parametrize(
     "inventory", [None, {"complete": False, "unavailable": ["github:offline"]}]
 )
 def test_graph_review_waits_for_complete_inventory_then_resumes(tmp_path, prepared, inventory):

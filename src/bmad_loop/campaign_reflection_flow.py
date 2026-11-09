@@ -29,7 +29,7 @@ from .campaign_model import (
     scopes_overlap,
 )
 from .campaign_paradev import ParadevWorkspaceProvider, ReflectionError, WorkspaceBinding
-from .campaign_titles import group_navigation, navigation_title, unit_navigation
+from .campaign_titles import group_navigation, issue_reference, navigation_title, unit_navigation
 from .platform_util import atomic_write_text, is_link_like, safe_segment
 from .policy import Policy
 from .signals import SessionAttribution, _parse_event, is_session_event
@@ -519,7 +519,7 @@ def reflect(
         if claim
         else {"state": "pending", "windows": []}
     )
-    navigation = unit_navigation(unit, projection)
+    navigation = unit_navigation(unit, projection, snapshot=snapshot)
     title = navigation_title(**navigation, description=unit.spec.title)
     metadata = provider.reflect(
         binding,
@@ -536,12 +536,12 @@ def reflect(
     task = {"state": "off"}
     if snapshot.spec.paradev.tasks:
         try:
+            issue, issue_url = issue_reference(unit, snapshot=snapshot)
             links = tuple(
                 value
                 for value in (
                     _pr_url(unit),
-                    (unit.bindings.get("issue") or {}).get("url", "")
-                    or unit.bindings.get("issue_url", ""),
+                    issue.get("url", "") or issue_url,
                 )
                 if value
             )
@@ -557,7 +557,9 @@ def reflect(
             task = {"state": "pending", "detail": str(exc)}
     for window in projection["windows"]:
         if window["state"] in ("active", "launching"):
-            terminal_navigation = unit_navigation(unit, {**projection, "windows": [window]})
+            terminal_navigation = unit_navigation(
+                unit, {**projection, "windows": [window]}, snapshot=snapshot
+            )
             prefix = navigation_title(**terminal_navigation)
             observed = provider.bind_terminal(
                 binding,

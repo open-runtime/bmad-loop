@@ -120,6 +120,70 @@ def test_group_aggregates_actual_members_without_merging_other_initiatives():
     assert navigation_title(**nav) == "@nava/@tina · E:epic · I:#42/#43 · PR:#18/#19"
 
 
+@pytest.fixture
+def pending_issue_navigation():
+    work = unit()
+    work.claim = None
+    work.bindings.pop("issue")
+    work.bindings.pop("pr")
+    work.bindings["hierarchy_ready"] = False
+    shared = {
+        "kind": "issue",
+        "number": 529,
+        "database_id": 6090790724,
+        "url": "https://github.com/owner/repo/issues/529",
+    }
+    snapshot = CampaignSnapshot(
+        "campaign",
+        "owner/repo",
+        CampaignSpec("test"),
+        units={work.id: work},
+        bindings={"github_hierarchy": {"story:" + work.id: shared}},
+    )
+    return work, snapshot, shared
+
+
+def test_navigation_uses_exact_shared_story_before_hierarchy_is_ready(pending_issue_navigation):
+    work, snapshot, _ = pending_issue_navigation
+    expected = {"names": (), "epics": ("epic",), "issues": ("#529",), "prs": ()}
+    assert unit_navigation(work, snapshot=snapshot) == expected
+    assert group_navigation(snapshot, work) == expected
+    assert unit_navigation(work)["issues"] == ()  # Prior API has no shared context.
+    assert work.bindings["hierarchy_ready"] is False and "issue" not in work.bindings
+
+
+@pytest.mark.parametrize(
+    "fault", ["other-unit", "foreign-repository", "no-native-id", "pr", "bool-number"]
+)
+def test_shared_navigation_never_guesses_unconfirmed_or_foreign_identity(
+    pending_issue_navigation, fault
+):
+    work, snapshot, shared = pending_issue_navigation
+    if fault == "other-unit":
+        snapshot.bindings["github_hierarchy"] = {"story:another": shared}
+    elif fault == "foreign-repository":
+        shared["url"] = "https://github.com/foreign/repo/issues/529"
+    elif fault == "no-native-id":
+        shared.pop("database_id")
+    elif fault == "pr":
+        shared["kind"] = "pr"
+    else:
+        shared["number"] = True
+    assert unit_navigation(work, snapshot=snapshot)["issues"] == ()
+
+
+@pytest.mark.parametrize(
+    "local", [{"issue": {"number": 42}}, {"issue_url": "https://github.com/owner/repo/issues/43"}]
+)
+def test_unit_issue_identity_keeps_precedence_over_shared_navigation(
+    pending_issue_navigation, local
+):
+    work, snapshot, _ = pending_issue_navigation
+    work.bindings.update(local)
+    expected = ("#42",) if "issue" in local else ("#43",)
+    assert unit_navigation(work, snapshot=snapshot)["issues"] == expected
+
+
 def test_managed_bridge_precedes_private_native_actor_and_is_generation_bound():
     work = unit()
     work.bindings["managed_communication"] = {

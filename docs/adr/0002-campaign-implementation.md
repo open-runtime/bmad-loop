@@ -1522,6 +1522,10 @@ independent of labels. Refresh labels after actor reassignment and GitHub discov
 including quiescent sibling workspaces. Use a separate display-title method so
 renaming cannot break window identity, and persist title-write intent before
 native mutation so lost acknowledgements cannot become operator suffixes.
+Before hierarchy reconciliation finishes, use an exact confirmed campaign story
+issue binding for navigation when the unit has no local issue reference. This
+display fallback does not mark hierarchy reconciliation complete or authorize
+work. Newly confirmed shared bindings also invalidate the reflection projection.
 Keep genuine operator terminal text after the navigation prefix. Normalize
 managed title text consistently with the native host's removal of
 replacement characters and Braille spinner glyphs before verifying readback.

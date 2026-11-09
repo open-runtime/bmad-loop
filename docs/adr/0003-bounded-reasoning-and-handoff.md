@@ -74,6 +74,9 @@ identity, and the next application recomputes it from current evidence. Job
 bookkeeping does not change semantic context; never retain this cache across
 applications or reuse it across purposes. This keeps a large map batch from
 rehashing the full inventory for every child on the coordinator thread.
+Routing, priority and reporting contexts omit repository inventory and must not
+normalize that unused inventory. Proposal evaluation reuses a purpose's context
+identity only within that evaluation; the next evaluation reads current facts.
 Qualify startup through incomplete discovery, recovery, capacity observation,
 workspace allocation and worker launch using the normal coordinator path, rather
 than injecting a workspace into every fixture. This regression is separate from

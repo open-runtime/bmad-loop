@@ -554,6 +554,9 @@ user-owned workspace content.
 Managed workspace, task and terminal titles start with the observed hcom name,
 epic, issue and PR: `@tina · E:epic · I:#42 · PR:#18 · description`. Missing
 bindings display `pending`; no name is inferred from a model or another worker.
+Confirmed campaign story issues appear before hierarchy setup finishes, even
+when their per-unit issue binding is still pending. This changes navigation only;
+the remaining hierarchy and admission checks still apply.
 Groups aggregate their members' actors/issues/PRs, with counts when the bounded
 label omits additional members. Stable workspace and group identities survive
 renaming. Actor changes and discovered GitHub links refresh the labels, including

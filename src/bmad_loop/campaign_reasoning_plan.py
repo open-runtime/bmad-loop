@@ -95,11 +95,15 @@ def context(snapshot, purpose: str) -> dict[str, Any]:
     # The coverage receipt digest includes its observation time. Semantic advice
     # follows the observed facts, not that receipt identity: otherwise each poll
     # invalidates an unchanged, possibly partitioned graph review.
-    inventory = {
-        key: value
-        for key, value in snapshot.bindings.get("inventory", {}).items()
-        if key != "digest"
-    }
+    inventory = (
+        {
+            key: value
+            for key, value in snapshot.bindings.get("inventory", {}).items()
+            if key != "digest"
+        }
+        if purpose in {"graph_review", "semantic_sync", "triage"}
+        else {}
+    )
     coverage = inventory.get("github_coverage")
     if isinstance(coverage, dict) and isinstance(coverage.get("identity_observations"), list):
         # A successful clock-only refresh is an observation diagnostic, not a
@@ -197,18 +201,27 @@ def proposals(runtime, snapshot) -> tuple[Proposal, ...]:
     state = snapshot.bindings.get("semantic_jobs", {})
     from .campaign_reasoning_partition import ready as partition_ready
 
+    fingerprints: dict[str, str] = {}
+
+    def current(purpose):
+        # This read-only pass does not mutate its context. Reuse within the
+        # pass only; the next invocation must observe new facts and revisions.
+        if purpose not in fingerprints:
+            fingerprints[purpose] = fingerprint(snapshot, purpose)
+        return fingerprints[purpose]
+
     advance = [
         key
         for key, pipeline in state.get("pipelines", {}).items()
         if _eligible(snapshot, pipeline["purpose"])
-        and fingerprint(snapshot, pipeline["purpose"]) == pipeline["context_digest"]
+        and current(pipeline["purpose"]) == pipeline["context_digest"]
         and partition_ready(runtime, snapshot, pipeline)
     ]
     needed = {
-        purpose: fingerprint(snapshot, purpose)
+        purpose: current(purpose)
         for purpose in sorted(set(snapshot.spec.reasoning.purposes) & ROLES.keys())
         if _eligible(snapshot, purpose)
-        and state.get("triggers", {}).get(purpose) != fingerprint(snapshot, purpose)
+        and state.get("triggers", {}).get(purpose) != current(purpose)
     }
     return (
         (

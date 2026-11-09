@@ -140,7 +140,7 @@ def presentation(snapshot, request=None):
         if unit.bindings.get("native"):
             binding = workspace_binding(unit)
             navigation = (
-                {**unit_navigation(unit), "names": ()}
+                {**unit_navigation(unit, snapshot=snapshot), "names": ()}
                 if unit_id in snapshot.units
                 else {"epics": ("unbound",), "issues": ("none",), "prs": ("none",)}
             )
@@ -479,7 +479,7 @@ def perform(runtime, snapshot, action, *, reconcile: bool = False) -> Observatio
                     from .campaign_titles import navigation_title, unit_navigation
 
                     nav = (
-                        unit_navigation(snapshot.units[request.unit])
+                        unit_navigation(snapshot.units[request.unit], snapshot=snapshot)
                         if request.unit in snapshot.units
                         else {}
                     )
@@ -567,7 +567,7 @@ def perform(runtime, snapshot, action, *, reconcile: bool = False) -> Observatio
                 from .campaign_titles import navigation_title, unit_navigation
 
                 nav = (
-                    unit_navigation(snapshot.units[request.unit])
+                    unit_navigation(snapshot.units[request.unit], snapshot=snapshot)
                     if request.unit in snapshot.units
                     else {}
                 )
