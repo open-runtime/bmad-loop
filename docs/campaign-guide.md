@@ -634,6 +634,15 @@ Stop closes admissions and drains current bounded stages by default. Explicit
 termination uses owned process controls and retains unresolved claims. Release
 removes an operator hold; it does not approve missing checks or waive another
 kind of hold. Reconcile refreshes observations without launching new workers.
+
+A `launch_preparation` hold means the controller proved that input preparation
+failed before a native request was persisted. Its claim is quiescent and its
+reason remains visible. After correcting that cause, an explicit reconcile or
+resume can rearm the recorded refusal; the next launch requires a fresh stage
+boundary and a new identity. Ordinary ticks do not repeatedly retry it, and
+existing owner holds and lifetime attempt limits remain in force. An uncertain
+launch acknowledgement does not qualify for this recovery.
+
 Hold also reaches the existing worker's automatic input and retry boundaries;
 it permits real completion through the usual Stop/death path. Release first
 observes exact process quiescence, source and Git identity. Changed acceptance

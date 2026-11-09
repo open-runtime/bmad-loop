@@ -311,6 +311,25 @@ a representative large inventory without inference, verify its input size and
 required obligations, and exercise retrieval, tampering and permission failures.
 An isolated discovery test or small scripted stage does not prove this connection.
 
+Apply the same distinction to GitHub boundary snapshots and accumulated planning
+history: repository-wide pull lists, intake metadata and prior-stage artifacts
+belong in indexed source records. Preserve the current selected issue/PR comments,
+reviews, intake observations, authority, acceptance and required findings exactly.
+Nested records retain their original JSON paths and keyed mapping layout so the
+complete input can be reconstructed. Qualification includes the normal boundary
+and intake/planning producers for a large campaign, not just a large `inventory`
+field in an otherwise small synthetic context.
+
+A typed preparation refusal before the native request is persisted is a distinct
+outcome from an uncertain launch. Seal it against the action, claim, attempt,
+generation and configuration; settle that claim as not launched and expose a
+`launch_preparation` hold. An explicit supported reconcile or resume may rearm
+only that proved refusal, preserving its history and requiring a fresh stage
+boundary and new launch identity. Repeated active ticks do not retry it. Existing
+request/startup/completion evidence, conflicting ownership, and owner or operator
+holds cannot be cleared by this path. Never infer a safe retry solely from a
+missing launch acknowledgement.
+
 Turns, time, output tokens, reasoning tokens and total spend are different limits.
 Enforce a whole-job bound even if a CLI resets its turn limit on each queued input.
 Do not enqueue unlimited follow-ups. Pure extraction gets no repository mutation

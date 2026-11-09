@@ -16,6 +16,7 @@ breaking changes may land in a minor release.
 
 - Scope linked GitHub evidence to selected work and expose unresolved optional references.
 - Deliver large campaign context through bounded stage prompts and immutable read-only artifacts.
+- Recover proved stage preparation failures without treating them as uncertain worker launches.
 - Give Grok tool telemetry a finite wire allowance separate from model output limits.
 - Admit explicitly enabled TeamRouter credit routes using exact-model account evidence.
 - Observe native Grok and Muse allowance without inference; preserve unknown provider concurrency.

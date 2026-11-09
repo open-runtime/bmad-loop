@@ -93,6 +93,7 @@ def test_duplicates_return_cached_result_and_restart_keeps_budget(scoped):
 @pytest.mark.skipif(sys.platform != "darwin", reason="actual macOS confinement")
 @pytest.mark.parametrize("mode", ["timeout", "output", "background", "double-fork", "detached"])
 def test_command_bounds_and_background_child_are_settled(scoped, mode, reap_leftovers):
+    """Publish writer identity before detaching so early refusal cannot race readiness."""
     workspace, grants, directory = scoped
     background = mode in {"background", "double-fork", "detached"}
     # Foreground exits/detachment drive these cases; 30 seconds is only a hang
@@ -101,7 +102,8 @@ def test_command_bounds_and_background_child_are_settled(scoped, mode, reap_left
     child = (
         "import os,time; from pathlib import Path; "
         "Path('src/background.pid').write_text(str(os.getpid())); "
-        "exec(\"while not Path('src/released-after-return').exists(): time.sleep(0.01)\"); "
+        + ("os.setsid(); " if mode == "detached" else "")
+        + "exec(\"while not Path('src/released-after-return').exists(): time.sleep(0.01)\"); "
         "Path('src/late.txt').write_text('late')"
     )
     wait_ready = "exec(\"while not Path('src/background.pid').exists(): time.sleep(0.01)\")"
@@ -120,9 +122,7 @@ def test_command_bounds_and_background_child_are_settled(scoped, mode, reap_left
         ),
         "detached": (
             "import subprocess,sys,time; from pathlib import Path; "
-            f"subprocess.Popen([sys.executable,'-c',{child!r}],start_new_session=True); "
-            + wait_ready
-            + "; time.sleep(60)"
+            f"subprocess.Popen([sys.executable,'-c',{child!r}]); " + wait_ready + "; time.sleep(60)"
         ),
     }[mode]
     result = run(tool, code)

@@ -261,7 +261,7 @@ def _write_context(directory: Path, bulk: dict) -> tuple[dict, list[dict], dict]
         buffer.extend(b"\n")
 
     for key, value in bulk.items():
-        if key == "inventory" and isinstance(value, dict):
+        if key in {"inventory", "/intake/inventory"} and isinstance(value, dict):
             collections = {
                 name: value[name]
                 for name in (
@@ -290,6 +290,10 @@ def _write_context(directory: Path, bulk: dict) -> tuple[dict, list[dict], dict]
             layouts[key] = {"kind": "array", "count": len(value)}
             for position, row in enumerate(value):
                 append(key, "", position, row)
+        elif isinstance(value, dict):
+            layouts[key] = {"kind": "mapping", "keys": list(value)}
+            for name, item in value.items():
+                append(key, "", name, item)
         else:
             layouts[key] = {"kind": "value"}
             append(key, "", 0, value)
@@ -314,14 +318,52 @@ def prepare_context(
     directory: Path, context: dict, *, issue_numbers=(), pr_numbers=()
 ) -> tuple[dict, list[dict]]:
     """Keep exact obligations inline and complete evidence in indexed immutable files."""
+    if len(_encoded(context)) <= MAX_INLINE_CONTEXT_BYTES:
+        return context, []
     bulk = {
         key: context[key]
-        for key in ("inventory", "available_evidence_ids", "external_ownership")
+        for key in (
+            "inventory",
+            "available_evidence_ids",
+            "external_ownership",
+            "prior_artifacts",
+            "prior_stages",
+            "current_unit_states",
+            "source_observations",
+        )
         if key in context
     }
-    if not bulk or len(_encoded(context)) <= MAX_INLINE_CONTEXT_BYTES:
-        return context, []
     projected = {key: value for key, value in context.items() if key not in bulk}
+    # Stage-boundary collection includes the entire repository frontier alongside
+    # the selected issue/PR/comment/review bundle. Preserve the selected bundle
+    # inline; index the portfolio copies and old stage history separately.
+    for parts in (
+        ("github_stage_inputs", "open_pulls"),
+        ("github_stage_inputs", "external_pulls"),
+        ("github_stage_inputs", "repository_inputs"),
+        ("github_stage_inputs", "repository_metadata_owned"),
+        ("github_stage_inputs", "external_branches"),
+        ("github_stage_inputs", "intake"),
+        ("intake", "inventory"),
+        ("intake", "existing_units"),
+        ("intake", "bindings"),
+    ):
+        parent = projected
+        for part in parts[:-1]:
+            child = parent.get(part)
+            if not isinstance(child, dict):
+                break
+            copied = dict(child)
+            parent[part] = copied
+            parent = copied
+        else:
+            if parts[-1] in parent:
+                pointer = "/" + "/".join(parts)
+                bulk[pointer] = parent.pop(parts[-1])
+                parent["retrievable_fields"] = {
+                    **parent.get("retrievable_fields", {}),
+                    parts[-1]: pointer,
+                }
     # Acceptance, source obligations, owner decisions, feedback and stage inputs
     # are never shortened to make unrelated portfolio evidence fit.
     if len(_encoded(projected)) > MAX_INLINE_CONTEXT_BYTES:
@@ -344,6 +386,11 @@ def prepare_context(
             "stays within its limits; do not print the whole inventory or index. All original "
             "records and evidence IDs remain retrievable. Layout plus records reconstruct the "
             "full source (object metadata uses collection _fields and position as field name); "
+            "mapping records use position as their exact key. Source keys beginning with / "
+            "are original context JSON-pointer paths, also named by retrievable_fields. "
+            "Restore those exact values to reconstruct the nested context. Current selected "
+            "GitHub issues/comments/reviews, intake observations/authority and required findings "
+            "remain inline; prior history and sibling portfolio evidence still require retrieval. "
             "its digest uses sorted-key compact UTF-8 JSON. Missing required "
             "evidence is a hold, never permission to assume absence or waive acceptance."
         ),

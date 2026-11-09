@@ -566,7 +566,7 @@ class CampaignRuntime:
         )
         return tuple(proposals)
 
-    def prepare_resume(self, snapshot: CampaignSnapshot) -> bool:
+    def prepare_resume(self, snapshot: CampaignSnapshot, *, rearm_preparation: bool = True) -> bool:
         from .campaign_attribution import restore
         from .campaign_native_review_flow import current, required
         from .campaign_review_freshness import invalidate, stale
@@ -580,6 +580,54 @@ class CampaignRuntime:
             ):
                 changed = invalidate(snapshot, unit) or changed
             hold = unit.hold
+            if (
+                rearm_preparation
+                and hold
+                and hold.kind == "launch_preparation"
+                and unit.claim
+                and unit.claim.quiescent
+            ):
+                from .campaign_action_history import action as historical_action
+
+                prior = historical_action(snapshot, hold.id)
+                if prior is not None and prior.state == "confirmed":
+                    refusal = self._launch_preparation_refusal(snapshot, prior)
+                    if (
+                        refusal is not None
+                        and refusal.state == "confirmed"
+                        and refusal.data.get("preparation_refused")
+                        == unit.evidence.get("launch_preparation_refusal")
+                    ):
+                        reason = refusal.data["preparation_refused"]["reason"]
+                        if prior.payload.get("result_contract") == "intake-triage-v1":
+                            from .campaign_runtime_intake import fail_stage
+
+                            fail_stage(snapshot, unit.id, {"error": reason}, launch_id=prior.id)
+                        if (
+                            unit.spec.kind == "planning"
+                            and prior.payload.get("stage") in snapshot.spec.planning.stages
+                        ):
+                            from .campaign_planning_flow import fail_stage as fail_planning
+
+                            fail_planning(
+                                snapshot,
+                                unit.id,
+                                prior.payload["stage"],
+                                launch_id=prior.id,
+                                reason=reason,
+                            )
+                        if unit.hold != hold:
+                            changed = True  # Existing lifetime attempt limits remain authoritative.
+                            continue
+                        unit.evidence.setdefault("launch_preparation_history", []).append(
+                            unit.evidence.pop("launch_preparation_refusal")
+                        )
+                        unit.evidence.pop("stage_boundary_ready", None)
+                        unit.hold = None
+                        add_event(
+                            snapshot, "launch-preparation-rearmed", unit=unit.id, action=prior.id
+                        )
+                        changed = True
             if (
                 hold
                 and hold.kind == "approval"
@@ -1781,6 +1829,9 @@ class CampaignRuntime:
                 result.error,
             )
         if action.kind == "launch":
+            refused = self._launch_preparation_refusal(snapshot, action)
+            if refused is not None:
+                return refused
             claim = snapshot.units[action.unit].claim
             if claim is None:
                 return Observation("unknown", reason="launch ownership missing")
@@ -3196,7 +3247,126 @@ class CampaignRuntime:
             unit.bindings.get("source_revision", ""),
         )
 
+    def _launch_preparation_refusal(self, snapshot, action) -> Observation | None:
+        """Reconcile only an explicit refusal sealed before a native request existed."""
+        directory = self.store.directory(snapshot.id) / "workers" / action.id
+        path = directory / "preparation-refused.json"
+        from .campaign_headless import read_json
+        from .platform_util import is_link_like
+
+        if not path.exists() and not is_link_like(path):
+            return None
+        claim = snapshot.units[action.unit].claim
+        if (
+            not claim
+            or claim.launch_id != action.id
+            or claim.generation != action.generation
+            or any(
+                (directory / name).exists() or is_link_like(directory / name)
+                for name in ("request.json", "startup.json", "receipt.json")
+            )
+        ):
+            return Observation(
+                "unknown", reason="preparation refusal conflicts with launch ownership"
+            )
+        if is_link_like(directory):
+            return Observation("unknown", reason="preparation refusal directory is redirected")
+        value = read_json(path, limit=65536)
+        expected = {
+            "schema_version": 1,
+            "campaign_id": snapshot.id,
+            "unit_id": action.unit,
+            "launch_id": action.id,
+            "generation": action.generation,
+            "attempt": claim.attempt,
+            "config_revision": snapshot.config_revision,
+            "phase": "before_request",
+        }
+        if (
+            not isinstance(value, dict)
+            or any(
+                type(value.get(key)) is not type(item) or value.get(key) != item
+                for key, item in expected.items()
+            )
+            or not isinstance(value.get("reason"), str)
+            or not value["reason"]
+        ):
+            return Observation("unknown", reason="preparation refusal binding mismatch")
+        return Observation("confirmed", {"not_launched": True, "preparation_refused": value})
+
     def _perform_launch(self, snapshot, action) -> Observation:
+        from . import campaign_hold
+        from .campaign_execution import CampaignExecutionError
+        from .platform_util import is_link_like
+
+        prior = self._launch_preparation_refusal(snapshot, action)
+        if prior is not None:
+            return prior
+        try:
+            prepared = self._prepare_launch(snapshot, action)
+        except (CampaignError, CampaignExecutionError) as exc:
+            # This helper cannot spawn. Once a request exists, however, absence
+            # of startup is not proof of absence: preserve uncertain launches.
+            directory = self.store.directory(snapshot.id) / "workers" / action.id
+            claim = snapshot.units[action.unit].claim
+            if (
+                not claim
+                or claim.launch_id != action.id
+                or claim.generation != action.generation
+                or is_link_like(directory)
+                or any(
+                    (directory / name).exists() or is_link_like(directory / name)
+                    for name in ("request.json", "startup.json", "receipt.json")
+                )
+            ):
+                raise
+            value = {
+                "schema_version": 1,
+                "campaign_id": snapshot.id,
+                "unit_id": action.unit,
+                "launch_id": action.id,
+                "generation": action.generation,
+                "attempt": claim.attempt,
+                "config_revision": snapshot.config_revision,
+                "phase": "before_request",
+                "reason": f"{type(exc).__name__}: {exc}",
+            }
+            directory.mkdir(parents=True, exist_ok=True)
+            encoded = json.dumps(value, sort_keys=True)
+            if len(encoded.encode("utf-8")) > 65536:
+                raise CampaignError("launch preparation refusal exceeds its byte bound") from exc
+            atomic_write_text(
+                directory / "preparation-refused.json", encoded, follow_symlinks=False
+            )
+            refusal = self._launch_preparation_refusal(snapshot, action)
+            if refusal is None:
+                raise CampaignError("launch preparation refusal was not durably recorded")
+            return refusal
+        if isinstance(prepared, Observation):
+            return prepared
+        envelope, request, launch_env = prepared
+        path = prepare_launch(envelope, request)
+        unit = snapshot.units[action.unit]
+        if campaign_hold.active(
+            campaign_hold.channel(self.store.directory(snapshot.id), unit.id),
+            campaign=snapshot.id,
+            unit=unit.id,
+        ):
+            return Observation("confirmed", {"not_launched": True})
+        process = spawn(path, env=launch_env)
+        return Observation(
+            "confirmed",
+            {
+                "launched": True,
+                "pid": process.pid,
+                "directory": str(envelope.directory),
+                "request": str(path),
+                "managed_communication": request.get("managed_communication"),
+            },
+        )
+
+    def _prepare_launch(self, snapshot, action):
+        """Prepare immutable inputs without persisting a request or spawning a child."""
         unit = snapshot.units[action.unit]
         from . import campaign_hold
 
@@ -3645,7 +3815,6 @@ class CampaignRuntime:
             binding = prepare_communication(self, snapshot, unit=unit)
             if binding:
                 request["managed_communication"] = binding
-        path = prepare_launch(envelope, request)
         launch_env = sanitized_actor_env(os.environ, communication=snapshot.spec.communication)
         if snapshot.spec.paradev.reflect:
             from .campaign_reflection_flow import sanitized_worker_env, workspace_binding
@@ -3656,23 +3825,7 @@ class CampaignRuntime:
                 state_dir=self.store.directory(snapshot.id) / "native-transport",
                 communication=snapshot.spec.communication,
             )
-        if campaign_hold.active(
-            campaign_hold.channel(self.store.directory(snapshot.id), unit.id),
-            campaign=snapshot.id,
-            unit=unit.id,
-        ):
-            return Observation("confirmed", {"not_launched": True})
-        process = spawn(path, env=launch_env)
-        return Observation(
-            "confirmed",
-            {
-                "launched": True,
-                "pid": process.pid,
-                "directory": str(directory),
-                "request": str(path),
-                "managed_communication": request.get("managed_communication"),
-            },
-        )
+        return envelope, request, launch_env
 
     def _perform_observe_worker(self, snapshot, action) -> Observation:
         unit = snapshot.units[action.unit]
@@ -5106,10 +5259,27 @@ class CampaignRuntime:
                     self._set_hold(
                         unit, Hold("adoption_fence", data["adoption_refused"], id=action.id)
                     )
-                if unit.state == UnitState.CLAIMED:
+                if unit.state == UnitState.CLAIMED and not (
+                    data.get("preparation_refused")
+                    and action.payload.get("result_contract") == "intake-triage-v1"
+                ):
                     transition(snapshot, unit.id, UnitState.READY)
                 elif unit.state == UnitState.VERIFYING:
                     transition(snapshot, unit.id, UnitState.SYNCING)
+                if data.get("preparation_refused"):
+                    refusal = data["preparation_refused"]
+                    unit.evidence["launch_preparation_refusal"] = refusal
+                    self._set_hold(
+                        unit, Hold("launch_preparation", refusal["reason"], id=action.id)
+                    )
+                    add_event(
+                        snapshot,
+                        "launch-preparation-refused",
+                        unit=unit.id,
+                        action=action.id,
+                        reason=refusal["reason"],
+                    )
+                    return
                 add_event(snapshot, "operator-held-launch-suppressed", unit=unit.id)
                 return
             if data.get("not_launched") and data.get("remote_feedback_changed"):
@@ -5645,7 +5815,7 @@ class CampaignRuntime:
         # A resumed review may have been live when startup attribution repair
         # ran. Repair only after accepting its result, including deferred
         # stage-boundary results, so a same-family review is invalidated too.
-        self.prepare_resume(snapshot)
+        self.prepare_resume(snapshot, rearm_preparation=False)
 
     def attach(self, campaign_id: str, unit_id: str, role: str = "execution") -> int:
         from .campaign_operator import attach
