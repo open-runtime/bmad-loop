@@ -141,7 +141,8 @@ def issue_reference(unit, *, snapshot=None) -> tuple[dict, str]:
         or number < 1
         or type(native_id) is not int
         or native_id < 1
-        or shared.get("url") != f"https://github.com/{snapshot.repository}/issues/{number}"
+        or str(shared.get("url", "")).lower()
+        != f"https://github.com/{snapshot.repository}/issues/{number}".lower()
     ):
         return {}, ""
     return shared, shared["url"]

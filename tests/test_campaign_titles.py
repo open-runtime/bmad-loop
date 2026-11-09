@@ -152,6 +152,13 @@ def test_navigation_uses_exact_shared_story_before_hierarchy_is_ready(pending_is
     assert work.bindings["hierarchy_ready"] is False and "issue" not in work.bindings
 
 
+def test_shared_story_url_match_is_case_insensitive(pending_issue_navigation):
+    work, snapshot, shared = pending_issue_navigation
+    snapshot.repository = "Owner/Repo"
+    shared["url"] = "https://github.com/owner/repo/issues/529"
+    assert unit_navigation(work, snapshot=snapshot)["issues"] == ("#529",)
+
+
 @pytest.mark.parametrize(
     "fault", ["other-unit", "foreign-repository", "no-native-id", "pr", "bool-number"]
 )
