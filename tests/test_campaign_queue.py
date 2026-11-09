@@ -572,7 +572,9 @@ def test_failed_g_dequeues_before_h_repair_and_lost_removal_ack_is_reconciled(
         flow,
         "PublicationController",
         lambda *a, **k: SimpleNamespace(
-            inspect=lambda _: SimpleNamespace(rules=rules, base_head=queued.base),
+            inspect=lambda _: SimpleNamespace(
+                pr=gateway.pull(candidate.pr_number), rules=rules, base_head=queued.base
+            ),
             evaluate=lambda *a, **k: SimpleNamespace(reasons=()),
         ),
     )

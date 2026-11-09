@@ -72,7 +72,9 @@ candidate/base and complete findings. Configure the optional `native_review_pair
 role to make these two actual native reviews a required durable stage before
 independent publication review. The schema-mapping turn is a third turn, never a
 substitute for either review. Retain both delegate artifacts and their combined
-findings. The pair consumes ordinary review/shared capacity, binds the exact
+findings. The mapping turn receives the immutable original task and input as well
+as the findings; delegated review context is not assumed to exist in the parent
+conversation. The pair consumes ordinary review/shared capacity, binds the exact
 candidate, base, graph and configuration, and is invalidated with candidate drift.
 Missing or single-review capabilities cannot satisfy the pair. Pair findings
 enter the existing same-PR repair path; its receipt cannot waive independent
@@ -208,6 +210,19 @@ took 0.969 seconds. This is scripted integration evidence; it does not establish
 real-provider throughput. Later changes require impact assessment and affected
 qualification, and these checkpoints do not satisfy writable continuation,
 installation-bound route proofs or REM delivery.
+
+The frozen `e57061ea` regression passed 21,066 tests with 261 skips and three
+failures. One fixture omitted the applied producer state and retained obsolete
+artifact-size expectations. Two production races remained: a messaging observer
+could open SQLite before schema initialization completed, and queue publication
+could land between remote reads, leaving a prepared dequeue unable to reconcile.
+The repairs serialize connection/schema setup with a bounded cross-process lock
+that is released before ordinary SQL transactions, and route terminal queue reads
+through canonical landing verification. A pending dequeue rechecks terminal or
+removed membership before preparing another mutation. Exact PR identity, accepted
+head and checkpoint ancestry remain required. The regressions exercise controlled
+interleavings and complete production campaigns; final integrated checks remain
+required for the repaired candidate.
 
 ## Command and configuration contract
 

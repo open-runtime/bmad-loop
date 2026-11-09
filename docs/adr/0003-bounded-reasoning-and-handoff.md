@@ -820,6 +820,17 @@ proof. Recompute new packet and artifact budgets only from earned capabilities,
 then run new reduction and continuation jobs. Never reinterpret a failed receipt
 under a larger later budget. Preserve the retained history and exact owner index.
 
+A subsequent fresh stored-artifact reducer earned current `reduce-v5` semantic
+qualification at Grok medium effort, independently audited by Muse. Its complete
+retained result covers all five children and all 38 owner quote references, with
+historical uncertainties explicit. The destination packet selects bounded,
+source-addressable views from that artifact; its initial-context budget does not
+discard the full summary tree. This new proof does not regrade the earlier failed
+compact-artifact requests. The current full-corpus trial retains its completed
+maps and immutable attempts across a drained source-repair checkpoint. Completion
+of that trial, an independent full-source audit and writable continuation remain
+separate requirements.
+
 Those regression and load results qualify their named earlier candidates.
 The delivery completion extension requires fresh final checks and
 reviews after its changes. Hosted Actions remain disabled; unrun platform gates

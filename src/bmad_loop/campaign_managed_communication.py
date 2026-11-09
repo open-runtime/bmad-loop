@@ -8,12 +8,13 @@ cursor advances; neither mail nor hcom status decides native session completion.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import sqlite3
 import subprocess
 import time
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 from .campaign_communication import CommunicationError, HcomObserver
@@ -27,7 +28,7 @@ from .campaign_message_bridge import (
 )
 from .campaign_messages import MessageLedger
 from .campaign_model import CampaignError
-from .platform_util import is_link_like
+from .platform_util import LockUnavailableError, file_lock, is_link_like
 
 PAGE = 100
 MAX_ENDPOINTS = 500
@@ -139,34 +140,73 @@ class ManagedCommunication:
         self.executable, self.runner, self.clock = executable, runner, clock
 
     @contextmanager
+    def _initialization_lock(self):
+        """Serialize connection/schema setup, never ordinary SQL transactions.
+
+        SQLite exposes a newly created file before its first schema exists. Both
+        observers and creators must pass this cross-process barrier. Bound the
+        wait explicitly: a blocking platform lock has no timeout on POSIX.
+        """
+        path = self.directory / ".schema.lock"
+        deadline = time.monotonic() + 10
+        with ExitStack() as stack:
+            while True:
+                if any(is_link_like(value) for value in (self.directory, self.path, path)):
+                    raise CampaignError("Managed communication index is redirected")
+                try:
+                    stack.enter_context(file_lock(path, blocking=False))
+                except LockUnavailableError as exc:
+                    if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                        raise
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise CampaignError(
+                            "Managed communication index initialization timed out"
+                        ) from exc
+                    time.sleep(min(0.01, remaining))
+                else:
+                    break
+            if any(is_link_like(value) for value in (self.directory, self.path, path)):
+                raise CampaignError("Managed communication index is redirected")
+            yield
+
+    @contextmanager
     def _db(self, *, write=False):
-        if is_link_like(self.directory) or is_link_like(self.path):
+        if any(
+            is_link_like(value)
+            for value in (self.directory, self.path, self.directory / ".schema.lock")
+        ):
             raise CampaignError("Managed communication index is redirected")
-        if write:
-            self.directory.mkdir(parents=True, exist_ok=True)
-            db = sqlite3.connect(self.path, timeout=10)
-            db.execute("PRAGMA journal_mode=WAL")
-            db.execute("PRAGMA synchronous=FULL")
-            db.executescript(
-                "CREATE TABLE IF NOT EXISTS endpoints ("
-                "sequence INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT UNIQUE NOT NULL,"
-                "room TEXT NOT NULL,name TEXT NOT NULL,state TEXT NOT NULL,"
-                "target TEXT NOT NULL,record TEXT NOT NULL,error TEXT NOT NULL);"
-                "CREATE INDEX IF NOT EXISTS endpoint_name ON endpoints(room,name,sequence);"
-                "CREATE INDEX IF NOT EXISTS endpoint_state ON endpoints(room,state,sequence);"
-                "CREATE INDEX IF NOT EXISTS endpoint_open ON endpoints(sequence) WHERE state!='closed';"
-                "CREATE INDEX IF NOT EXISTS endpoint_error ON endpoints(sequence) WHERE error!='';"
-                "CREATE INDEX IF NOT EXISTS endpoint_projection ON endpoints((state='closed'),sequence DESC);"
-                "CREATE TABLE IF NOT EXISTS rooms (room TEXT PRIMARY KEY,record TEXT NOT NULL);"
-            )
-        else:
-            db = sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True, timeout=10)
-        db.row_factory = sqlite3.Row
+        if not write and not self.path.exists():
+            # A read must not provision the index or its initialization sidecar.
+            raise sqlite3.OperationalError("unable to open database file")
+        db = None
         try:
+            with self._initialization_lock():
+                if write:
+                    db = sqlite3.connect(self.path, timeout=10)
+                    db.execute("PRAGMA journal_mode=WAL")
+                    db.execute("PRAGMA synchronous=FULL")
+                    db.executescript(
+                        "CREATE TABLE IF NOT EXISTS endpoints ("
+                        "sequence INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT UNIQUE NOT NULL,"
+                        "room TEXT NOT NULL,name TEXT NOT NULL,state TEXT NOT NULL,"
+                        "target TEXT NOT NULL,record TEXT NOT NULL,error TEXT NOT NULL);"
+                        "CREATE INDEX IF NOT EXISTS endpoint_name ON endpoints(room,name,sequence);"
+                        "CREATE INDEX IF NOT EXISTS endpoint_state ON endpoints(room,state,sequence);"
+                        "CREATE INDEX IF NOT EXISTS endpoint_open ON endpoints(sequence) WHERE state!='closed';"
+                        "CREATE INDEX IF NOT EXISTS endpoint_error ON endpoints(sequence) WHERE error!='';"
+                        "CREATE INDEX IF NOT EXISTS endpoint_projection ON endpoints((state='closed'),sequence DESC);"
+                        "CREATE TABLE IF NOT EXISTS rooms (room TEXT PRIMARY KEY,record TEXT NOT NULL);"
+                    )
+                else:
+                    db = sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True, timeout=10)
+                db.row_factory = sqlite3.Row
             with db:
                 yield db
         finally:
-            db.close()
+            if db is not None:
+                db.close()
 
     def _actor(self, room, target, facts=None):
         kwargs = {"room": room, "target": target, "facts": facts, "clock": self.clock}

@@ -144,6 +144,7 @@ def test_handoff_reduce_constructs_projected_requests_from_current_route_geometr
         data = encoded(result)
         path = blob(tmp_path / "applied", data)
         rows[child.id] = {
+            "state": "applied",
             "request": {"purpose": "handoff_map", "coordinates": {"summary_spec": asdict(child)}},
             "applied_result": {
                 "artifact_path": str(path),
@@ -167,7 +168,7 @@ def test_handoff_reduce_constructs_projected_requests_from_current_route_geometr
         "qualification": {"sha256": "scripted-writer"},
     }
     # I/O/route selection is injected here; the real producer owns partitioning,
-    # complete-source bindings, artifact allocation and complete prompt admission.
+    # complete-source bindings, stored-artifact mode and complete prompt admission.
     monkeypatch.setattr(flow, "_job", lambda runtime, snapshot, key: rows[key])
     monkeypatch.setattr(flow, "_summary_route", lambda *args, **kwargs: (candidate, reader))
     monkeypatch.setattr(flow, "_target_cap", lambda *args, **kwargs: writer)
@@ -195,7 +196,8 @@ def test_handoff_reduce_constructs_projected_requests_from_current_route_geometr
     assert {key for request in requests for key in request.dependencies} == set(rows)
     for request in requests:
         spec = request.coordinates["summary_spec"]
-        assert spec["artifact_bytes"] == 16565 and "8282 UTF-8 bytes" in request.prompt
+        assert spec["artifact_bytes"] == 0
+        assert request.limits.output_tokens == reader["output_tokens"]
         assert request.inputs[0]["tokens"] <= flow._budget(candidate, reader).payload_tokens
         _, manifest = render_input(request, reader)
         assert manifest["token_upper_bound"] <= 99662

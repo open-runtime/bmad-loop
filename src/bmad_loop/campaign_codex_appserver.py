@@ -558,7 +558,10 @@ def run(
                                 "Retain every unresolved finding. Supply campaign coordinates and acceptance evidence only from "
                                 "the original task and observed proof. Do not waive criteria or invent execution results."
                             ),
-                        }
+                        },
+                        # Native review delegates return findings, not their full
+                        # input. Deliver the unchanged task/sources to the mapper.
+                        {"type": "text", "text": prompt},
                     ],
                     "outputSchema": schema,
                     "effort": effort,

@@ -7,6 +7,12 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Fixed
+
+- Wait for managed messaging schema initialization before opening concurrent readers.
+- Reconcile queued PRs that merge during observation or before a pending dequeue.
+- Supply the immutable task context to Codex's native-review schema-mapping turn.
+
 ## [0.15.5] — 2026-11-08
 
 ### Fixed

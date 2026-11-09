@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import asdict
 from pathlib import Path
 
+from .campaign_github import GithubError
 from .campaign_merge_adapter import AdapterReceipt
 from .campaign_model import Hold, UnitState
 from .campaign_publication import PublicationController, PublicationRequirements, read_rules
@@ -73,15 +74,22 @@ def proposals(runtime, snapshot, unit, reserve) -> tuple[Proposal, ...]:
     return ()
 
 
-def observe_effect(runtime, snapshot, action) -> Observation:
-    unit = snapshot.units[action.unit]
-    gateway = runtime.gateway(snapshot)
-    candidate = runtime._candidate(snapshot, unit)
-    pr = gateway.pull(candidate.pr_number)
+def _terminal_effect(runtime, snapshot, action, candidate, pr):
+    """Reconcile terminal remote state through the ordinary landing proof."""
+    if pr.get("merged") is not True and pr.get("state") == "open":
+        return None
+    owned = snapshot.units[action.unit].bindings["pr"]
+    if (
+        pr.get("number") != candidate.pr_number
+        or (pr.get("head") or {}).get("sha") != candidate.head
+        or (pr.get("base") or {}).get("ref") != candidate.target
+        or (owned.get("node_id") and pr.get("node_id") != owned["node_id"])
+    ):
+        raise GithubError("terminal queued PR identity differs from the owned candidate")
     if pr.get("merged") is True:
         merged = runtime._perform_observe_merge(snapshot, action)
         return Observation(merged.state, {"merged": merged.data}, merged.reason, merged.retry_at)
-    if pr.get("state") != "open":
+    if pr.get("state") == "closed" and pr.get("merged") is False:
         return Observation(
             "confirmed",
             {
@@ -90,8 +98,24 @@ def observe_effect(runtime, snapshot, action) -> Observation:
                 "reason": "queued PR closed without merge",
             },
         )
+    return Observation(
+        "unknown", reason="queued PR terminal state is unconfirmed", retry_at=runtime.clock() + 5
+    )
+
+
+def observe_effect(runtime, snapshot, action) -> Observation:
+    unit = snapshot.units[action.unit]
+    gateway = runtime.gateway(snapshot)
+    candidate = runtime._candidate(snapshot, unit)
+    pr = gateway.pull(candidate.pr_number)
+    terminal = _terminal_effect(runtime, snapshot, action, candidate, pr)
+    if terminal is not None:
+        return terminal
     prior = unit.evidence.get("queue", {})
     member = membership(gateway, candidate)
+    expected_node = unit.bindings["pr"].get("node_id")
+    if not member.get("id") or (expected_node and member["id"] != expected_node):
+        raise GithubError("queue membership PR native identity changed")
     if member.get("merged") is True:
         merged = runtime._perform_observe_merge(snapshot, action)
         return Observation(merged.state, {"merged": merged.data}, merged.reason, merged.retry_at)
@@ -164,6 +188,11 @@ def observe_effect(runtime, snapshot, action) -> Observation:
         requirements=PublicationRequirements.from_spec(snapshot.spec.github),
     )
     observed = controller.inspect(candidate.pr_number)
+    # Queue publication can land between the initial PR/membership reads and
+    # this inspection. Terminal state is reconciliation, never a repair gate.
+    terminal = _terminal_effect(runtime, snapshot, action, candidate, observed.pr)
+    if terminal is not None:
+        return terminal
     gate = controller.evaluate(
         candidate,
         runtime._publication_evidence(snapshot, unit),
@@ -357,6 +386,13 @@ def publish_effect(runtime, snapshot, action) -> Observation:
 
 
 def dequeue_effect(runtime, snapshot, action) -> Observation:
+    # This preparation can survive a lost observation or race with queue landing.
+    # Settle terminal/removal readback before considering another mutation.
+    current = observe_effect(runtime, snapshot, action)
+    if current.state != "confirmed" or any(
+        key in current.data for key in ("merged", "closed", "dequeued")
+    ):
+        return current
     unit = snapshot.units[action.unit]
     intent = prepare_dequeue(
         runtime.gateway(snapshot),
@@ -371,6 +407,8 @@ def apply_effect(runtime, snapshot, unit, action, data) -> None:
     state = unit.evidence.setdefault("queue", {})
     if "merged" in data:
         unit.evidence["merge"] = data["merged"]
+        if data["merged"].get("landing_acceptance"):
+            unit.evidence["landing_acceptance"] = data["merged"]["landing_acceptance"]
         transition(snapshot, unit.id, UnitState.MERGED_PENDING_SYNC)
         return
     if data.get("closed"):
