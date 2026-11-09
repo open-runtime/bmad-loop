@@ -17,6 +17,7 @@ from bmad_loop.adapters.profile import get_profile
 from bmad_loop.campaign_capacity_transport import ProbeError
 from bmad_loop.campaign_model import RoleCandidate
 from bmad_loop.campaign_scheduler import route_unavailable
+from bmad_loop.process_host import ProcessHostError
 
 NOW = 1_794_207_000.0
 GROK = RoleCandidate("grok", "grok-4.7", "xhigh")
@@ -225,6 +226,7 @@ if mode == 'trailing-turn':
 if mode == 'metadata':
     print(json.dumps({'jsonrpc':'2.0','method':'_x.ai/mcp/servers_updated','params':{'mcpServers':[]}}),flush=True)
 if mode == 'graceful-delay': time.sleep(1.5)
+if mode == 'shutdown-wait': time.sleep(60)
 raise SystemExit(6 if mode == 'nonzero' else 0)
 """
 
@@ -361,11 +363,137 @@ def test_normal_eof_drain_uses_existing_whole_job_deadline(tmp_path, monkeypatch
     assert all(pid_gone(int(pid)) for pid in (tmp_path / "pids").read_text().splitlines())
 
 
+@pytest.mark.parametrize("cancel", [False, True], ids=["host-error", "keyboard-interrupt"])
+@pytest.mark.parametrize("cleanup_fails", [False, True], ids=["cleanup", "double-fault"])
+def test_eof_unwind_always_attempts_owned_cleanup_and_preserves_error(
+    tmp_path, monkeypatch, cancel, cleanup_fails
+):
+    fixture(tmp_path, monkeypatch, "grok", "shutdown-wait")
+    original_kill = transport.kill_tree
+    failure = KeyboardInterrupt() if cancel else ProcessHostError("private-host-detail")
+    children = []
+    cleanup_attempts = []
+
+    class CensusFault:
+        def __init__(self, host):
+            self.host = host
+
+        def descendants(self, pid):
+            raise failure
+
+        def __getattr__(self, name):
+            return getattr(self.host, name)
+
+    class FaultAtEOF(transport.StatusProcess):
+        def request(self, identifier, method, params):
+            result = super().request(identifier, method, params)
+            if method == "_x.ai/billing":
+                children.append(self)
+                self.host = CensusFault(self.host)
+            return result
+
+    def cleanup(proc, *, known):
+        cleanup_attempts.append(proc.pid)
+        if cleanup_fails:
+            raise RuntimeError("private-cleanup-detail")
+        original_kill(proc, known=known)
+
+    monkeypatch.setattr(native, "StatusProcess", FaultAtEOF)
+    monkeypatch.setattr(transport, "kill_tree", cleanup)
+    try:
+        if cancel:
+            with pytest.raises(KeyboardInterrupt) as caught:
+                native.observe(GROK, tmp_path, now=NOW)
+            assert caught.value is failure
+            if cleanup_fails:
+                assert "cleanup is unconfirmed" in " ".join(failure.__notes__)
+        else:
+            result = native.observe(GROK, tmp_path, now=NOW)
+            assert result and not result.known and not result.available
+            assert "ProcessHostError" in result.reason
+            assert "private" not in result.reason
+            if cleanup_fails:
+                assert "cleanup is unconfirmed" in result.reason
+        assert children and cleanup_attempts == [children[0].proc.pid]
+        if not cleanup_fails:
+            assert children[0].proc.poll() is not None
+            assert pid_gone(children[0].proc.pid)
+    finally:
+        # Even an ablated cleanup guard must not leave this fake owned child.
+        for child in children:
+            original_kill(child.proc, known=child.known)
+            for thread in child.threads:
+                thread.join(timeout=2)
+            for stream in (child.proc.stdout, child.proc.stderr):
+                if stream and not any(thread.is_alive() for thread in child.threads):
+                    stream.close()
+
+
 def test_unsupported_profile_does_not_spawn(tmp_path, monkeypatch):
     monkeypatch.setattr(
         native, "get_profile", lambda *_: pytest.fail("unsupported native observer")
     )
     assert native.observe(RoleCandidate("claude", "claude"), tmp_path) is None
+
+
+@pytest.mark.parametrize("fault", ["kill", "liveness", "reader"])
+def test_cleanup_uncertainty_survives_sanitized_observation(tmp_path, monkeypatch, fault):
+    fixture(tmp_path, monkeypatch, "grok")
+    original_kill = transport.kill_tree
+    children = []
+
+    class UnconfirmedReader:
+        def join(self, timeout=None):
+            pass
+
+        def is_alive(self):
+            return True
+
+    class UnconfirmedHost:
+        def __init__(self, host):
+            self.host = host
+
+        def liveness_of(self, pid, identity):
+            return "unknown"
+
+        def __getattr__(self, name):
+            return getattr(self.host, name)
+
+    class FaultAfterResponse(transport.StatusProcess):
+        def request(self, identifier, method, params):
+            result = super().request(identifier, method, params)
+            if method == "_x.ai/billing":
+                children.append(self)
+                if fault == "liveness":
+                    self.known[self.proc.pid] = self.host.identity(self.proc.pid)
+                    self.host = UnconfirmedHost(self.host)
+                if fault == "reader":
+                    self.threads.append(UnconfirmedReader())
+                if fault != "kill":
+                    raise ProbeError("initial status fault")
+            return result
+
+    def failed_cleanup(*args, **kwargs):
+        raise ProcessHostError("private-cleanup-detail")
+
+    monkeypatch.setattr(native, "StatusProcess", FaultAfterResponse)
+    if fault == "kill":
+        monkeypatch.setattr(transport, "kill_tree", failed_cleanup)
+    try:
+        result = native.observe(GROK, tmp_path, now=NOW)
+        assert result and not result.known and not result.available
+        assert "cleanup is unconfirmed" in result.reason
+        assert "private" not in result.reason
+        assert ("ProcessHostError" if fault == "kill" else "initial status fault") in result.reason
+    finally:
+        for child in children:
+            original_kill(child.proc, known=child.known)
+            actual_readers = [t for t in child.threads if not isinstance(t, UnconfirmedReader)]
+            for thread in actual_readers:
+                thread.join(timeout=2)
+            for stream in (child.proc.stdout, child.proc.stderr):
+                if stream and not any(t.is_alive() for t in actual_readers):
+                    stream.close()
 
 
 def test_unsafe_launch_override_refuses_before_spawn(tmp_path, monkeypatch):

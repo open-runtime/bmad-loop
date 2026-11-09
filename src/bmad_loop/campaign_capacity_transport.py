@@ -176,12 +176,14 @@ class StatusProcess:
 
     def __exit__(self, exc_type, exc, traceback):
         cleanup_problem = ""
+        cleanup_uncertain = False
+        primary = exc
+        forced = False
         try:
             if self.proc.stdin and not self.proc.stdin.closed:
                 self.proc.stdin.close()
-            # Successful native status clients may drain background metadata on
-            # EOF. Use the remainder of the same whole-job budget, not a new
-            # arbitrary one-second success deadline. Fault cleanup stays short.
+            # Successful native status clients may drain background metadata
+            # on EOF. Retain the same whole-job budget; fault cleanup is short.
             until = (
                 self.deadline
                 if exc is None
@@ -194,49 +196,67 @@ class StatusProcess:
                 except subprocess.TimeoutExpired:
                     pass
             forced = self.proc.poll() is None
-            # Also reap known descendants after the root has exited normally.
-            kill_tree(self.proc, known=self.known)
-            if self.proc.poll() is None or any(
-                self.host.liveness_of(pid, identity) != "dead"
-                for pid, identity in self.known.items()
-            ):
-                cleanup_problem = "native capacity process cleanup is unconfirmed"
-            elif forced:
-                cleanup_problem = "native capacity process did not exit on EOF"
-            elif self.proc.returncode:
-                cleanup_problem = "native capacity process failed"
+        except BaseException as error:
+            primary = primary or error
         finally:
-            # Owned processes have settled; readers must consume natural EOF.
-            # Stopping first can discard bytes already buffered after the last
-            # valid response, including forbidden agent activity or overflow.
-            for thread in self.threads:
-                thread.join(timeout=EXIT_GRACE_S)
-            self.stopped.set()
-            if exc is None and self.protocol and not any(t.is_alive() for t in self.threads):
-                # A valid status response followed by agent activity is not a
-                # clean read-only observation. Account for the complete wire.
-                while not self.messages.empty():
-                    piece = self.messages.get_nowait()
-                    if piece is not None:
-                        self.buffer += piece
-                for line in self.buffer.splitlines():
-                    try:
-                        message = json.loads(line)
-                    except (ValueError, UnicodeError):
-                        cleanup_problem = "native capacity trailing protocol is invalid"
-                        break
-                    if (
-                        not isinstance(message, dict)
-                        or message.get("jsonrpc") != "2.0"
-                        or "id" in message
-                        or message.get("method") not in _STATUS_NOTIFICATIONS
-                    ):
-                        cleanup_problem = "native capacity emitted unexpected trailing activity"
-                        break
-            for stream in (self.proc.stdout, self.proc.stderr):
-                if stream and not any(thread.is_alive() for thread in self.threads):
-                    stream.close()
-            if any(thread.is_alive() for thread in self.threads):
-                cleanup_problem = "native capacity stream cleanup is unconfirmed"
+            # Census faults and cancellation must not bypass cleanup of the
+            # process and already observed descendants. Retain the first error.
+            try:
+                kill_tree(self.proc, known=self.known)
+                if self.proc.poll() is None or any(
+                    self.host.liveness_of(pid, identity) != "dead"
+                    for pid, identity in self.known.items()
+                ):
+                    cleanup_uncertain = True
+                elif forced:
+                    cleanup_problem = "native capacity process did not exit on EOF"
+                elif self.proc.returncode:
+                    cleanup_problem = "native capacity process failed"
+            except BaseException as error:
+                cleanup_uncertain = True
+                primary = primary or error
+            try:
+                # Consume natural EOF before setting stopped: buffered tail may
+                # contain forbidden agent activity or an output-bound violation.
+                for thread in self.threads:
+                    thread.join(timeout=EXIT_GRACE_S)
+                readers_alive = any(thread.is_alive() for thread in self.threads)
+                if primary is None and self.protocol and not readers_alive:
+                    while not self.messages.empty():
+                        piece = self.messages.get_nowait()
+                        if piece is not None:
+                            self.buffer += piece
+                    for line in self.buffer.splitlines():
+                        try:
+                            message = json.loads(line)
+                        except (ValueError, UnicodeError):
+                            cleanup_problem = "native capacity trailing protocol is invalid"
+                            break
+                        if (
+                            not isinstance(message, dict)
+                            or message.get("jsonrpc") != "2.0"
+                            or "id" in message
+                            or message.get("method") not in _STATUS_NOTIFICATIONS
+                        ):
+                            cleanup_problem = "native capacity emitted unexpected trailing activity"
+                            break
+                for stream in (self.proc.stdout, self.proc.stderr):
+                    if stream and not readers_alive:
+                        stream.close()
+                if readers_alive:
+                    cleanup_uncertain = True
+            except BaseException as error:
+                cleanup_uncertain = True
+                primary = primary or error
+            finally:
+                self.stopped.set()
+        if cleanup_uncertain:
+            cleanup_problem = "native capacity cleanup is unconfirmed"
+            if primary is not None:
+                primary.add_note(cleanup_problem)
+                # A fixed marker survives observe()'s sanitized public boundary.
+                setattr(primary, "_native_capacity_cleanup_unconfirmed", True)
+        if primary is not None and primary is not exc:
+            raise primary
         if exc is None and (cleanup_problem or self.problem):
             raise ProbeError(cleanup_problem or self.problem)

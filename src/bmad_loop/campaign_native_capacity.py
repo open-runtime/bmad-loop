@@ -238,8 +238,12 @@ def observe(
         raw = _read_muse(binary, project, env, deadline)
         return from_muse(raw, candidate, now=time.time() if now is None else now)
     except ProbeError as exc:
-        return CapacityObservation(False, known=False, reason=str(exc))
+        reason = str(exc)
+        if getattr(exc, "_native_capacity_cleanup_unconfirmed", False):
+            reason += "; native capacity cleanup is unconfirmed"
+        return CapacityObservation(False, known=False, reason=reason)
     except (OSError, ValueError, ProfileError, ProcessHostError) as exc:
-        return CapacityObservation(
-            False, known=False, reason="native capacity observation failed: " + type(exc).__name__
-        )
+        reason = "native capacity observation failed: " + type(exc).__name__
+        if getattr(exc, "_native_capacity_cleanup_unconfirmed", False):
+            reason += "; native capacity cleanup is unconfirmed"
+        return CapacityObservation(False, known=False, reason=reason)
