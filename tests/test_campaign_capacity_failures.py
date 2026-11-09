@@ -306,6 +306,29 @@ def test_custom_unknown_concurrency_retains_exact_model_quota_and_freshness_gate
         assert not result.concurrency_known and result.slots == 0
 
 
+@pytest.mark.parametrize("command", [(), ("observer",)])
+def test_decoder_recursion_is_an_explicit_unknown_observation(tmp_path, monkeypatch, command):
+    # Decoder depth limits differ across supported Python versions. Exercise
+    # the decoder's failure contract without guessing a universal nesting limit.
+    def decode(value):
+        assert value == "deep-provider-json"
+        raise RecursionError("provider payload detail must not escape")
+
+    monkeypatch.setattr(campaign_capacity, "json", SimpleNamespace(loads=decode))
+    monkeypatch.setattr(
+        campaign_capacity,
+        "run_argv",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0, timed_out=False, interrupted=False, stdout="deep-provider-json"
+        ),
+    )
+    result = campaign_capacity.observe(
+        RoleCandidate("codex", "gpt-astra", capacity_command=command), tmp_path, now=1000
+    )
+    assert not result.available and not result.known
+    assert result.reason == "capacity probe returned invalid JSON"
+
+
 def test_missing_probe_is_an_explicit_unknown_capacity_observation(tmp_path):
     candidate = RoleCandidate(
         "codex", "gpt-test", capacity_command=(str(tmp_path / "missing-command"),)

@@ -239,10 +239,10 @@ waits. A command may advertise an integer `slots` limit or explicitly report
 `concurrency_known = false` when its provider exposes no concurrency limit.
 Unknown concurrency does not imply unknown quota or permission to use a model.
 
-Without a custom command, Claude and Codex use TeamRouter status. Ordinary quota
-eligibility and explicitly enabled purchased-credit eligibility are separate
-observations. Credit admission must identify an eligible account for the exact
-model; a provider-wide credit toggle cannot override model, authentication,
+Without a custom command, Claude and Codex use TeamRouter status. Claude uses
+ordinary quota eligibility. Codex also accepts explicitly enabled purchased-credit
+eligibility as a separate observation. Credit admission must identify an eligible
+account for the exact model; a provider-wide credit toggle cannot override model, authentication,
 throttling or routing restrictions. This does not enable paid usage or change
 TeamRouter settings.
 
@@ -252,6 +252,12 @@ model catalog. These probes create no conversation and submit no model prompt.
 An installed binary, a local model preset, past successful work or recorded spend
 alone does not establish current quota. Invalid or unavailable native telemetry
 remains a visible capacity wait.
+
+The built-in native observers support the shipped `grok` and `muse` launcher
+names without profile environment or argument overrides. Qualified headless
+workers use their capability recipe, so a custom profile launcher or environment
+cannot silently select a different account for the capacity probe. Such profiles
+require an explicit `capacity_command` that observes the actual worker route.
 
 TeamRouter's eligible account count is not a concurrency ceiling. When route
 telemetry does not advertise slots, the configured campaign and role limits bound

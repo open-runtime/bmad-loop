@@ -20,7 +20,7 @@ from pathlib import Path
 
 from .adapters.profile import ProfileError, get_profile
 from .campaign_capacity_transport import ProbeError, StatusProcess
-from .campaign_model import RoleCandidate
+from .campaign_model import CommunicationSpec, RoleCandidate
 from .campaign_scheduler import CapacityObservation
 from .process_host import ProcessHostError
 
@@ -92,7 +92,8 @@ def from_grok(
         raise ProbeError("native Grok subscription allowance is unidentified")
     config = _object(billing.get("config"))
     period = _object(config.get("currentPeriod"))
-    if period.get("type") not in {
+    period_type = period.get("type")
+    if not isinstance(period_type, str) or period_type not in {
         "USAGE_PERIOD_TYPE_DAILY",
         "USAGE_PERIOD_TYPE_WEEKLY",
         "USAGE_PERIOD_TYPE_MONTHLY",
@@ -222,9 +223,27 @@ def observe(
         return None
     try:
         profile = get_profile(candidate.profile, project)
+        if profile.binary != candidate.profile:
+            raise ProbeError("native capacity launcher overrides require a custom capacity command")
         if profile.launch_args:
             raise ProbeError("native capacity launch overrides require a custom capacity command")
-        env = {**os.environ, **profile.env}
+        if profile.env:
+            raise ProbeError(
+                "native capacity environment overrides require a custom capacity command"
+            )
+        from .campaign_reflection_flow import sanitized_actor_env
+
+        # Match the headless worker's inherited account environment, without
+        # borrowing its parent actor identity or enrolling a probe session.
+        # Headless jobs do not apply profile.env; neither may this observer.
+        env = sanitized_actor_env(
+            {
+                key: value
+                for key, value in os.environ.items()
+                if not key.startswith(("GH_", "GITHUB_"))
+            },
+            communication=CommunicationSpec(),
+        )
         binary = shutil.which(profile.binary, path=env.get("PATH"))
         if not binary:
             raise ProbeError("native capacity configured launcher is unavailable")

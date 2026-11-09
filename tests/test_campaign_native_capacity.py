@@ -194,6 +194,8 @@ if mode == 'timeout':
     time.sleep(60)
 if mode == 'overflow':
     os.write(1, b'x'*(300*1024)); time.sleep(60)
+if mode == 'deep-output' and sys.argv[1:] == ['usage', '--json']:
+    print('['*10000+']'*10000, flush=True); raise SystemExit(0)
 if sys.argv[1:] == ['usage', '--json']:
     print(json.dumps(config['usage']), flush=True)
     raise SystemExit(0)
@@ -209,6 +211,10 @@ for line in sys.stdin:
         print(json.dumps({'jsonrpc':'2.0','id':99,'method':'session/request_permission','params':{'secret':'do-not-expose'}}),flush=True)
     if mode == 'turn':
         print(json.dumps({'jsonrpc':'2.0','method':'turn/started','params':{}}),flush=True)
+    if mode == 'invalid-method':
+        print(json.dumps({'jsonrpc':'2.0','method':config['notification_method'],'params':{}}),flush=True)
+    if mode == 'deep-protocol':
+        print('['*10000+']'*10000, flush=True)
     if mode == 'metadata':
         print(json.dumps({'jsonrpc':'2.0','method':'_x.ai/mcp/servers_updated','params':{'mcpServers':[]}}),flush=True)
     if method == 'initialize': result = config.get('initialize', {})
@@ -223,6 +229,10 @@ for line in sys.stdin:
     if mode == 'descendant': time.sleep(0.2)
 if mode == 'trailing-turn':
     print(json.dumps({'jsonrpc':'2.0','method':'turn/started','params':{}}),flush=True)
+if mode == 'trailing-invalid-method':
+    print(json.dumps({'jsonrpc':'2.0','method':config['notification_method'],'params':{}}),flush=True)
+if mode == 'deep-trailing':
+    print('['*10000+']'*10000, flush=True)
 if mode == 'metadata':
     print(json.dumps({'jsonrpc':'2.0','method':'_x.ai/mcp/servers_updated','params':{'mcpServers':[]}}),flush=True)
 if mode == 'graceful-delay': time.sleep(1.5)
@@ -248,8 +258,15 @@ def fixture(tmp_path, monkeypatch, provider, mode=""):
             "exec ", f"printf 'entered\\n' > {shlex.quote(str(marker))}\nexec ", 1
         )
     binary.write_text(launcher)
-    profile = dataclasses.replace(
-        get_profile(provider), binary=str(binary), env={"CAPACITY_FIXTURE": str(config)}
+    monkeypatch.setenv("CAPACITY_FIXTURE", str(config))
+    profile = get_profile(provider)
+    original_which = native.shutil.which
+    monkeypatch.setattr(
+        native.shutil,
+        "which",
+        lambda command, **kwargs: (
+            str(binary) if command == provider else original_which(command, **kwargs)
+        ),
     )
     monkeypatch.setattr(native, "get_profile", lambda name, project: profile)
     return binary, data
@@ -353,6 +370,151 @@ def test_readonly_mcp_inventory_notifications_do_not_block_native_capacity(tmp_p
     fixture(tmp_path, monkeypatch, "grok", "metadata")
     result = native.observe(GROK, tmp_path, now=NOW)
     assert result and result.available and result.model_access
+    assert all(pid_gone(int(pid)) for pid in (tmp_path / "pids").read_text().splitlines())
+
+
+def test_fragmented_valid_metadata_is_bounded_by_bytes_not_chunk_count(tmp_path, monkeypatch):
+    fixture(tmp_path, monkeypatch, "grok", "metadata")
+    original_read = transport.os.read
+    pending_counts = []
+    totals = []
+
+    class FragmentedStatusProcess(transport.StatusProcess):
+        def _send(self, message):
+            super()._send(message)
+            if message.get("method") == "initialize":
+                # Pause consumption until >65 one-byte fragments have queued.
+                # A count-limited queue instead sets problem before this point.
+                while self.messages.qsize() < 100:
+                    self._check()
+                    threading.Event().wait(0.001)
+                pending_counts.append(self.messages.qsize())
+                totals.append(self.total)
+
+    monkeypatch.setattr(
+        transport.os, "read", lambda fd, size: original_read(fd, 1 if size == 4096 else size)
+    )
+    monkeypatch.setattr(native, "StatusProcess", FragmentedStatusProcess)
+    result = native.observe(GROK, tmp_path, now=NOW)
+    assert result and result.available and result.model_access
+    assert pending_counts and pending_counts[0] >= 100
+    assert totals[0] < transport.MAX_OUTPUT_BYTES
+    assert all(pid_gone(int(pid)) for pid in (tmp_path / "pids").read_text().splitlines())
+
+
+def test_native_rpc_writes_explicit_utf8_lf_on_binary_pipes(tmp_path, monkeypatch):
+    fixture(tmp_path, monkeypatch, "grok")
+    original_popen = transport.subprocess.Popen
+    launches = []
+    frames = []
+
+    class UnicodeStatusProcess(transport.StatusProcess):
+        def request(self, identifier, method, params):
+            if method == "initialize":
+                params = {**params, "clientInfo": {"name": "bmad-capacité", "version": "1"}}
+            return super().request(identifier, method, params)
+
+    class RecordingInput:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def write(self, frame):
+            assert isinstance(frame, bytes)
+            frames.append(frame)
+            return self.stream.write(frame)
+
+        def __getattr__(self, name):
+            return getattr(self.stream, name)
+
+    def spawn(*args, **kwargs):
+        child = original_popen(*args, **kwargs)
+        launches.append(kwargs)
+        child.stdin = RecordingInput(child.stdin)
+        return child
+
+    monkeypatch.setattr(transport.subprocess, "Popen", spawn)
+    monkeypatch.setattr(native, "StatusProcess", UnicodeStatusProcess)
+    result = native.observe(GROK, tmp_path, now=NOW)
+    assert result and result.available
+    assert len(launches) == 1
+    assert not launches[0].get("text") and launches[0].get("encoding") is None
+    assert len(frames) == 2
+    assert all(frame.endswith(b"\n") and b"\r" not in frame for frame in frames)
+    assert [json.loads(frame.decode("utf-8"))["method"] for frame in frames] == [
+        "initialize",
+        "_x.ai/billing",
+    ]
+    assert json.loads(frames[0].decode("utf-8"))["params"]["clientInfo"]["name"] == "bmad-capacité"
+    assert all(pid_gone(int(pid)) for pid in (tmp_path / "pids").read_text().splitlines())
+
+
+@pytest.mark.parametrize("method", [[], {}], ids=["list", "object"])
+@pytest.mark.parametrize(
+    "mode,reason",
+    [
+        ("invalid-method", "unexpected notification"),
+        ("trailing-invalid-method", "unexpected trailing activity"),
+    ],
+)
+def test_unhashable_notification_method_is_sanitized_unknown(
+    tmp_path, monkeypatch, method, mode, reason
+):
+    _, data = fixture(tmp_path, monkeypatch, "grok", mode)
+    data["notification_method"] = method
+    (tmp_path / "config.json").write_text(json.dumps(data))
+    result = native.observe(GROK, tmp_path, now=NOW)
+    assert result and not result.known and not result.available
+    assert reason in result.reason
+    assert all(pid_gone(int(pid)) for pid in (tmp_path / "pids").read_text().splitlines())
+
+
+@pytest.mark.parametrize(
+    "candidate,mode,reasons",
+    [
+        (MUSE, "deep-output", ("invalid JSON", "payload schema mismatch")),
+        (GROK, "deep-protocol", ("invalid protocol JSON", "protocol schema mismatch")),
+        (GROK, "deep-trailing", ("trailing protocol is invalid", "unexpected trailing activity")),
+    ],
+)
+def test_deeply_nested_native_json_is_sanitized_unknown(
+    tmp_path, monkeypatch, candidate, mode, reasons
+):
+    """Decoder depth limits differ by Python; the parsed array is never a schema."""
+    fixture(tmp_path, monkeypatch, candidate.profile, mode)
+    result = native.observe(candidate, tmp_path, now=NOW)
+    assert result and not result.known and not result.available
+    assert any(reason in result.reason for reason in reasons)
+    assert all(pid_gone(int(pid)) for pid in (tmp_path / "pids").read_text().splitlines())
+
+
+@pytest.mark.parametrize(
+    "candidate,mode,reason",
+    [
+        (MUSE, "deep-output", "invalid JSON"),
+        (GROK, "deep-protocol", "invalid protocol JSON"),
+        (GROK, "deep-trailing", "trailing protocol is invalid"),
+    ],
+)
+def test_decoder_recursion_error_is_sanitized_unknown(
+    tmp_path, monkeypatch, candidate, mode, reason
+):
+    """Force only the known bad frame's decoder fault, without a depth assumption."""
+    fixture(tmp_path, monkeypatch, candidate.profile, mode)
+    original_loads = transport.json.loads
+    frame = "[" * 10000 + "]" * 10000
+    rejected = []
+
+    def decode(value, *args, **kwargs):
+        if value in (frame, frame + "\n", frame.encode(), (frame + "\n").encode()):
+            rejected.append(True)
+            raise RecursionError("synthetic decoder stack limit")
+        return original_loads(value, *args, **kwargs)
+
+    monkeypatch.setattr(transport.json, "loads", decode)
+    result = native.observe(candidate, tmp_path, now=NOW)
+    assert rejected
+    assert result and not result.known and not result.available
+    assert reason in result.reason
     assert all(pid_gone(int(pid)) for pid in (tmp_path / "pids").read_text().splitlines())
 
 

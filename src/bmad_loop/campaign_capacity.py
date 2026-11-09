@@ -244,7 +244,7 @@ def observe(
         return CapacityObservation(False, reason="capacity probe unavailable", known=False)
     try:
         raw = json.loads(result.stdout)
-    except ValueError:
+    except (ValueError, RecursionError):
         return CapacityObservation(
             False, reason="capacity probe returned invalid JSON", known=False
         )

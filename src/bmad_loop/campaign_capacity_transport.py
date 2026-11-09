@@ -15,6 +15,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 from .childrun import hard_stop_pending, kill_tree
 from .process_host import get_process_host
@@ -45,7 +46,9 @@ class StatusProcess:
         self.host = get_process_host()
         self.deadline = deadline
         self.known: dict[int, float | None] = {}
-        self.messages: queue.Queue[bytes | None] = queue.Queue(maxsize=65)
+        # The cumulative byte counter bounds capture across both streams.
+        # A separate item limit would reject harmless fragmented pipe reads.
+        self.messages: queue.Queue[bytes | None] = queue.Queue()
         self.stopped = threading.Event()
         self.lock = threading.Lock()
         self.total = 0
@@ -53,15 +56,15 @@ class StatusProcess:
         self.buffer = b""
         self.eof = False
         self.protocol = False
-        self.proc = subprocess.Popen(
+        # This handle participates in stream-agnostic childrun cleanup. Wire I/O
+        # is binary so Windows cannot translate JSON-RPC LF frames to CRLF.
+        self.proc: subprocess.Popen[Any] = subprocess.Popen(
             argv,
             cwd=project,
             env=env,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
         )
         self.threads = []
         try:
@@ -88,8 +91,6 @@ class StatusProcess:
                         return
                 if stdout:
                     self.messages.put_nowait(piece)
-        except queue.Full:
-            self.problem = "native capacity output exceeded its bound"
         except (OSError, ValueError):
             if not self.stopped.is_set():
                 self.problem = "native capacity stream failed"
@@ -127,7 +128,7 @@ class StatusProcess:
             self.buffer += self._piece()
         try:
             return json.loads(self.buffer)
-        except (ValueError, UnicodeError) as exc:
+        except (ValueError, UnicodeError, RecursionError) as exc:
             raise ProbeError("native capacity returned invalid JSON") from exc
 
     def notify(self, method: str) -> None:
@@ -137,7 +138,7 @@ class StatusProcess:
         self._check()
         assert self.proc.stdin is not None
         try:
-            self.proc.stdin.write(json.dumps(message) + "\n")
+            self.proc.stdin.write((json.dumps(message) + "\n").encode("utf-8"))
             self.proc.stdin.flush()
         except (BrokenPipeError, OSError) as exc:
             raise ProbeError("native capacity input closed") from exc
@@ -153,7 +154,7 @@ class StatusProcess:
             line, self.buffer = self.buffer.split(b"\n", 1)
             try:
                 message = json.loads(line)
-            except (ValueError, UnicodeError) as exc:
+            except (ValueError, UnicodeError, RecursionError) as exc:
                 raise ProbeError("native capacity returned invalid protocol JSON") from exc
             if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
                 raise ProbeError("native capacity protocol schema mismatch")
@@ -162,7 +163,10 @@ class StatusProcess:
                     raise ProbeError("native capacity requested an unauthorized client action")
                 # No model work is requested. A provider that nevertheless
                 # emits turn/session events has violated this status contract.
-                if message["method"] not in _STATUS_NOTIFICATIONS:
+                if (
+                    not isinstance(message["method"], str)
+                    or message["method"] not in _STATUS_NOTIFICATIONS
+                ):
                     raise ProbeError("native capacity emitted an unexpected notification")
                 continue
             if type(message.get("id")) is not int or message["id"] != identifier:
@@ -229,13 +233,14 @@ class StatusProcess:
                     for line in self.buffer.splitlines():
                         try:
                             message = json.loads(line)
-                        except (ValueError, UnicodeError):
+                        except (ValueError, UnicodeError, RecursionError):
                             cleanup_problem = "native capacity trailing protocol is invalid"
                             break
                         if (
                             not isinstance(message, dict)
                             or message.get("jsonrpc") != "2.0"
                             or "id" in message
+                            or not isinstance(message.get("method"), str)
                             or message.get("method") not in _STATUS_NOTIFICATIONS
                         ):
                             cleanup_problem = "native capacity emitted unexpected trailing activity"
