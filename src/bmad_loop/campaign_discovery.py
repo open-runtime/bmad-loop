@@ -316,7 +316,8 @@ class RepositoryDiscovery:
                     continue
                 detail_bytes += len(json.dumps(detail).encode())
                 if detail_bytes > self.max_detail_bytes * 4:
-                    truncated.append("git:branch_detail_byte_limit")
+                    if "git:branch_detail_byte_limit" not in truncated:
+                        truncated.append("git:branch_detail_byte_limit")
                     row["inspection"] = "detail_byte_limit"
                     # Continue classifying every remaining ref; a byte budget
                     # must not conceal whether later refs overlap this scope.

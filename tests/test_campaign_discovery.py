@@ -408,6 +408,7 @@ def test_many_preserved_aliases_keep_complete_scoped_branch_evidence(semantic_in
 
 
 def test_many_distinct_relevant_heads_are_limited_by_bytes_not_branch_count(semantic_inventory):
+    """Ablation: removing the aggregate marker guard repeats the same truncation reason."""
     from conftest import git
 
     repo, remote, base, head, gateway = semantic_inventory
@@ -436,6 +437,22 @@ def test_many_distinct_relevant_heads_are_limited_by_bytes_not_branch_count(sema
     ]
     assert len(independent) == 40
     assert all("external implementation" in row["branch_evidence"]["diff"] for row in independent)
+    bounded = RepositoryDiscovery(gateway, repo, max_detail_bytes=2000).collect(
+        remote="inventory", relevant_paths=("src/shared.py",)
+    )
+    assert not bounded.complete
+    assert bounded.truncated.count("git:branch_detail_byte_limit") == 1
+    assert {(row["ref"], row["sha"]) for row in bounded.remote_refs} == {
+        (row["ref"], row["sha"]) for row in receipt.remote_refs
+    }
+    limited = [
+        row for row in bounded.remote_refs if row["ref"].startswith("refs/heads/independent/")
+    ]
+    assert len(limited) == 40
+    assert sum(row.get("inspection") == "detail_byte_limit" for row in limited) > 1
+    assert all(
+        "branch_evidence" in row or row.get("inspection") == "detail_byte_limit" for row in limited
+    )
 
 
 def test_scoped_branch_evidence_excludes_unrelated_patch_and_commit_history(semantic_inventory):
