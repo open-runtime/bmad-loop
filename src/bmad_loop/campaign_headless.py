@@ -918,6 +918,28 @@ class HeadlessRunner:
             raise CampaignError("Headless receipt identity changed")
         if receipt.get("processes_quiescent") is not True:
             return {"state": "unknown", "reason": "Headless descendant containment is unproven"}
+        # Some native transports park their bootstrap after the worker exits.
+        # Dispose that owned transport only after all completion proofs above;
+        # a best-effort kill alone cannot establish its final disposition.
+        dispose = getattr(self.mux, "dispose_completed_window", None)
+        if dispose is not None:
+            if window is None:
+                return {
+                    "state": "unknown",
+                    "reason": "Completed headless terminal disposal lacks an owned window binding",
+                }
+            try:
+                disposed = dispose(envelope["session"], window["native_id"])
+            except (OSError, MultiplexerError) as exc:
+                return {
+                    "state": "unknown",
+                    "reason": f"Completed headless terminal disposal unconfirmed: {exc}",
+                }
+            if disposed is not True:
+                return {
+                    "state": "unknown",
+                    "reason": "Completed headless terminal disposal is unconfirmed",
+                }
         receipt.update(
             quiescent=True,
             completion_evidence="owned-window-death-and-process-readback",

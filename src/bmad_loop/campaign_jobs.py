@@ -239,6 +239,10 @@ def current(
         return handoff.get("id") == coordinates["handoff_id"]
     if coordinates["graph_revision"] != snapshot.graph_revision:
         return False
+    if coordinates.get("intake_baseline"):
+        from .campaign_intake_baseline import current as baseline_current
+
+        return baseline_current(snapshot, request)
     if coordinates.get("context_digest"):
         from .campaign_reasoning_plan import ROLES, fingerprint
 

@@ -82,6 +82,17 @@ workspace allocation and worker launch using the normal coordinator path, rather
 than injecting a workspace into every fixture. This regression is separate from
 actual native delivery and live-worker stop/resume qualification.
 
+Initial issue comparison is a required unit-bound triage job, rather than a new
+planning workspace or portfolio job. It compares the full initial issue against
+the committed selected specification and applies only to the captured version.
+No inferred equivalence, truncated input or successful process exit can settle the
+issue. The normal durable job lifecycle validates the structured verdict; changed
+sources and uncertain processes prevent application. Unavailable reasoning returns
+the issue to ordinary intake instead of indefinitely preventing story execution.
+Headless job completion also proves disposal of its owned native terminal while
+retaining logs and identity history. Quiescence alone must not strand a parked
+bootstrap terminal or authorize closing another session's pane.
+
 Optimize sequencing and useful parallelism through dependencies, ownership and
 token/session capacity. Preserve existing source initiatives/sprints and their
 GitHub mapping; introduce no calendar, dates, velocity or sprint-capacity model.

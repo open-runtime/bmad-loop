@@ -312,6 +312,13 @@ Conflicting identities or unresolved prior writes pause reconciliation instead
 of creating duplicate parents or moving existing work.
 
 GitHub intake observes selected issues or all open and newly edited issues.
+When bounded triage reasoning is enabled and qualified, the first issue version
+bound to a selected story is compared with that story's committed specification
+in its existing workspace before coding. A validated finding that all requirements
+are represented avoids an additional intake workspace. Comments, later edits and
+new requirements still enter normal triage. Missing capacity or qualification falls
+back to normal intake; status exposes a pending comparison and other stories can
+continue. A mirror marker or matching issue identity alone never proves coverage.
 Repository discovery includes existing PRs, branches and accessible local work.
 Triage proposes attachment, same-PR repair, new planning work, duplicate links,
 clarification or a hold. An incoming issue is evidence and product intent;

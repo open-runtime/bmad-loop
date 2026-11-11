@@ -43,8 +43,14 @@ identity reflection, outside-peer communication or live-worker drain/resume.
 
 The next follow-up implements the following additional goals. Earlier release
 qualification does not establish these new behaviors. Preserve the existing REM
-pilot and its three clean workspaces; it remains stopped until affected startup
+pilot's evidence and selected branches; it remains stopped until affected startup
 and route qualifications pass. Its selected work is issues #1582 and #529.
+The owner-authorized November 10 cleanup archived its three workspaces and retained
+the selected branches in preservation draft PRs #2331 and #2332. Recovery must use
+verified adoption of those branches, not recreate deleted native identities or
+blindly resume a snapshot whose workspaces no longer exist. Those drafts contain
+specifications, not delivered implementations. Active unrelated REM sessions remain
+outside this recovery operation.
 
 | Goal                         | Contract and completion evidence                                                                                                                                                                                                                                            |
 | ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -1081,6 +1087,18 @@ digest, author, origin URL and observed content. Deduplicate identical versions;
 edits create new input. Suppress feedback from the campaign's own marked comments.
 Persist these inbox records separately from outbound action receipts.
 
+Before a selected story's first writer, compare its initial bound or exactly
+mirrored issue version with its committed specification through a bounded triage
+job in that story's workspace. Identity markers establish the match, not semantic
+coverage. With qualified triage reasoning enabled, only a current represented
+verdict with no missing requirements settles that version without an intake unit.
+Bind the comparison to issue version, source, head, graph and frozen configuration.
+Comments, later edits, ambiguous matches and additional requirements retain normal
+triage. Missing qualification, exhausted attempts or a bounded never-launched
+admission wait also fall back to normal triage. Live or uncertain jobs retain their
+claims. A pending comparison is visible and does not reserve an execution slot
+against unrelated stories; owner holds still prevent launch.
+
 Deterministic matching handles known bindings, duplicates and lifecycle facts.
 Semantic triage runs as a bounded coding-CLI session, using the normal completion
 contract and a validated result artifact. It proposes one of: attach to existing
@@ -1632,6 +1650,12 @@ do not create a coding agent to display history or keep one alive for its tab.
 Parked terminal-history retention is an optional later capability, not required
 for this PR. Record latest completed/failed phase per unit and preserve artifacts
 until the campaign retention policy permits removal.
+Headless completion additionally disposes only its exact owned native terminal
+after worker and descendant quiescence, matching receipt and containment evidence.
+Require daemon absence after disposal before acknowledging completion. Missing or
+replaced identities, uncertain acknowledgements and lingering terminals remain
+observable and recoverable; never close the workspace or unrelated panes. Native
+transcripts, output and completed-session identities survive terminal disposal.
 
 Hold/takeover first acknowledges a durable scheduler hold and suppresses all
 automatic nudges/retries/publication. It can permit direct input to the same

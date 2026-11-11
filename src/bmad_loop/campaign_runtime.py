@@ -719,7 +719,12 @@ class CampaignRuntime:
             )
         ) and not self._pending(snapshot, "", "intake"):
             proposals.append(Proposal("intake", ""))
-        admission = admit(snapshot, now=now)
+        from .campaign_intake_baseline import admission_waits
+        from .campaign_intake_baseline import proposals as baseline_proposals
+
+        proposals.extend(baseline_proposals(snapshot, now=now))
+        baseline_waits = admission_waits(snapshot)
+        admission = admit(snapshot, now=now, blocked=baseline_waits)
         selected = set(admission.units)
         reserved = Counter(
             claim.resource
@@ -927,6 +932,9 @@ class CampaignRuntime:
                 )
                 continue
             from .campaign_handoff_flow import resume_proposal
+
+            if unit.state == UnitState.READY and key in baseline_waits:
+                continue
 
             continuation = resume_proposal(snapshot, unit, runtime=self)
             if continuation is not None:
@@ -1958,6 +1966,7 @@ class CampaignRuntime:
             "lifecycle",
             "planning-complete",
             "intake-control",
+            "intake-baseline",
             "intake-cancel",
             "intake-note",
             "intake-refresh",
@@ -2500,6 +2509,11 @@ class CampaignRuntime:
 
     def _perform_intake_control(self, snapshot, action) -> Observation:
         return Observation("confirmed", action.payload)
+
+    def _perform_intake_baseline(self, snapshot, action) -> Observation:
+        from .campaign_intake_baseline import perform
+
+        return perform(self, snapshot, action)
 
     def _perform_intake_note(self, snapshot, action) -> Observation:
         from .campaign_runtime_intake import disposition_intent
@@ -5210,6 +5224,10 @@ class CampaignRuntime:
             from .campaign_runtime_intake import create_control
 
             create_control(snapshot, data)
+        elif kind == "intake-baseline":
+            from .campaign_intake_baseline import apply
+
+            apply(snapshot, action, observation)
         elif kind == "usage-hold":
             self._set_hold(unit, Hold("lifetime_budget", data["reason"], id=action.id))
         elif kind == "adopt-draft":

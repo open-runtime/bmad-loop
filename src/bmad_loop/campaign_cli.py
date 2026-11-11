@@ -351,13 +351,14 @@ def status_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
 
     """Project execution identities; omit private configuration and evidence."""
     from .campaign_external_provenance import summary as external_provenance_summary
+    from .campaign_intake_baseline import admission_waits
     from .campaign_metrics import document as timing_document
     from .campaign_operator import diagnostics
     from .campaign_scheduler import admit
     from .sanitize import scrub_json, scrub_text
 
     units = []
-    admission = admit(snapshot)
+    admission = admit(snapshot, blocked=admission_waits(snapshot))
     inventory = snapshot.bindings.get("inventory", {})
     discovery_wait = (
         (

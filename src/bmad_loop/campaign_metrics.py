@@ -17,7 +17,13 @@ from .campaign_store import add_event
 
 def observe_admission(snapshot: CampaignSnapshot, *, now: float) -> bool:
     """Persist reason changes, rather than one sample per coordinator tick."""
-    admission = admit(snapshot, now=now) if snapshot.phase == "active" else None
+    from .campaign_intake_baseline import admission_waits
+
+    admission = (
+        admit(snapshot, now=now, blocked=admission_waits(snapshot))
+        if snapshot.phase == "active"
+        else None
+    )
     waits = dict(admission.waits) if admission else {}
     selected = set(admission.units) if admission else set()
     if admission:

@@ -20,6 +20,8 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Compare initial mirrored issues with selected committed stories before allocating additional intake work; retain new requirements and bounded fallback.
+- Release completed owned headless terminals only after exact process, receipt and native-identity verification; preserve output and unrelated views.
 - Separate initiative/epic folders, story workspaces and session actor identities in Paradev reflection.
 - Preserve manual workspace, folder and task presentation changes during managed refreshes.
 - Renew startup routes after proved ended optional reasoning without resetting failures, attempts or usage.

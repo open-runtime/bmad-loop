@@ -122,7 +122,9 @@ def writer_available(
     return True
 
 
-def admit(snapshot: CampaignSnapshot, *, now: float = 0) -> Admission:
+def admit(
+    snapshot: CampaignSnapshot, *, now: float = 0, blocked: Mapping[str, str] | None = None
+) -> Admission:
     waits: dict[str, str] = {}
     if snapshot.phase != "active":
         return Admission(
@@ -170,6 +172,8 @@ def admit(snapshot: CampaignSnapshot, *, now: float = 0) -> Admission:
             continue
         if unit.hold:
             waits[key] = f"hold:{unit.hold.kind}"
+        elif blocked and key in blocked:
+            waits[key] = blocked[key]
         elif unit.retry_at is not None and now < unit.retry_at:
             waits[key] = "retry-wait"
         elif unit.claim and not unit.claim.quiescent:
