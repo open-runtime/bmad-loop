@@ -6,7 +6,9 @@ import pytest
 
 from bmad_loop import campaign_handoff_flow as flow
 from bmad_loop.campaign_fidelity import (
+    FINAL_AUDIT_PROMPT_VERSION,
     HISTORY_AUDIT_PROMPT_VERSION,
+    contract_header,
     route_binding,
     semantic_contract,
 )
@@ -307,6 +309,40 @@ def test_editing_audit_schema_manifest_cannot_relabel_independent_native_receipt
     with pytest.raises(flow.HandoffRouteWait, match="semantic contract"):
         flow.validate_fidelity_qualification(cap, purpose="handoff_audit")
     assert receipt_path.read_bytes() == native_bytes
+
+
+def test_final_audit_binds_final_prompt_not_history_audit(proof):
+    from pathlib import Path
+
+    _, expected = contract_header("handoff_final_audit", flow.AUDIT_SCHEMA)
+    assert expected["audit_prompt_version"] == FINAL_AUDIT_PROMPT_VERSION
+    _, audit = contract_header("handoff_audit", flow.AUDIT_SCHEMA)
+    assert audit["audit_prompt_version"] == HISTORY_AUDIT_PROMPT_VERSION
+    cap, path = proof
+    evidence = read_json(path)
+    bindings = [route_binding(cap, "handoff_final_audit")]
+    evidence.update(
+        route_bindings=bindings,
+        audit_schema_digest=digest(flow.AUDIT_SCHEMA),
+        audit_prompt_version=HISTORY_AUDIT_PROMPT_VERSION,
+    )
+    receipt_path = Path(evidence["independent_review"]["native_receipt_path"])
+    receipt = read_json(receipt_path)
+    receipt["result"].update(
+        route_bindings_digest=digest(bindings),
+        audit_prompt_version=HISTORY_AUDIT_PROMPT_VERSION,
+        semantic_contract_digests={
+            "handoff_final_audit": digest(
+                semantic_contract("handoff_final_audit", flow.AUDIT_SCHEMA)
+            )
+        },
+    )
+    write_json(receipt_path, receipt)
+    evidence["independent_review"]["sha256"] = file_digest(receipt_path)
+    write_json(path, evidence)
+    cap["semantic_qualification"]["proofs"][0]["sha256"] = file_digest(path)
+    with pytest.raises(flow.HandoffRouteWait, match="does not match|audit prompt"):
+        flow.validate_fidelity_qualification(cap, purpose="handoff_final_audit")
 
 
 def test_map_proof_ignores_unused_audit_schema_and_reducer_prompt(proof, monkeypatch):

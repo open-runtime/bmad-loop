@@ -867,12 +867,16 @@ def dispatch(args: argparse.Namespace) -> int:
         migrated = store.migrate_state(campaign_id)
         return _emit(args, _result(command, campaign=status_document(migrated)))
     if command == "reconfigure":
+        import tomllib
+
         from .campaign_reconfiguration import reconfigure
 
+        with Path(args.spec).expanduser().open("rb") as stream:
+            proposed = tomllib.load(stream)
         result = reconfigure(
             store,
             campaign_id,
-            parse_spec(Path(args.spec).expanduser()),
+            proposed,
             expected_revision=args.expected_revision,
             reason=args.reason,
             preview=args.preview,

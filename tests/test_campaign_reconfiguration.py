@@ -241,6 +241,24 @@ def test_legacy_snapshot_default_and_new_spec_default_differ(campaign):
     assert spec_from_dict(raw["spec"]).paradev.group_by == "epic"
 
 
+def test_omitted_group_by_does_not_infer_epic_regroup(campaign):
+    store, before, _, _ = campaign
+    before = change(campaign)
+    assert before.spec.paradev.group_by == "story"
+    raw = spec_to_dict(before.spec)
+    raw["paradev"].pop("group_by")
+    assert spec_from_dict(raw).paradev.group_by == "epic"
+    after = config.reconfigure(
+        store,
+        before.id,
+        raw,
+        expected_revision=before.revision,
+        reason="Reuse original TOML without regrouping",
+    )
+    assert after.spec.paradev.group_by == "story"
+    assert (after.bindings.get("paradev_regroup") or {}).get("to_group_by") != "epic"
+
+
 @pytest.mark.parametrize("limit", [0, -1, True, 1.5, None, 1024 * 1024 * 1024 + 1])
 def test_history_budget_is_finite_and_positive(campaign, limit):
     raw = spec_to_dict(campaign[1].spec)

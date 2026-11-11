@@ -119,12 +119,14 @@ def contract_header(purpose, audit_schema, contract=""):
         )
         if purpose in {"handoff_map", "handoff_reduce", "handoff_final"}:
             expected["summary_job_schema_digest"] = actual_contract["summary_job_schema_digest"]
-        if purpose == "handoff_final_audit":
-            expected["audit_schema_digest"] = actual_contract["audit_schema_digest"]
-        if purpose == "handoff_audit":
+        if purpose in {"handoff_audit", "handoff_final_audit"}:
             expected.update(
                 audit_schema_digest=actual_contract["audit_schema_digest"],
-                audit_prompt_version=HISTORY_AUDIT_PROMPT_VERSION,
+                audit_prompt_version=(
+                    FINAL_AUDIT_PROMPT_VERSION
+                    if purpose == "handoff_final_audit"
+                    else HISTORY_AUDIT_PROMPT_VERSION
+                ),
             )
     return actual_contract, expected
 
