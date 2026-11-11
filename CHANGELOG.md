@@ -9,6 +9,7 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- Bound opt-in Claude summary requests with native stream accounting, typed limit cancellation and retained partial usage.
 - Prepare stopped successors and transfer exact preserved startup PRs from permanently retired campaigns without reopening archived sessions.
 - Audit and reconcile existing repository work with bounded parallel reasoning, independent review and preserved history.
 - Configure ordered summary routes per stage, mandatory final synthesis and independent audit-family reservation.

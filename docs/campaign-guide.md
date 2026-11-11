@@ -1182,6 +1182,16 @@ qualification. Claude's native rate-limit telemetry remains a quota outcome even
 when its final result only reports a generic error. Provider exhaustion does not
 justify changing accounts or loosening a route's permissions.
 
+Claude no-tools proposals may opt into the separately qualified
+`claude-code-v2` native-limit contract. It requires `--include-partial-messages`,
+counts distinct root model requests against the job turn allowance and checks
+cumulative per-message output against the final native usage. Typed output-limit
+events or excess observed requests/output trigger owned-process cancellation.
+The worker checks every 100ms; this is reactive containment, so a native retry
+may already have started. Partial usage stays a lower bound and cannot earn a
+successful grant. Existing recipes remain unchanged. Adding v2 requires fresh
+qualification binding the exact launcher, helper, stream and completed receipt.
+
 `bmad-loop campaign trial-handoff SNAPSHOTS --capability CAPABILITY --directory PRIVATE_DIRECTORY --parallel 4 --json`
 exercises sealed history through qualified native map/reduce jobs and production
 citation/coverage validators. The snapshots explicitly name archived prefixes;

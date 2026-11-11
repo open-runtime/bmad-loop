@@ -1338,6 +1338,24 @@ output ceiling and one structured-output attempt; model caps may lower the outpu
 allowance. Whole-job elapsed time and aggregate
 token/turn validation remain independent limits, including provider reasoning
 and any internal turns. Do not claim a per-request ceiling is an aggregate cap.
+
+The opt-in `claude-code-v2` no-tools recipe additionally requires native partial
+message events and exact stream-helper dependencies. Count distinct root model
+message IDs against the frozen job turn allowance; a StructuredOutput tool round
+does not start another model request. Accumulate each message's cumulative output
+usage once and reconcile it with terminal usage and native iterations when
+provided. Malformed, nested or incomplete accounting cannot earn qualification.
+Existing v1 recipes and proofs retain their original contract.
+
+The disposable worker incrementally reads bounded JSONL records every 100ms.
+Typed `max_tokens`, excess observed output or another model request beyond the
+allowance causes owned-process cancellation. This is reactive containment: a
+native continuation may start before cancellation reaches it. Partial usage
+remains a lower bound, never complete billing or successful qualification.
+Quota/authentication/transport failures retain their native cause even before
+the first model message. New v2 recipes require fresh transport qualification
+with matching stream and receipt evidence; no existing proof is promoted.
+
 Reducer grouping measures the exact native-event projection, including its
 source-input wrapper. The complete child summaries remain hash-bound and retained.
 This avoids rejecting a usable route because internal metadata omitted from the
