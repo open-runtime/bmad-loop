@@ -39,7 +39,7 @@ class PreparedHost(Host):
                 assert payload is not None
                 assert payload["workspaceId"] in {row["id"] for row in self.workspaces}
                 return {"sessions": []}
-            return super().rpc(procedure, payload)
+            return super().rpc(procedure, payload, mutate=mutate)
 
     def cli(self, args):
         with self.lock:

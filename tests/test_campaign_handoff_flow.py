@@ -1,5 +1,6 @@
 """Owned continuation preserves work and never transfers approval or native IDs."""
 
+import copy
 import dataclasses
 import json
 from pathlib import Path
@@ -49,12 +50,13 @@ def campaign(prepared, project, tmp_path):
         else:
             value = fixture_capability(tmp_path, value, candidate)
         from bmad_loop.campaign_fidelity import (
+            FINAL_AUDIT_PROMPT_VERSION,
             HISTORY_AUDIT_PROMPT_VERSION,
             PURPOSES,
             route_binding,
             semantic_contract,
         )
-        from bmad_loop.campaign_headless import file_digest, write_json
+        from bmad_loop.campaign_headless import file_digest, read_json, write_json
         from bmad_loop.campaign_summary import (
             EXTRACT_PROMPT_VERSION,
             REDUCE_PROMPT_VERSION,
@@ -136,10 +138,38 @@ def campaign(prepared, project, tmp_path):
         }
         qualification_path = tmp_path / (evidence_name + "-fidelity.json")
         write_json(qualification_path, qualification)
-        value["semantic_qualification"] = {
+        primary = {
             "schema_version": 2,
             "path": str(qualification_path),
             "sha256": file_digest(qualification_path),
+        }
+        # Final-synthesis auditing earns a different prompt header. Keep its
+        # receipt/proof separate so the legacy history audit remains qualified.
+        final_bindings = [route_binding(value, "handoff_final_audit", candidate)]
+        final_native = read_json(native_path)
+        final_native["result"].update(
+            audit_prompt_version=FINAL_AUDIT_PROMPT_VERSION,
+            route_bindings_digest=digest(final_bindings),
+        )
+        final_native_path = tmp_path / (evidence_name + "-native-final-audit.json")
+        write_json(final_native_path, final_native)
+        final_proof = copy.deepcopy(qualification)
+        final_proof.update(
+            route_bindings=final_bindings,
+            audit_prompt_version=FINAL_AUDIT_PROMPT_VERSION,
+            independent_review={
+                "native_receipt_path": str(final_native_path),
+                "sha256": file_digest(final_native_path),
+            },
+        )
+        final_path = tmp_path / (evidence_name + "-final-audit-fidelity.json")
+        write_json(final_path, final_proof)
+        value["semantic_qualification"] = {
+            **primary,
+            "proofs": [
+                primary,
+                {"path": str(final_path), "sha256": file_digest(final_path)},
+            ],
         }
         return value
 

@@ -135,7 +135,7 @@ def test_handoff_reduce_constructs_projected_requests_from_current_route_geometr
     from bmad_loop import campaign_handoff_flow as flow
     from bmad_loop.campaign_headless import render_input
     from bmad_loop.campaign_jobs import request_from_dict
-    from bmad_loop.campaign_model import RoleCandidate
+    from bmad_loop.campaign_model import ReasoningSpec, RoleCandidate
     from bmad_loop.campaign_transcripts import blob
 
     children = recorded_size_children(tmp_path)
@@ -180,7 +180,7 @@ def test_handoff_reduce_constructs_projected_requests_from_current_route_geometr
     )
     snapshot = SimpleNamespace(
         config_revision=1,
-        spec=SimpleNamespace(reasoning=SimpleNamespace(packet_token_limit=160000, timeout_s=600)),
+        spec=SimpleNamespace(reasoning=ReasoningSpec(packet_token_limit=160000, timeout_s=600)),
     )
     runtime, unit = SimpleNamespace(clock=lambda: 1.0), SimpleNamespace(id="story")
     value = {
@@ -191,8 +191,11 @@ def test_handoff_reduce_constructs_projected_requests_from_current_route_geometr
         "capture": {"sources": []},
     }
     planned = flow._reduce(runtime, snapshot, unit, value)
-    assert planned["reduction"] and len(planned["requests"]) == 2
-    requests = [request_from_dict(raw) for raw in planned["requests"]]
+    assert isinstance(planned, dict) and planned["reduction"]
+    raw_requests = planned["requests"]
+    assert isinstance(raw_requests, list) and len(raw_requests) == 2
+    assert all(isinstance(raw, dict) for raw in raw_requests)
+    requests = [request_from_dict(raw) for raw in raw_requests]
     assert {key for request in requests for key in request.dependencies} == set(rows)
     for request in requests:
         spec = request.coordinates["summary_spec"]

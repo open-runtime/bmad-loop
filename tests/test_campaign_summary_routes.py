@@ -193,6 +193,7 @@ def test_legacy_reducer_proof_does_not_qualify_final_synthesis(campaign):
     value["independent_review"]["sha256"] = file_digest(receipt)
     write_json(proof, value)
     cap["semantic_qualification"]["sha256"] = file_digest(proof)
+    cap["semantic_qualification"]["proofs"][0]["sha256"] = file_digest(proof)
     validate(cap, flow.AUDIT_SCHEMA, candidate=candidate, purpose="handoff_reduce")
     with pytest.raises(CampaignError, match="semantic contract"):
         validate(cap, flow.AUDIT_SCHEMA, candidate=candidate, purpose="handoff_final")

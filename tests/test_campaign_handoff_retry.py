@@ -264,6 +264,7 @@ def test_summary_purpose_selects_exact_qualified_effort(campaign):
         evidence["independent_review"]["sha256"] = file_digest(receipt_path)
         write_json(path, evidence)
         cap["semantic_qualification"]["sha256"] = file_digest(path)
+        cap["semantic_qualification"]["proofs"][0]["sha256"] = file_digest(path)
         variants[candidate.effort] = {"reasoning": cap}
     snapshot.config_snapshot["reasoning_capabilities"][base.profile + ":" + base.model] = {
         "by_effort": variants

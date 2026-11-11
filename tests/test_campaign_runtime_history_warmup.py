@@ -123,6 +123,14 @@ def test_live_prefix_maps_are_reused_after_append_and_quota_handoff(
             ),
         )
     _, snapshot = create(case.repo, spec)
+    if managed:
+        from bmad_loop.campaign_summary_routes import STAGES, qualified_candidates
+
+        for stage in STAGES:
+            options, exclusions = qualified_candidates(
+                snapshot.spec, snapshot.config_snapshot["reasoning_capabilities"], stage
+            )
+            assert options, (stage, exclusions)
     dependent = snapshot.units["source:project:dependent"]
     dependent.spec = dataclasses.replace(dependent.spec, after=(UNIT,))
     snapshot.graph_revision += 1
