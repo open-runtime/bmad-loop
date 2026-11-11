@@ -1837,6 +1837,10 @@ uncertain dispatch without provider calls.
 Native reasoning jobs use the same typed wait without failing their attempt. Their
 existing immutable request/launch-intent journal supplies dispatch containment; a
 busy bridge never resets that journal or replaces the job claim.
+Indexing a registration intent never replaces an existing endpoint identity. An
+observer can encounter a newly indexed intent before its actor identity exists;
+it reports incomplete registration and preserves that room's mail and cursor until
+the identity is available. Existing actor records remain the recovery authority.
 
 The endpoint ledger, bounded shared-room poller and durable message ledger survive
 coordinator restart. They preserve uncertain replies, detect database replacement,

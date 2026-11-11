@@ -235,6 +235,16 @@ class ManagedCommunication:
             )
         return self._public(record, target=target, error=error)
 
+    def _index_intent(self, room, target):
+        """Publish initial intent without erasing an already registered identity."""
+        record = {"room": room, "target": target, "state": "registering"}
+        with self._db(write=True) as db:
+            db.execute(
+                "INSERT OR IGNORE INTO endpoints(id,room,name,state,target,record,error) "
+                "VALUES(?,?,'','registering',?,?,'')",
+                (_key(target), room, json.dumps(target, sort_keys=True), json.dumps(record)),
+            )
+
     @staticmethod
     def _public(record, *, target=None, error="", sequence=None):
         return {
@@ -273,7 +283,7 @@ class ManagedCommunication:
                 )
         # Index intent before the first external write. Lost registration replies
         # remain discoverable even if the coordinator dies before saving binding.
-        self._save(room, target, {"room": room, "target": target, "state": "registering"})
+        self._index_intent(room, target)
         try:
             record = actor.start(background=False)
             if facts:
@@ -581,9 +591,15 @@ class ManagedCommunication:
                     ).fetchall()
                 if len(rows) > MAX_ENDPOINTS:
                     raise CommunicationError("Room endpoint page exceeds polling bound")
-                bindings = process_bindings(
-                    room, tuple(json.loads(row["record"])["process_id"] for row in rows)
-                )
+                process_ids = tuple(json.loads(row["record"]).get("process_id") for row in rows)
+                if any(not isinstance(value, str) or not value for value in process_ids):
+                    # A concurrent prepare may have indexed its first intent
+                    # after the endpoint pass above. It has no actor identity
+                    # yet: preserve this room's mail and cursor until it does.
+                    raise BridgeError(
+                        "Managed bridge registration identity is incomplete; room observation deferred"
+                    )
+                bindings = process_bindings(room, process_ids)
                 complete = True
                 for row in rows:
                     target = json.loads(row["target"])

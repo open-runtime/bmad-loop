@@ -22,6 +22,7 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Preserve registered bridge identities during refresh and defer mail observation for incomplete registrations.
 - Retry exact pre-worker managed-registration contention without duplicating actors or uncertain launches.
 - Keep truncated repository audits incomplete through resume, reconciliation and public status.
 - Recognize terminated Linux zombie descendants as dead while retaining PID-reuse and unreadable-process safeguards.

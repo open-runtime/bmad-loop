@@ -709,6 +709,9 @@ launch intents or consumed proofs retain ordinary uncertain-launch reconciliatio
 absence of a startup file never authorizes another dispatch.
 Reasoning jobs expose the same wait without consuming a failed attempt and retain
 their existing native request/launch-intent recovery boundary.
+During initial actor registration, communication status can temporarily report an
+incomplete identity. The room's messages and cursor remain unchanged until the
+original registration finishes; refreshing an existing actor preserves its identity.
 
 Closed endpoints never restart a writer. Lost acknowledgements, unknown owners
 and a replaced room database remain explicit errors. Completion/drain waits for
