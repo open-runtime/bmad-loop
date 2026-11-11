@@ -150,6 +150,10 @@ def advance_owned_remote(project, tmp_path, runtime):
     head = git(
         project.project,
         "--git-dir=" + str(remote),
+        "-c",
+        "user.name=Scripted Bot",
+        "-c",
+        "user.email=bot@example.test",
         "commit-tree",
         before + "^{tree}",
         "-p",

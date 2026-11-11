@@ -190,7 +190,19 @@ def test_confirmed_recovery_does_not_adopt_later_tip_or_erase_external_debt(
     head = recovered["head"]
     # Native readback may advance after the confirmed checkpoint. Its SHA is
     # not the checkpoint we authenticated, even if all its parents are known.
-    later = git(remote, "commit-tree", head + "^{tree}", "-p", head, "-m", "external follow-up")
+    later = git(
+        remote,
+        "-c",
+        "user.name=Scripted Bot",
+        "-c",
+        "user.email=bot@example.test",
+        "commit-tree",
+        head + "^{tree}",
+        "-p",
+        head,
+        "-m",
+        "external follow-up",
+    )
     git(remote, "update-ref", "refs/heads/" + pusher.branch, later, head)
     assert pusher.reconcile("recovery:retry-1").remote_head == later
     result = {"outcome": "recovered", "recovery": recovered, "head": head}
