@@ -7,6 +7,8 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+## [0.16.0] — 2026-11-11
+
 ### Added
 
 - Bound opt-in Claude summary requests with native stream accounting, typed limit cancellation and retained partial usage.
@@ -7096,7 +7098,8 @@ enforced in CI.
   implementation phase, driven by a Python control loop with hook-based session transport and
   resumable on-disk run state.
 
-[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.15.8...HEAD
+[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.16.0
 [0.15.8]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.15.8
 [0.15.7]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.15.7
 [0.15.6]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.15.6
