@@ -177,6 +177,32 @@ def test_muse_exact_model_must_belong_to_selected_provider():
     assert not observed.available and not observed.model_access
 
 
+@pytest.mark.parametrize("reason", ["server_sent_no_usage", "private provider message"])
+def test_muse_empty_usage_is_unknown_with_only_the_known_native_reason(
+    tmp_path, monkeypatch, reason
+):
+    data = muse()
+    data["usage"] = {"schemaVersion": 1, "allowance": None, "reason": reason}
+    monkeypatch.setattr(native, "_read_muse", lambda *args: data)
+    original_which = native.shutil.which
+    monkeypatch.setattr(
+        native.shutil,
+        "which",
+        lambda command, **kwargs: (
+            "muse" if command == "muse" else original_which(command, **kwargs)
+        ),
+    )
+    observed = native.observe(MUSE, tmp_path, now=NOW)
+    assert observed is not None and not observed.known and not observed.available
+    assert route_unavailable(observed, now=NOW)
+    assert observed.observed_at is None and observed.expires_at is None
+    if reason == "server_sent_no_usage":
+        assert observed.reason == "native Muse allowance unavailable: server_sent_no_usage"
+    else:
+        assert observed.reason == "native capacity payload schema mismatch"
+        assert reason not in observed.reason
+
+
 _FAKE = """open(__file__ + '.entered', 'w').write('python entered\\n')
 import json, os, subprocess, sys, time
 from pathlib import Path

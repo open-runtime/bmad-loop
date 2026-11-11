@@ -120,6 +120,81 @@ def test_cannot_raise_role_limits(campaign):
         )
 
 
+def test_reconfiguration_cannot_remove_native_review_pair(campaign):
+    _, before, template, _ = campaign
+    current = replace(
+        before.spec, roles=(("native_review_pair", RoleSpec(profile="codex", model="gpt-test")),)
+    )
+    with pytest.raises(CampaignError, match="cannot remove configured roles"):
+        config._proposed(current, replace(current, roles=()), template.policy)
+
+
+@pytest.fixture
+def owner_review_policy(campaign):
+    from conftest import git
+
+    root = Path(campaign[1].root)
+    path = root / "review-policy.md"
+    path.write_text(
+        "Owner direction: retain the native review; remove mandatory cross-family publication review.\n"
+    )
+    git(root, "add", path.name)
+    git(root, "commit", "-m", "Record owner publication review policy")
+    return git(root, "rev-parse", "HEAD").strip() + ":" + path.name
+
+
+@pytest.mark.parametrize("explicit_source", [False, True])
+def test_review_policy_requires_explicit_committed_adoption(
+    campaign, owner_review_policy, explicit_source
+):
+    before = campaign[1]
+    proposed = replace(
+        before.spec,
+        github=replace(before.spec.github, require_independent_review=False),
+        decisions=replace(
+            before.spec.decisions,
+            sources=(
+                (*before.spec.decisions.sources, "review-policy.md")
+                if explicit_source
+                else before.spec.decisions.sources
+            ),
+        ),
+    )
+    with pytest.raises(CampaignError, match="scope, policy and limits"):
+        change(campaign, proposed=proposed)
+    after = change(campaign, proposed=proposed, review_policy_source=owner_review_policy)
+    assert after.spec.github.require_independent_review is False
+    assert after.spec.decisions.sources == (*before.spec.decisions.sources, "review-policy.md")
+    record = after.bindings["configuration_revisions"][-1]["review_policy"]
+    assert record["previous_require_independent_review"] is True
+    assert record["source"]["commit"] == owner_review_policy.split(":", 1)[0]
+    assert record["source"]["content"].startswith("Owner direction:")
+
+
+@pytest.mark.parametrize("fault", ["missing", "branch-name", "checks", "extra-source"])
+def test_review_policy_exception_does_not_expand_other_authority(
+    campaign, owner_review_policy, fault
+):
+    before = campaign[1]
+    proposed = replace(
+        before.spec, github=replace(before.spec.github, require_independent_review=False)
+    )
+    reference = owner_review_policy
+    if fault == "missing":
+        reference = reference.split(":", 1)[0] + ":missing.md"
+    elif fault == "branch-name":
+        reference = "HEAD:review-policy.md"
+    elif fault == "checks":
+        proposed = replace(
+            proposed, github=replace(proposed.github, required_checks=("other-check",))
+        )
+    elif fault == "extra-source":
+        proposed = replace(proposed, decisions=replace(proposed.decisions, sources=("other.md",)))
+    with pytest.raises(CampaignError):
+        change(campaign, proposed=proposed, review_policy_source=reference)
+    assert campaign[0].load(before.id).revision == before.revision
+
+
 def test_cannot_remove_existing_native_route_to_fall_back_to_legacy(campaign, prepared):
     _, before, template, _ = campaign
     candidate = prepared[3]

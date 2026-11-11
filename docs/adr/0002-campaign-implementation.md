@@ -85,6 +85,15 @@ tab/pane layout and operator tab labels; a shared tab cannot represent a single
 actor when it contains multiple sessions. Historical phase views reattach exact
 retained terminals and never create a substitute live session.
 
+REM's committed 2026-11-10 owner policy removes mandatory cross-family publication
+review while retaining its native review cycle. The stopped pilot's revision 8
+predates that direction. Support explicit startup adoption through
+`--review-policy-source COMMIT:PATH`: bind a committed regular document in current
+local ancestry, permit only `github.require_independent_review`, append
+that exact decision source if absent, and archive the old/new value and source.
+All unit/attempt, hold, check, native-review and budget protections still apply.
+Ordinary route/group changes cannot change this policy or remove configured roles.
+
 ### Accepted completion extension — 2026-11-08
 
 Reconcile every earlier requirement against its ordinary CLI/runtime path, tests,

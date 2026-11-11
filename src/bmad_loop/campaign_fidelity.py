@@ -202,6 +202,16 @@ def _proof(
         raise CampaignError("Independent native fidelity receipt is missing or changed")
     receipt = read_json(Path(independent["native_receipt_path"]))
     observed = provider_family(receipt.get("observed_model", ""))
+    # Older receipts record one primary model. A present auxiliary list is
+    # additional observed participation, never a replacement for that primary.
+    models = receipt.get("observed_models", [])
+    if not isinstance(models, list):
+        raise CampaignError("Independent native fidelity contributor list is malformed")
+    observed_families = {observed, *(provider_family(model) for model in models)}
+    if "" in observed_families or provider_family(cap["model"]) in observed_families:
+        raise CampaignError(
+            "Independent native fidelity contributors are unknown or not independent"
+        )
     result = receipt.get("result") or {}
     if (
         "audit_prompt_version" in expected

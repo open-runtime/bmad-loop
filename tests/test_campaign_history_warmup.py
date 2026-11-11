@@ -5,6 +5,7 @@ import json
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 from test_campaign_handoff_flow import campaign as campaign
@@ -13,7 +14,7 @@ from test_campaign_headless import prepared as prepared
 from bmad_loop import campaign_history_warmup as warmup
 from bmad_loop import campaign_reasoning_flow as reasoning
 from bmad_loop import runs
-from bmad_loop.adapters.base import SessionHandle, SessionSpec
+from bmad_loop.adapters.base import CodingCLIAdapter, SessionHandle, SessionSpec
 from bmad_loop.campaign_jobs import current, request_from_dict
 from bmad_loop.campaign_model import OutboxAction
 from bmad_loop.campaign_reflection_flow import observe_adapter
@@ -33,7 +34,7 @@ def active(campaign, monkeypatch):
         start_session=lambda spec: SessionHandle(spec.task_id, "native", 1, "native-before")
     )
     observe_adapter(
-        adapter,
+        cast(CodingCLIAdapter, adapter),
         directory=directory,
         run_dir=run_dir,
         claim=unit.claim,
@@ -60,7 +61,9 @@ def active(campaign, monkeypatch):
 
 def observe(active):
     runtime, snapshot, unit, _ = active
-    (proposal,) = warmup.proposals(runtime, snapshot)
+    proposals = warmup.proposals(runtime, snapshot)
+    assert proposals and len(proposals) == 1
+    proposal = proposals[0]
     action = OutboxAction("warm", proposal.kind, unit.id, proposal.payload, snapshot.generation)
     observation = warmup.perform(runtime, snapshot, action)
     assert observation.state == "confirmed", observation
@@ -496,3 +499,72 @@ def test_exhausted_full_page_advances_but_is_not_final_handoff_coverage(
         for event in row["coordinates"]["summary_spec"]["event_ids"]
     }
     assert first_events <= final_events
+
+
+@pytest.mark.parametrize("oversized", ["input", "artifact"])
+def test_smaller_reserved_auditor_invalidates_optional_map_for_reextraction(
+    active, tmp_path, oversized
+):
+    from test_campaign_summary_routes import _fill_summary, staged
+
+    from bmad_loop import campaign_handoff_flow as flow
+    from bmad_loop.campaign_transcripts import encoded
+
+    runtime, snapshot, unit, source = active
+    staged(snapshot)
+    mapper = snapshot.spec.candidates("summarization")[0]
+    snapshot.config_snapshot["reasoning_capabilities"][mapper.profile + ":" + mapper.model][
+        "reasoning"
+    ] = runtime.fixture_cap(mapper, output_tokens=16384)
+    if oversized == "input":
+        with source.open("a") as stream:
+            stream.write(
+                json.dumps(
+                    {
+                        "type": "response_item",
+                        "payload": {"type": "message", "role": "assistant", "content": "x" * 18000},
+                    }
+                )
+                + "\n"
+            )
+    observed = observe(active)
+    assert observed.data["requests"]
+    for raw in observed.data["requests"]:
+        _fill_summary(
+            runtime, snapshot, snapshot.jobs[raw["id"]], near_limit=oversized == "artifact"
+        )
+    sources = final_sources(active, tmp_path)
+    before, rejected = warmup.reusable(runtime, snapshot, unit, sources)
+    assert before and not rejected
+    auditor = snapshot.spec.candidates("handoff_audit")[0]
+    snapshot.config_snapshot["reasoning_capabilities"][auditor.profile + ":" + auditor.model][
+        "reasoning"
+    ] = runtime.fixture_cap(auditor, input_tokens=65536, context_tokens=131072, output_tokens=16384)
+    source_limit, artifact_limit, _ = flow._audit_limits(snapshot, "anthropic")
+    expected = {
+        spec.id
+        for spec, result in before
+        if spec.input_tokens > source_limit or len(encoded(result)) > artifact_limit
+    }
+    assert expected
+    after, rejected = warmup.reusable(runtime, snapshot, unit, sources)
+    assert expected <= set(rejected)
+    assert not expected & {spec.id for spec, _ in after}
+    # Exact source remains available to the mandatory planner; no coverage is
+    # manufactured from the rejected optional artifacts.
+    from bmad_loop.campaign_summary import plan_remaining_maps
+    from bmad_loop.campaign_transcripts import HistorySnapshot, merge_lineage_events
+
+    candidate, cap = flow._summary_route(
+        runtime, snapshot, "summarization", {"audit_family": "anthropic"}
+    )
+    budget, _ = flow._summary_budget(
+        runtime, snapshot, {"audit_family": "anthropic"}, candidate, cap
+    )
+    planned = plan_remaining_maps(
+        merge_lineage_events(tuple(HistorySnapshot(**row) for row in sources)),
+        after,
+        budget,
+        tmp_path / "reextract",
+    )
+    assert planned and max(spec.input_tokens for spec in planned) <= source_limit

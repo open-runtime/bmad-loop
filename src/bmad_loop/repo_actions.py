@@ -80,16 +80,18 @@ def referencing_pulls(catalog, source, repository):
     if source["kind"] != "issue":
         return []
     number = source["record"]["number"]
-    pattern = (
-        rf"(?<![\w/])#{number}\b|https://github\.com/{re.escape(repository)}/issues/{number}\b"
-    )
     return [
         item
         for item in catalog["objects"].values()
         if item["kind"] == "pr"
         and item["record"].get("state") == "open"
-        and re.search(pattern, item["record"].get("body") or "")
+        and references_issue(item["record"].get("body") or "", repository, number)
     ]
+
+
+def references_issue(body, repository, number):
+    pattern = rf"(?<![\w/])#{number}\b|(?<![\w/]){re.escape(repository)}#{number}\b|https://github\.com/{re.escape(repository)}/issues/{number}\b"
+    return re.search(pattern, body, re.IGNORECASE) is not None
 
 
 def validate_action(action, evidence, policy, *, owners=None, project=None):
@@ -225,7 +227,10 @@ def validate_action(action, evidence, policy, *, owners=None, project=None):
         matching_units = set()
         for item in owners.get("items", ()):
             details = item.get("details") or {}
-            if item.get("kind") != "native-unit" or details.get("repository") != policy.repository:
+            if (
+                item.get("kind") != "native-unit"
+                or str(details.get("repository", "")).casefold() != policy.repository.casefold()
+            ):
                 continue
             bindings = (details.get("issue"), details.get("shared_issue"))
             linked = (
@@ -233,8 +238,8 @@ def validate_action(action, evidence, policy, *, owners=None, project=None):
                     isinstance(binding, dict) and binding.get("number") == number
                     for binding in bindings
                 )
-                or details.get("issue_url")
-                == f"https://github.com/{policy.repository}/issues/{number}"
+                or str(details.get("issue_url", "")).casefold()
+                == f"https://github.com/{policy.repository}/issues/{number}".casefold()
             )
             if linked:
                 matching_units.add((details.get("campaign_id"), details.get("unit_id")))
@@ -253,10 +258,9 @@ def validate_action(action, evidence, policy, *, owners=None, project=None):
                 and (details.get("claim") or {}).get("quiescent") is not True
             ):
                 raise CampaignError("A native reasoning owner still holds this issue")
-        pattern = rf"(?<![\w/])#{number}\b|https://github\.com/{re.escape(policy.repository)}/issues/{number}\b"
         if any(
             row["record"].get("state") == "open"
-            and re.search(pattern, row["record"].get("body") or "")
+            and references_issue(row["record"].get("body") or "", policy.repository, number)
             for row in evidence.get("pulls", ())
         ):
             raise CampaignError("Open PR still references this issue")

@@ -156,6 +156,7 @@ print(json.dumps(dict(type='result',structured_output=result,usage=dict(input_to
 @pytest.fixture
 def workflow(project, routes, monkeypatch):
     project = project.project
+    monkeypatch.setenv("BMAD_LOOP_STATE_DIR", str(project.parent / "native-state"))
     caps, candidates = routes
     policy = RepoPolicy(
         "a/b",
@@ -588,7 +589,7 @@ def test_auxiliary_author_debt_preserved_without_granting_independent_review(
 
     def changed(path):
         result = original(path)
-        if result["state"] == "finished":
+        if result["state"] == "finished" and result["receipt"]["observed_model"] == "gpt-test":
             result["receipt"]["observed_models"] = models
         return result
 
@@ -596,6 +597,7 @@ def test_auxiliary_author_debt_preserved_without_granting_independent_review(
     runtime.audit()
     assert runtime.state["phase"] == "ready"
     assert all(row["state"] == "completed" for row in runtime.state["jobs"].values())
+    assert len(runtime.state["jobs"]) == 1
     assert runtime.state["actions"][0]["state"] == "held"
     assert not any(method != "GET" for method, _, _ in transport.requests)
 
@@ -886,12 +888,14 @@ def test_partial_audit_with_approved_subset_cannot_reconcile(workflow):
 @pytest.mark.skipif(
     sys.platform != "darwin", reason="Real read-only fixture uses maintained macOS sandbox"
 )
-def test_qualified_readonly_route_prepares_outside_its_evidence_workspace(workflow, tmp_path):
+def test_qualified_readonly_route_prepares_outside_its_evidence_workspace(
+    workflow, tmp_path, monkeypatch
+):
     import test_campaign_execution_qualification as writer_module
     import test_campaign_readonly_qualification as readonly_module
 
-    from bmad_loop.campaign_execution_qualification import qualify
-    from bmad_loop.campaign_headless import read_json
+    from bmad_loop import campaign_execution_qualification as qualification
+    from bmad_loop.campaign_headless import read_json, write_json
     from bmad_loop.repo_actions import PROPOSAL_SCHEMA
 
     runtime, _ = workflow
@@ -899,29 +903,97 @@ def test_qualified_readonly_route_prepares_outside_its_evidence_workspace(workfl
     candidate = runtime.policy.proposer
     base = (None, None, None, candidate, cap)
     writer = writer_module.writer.__wrapped__(base, tmp_path)
-    proposal, candidate, _ = readonly_module.readonly.__wrapped__(writer, tmp_path)
-    result = qualify(
-        proposal,
-        tmp_path / "readonly-proof",
-        input_bytes=4096,
-        output_tokens=4096,
-        timeout_s=20,
-        runner=HeadlessRunner(ChildMux()),
+    proposal, candidate, proposal_cap = readonly_module.readonly.__wrapped__(writer, tmp_path)
+    script = tmp_path / "writer.py"
+    original = script.read_text(encoding="utf-8")
+    script.write_text(
+        """import json,re,sys
+from pathlib import Path
+text=Path(sys.argv[1]).read_text()
+if 'QUALIFICATION NONCE' not in text:
+    try: Path('forbidden-write.txt').write_text('escape')
+    except PermissionError: pass
+    else: raise AssertionError('read-only job could write evidence workspace')
+    print(json.dumps({'type':'system','model':'gpt-test','session_id':'readonly-audit'}))
+    print(json.dumps({'type':'result','structured_output':{'actions':[],'planning_required':[]},'usage':{'input_tokens':100,'output_tokens':20}}))
+    raise SystemExit(0)
+""" + original,
+        encoding="utf-8",
     )
+    proposal_cap["dependencies"][0]["sha256"] = file_digest(script)
+    proposal.write_text(json.dumps(proposal_cap), encoding="utf-8")
+    # This controller seam uses synthetic qualification session evidence like
+    # fixture_writer_capability. Real Git readback and OS write-denial probing
+    # remain; the repository job below runs the actual sandboxed native child.
+    request, probe, grants = qualification.build(
+        tmp_path / "readonly-proof", candidate, proposal_cap, input_bytes=4096, output_tokens=4096
+    )
+    path = HeadlessRunner(ChildMux())._prepare(
+        tmp_path / "readonly-proof/job",
+        request,
+        candidate,
+        proposal_cap,
+        launch_id="writer-probe-" + probe["nonce"],
+        generation=1,
+        permissions="read-only-tools",
+        grants=grants,
+        probe=probe,
+    )
+    envelope = read_json(path)
+    receipt = {
+        "schema_version": 1,
+        "job_id": request.id,
+        "request_digest": envelope["request_digest"],
+        "launch_id": envelope["launch_id"],
+        "generation": 1,
+        "outcome": "completed",
+        "quiescent": True,
+        "processes_quiescent": True,
+        "completion_evidence": "owned-window-death-and-process-readback",
+        "input_complete": True,
+        "input_delivery": envelope["input"],
+        "session_id": "synthetic-readonly-proof",
+        "selected_model": candidate.model,
+        "observed_model": candidate.model,
+        "observed_models": [candidate.model],
+        "turns": 1,
+        "usage_known": True,
+        "usage": {"input_tokens": 1000, "output_tokens": 80},
+        "result": qualification.expected_result(probe),
+    }
+    write_json(path.parent / "receipt.json", receipt)
+    result = qualification.result(path, {"state": "finished", "receipt": receipt})
     assert result["ok"], result
     runtime.state["capabilities"]["proposer"] = read_json(Path(result["capability_path"]))
-    _, row = runtime.jobs._prepare(
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    with monkeypatch.context() as isolated:
+        isolated.setenv("GIT_DIR", str(foreign / ".git"))
+        isolated.setenv("GIT_WORK_TREE", str(foreign))
+        runtime.jobs._prepare(
+            runtime.state,
+            (
+                "readonly",
+                "proposer",
+                {"shard": {}},
+                "Read this complete bounded evidence",
+                PROPOSAL_SCHEMA,
+            ),
+        )
+    assert not (foreign / ".git").exists()
+    result = runtime.jobs.run(
         runtime.state,
-        (
-            "readonly",
-            "proposer",
-            {"shard": {}},
-            "Read this complete bounded evidence",
-            PROPOSAL_SCHEMA,
-        ),
+        "readonly",
+        "proposer",
+        {"shard": {}},
+        "Read this complete bounded evidence",
+        PROPOSAL_SCHEMA,
     )
+    assert result == {"actions": [], "planning_required": []}
+    row = next(iter(runtime.state["jobs"].values()))
     envelope = read_json(Path(row["path"]))
     workspace = Path(envelope["grants"]["workspace"])
+    assert workspace == runtime.store.project
     assert not Path(row["path"]).is_relative_to(workspace)
     assert envelope["permissions"] == "read-only-tools"
     assert envelope["grants"]["scopes"] == []
@@ -958,3 +1030,208 @@ def test_large_repository_index_uses_bounded_related_candidates_without_losing_s
     assert all(
         view["candidate_selection"]["mode"] == "related_subset_not_exhaustive" for view in views
     )
+
+
+@pytest.mark.parametrize("reference", ["issue", "issue_url"])
+def test_case_insensitive_native_repository_ownership_is_not_skipped(decision, reference):
+    action, evidence, policy, _ = decision
+    details = {"repository": "A/B", "unit_id": "owned", "campaign_id": "campaign"}
+    details[reference] = (
+        {"number": 2} if reference == "issue" else "https://github.com/A/B/issues/2"
+    )
+    owners = {"items": [{"kind": "native-unit", "state": "draft", "details": details}]}
+    with pytest.raises(CampaignError, match="campaign owns"):
+        validate_action(action, evidence, policy, owners=owners)
+    details["repository"] = "genuinely/foreign"
+    validate_action(action, evidence, policy, owners=owners)
+
+
+@pytest.mark.parametrize(
+    "body", ["Fixes a/b#2", "Fixes A/B#2", "Fixes #2", "Fixes https://github.com/A/B/issues/2"]
+)
+def test_open_pull_reference_forms_block_issue_closure(decision, body):
+    from bmad_loop.repo_actions import referencing_pulls
+
+    action, evidence, policy, _ = decision
+    pull = {"kind": "pr", "record": {"state": "open", "body": body, "number": 9}}
+    evidence["pulls"] = referencing_pulls(
+        {"objects": {"pull:9": pull}}, evidence["source"], policy.repository
+    )
+    assert evidence["pulls"] == [pull]
+    with pytest.raises(CampaignError, match="[Pp][Rr]|[Pp]ull"):
+        validate_action(action, evidence, policy)
+    pull["record"]["body"] = "Fixes foreign/repo#2 and https://github.com/foreign/repo/issues/2"
+    evidence["pulls"] = referencing_pulls(
+        {"objects": {"pull:9": pull}}, evidence["source"], policy.repository
+    )
+    assert evidence["pulls"] == []
+    validate_action(action, evidence, policy)
+
+
+def test_independent_action_reviews_share_bounded_parallel_scheduler(
+    workflow, monkeypatch, tmp_path
+):
+    runtime, transport = workflow
+    for number in (3, 4):
+        transport.rows[number] = {
+            **transport.rows[2],
+            "id": 100 + number,
+            "number": number,
+            "html_url": f"https://github.com/a/b/issues/{number}",
+        }
+        transport.comments[number] = []
+    cap = runtime.state["capabilities"]["proposer"]
+    script = Path(cap["dependencies"][0]["path"])
+    text = script.read_text(encoding="utf-8")
+    start, end = text.index("    actions=[]"), text.index("    result=dict(actions=actions")
+    text = (
+        text[:start]
+        + "    actions=[dict(kind='label',source=key,target='',labels=['organized'],reason='Evidence-backed organization') for key in value['shard']]\n"
+        + text[end:]
+    )
+    script.write_text(text, encoding="utf-8")
+    cap["dependencies"][0]["sha256"] = file_digest(script)
+    runtime.state["capabilities"]["proposer"] = fixture_capability(
+        tmp_path, cap, runtime.policy.proposer
+    )
+    runtime.jobs.policy = replace(runtime.policy, max_sessions=2)
+    runtime.jobs.capacity = lambda *args: CapacityObservation(
+        True, slots=3, model_access=True, observed_at=time.time(), expires_at=time.time() + 60
+    )
+    mux, peaks = runtime.jobs.runner.mux, []
+    start_window = mux.new_window
+
+    def tracked(*args):
+        result = start_window(*args)
+        if any(
+            row["role"] == "reviewer" and row["state"] in {"prepared", "running"}
+            for row in runtime.state["jobs"].values()
+        ):
+            peaks.append(sum(process.poll() is None for process in mux.processes.values()))
+        return result
+
+    monkeypatch.setattr(mux, "new_window", tracked)
+    runtime.audit()
+    assert runtime.state["phase"] == "ready", runtime.state["reason"]
+    assert max(peaks) == 2
+    assert len(runtime.state["actions"]) == 4
+    assert all(row["state"] == "approved" and row["review_job"] for row in runtime.state["actions"])
+    before = len(mux.processes)
+    runtime.audit()
+    assert len(mux.processes) == before
+
+
+@pytest.fixture
+def managed_repo(workflow, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from test_campaign_message_bridge import FakeHcom, seed_room
+
+    from bmad_loop import campaign_message_bridge as bridge
+    from bmad_loop.campaign_managed_communication import ManagedCommunication
+    from bmad_loop.repo_communication import RepoCommunication
+
+    runtime, transport = workflow
+    room = tmp_path / "repo-room"
+    seed_room(room)
+    fake = FakeHcom()
+    monkeypatch.setattr(
+        bridge,
+        "get_process_host",
+        lambda: SimpleNamespace(identity=lambda pid: 42.5, liveness_of=lambda *args: "dead"),
+    )
+    monkeypatch.setenv("HCOM_DIR", str(tmp_path / "foreign-room-must-not-be-used"))
+    policy = replace(runtime.policy, communication_room=str(room))
+    runtime.policy = runtime.jobs.policy = policy
+    runtime.state.update(
+        policy=json.loads(json.dumps(asdict(policy))), policy_digest=digest(asdict(policy))
+    )
+    runtime.store.save(runtime.state, "fixture-explicit-room")
+    communication = RepoCommunication(
+        runtime.store,
+        policy,
+        factory=lambda directory: ManagedCommunication(
+            directory, executable="fake-hcom", runner=fake, clock=lambda: 100
+        ),
+    )
+    runtime.jobs.communication = communication
+    return runtime, fake, communication, room
+
+
+def test_explicit_managed_repo_endpoints_follow_actual_native_completion(managed_repo):
+    from bmad_loop.campaign_headless import read_json
+    from bmad_loop.repo_runtime import status
+
+    runtime, fake, communication, room = managed_repo
+    runtime.audit()
+    assert runtime.state["phase"] == "ready", runtime.state["reason"]
+    assert fake.count("start") == fake.count("stop") == 2
+    assert not communication.manager(runtime.state).has_open()
+    for row in runtime.state["jobs"].values():
+        envelope = read_json(Path(row["path"]))
+        assert envelope["communication_room"] == str(room)
+        assert envelope["managed_binding"] == row["endpoint"]
+        assert row["endpoint"]["target"]["launch_id"] == row["launch_id"]
+        assert row["verified_quiescent"] is True
+    document = status(runtime.state)
+    assert document["communication"]["available"]
+    assert all(row["endpoint"]["kind"] == "bridge" for row in document["jobs"].values())
+    assert all(call[1]["env"]["HCOM_DIR"] == str(room) for call in fake.calls)
+
+
+def test_prelaunch_stop_closes_exact_controller_and_resumes_without_native_attempt_charge(
+    managed_repo, monkeypatch
+):
+    runtime, fake, communication, _ = managed_repo
+    prepare = runtime.jobs.runner.prepare
+
+    def stop_after_prepare(*args, **kwargs):
+        result = prepare(*args, **kwargs)
+        runtime.store.stop(runtime.state["id"])
+        return result
+
+    monkeypatch.setattr(runtime.jobs.runner, "prepare", stop_after_prepare)
+    runtime.audit()
+    assert runtime.state["phase"] == "stopped"
+    row = next(iter(runtime.state["jobs"].values()))
+    previous = row["launch_id"]
+    assert row["state"] == "preparation_stopped" and row["attempt"] == 1
+    assert not runtime.jobs.runner.mux.processes and fake.count("stop") == 1
+    monkeypatch.setattr(runtime.jobs.runner, "prepare", prepare)
+    runtime.store.stop(runtime.state["id"], False)
+    runtime.audit()
+    assert runtime.state["phase"] == "ready", runtime.state["reason"]
+    assert row["launch_id"] != previous and row["preparations"][0]["launch_id"] == previous
+    assert row["attempt"] == 1 and len(runtime.jobs.runner.mux.processes) == 2
+    assert fake.count("start") == fake.count("stop") == 3
+    assert not communication.manager(runtime.state).has_open()
+
+
+@pytest.mark.parametrize("marker", ["launch-intent.json", "startup.json", "receipt.json"])
+def test_managed_controller_does_not_close_on_uncertain_native_presence(managed_repo, marker):
+    from bmad_loop.repo_actions import PROPOSAL_SCHEMA
+
+    runtime, _, communication, _ = managed_repo
+    identity, row = runtime.jobs._prepare(
+        runtime.state,
+        ("uncertain-control", "proposer", {"shard": {}}, "Read bounded evidence", PROPOSAL_SCHEMA),
+    )
+    runtime.jobs._materialize(runtime.state, identity, row)
+    (Path(row["path"]).parent / marker).write_text("{}", encoding="utf-8")
+    runtime.jobs._settle_controllers(runtime.state)
+    assert communication.manager(runtime.state).has_open()
+    assert row["controller_quiescent"] is False
+    assert row["state"] == "prepared"
+    # This test manufactured no process; close only its exact fake endpoint.
+    communication.manager(runtime.state).close(row["endpoint"]["target"], outcome="fixture-ended")
+
+
+def test_external_control_refuses_product_state_root_before_creating_directory(
+    workflow, monkeypatch
+):
+    runtime, _ = workflow
+    selected = runtime.store.project / "wrong-native-control"
+    monkeypatch.setenv("BMAD_LOOP_STATE_DIR", str(selected))
+    with pytest.raises(CampaignError, match="outside the product"):
+        runtime.store.control_directory(runtime.state["id"])
+    assert not selected.exists()

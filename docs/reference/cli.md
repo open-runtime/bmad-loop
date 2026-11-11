@@ -24,7 +24,7 @@ for policy, budgets, ownership and closure requirements.
 
 - The top-level parser documents only `-h` and `--version`. A subcommand is required; a missing or unknown one exits 2.
 - **`--project PROJECT`** — every subcommand except `relay` accepts it. It names the target project root; the default is the current directory. Legacy commands apply the project's `[mux] backend` choice; a broken `policy.toml` falls back to auto-selection there. Campaign validation and observations bypass this legacy mux setup. Commands that need the policy load it themselves and fail with `error: …`, exit 1.
-- **`--json`** — accepted by `validate`, `plugins`, `probe-adapter`, `decisions`, `confirm`, `list`, `status`, `diagnose`, `cleanup`, `clean` and campaign commands except `campaign attach`. See [Machine-readable output](#machine-readable-output---json).
+- **`--json`** — accepted by `validate`, `plugins`, `probe-adapter`, `decisions`, `confirm`, `list`, `status`, `diagnose`, `cleanup`, `clean`, repository commands and campaign commands except `campaign attach`. See [Machine-readable output](#machine-readable-output---json).
 
 ### Run references
 
@@ -68,7 +68,7 @@ bmad-loop campaign steer ID [--unit UNIT] [--job JOB] --text TEXT [--request-id 
 bmad-loop campaign handoff ID --unit UNIT [--profile PROFILE] [--model MODEL] [--effort EFFORT] [--reason TEXT] [--json]
 bmad-loop campaign migrate-state ID [--json]
 bmad-loop campaign requalify ID --capabilities FILE --expected-revision REVISION --reason TEXT [--json]
-bmad-loop campaign reconfigure ID --spec FILE --expected-revision REVISION --reason TEXT [--preview] [--json]
+bmad-loop campaign reconfigure ID --spec FILE --expected-revision REVISION --reason TEXT [--review-policy-source COMMIT:PATH] [--preview] [--json]
 bmad-loop campaign reflect ID [--unit UNIT] [--expected-revision REVISION] [--preview] [--json]
 bmad-loop campaign resume ID [--json]
 bmad-loop campaign stop ID [--terminate-workers] [--json]
@@ -109,11 +109,15 @@ and campaigns that already began delivery. This is not a general mid-delivery
 installation migration or permission to rewrite qualification receipts.
 
 Reconfiguration explicitly changes qualified routes, summary pools and grouping
-before unit execution. Scope, policy, grants and limits stay frozen; the full
+before unit execution. Scope, worker policy, grants, reviews and limits stay frozen; the full
 specification and current revision are required. Preview returns a proposal;
 apply returns campaign status with a new immutable configuration revision. Neither
 starts workers. Stopped reflection returns per-workspace display results and
 refreshes only existing bound resources. Its preview performs no display writes.
+The optional `--review-policy-source` explicitly adopts a committed owner decision
+for `github.require_independent_review` only, appending the exact
+decision path if absent. It cannot remove native reviews, required checks or other gates;
+the complete source and previous value are retained with the startup revision.
 Renewed semantic proof coordinates must preserve every declared current purpose
 and contract and pass full fidelity validation against the replacement route.
 

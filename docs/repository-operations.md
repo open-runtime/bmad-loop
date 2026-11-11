@@ -60,6 +60,20 @@ protected labels remain holds.
 Proposal and review sessions share `max_sessions`. Attempts and failure history
 survive resume. Admission waits do not consume a launch attempt.
 
+Optional `communication_room` enables a managed controller endpoint for each job.
+Supply an existing absolute hcom room directory explicitly; the audit does not
+borrow the caller's ambient room or impersonate a native agent. Endpoint replies
+identify themselves as controller status, and incoming messages remain advisory
+mail rather than owner authority. Status includes endpoint availability and
+closing state.
+
+To show jobs in an existing Paradev workspace, set both
+`presentation_workspace` (its absolute path) and `presentation_workspace_id`.
+The workspace must belong to the audited repository. This creates no worktree
+or workspace and preserves existing tab names and layouts. Native control files
+live outside the read-only repository workspace; the audit ledger retains the
+evidence and frozen policy in Git's common directory.
+
 The default limits are 64 MiB of aggregate metadata, 1,000,000 detail bytes per
 object, 10,000 objects, 1,000 pagination pages and 128 reasoning jobs. Each job
 defaults to 131,072 input bytes, 8,192 output tokens, four turns and 1,800 seconds,

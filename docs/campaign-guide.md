@@ -741,11 +741,20 @@ require their original qualified installation; this command refuses those cases.
 
 `reconfigure` explicitly changes qualified route pools, summary-stage mappings or
 grouping at the same stopped startup boundary. It preserves source scope,
-acceptance, policy, grants and resource limits. Supply the updated full campaign
+acceptance, worker policy, grants, configured reviews and resource limits. Supply the updated full campaign
 specification and exact current revision; `--preview` validates and shows the
 change without publishing a revision. Applying without `--preview` writes an
 immutable configuration revision while preserving prior specifications, templates,
 capabilities, attempts and workspace identities. It does not resume the campaign.
+
+An owner may separately adopt a changed publication-family policy before any
+unit starts by adding `--review-policy-source FULL_COMMIT:relative/decision.md`.
+The exact committed regular document must belong to the project's current
+ancestry. This explicit operation may change only
+`github.require_independent_review` and adds that exact document to decision
+sources if absent. It preserves required checks, native reviews, holds, budgets and all
+other policy. The prior value and complete source document remain in the
+configuration history. Repository prose alone cannot trigger this exception.
 
 `reflect` refreshes existing bound workspace, task and session views while stopped.
 It launches no workers, creates no workspaces and leaves unbound tasks explicit.

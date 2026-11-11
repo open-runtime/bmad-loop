@@ -30,6 +30,9 @@ class RepoPolicy:
     labels: tuple[str, ...] = ()
     protected_labels: tuple[str, ...] = ("bmad:hold",)
     ownership_observer: str = ""
+    communication_room: str = ""
+    presentation_workspace: str = ""
+    presentation_workspace_id: str = ""
     max_mutations: int = 100
     max_closures: int = 20
     metadata_bytes: int = 64 * 1024 * 1024
@@ -80,6 +83,19 @@ class RepoPolicy:
                 raise CampaignError(f"{name} must be a positive integer")
         if self.max_closures > self.max_mutations:
             raise CampaignError("Closure limit exceeds mutation limit")
+        for name in ("communication_room", "presentation_workspace"):
+            value = getattr(self, name)
+            if value and (
+                not isinstance(value, str)
+                or not Path(value).is_absolute()
+                or is_link_like(Path(value))
+                or not Path(value).is_dir()
+            ):
+                raise CampaignError(f"{name} must be an explicit existing absolute directory")
+        if bool(self.presentation_workspace) != bool(self.presentation_workspace_id):
+            raise CampaignError(
+                "Presentation requires an exact existing workspace path and identity"
+            )
         for values in (self.labels, self.protected_labels):
             if len(set(values)) != len(values) or any(
                 not isinstance(v, str) or not v.strip() or len(v) > 50 for v in values

@@ -110,6 +110,8 @@ class RepoRuntime:
                 for family in job.get("families", ())
             }
             for view, result in zip(views, results, strict=True):
+                if result is None:
+                    raise CampaignError("Repository proposer has no validated result")
                 planning.extend(result["planning_required"])
                 for action in result["actions"]:
                     if action["source"] not in view["shard"] or (
@@ -119,6 +121,7 @@ class RepoRuntime:
                     proposals[digest(action)] = action
             state["planning_required"] = sorted(set(planning))
             existing = {row["id"]: row for row in state["actions"]}
+            prepared_reviews = []
             for identity, action in proposals.items():
                 if identity in existing:
                     continue
@@ -158,16 +161,31 @@ class RepoRuntime:
                         "evidence_digest": digest(evidence),
                         "intent_blocks": intent_blocks(evidence["source"]),
                     }
-                    review = self.jobs.run(
-                        state, "review-" + identity, "reviewer", proof, REVIEW, REVIEW_SCHEMA
-                    )
-                    reviewer_families = {
-                        family
-                        for job in state["jobs"].values()
-                        if job["role"] == "reviewer"
-                        for family in job.get("families", ())
-                    }
-                    if "" in reviewer_families or author_families & reviewer_families:
+                    prepared_reviews.append((row, evidence, proof))
+                except CampaignError as exc:
+                    row["reason"] = str(exc)
+                    state["actions"].append(row)
+                    self._save("action-refused", action=identity, reason=row["reason"])
+            review_tasks = [
+                ("review-" + row["id"], "reviewer", proof, REVIEW, REVIEW_SCHEMA)
+                for row, _, proof in prepared_reviews
+            ]
+            reviews = self.jobs.run_many(state, review_tasks, allow_failed=True)
+            for (row, evidence, proof), review in zip(prepared_reviews, reviews, strict=True):
+                action, identity = row["action"], row["id"]
+                job_id = (
+                    "repo-" + digest(["review-" + identity, proof, state["policy_digest"]])[:32]
+                )
+                job = state["jobs"][job_id]
+                try:
+                    if review is None:
+                        raise CampaignError(job["reason"])
+                    reviewer_families = set(job.get("families", ()))
+                    if (
+                        not reviewer_families
+                        or "" in reviewer_families
+                        or author_families & reviewer_families
+                    ):
                         raise CampaignError(
                             "Review telemetry intersects the observed author families"
                         )
@@ -176,12 +194,11 @@ class RepoRuntime:
                         state="approved",
                         evidence=self.store.artifact(state["id"], "action-evidence", evidence),
                         review=self.store.artifact(state["id"], "review", review),
+                        review_job=job_id,
                         steps=steps(
                             action, evidence, state["id"], state["generation"], self.gateway
                         ),
                     )
-                except RepoCapacityWait:
-                    raise
                 except CampaignError as exc:
                     row["reason"] = str(exc)
                 state["actions"].append(row)
@@ -384,8 +401,14 @@ def status(state):
         "inventory": state["inventory"],
         "source_coverage": state.get("source_coverage"),
         "audit_complete": state.get("audit_complete", False),
+        "communication": state.get("communication", {"mode": "disabled", "available": True}),
         "jobs": {
-            key: {"state": row["state"], "role": row["role"]} for key, row in state["jobs"].items()
+            key: {
+                field: row[field]
+                for field in ("state", "role", "attempt", "launch_id", "endpoint", "reason")
+                if field in row
+            }
+            for key, row in state["jobs"].items()
         },
         "actions": state["actions"],
         "mutations": state["mutations"],

@@ -84,3 +84,29 @@ def test_stream_seal_rejects_a_record_over_its_independent_bound(tmp_path):
     sealed, _, _, _ = seal_source(source, tmp_path / "sealed", maximum=64)
     with pytest.raises(CampaignError, match="record exceeds"):
         list(record_lines(sealed, 32))
+
+
+def test_stream_seal_refuses_fifo_before_any_blocking_read(tmp_path, monkeypatch):
+    import os
+
+    from bmad_loop.campaign_model import CampaignError
+    from bmad_loop.campaign_transcripts import seal_source
+
+    if not hasattr(os, "mkfifo") or not hasattr(os, "O_NONBLOCK"):
+        pytest.skip("Host has no FIFO/nonblocking-open contract")
+    source = tmp_path / "redirected-native-stream"
+    os.mkfifo(source)
+    original = os.open
+    observed = []
+
+    def checked(path, flags, *args, **kwargs):
+        if Path(path) == source:
+            # Removal fails immediately rather than hanging on this empty FIFO.
+            assert flags & os.O_NONBLOCK
+            observed.append(flags)
+        return original(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", checked)
+    with pytest.raises(CampaignError, match="regular"):
+        seal_source(source, tmp_path / "sealed", maximum=4096)
+    assert observed

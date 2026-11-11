@@ -20,10 +20,12 @@ from .campaign_headless import (
     read_json,
     readonly_grants,
 )
-from .campaign_jobs import JobLimits, JobRequest, digest, validate_result
+from .campaign_jobs import JobLimits, JobRequest, digest, request_from_dict, validate_result
 from .campaign_model import CampaignError
 from .campaign_scheduler import route_unavailable
-from .repo_store import RepoStopped
+from .platform_util import is_link_like
+from .repo_communication import RepoCommunication
+from .repo_store import RepoStopped, common_dir
 
 
 class RepoCapacityWait(CampaignError):
@@ -31,14 +33,21 @@ class RepoCapacityWait(CampaignError):
 
 
 class RepoJobs:
-    def __init__(self, store, policy, *, runner=None, capacity=observe):
+    def __init__(self, store, policy, *, runner=None, capacity=observe, communication=None):
         self.store, self.policy = store, policy
         self.runner, self.capacity = runner or HeadlessRunner(), capacity
+        self.injected_runner = runner is not None
+        self.communication = communication or RepoCommunication(store, policy)
 
     def _prepare(self, state, task):
         name, role, value, prompt, schema = task
         identity = "repo-" + digest([name, value, state["policy_digest"]])[:32]
         row = state["jobs"].get(identity)
+        if row and row["state"] == "preparation_stopped":
+            row.setdefault("preparations", []).append(
+                {key: row[key] for key in ("path", "launch_id")}
+            )
+            row.update(state="retry_preparing", preparation=row.get("preparation", 0) + 1)
         if row and row["state"] == "capacity_wait" and row.get("receipt"):
             if row.get("waiting_epoch") == state.get("resume_epoch", 0):
                 return identity, row
@@ -104,38 +113,79 @@ class RepoJobs:
             candidates=(candidate,),
         )
         launch_id = identity + f"-attempt-{row['attempt']}"
-        directory = self.store.directory(state["id"]) / "jobs" / launch_id
-        read_workspace = self.store.directory(state["id"]) / "evidence-workspace"
-        from .platform_util import is_link_like
-
-        if is_link_like(read_workspace):
-            raise CampaignError("Repository evidence workspace is redirected")
-        read_workspace.mkdir(exist_ok=True)
-        grants = (
-            readonly_grants(read_workspace, coordinates, cap, read_only_paths=(str(path),))
-            if cap["permissions"] == "read-only-tools"
-            else None
-        )
-        prepared = self.runner.prepare(
-            directory,
-            request,
-            candidate,
-            cap,
-            launch_id=launch_id,
-            generation=1,
-            permissions=cap["permissions"],
-            grants=grants,
-        )
+        if row.get("preparation"):
+            launch_id += f"-preparation-{row['preparation']}"
+        directory = self.store.control_directory(state["id"]) / "jobs" / launch_id
         row.pop("receipt", None)
+        row.pop("endpoint", None)
         row.update(
             state="prepared",
-            path=str(prepared),
+            path=str(directory / "request.json"),
+            request=self.store.artifact(state["id"], "job-request", asdict(request)),
             request_digest=digest(asdict(request)),
             launch_id=launch_id,
             reason="",
+            controller_quiescent=False,
+            verified_quiescent=False,
         )
         self.store.save(state, "job-prepared", job=identity, attempt=row["attempt"])
         return identity, row
+
+    def _materialize(self, state, identity, row):
+        candidate, cap = getattr(self.policy, row["role"]), state["capabilities"][row["role"]]
+        request = request_from_dict(self.store.read(row["request"]))
+        read_workspace = (
+            Path(self.policy.presentation_workspace)
+            if self.policy.presentation_workspace
+            else self.store.project
+        )
+        presentation = None
+        if self.policy.presentation_workspace:
+            if common_dir(read_workspace) != self.store.common:
+                raise CampaignError("Repository presentation belongs to another repository")
+            presentation = {
+                "workspace": str(read_workspace),
+                "workspace_id": self.policy.presentation_workspace_id,
+                "navigation_prefix": "Repository audit · " + row["role"],
+            }
+            if not self.injected_runner:
+                from .adapters.paradev_backend import ParadevMultiplexer
+
+                self.runner = HeadlessRunner(
+                    ParadevMultiplexer(
+                        state_dir=self.store.control_directory(state["id"]) / "native-transport"
+                    )
+                )
+                self.injected_runner = True
+        grants = (
+            readonly_grants(
+                read_workspace,
+                request.coordinates,
+                cap,
+                read_only_paths=tuple(source["path"] for source in request.inputs),
+            )
+            if cap["permissions"] == "read-only-tools"
+            else None
+        )
+        endpoint = self.communication.prepare(state, identity)
+        if endpoint:
+            row["endpoint"] = endpoint
+            self.store.save(state, "job-controller-prepared", job=identity)
+        prepared = self.runner.prepare(
+            Path(row["path"]).parent,
+            request,
+            candidate,
+            cap,
+            launch_id=row["launch_id"],
+            generation=1,
+            permissions=cap["permissions"],
+            grants=grants,
+            communication_room=self.policy.communication_room,
+            presentation=presentation,
+            managed_binding=endpoint,
+        )
+        if str(prepared) != row["path"]:
+            raise CampaignError("Repository native request path changed")
 
     def _start(self, state, identity, row, reserved):
         candidate = getattr(self.policy, row["role"])
@@ -154,6 +204,12 @@ class RepoJobs:
                 yield
 
         try:
+            # Capacity is checked before registering a controller, then again at
+            # the irreversible native launch-intent boundary.
+            if not Path(row["path"]).exists():
+                with admission():
+                    pass
+                self._materialize(state, identity, row)
             observed = self.runner.launch(Path(row["path"]), admission=admission)
         except (RepoCapacityWait, RepoStopped) as exc:
             row.update(state="capacity_wait", reason=str(exc))
@@ -173,6 +229,13 @@ class RepoJobs:
             and receipt.get("request_digest") == row["request_digest"]
             and receipt.get("quiescent") is True
         )
+        row["verified_quiescent"] = identity_ok
+        if not identity_ok:
+            row.update(
+                state="unknown", reason="Repository native receipt identity/quiescence is uncertain"
+            )
+            self.store.save(state, "job-uncertain", job=identity)
+            return
         if identity_ok and receipt.get("outcome") == "quota":
             row.update(
                 state="capacity_wait",
@@ -207,11 +270,48 @@ class RepoJobs:
                     reason="Repository native receipt failed identity, completion or attribution validation",
                 )
         self.store.save(state, "job-terminal", job=identity, state=row["state"])
+        self.communication.sync(state, strict=False)
 
-    def run_many(self, state, tasks):
+    def _settle_controllers(self, state):
+        if not self.policy.communication_room:
+            return
+        for identity, row in state["jobs"].items():
+            if (
+                not row.get("endpoint")
+                or row.get("receipt")
+                or row["state"] not in {"prepared", "capacity_wait", "retry_preparing"}
+            ):
+                continue
+            directory = Path(row["path"]).parent
+            # Only positive prelaunch absence permits controller closure. Links
+            # and any persisted native intent stay uncertain and unreplaced.
+            if any(
+                path.exists() or is_link_like(path)
+                for path in (
+                    directory / "launch-intent.json",
+                    directory / "startup.json",
+                    directory / "receipt.json",
+                )
+            ):
+                continue
+            row.update(state="preparation_stopped", controller_quiescent=True)
+            self.store.save(state, "job-controller-prelaunch-closed", job=identity)
+        self.communication.sync(state)
+
+    def run_many(self, state, tasks, *, allow_failed=False):
+        try:
+            return self._run_many(state, tasks, allow_failed=allow_failed)
+        finally:
+            self._settle_controllers(state)
+
+    def _run_many(self, state, tasks, *, allow_failed=False):
         selected = [self._prepare(state, task) for task in tasks]
         waiting_routes = set()
+        next_communication = 0.0
         while True:
+            if self.policy.communication_room and time.monotonic() >= next_communication:
+                self.communication.sync(state, strict=False)
+                next_communication = time.monotonic() + 5
             active = []
             for identity, row in state["jobs"].items():
                 if row["state"] in {"running", "unknown", "uncertain"}:
@@ -256,10 +356,16 @@ class RepoJobs:
                     "Repository native job outcome uncertain; replacement forbidden"
                 )
             failures = [row for _, row in selected if row["state"] == "failed"]
-            if failures:
+            if failures and not allow_failed:
                 raise CampaignError(failures[0]["reason"])
-            if all(row["state"] == "completed" for _, row in selected):
-                return [self.store.read(row["result"]) for _, row in selected]
+            if all(
+                row["state"] == "completed" or (allow_failed and row["state"] == "failed")
+                for _, row in selected
+            ):
+                return [
+                    self.store.read(row["result"]) if row["state"] == "completed" else None
+                    for _, row in selected
+                ]
             if self.store.stopped(state["id"]):
                 raise RepoCapacityWait("Repository audit stop requested; active children drained")
             raise RepoCapacityWait(

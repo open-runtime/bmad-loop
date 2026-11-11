@@ -1,6 +1,8 @@
 """Explicit startup-only route and presentation changes with immutable history.
 
-This operation cannot change accepted work, limits, policy or grants. It shares
+This operation cannot change accepted work, limits, worker policy or grants.
+An explicit committed owner-policy reference may change the publication-family
+condition before any unit starts; required checks and reviews remain frozen. It shares
 the startup proof with equivalent capability renewal, but records a distinct
 configuration change. Preview performs validation without publishing anything;
 neither form starts a worker or mutates GitHub or Paradev.
@@ -10,6 +12,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import re
 from pathlib import Path
 
 from .adapters.profile import get_profile
@@ -27,15 +30,35 @@ from .campaign_requalification import (
 from .campaign_route_readiness import inspect, permissions_for, selected_capability
 from .campaign_store import CampaignStore, RevisionConflict, add_event
 from .platform_util import atomic_write_text, is_link_like
+from .verify import git_bytes
 
 
-def _proposed(current: CampaignSpec, proposed: CampaignSpec, policy) -> CampaignSpec:
+def _proposed(
+    current: CampaignSpec, proposed: CampaignSpec, policy, *, review_policy_path=""
+) -> CampaignSpec:
     """Accept a source specification without re-importing or changing its graph."""
     if proposed.units and proposed.units != current.units:
         raise CampaignError("startup reconfiguration cannot change accepted units")
     proposed = resolve_roles(dataclasses.replace(proposed, units=current.units), policy)
     current = resolve_roles(current, policy)
+    if set(dict(current.roles)) - set(dict(proposed.roles)):
+        raise CampaignError("startup reconfiguration cannot remove configured roles or reviews")
+    if review_policy_path:
+        sources = current.decisions.sources
+        appended = sources if review_policy_path in sources else (*sources, review_policy_path)
+        if proposed.decisions.sources not in (
+            sources,
+            appended,
+        ):
+            raise CampaignError("review policy adoption may only append its exact decision source")
+        proposed = dataclasses.replace(
+            proposed, decisions=dataclasses.replace(proposed.decisions, sources=appended)
+        )
     left, right = spec_to_dict(current), spec_to_dict(proposed)
+    if review_policy_path:
+        for value in (left, right):
+            value["github"].pop("require_independent_review")
+            value["decisions"].pop("sources")
     for value in (left, right):
         value.pop("roles")
         value.pop("role_pools")
@@ -54,6 +77,44 @@ def _proposed(current: CampaignSpec, proposed: CampaignSpec, policy) -> Campaign
         if any(previous[key] != value for key, value in changed.items() if key not in route_fields):
             raise CampaignError("startup reconfiguration cannot change role limits")
     return spec_from_dict(spec_to_dict(proposed))
+
+
+def _review_policy_source(project: Path, reference: str) -> dict:
+    """Bind an operator-selected exception to a committed local decision.
+
+    This records evidence; file prose cannot invoke this operation or choose
+    fields. Only the explicit CLI operation supplies the narrow authority.
+    """
+    if not reference:
+        return {}
+    commit, separator, path = reference.partition(":")
+    if (
+        not separator
+        or not re.fullmatch(r"[0-9a-f]{40}", commit)
+        or not path
+        or Path(path).is_absolute()
+        or ".." in Path(path).parts
+        or "\0" in path
+        or "\\" in path
+    ):
+        raise CampaignError("review policy source must be a full COMMIT:relative/path")
+    ancestor = git_bytes(project, "merge-base", "--is-ancestor", commit, "HEAD")
+    entry = git_bytes(project, "--literal-pathspecs", "ls-tree", "-z", commit, "--", path)
+    if entry.returncode or not entry.stdout.startswith((b"100644 blob ", b"100755 blob ")):
+        raise CampaignError("review policy source must be a committed regular document")
+    size = git_bytes(project, "cat-file", "-s", commit + ":" + path)
+    if ancestor.returncode or size.returncode or not size.stdout.strip().isdigit():
+        raise CampaignError("review policy source must be committed in accepted local ancestry")
+    if not 0 < int(size.stdout) <= 1024 * 1024:
+        raise CampaignError("review policy source must be a nonempty bounded document")
+    content = git_bytes(project, "show", commit + ":" + path)
+    if content.returncode:
+        raise CampaignError("review policy source cannot be read")
+    try:
+        document = content.stdout.decode("utf-8")
+    except UnicodeError as exc:
+        raise CampaignError("review policy source must be UTF-8 text") from exc
+    return {"commit": commit, "path": path, "content": document}
 
 
 def _profiles(current, proposed, template, project, routes, previous_routes):
@@ -141,6 +202,7 @@ def reconfigure(
     expected_revision: int,
     reason: str,
     preview: bool = False,
+    review_policy_source: str = "",
 ):
     """Validate, then commit one stopped startup revision under the coordinator lock."""
     if type(expected_revision) is not int or expected_revision < 0 or not reason.strip():
@@ -161,7 +223,13 @@ def reconfigure(
             or template.config_revision != snapshot.config_revision
         ):
             raise CampaignError("campaign configuration binding mismatch")
-        proposed = _proposed(snapshot.spec, proposed, template.policy)
+        policy_source = _review_policy_source(Path(snapshot.root), review_policy_source)
+        proposed = _proposed(
+            snapshot.spec,
+            proposed,
+            template.policy,
+            review_policy_path=policy_source.get("path", ""),
+        )
         if proposed.paradev.reflect:
             from .campaign_titles import group_key
 
@@ -199,6 +267,15 @@ def reconfigure(
             "previous_capabilities_digest": digest(old_routes),
             "capabilities_digest": digest(routes),
             "route_exclusions": exclusions,
+            "review_policy": (
+                {
+                    "source": policy_source,
+                    "previous_require_independent_review": snapshot.spec.github.require_independent_review,
+                    "require_independent_review": proposed.github.require_independent_review,
+                }
+                if policy_source
+                else None
+            ),
         }
         if preview:
             return {

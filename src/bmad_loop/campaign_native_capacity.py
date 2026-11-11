@@ -130,6 +130,10 @@ def from_muse(raw: dict, candidate: RoleCandidate, *, now: float) -> CapacityObs
     usage = _object(raw.get("usage"))
     if type(usage.get("schemaVersion")) is not int or usage["schemaVersion"] != 1:
         raise ProbeError("native Muse allowance schema is unsupported")
+    if usage.get("allowance") is None and usage.get("reason") == "server_sent_no_usage":
+        # A valid native response before the server has usage for this window.
+        # A model catalog cannot substitute for the missing allowance evidence.
+        raise ProbeError("native Muse allowance unavailable: server_sent_no_usage")
     allowance = _object(usage.get("allowance"))
     if allowance.get("source") != "mint" or usage.get("reason") is not None:
         raise ProbeError("native Muse allowance is unavailable")

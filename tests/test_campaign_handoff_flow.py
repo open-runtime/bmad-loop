@@ -32,7 +32,7 @@ def campaign(prepared, project, tmp_path):
     _, _, _, first, basecap = prepared
     second = RoleCandidate("claude", "claude-test", "high", "anthropic")
 
-    def cap(candidate, execution=False):
+    def cap(candidate, execution=False, **limits):
         from test_campaign_execution_qualification import fixture_writer_capability
         from test_campaign_headless import fixture_capability
 
@@ -42,6 +42,7 @@ def campaign(prepared, project, tmp_path):
             "model": candidate.model,
             "efforts": [candidate.effort],
             "permissions": "workspace-tools" if execution else "no-tools",
+            **limits,
         }
         if execution:
             value = fixture_writer_capability(tmp_path, value, candidate, input_bytes=100000)

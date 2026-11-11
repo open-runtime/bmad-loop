@@ -254,13 +254,14 @@ def _prefix_matches(old, new):
     """Compare immutable raw bytes, including complete records and a partial tail."""
     if old["source_id"] != new["source_id"] or old["captured_bytes"] > new["captured_bytes"]:
         return False
+    from .campaign_transcripts import stream_hash
+
     raw = Path(new["raw_path"])
     # read_json/snapshot_history own these immutable blobs; verify both hashes
     # rather than trusting event IDs to authorize obsolete summary facts.
-    data = raw.read_bytes()
     return (
-        hashlib.sha256(data).hexdigest() == new["raw_sha256"]
-        and hashlib.sha256(data[: old["captured_bytes"]]).hexdigest() == old["raw_sha256"]
+        stream_hash(raw) == new["raw_sha256"]
+        and stream_hash(raw, length=old["captured_bytes"]) == old["raw_sha256"]
     )
 
 
@@ -361,7 +362,19 @@ def reusable(runtime, snapshot, unit, sources):
             )
         if valid:
             try:
-                completed.append((spec, _applied(row)))
+                result = _applied(row)
+                if enabled(snapshot.spec):
+                    from .campaign_handoff_flow import _audit_limits
+
+                    source_limit, artifact_limit, _ = _audit_limits(
+                        snapshot, index.get("audit_family", "")
+                    )
+                    if spec.input_tokens > source_limit or len(encoded(result)) > artifact_limit:
+                        # Optional work remains archived, but cannot force an
+                        # unauditable mandatory handoff. Re-extract exact sources.
+                        rejected.append(key)
+                        continue
+                completed.append((spec, result))
             except (CampaignError, OSError, ValueError):
                 rejected.append(key)
         else:
@@ -370,7 +383,7 @@ def reusable(runtime, snapshot, unit, sources):
 
 
 def perform(runtime, snapshot, action):
-    from .campaign_handoff_flow import _budget, _job, _stage_coordinates, _summary_route
+    from .campaign_handoff_flow import _job, _stage_coordinates, _summary_budget, _summary_route
     from .campaign_summary import (
         SummaryJobSpec,
         load_input,
@@ -507,14 +520,18 @@ def perform(runtime, snapshot, action):
                 break
             selected.append(event)
             size += length
-        planned = plan_remaining_maps(
-            tuple(selected), completed, _budget(candidate, cap), root / "maps"
-        )
+        budget, artifact_limit = _summary_budget(runtime, snapshot, routing, candidate, cap)
+        planned = plan_remaining_maps(tuple(selected), completed, budget, root / "maps")
         indexed = set(index["jobs"])
         planned = tuple(
-            dataclasses.replace(spec, id=identifier)
+            dataclasses.replace(spec, id=identifier, artifact_bytes=artifact_limit)
             for spec in planned
-            if (identifier := digest([state["id"], spec.id, snapshot.config_revision]))
+            if (
+                identifier := digest(
+                    [state["id"], spec.id, snapshot.config_revision]
+                    + ([artifact_limit] if artifact_limit else [])
+                )
+            )
             not in indexed
         )
         limit = min(BATCH_SIZE, MAX_INDEX_JOBS - len(indexed))

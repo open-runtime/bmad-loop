@@ -6,6 +6,7 @@ Stop requests are independent of the long-running reader/model coordinator.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -14,6 +15,7 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
+from . import runs
 from .campaign_jobs import digest
 from .campaign_model import CampaignError
 from .platform_util import atomic_write_text, file_lock, is_link_like
@@ -46,6 +48,26 @@ class RepoStore:
         if is_link_like(path):
             raise CampaignError("Repository audit directory is redirected")
         return path
+
+    def control_directory(self, identity):
+        self.directory(identity)
+        root = (
+            runs.state_root()
+            / "repo-audits"
+            / hashlib.sha256(str(self.common).encode()).hexdigest()[:24]
+        )
+        directory = root / identity
+        for path in (root.parent, root, directory):
+            if is_link_like(path):
+                raise CampaignError("Repository native control directory is redirected")
+        if directory.resolve().is_relative_to(self.project) or directory.resolve().is_relative_to(
+            self.common
+        ):
+            raise CampaignError(
+                "Repository native control must remain outside the product workspace"
+            )
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        return directory
 
     @contextmanager
     def connection(self, identity):

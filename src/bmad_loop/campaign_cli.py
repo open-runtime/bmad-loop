@@ -155,6 +155,12 @@ def register(subparsers: Any) -> None:
             child.add_argument("--reason", required=True)
         if command == "reconfigure":
             child.add_argument("--spec", required=True, metavar="FILE")
+            child.add_argument(
+                "--review-policy-source",
+                default="",
+                metavar="COMMIT:PATH",
+                help="explicitly adopt a committed owner publication-family policy before any unit starts",
+            )
             child.add_argument("--expected-revision", required=True, type=int)
             child.add_argument("--reason", required=True)
             child.add_argument("--preview", action="store_true")
@@ -876,6 +882,7 @@ def dispatch(args: argparse.Namespace) -> int:
             expected_revision=args.expected_revision,
             reason=args.reason,
             preview=args.preview,
+            review_policy_source=args.review_policy_source,
         )
         if isinstance(result, dict):
             return _emit(args, _result(command, proposal=result))

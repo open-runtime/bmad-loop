@@ -15,7 +15,7 @@ from pathlib import Path
 from . import verify
 from .campaign_handoff_obligations import AUDIT_SCHEMA
 from .campaign_headless import capability_admission, capability_for, read_json, validate_capability
-from .campaign_jobs import JobLimits, JobRequest, prepare
+from .campaign_jobs import JobLimits, JobRequest, prepare, request_from_dict
 from .campaign_model import CampaignError, Hold, RoleCandidate, UnitState
 from .campaign_store import add_event, transition
 from .campaign_supervisor import Observation, Proposal
@@ -1101,23 +1101,98 @@ def _summary_route(
     return selected, _cap(snapshot, selected, "reasoning")
 
 
-def _summary_authors(runtime, snapshot, value):
+def _observed_families(row):
+    """Use native attribution, including auxiliaries, never selected-model guesses."""
+    receipts = [row.get("receipt") or {}]
+    retained = (row.get("applied_result") or {}).get("receipt")
+    if retained and retained != receipts[0]:
+        receipts.append(retained)
+    return set().union(*(_receipt_families(receipt) for receipt in receipts))
+
+
+def _receipt_families(receipt):
     from .campaign_headless import provider_family
 
+    family = receipt.get("provider_family")
+    families = set()
+    if family:
+        if family not in {"openai", "anthropic", "google", "xai", "meta"}:
+            raise HandoffRouteWait("Summary contributor family is unknown")
+        families.add(family)
+    models = receipt.get("observed_models", [])
+    if not isinstance(models, list):
+        raise HandoffRouteWait("Summary contributor models are malformed")
+    models = [*models, *([receipt["observed_model"]] if receipt.get("observed_model") else [])]
+    for model in models:
+        observed = provider_family(model)
+        if not observed:
+            raise HandoffRouteWait("Summary contributor model family is unknown")
+        families.add(observed)
+    if not families:
+        raise HandoffRouteWait("Applied summary author family is unknown")
+    return families
+
+
+def _summary_authors(runtime, snapshot, value):
+    """Retain every observed contributor to artifacts used by the summary tree."""
     result = set()
     for field in ("all_jobs", "constraint_jobs", "recovery_jobs"):
         for identifier in (value or {}).get(field, ()):
             row = _job(runtime, snapshot, identifier)
-            if row.get("state") != "applied":
+            if row.get("state") != "applied" and not row.get("applied_result"):
                 continue
-            family = (row.get("receipt") or {}).get("provider_family")
-            if not family:
-                selection = row.get("selection") or {}
-                family = provider_family(selection.get("model", ""))
-            if not family:
-                raise HandoffRouteWait("Applied summary author family is unknown")
-            result.add(family)
+            result.update(_observed_families(row))
     return result
+
+
+def _audit_limits(snapshot, family):
+    """Plan against every qualified fallback in the reserved auditor family."""
+    from .campaign_headless import provider_family
+    from .campaign_summary_routes import qualified_candidates
+
+    options, _ = qualified_candidates(
+        snapshot.spec, snapshot.config_snapshot.get("reasoning_capabilities", {}), "audit"
+    )
+    capacities = []
+    for candidate in options:
+        if provider_family(candidate.model) != family:
+            continue
+        cap = _cap(snapshot, candidate, "reasoning")
+        capacities.append(
+            min(
+                cap["input_tokens"],
+                cap["context_tokens"] - cap["output_tokens"] - cap["reserved_tokens"],
+            )
+        )
+    if not capacities:
+        raise HandoffRouteWait("Reserved audit family has no qualified input envelope")
+    bound = min(capacities)
+    if bound < 16384:
+        raise HandoffRouteWait("Reserved audit route has insufficient compatible summary space")
+    return bound // 8, bound // 16, bound // 8
+
+
+def _summary_budget(runtime, snapshot, value, candidate, cap, stage="leaf"):
+    from .campaign_summary_routes import enabled
+
+    budget = _budget(candidate, cap)
+    if not enabled(snapshot.spec):
+        return budget, 0
+    family = _stage_coordinates(runtime, snapshot, value, candidate, stage)["audit_family"]
+    source_limit, leaf_limit, final_limit = _audit_limits(snapshot, family)
+    if stage == "leaf":
+        budget = dataclasses.replace(
+            budget,
+            context_tokens=min(
+                budget.context_tokens,
+                source_limit
+                + budget.output_tokens
+                + budget.prompt_tokens
+                + budget.thinking_tokens
+                + budget.working_tokens,
+            ),
+        )
+    return budget, final_limit if stage == "final" else leaf_limit
 
 
 def _stage_coordinates(runtime, snapshot, value, candidate, stage):
@@ -1205,8 +1280,9 @@ def _maps(runtime, snapshot, unit, value):
         ),
     }
     candidate, cap = _summary_route(runtime, snapshot, "summarization", value)
+    budget, artifact_limit = _summary_budget(runtime, snapshot, value, candidate, cap)
     planned = plan_remaining_maps(
-        events, completed, _budget(candidate, cap), _root(runtime, snapshot, value) / "maps"
+        events, completed, budget, _root(runtime, snapshot, value) / "maps"
     )
     jobs = []
     for planned_spec in planned:
@@ -1214,7 +1290,9 @@ def _maps(runtime, snapshot, unit, value):
             planned_spec,
             id=digest(
                 [value["id"], planned_spec.id, value.get("plan_epoch", 0), snapshot.config_revision]
+                + ([artifact_limit] if artifact_limit else [])
             ),
+            artifact_bytes=artifact_limit,
         )
         coordinates = {
             **_coordinates(snapshot, unit, value),
@@ -1348,7 +1426,7 @@ def _reduce(runtime, snapshot, unit, value):
         candidate, cap = _summary_route(
             runtime, snapshot, "summarization", value, purpose="handoff_reduce", contract=""
         )
-    budget = _budget(candidate, cap)
+    budget, artifact_limit = _summary_budget(runtime, snapshot, value, candidate, cap, stage)
     # Stored native/structural evidence is independent of the initial view.
     # Complete artifacts remain indexed; assembly budgets selected context only
     # after mandatory current authority has been independently audited.
@@ -1356,7 +1434,7 @@ def _reduce(runtime, snapshot, unit, value):
         children,
         budget,
         _root(runtime, snapshot, value) / "reductions",
-        artifact_bytes=0,
+        artifact_bytes=artifact_limit,
         project_native_events=True,
     )
     jobs = []
@@ -1479,11 +1557,19 @@ def _summary_replan(runtime, snapshot, unit, value):
                 purpose="handoff_final" if stage == "final" else "handoff_reduce",
                 stage=stage,
             )
+            budget, artifact_limit = _summary_budget(
+                runtime, snapshot, value, candidate, cap, stage or "intermediate"
+            )
             spec = dataclasses.replace(
                 planned,
                 id=digest([value["id"], planned.id, value["plan_epoch"], snapshot.config_revision]),
-                route=_budget(candidate, cap).route,
+                route=budget.route,
                 output_tokens=min(planned.output_tokens, cap["output_tokens"]),
+                artifact_bytes=(
+                    min(planned.artifact_bytes, artifact_limit)
+                    if planned.artifact_bytes and artifact_limit
+                    else artifact_limit or planned.artifact_bytes
+                ),
                 prompt_version=FINAL_PROMPT_VERSION if stage == "final" else REDUCE_PROMPT_VERSION,
             )
             coordinates = {
@@ -1557,11 +1643,9 @@ def _audit_plan(runtime, snapshot, unit, value):
     reduced = _reduce(runtime, snapshot, unit, value)
     if reduced is not None and "requests" in reduced:
         return reduced
-    map_families = {
-        (_job(runtime, snapshot, key).get("receipt") or {}).get("provider_family")
-        for key in value.get("all_jobs", value["jobs"])
-        if _job(runtime, snapshot, key)["state"] == "applied"
-    }
+    map_families = _summary_authors(
+        runtime, snapshot, {**value, "all_jobs": value.get("all_jobs", value["jobs"])}
+    )
     candidate, cap = _summary_route(runtime, snapshot, "handoff_audit", value, map_families)
     from .campaign_headless import provider_family
 
@@ -1600,12 +1684,22 @@ def _audit_plan(runtime, snapshot, unit, value):
                 {"job_id": identifier, "summary": _applied(_job(runtime, snapshot, identifier))}
                 for identifier in value["jobs"]
             ]
-        for batch in batches(
-            spans,
-            content=content_base,
-            input_bound=cap["input_tokens"] // 2,
-            output_bound=cap["output_tokens"],
-        ):
+        try:
+            planned_batches = batches(
+                spans,
+                content=content_base,
+                input_bound=min(
+                    cap["input_tokens"],
+                    cap["context_tokens"] - cap["output_tokens"] - cap["reserved_tokens"],
+                )
+                // 2,
+                output_bound=cap["output_tokens"],
+            )
+        except CampaignError as exc:
+            raise HandoffRouteWait(
+                "Complete history audit context cannot fit: " + str(exc)
+            ) from exc
+        for batch in planned_batches:
             owner_ids = sorted({row["source_id"] for row in batch})
             content = {**content_base, "owner_spans": batch}
             data = encoded(content)
@@ -1666,6 +1760,15 @@ def _audit_plan(runtime, snapshot, unit, value):
                     )
                 )
             )
+    from .campaign_headless import render_input
+
+    for job in jobs:
+        try:
+            render_input(request_from_dict(job), cap)
+        except CampaignError as exc:
+            raise HandoffRouteWait(
+                "Complete history audit envelope cannot fit: " + str(exc)
+            ) from exc
     return {"requests": jobs, **(reduced or {})}
 
 
@@ -1685,7 +1788,7 @@ def apply_audit(runtime, snapshot, row):
         raise CampaignError("Handoff audit coordinates changed")
     contract = coordinates.get("contract", "")
     if not contract or contract.endswith("audit-v1"):
-        observed_family = (row.get("receipt") or {}).get("provider_family")
+        observed_families = _observed_families(row)
         reviewed = (
             row["request"]["dependencies"]
             if contract
@@ -1695,11 +1798,10 @@ def apply_audit(runtime, snapshot, row):
                 if _job(runtime, snapshot, key)["state"] == "applied"
             ]
         )
-        writers = {
-            (_job(runtime, snapshot, key).get("receipt") or {}).get("provider_family")
-            for key in reviewed
-        }
-        if not observed_family or observed_family in writers or (reviewed and not all(writers)):
+        writers = set().union(
+            *(_observed_families(_job(runtime, snapshot, key)) for key in reviewed)
+        )
+        if observed_families & writers:
             raise CampaignError("Actual handoff audit family is missing or not independent")
     if contract in {
         "constraint-reduce-v1",
@@ -1942,10 +2044,7 @@ def _constraint_plan(runtime, snapshot, unit, value):
 def _constraint_audit_plan(runtime, snapshot, unit, value):
     from .campaign_handoff_constraints import AUDIT_SCHEMA as CONSTRAINT_AUDIT_SCHEMA
 
-    families = {
-        (_job(runtime, snapshot, key).get("receipt") or {}).get("provider_family")
-        for key in value["constraint_jobs"]
-    }
+    families = _summary_authors(runtime, snapshot, value)
     candidate, cap = _summary_route(
         runtime,
         snapshot,
@@ -2030,7 +2129,7 @@ def _recovery_audit_plan(runtime, snapshot, unit, value):
             "reason": "; ".join(proposed.get("unresolved", []))
             or "Missing native history requires authoritative current owner evidence",
         }
-    families = {row.get("receipt", {}).get("provider_family")}
+    families = _summary_authors(runtime, snapshot, value)
     candidate, cap = _summary_route(
         runtime,
         snapshot,
@@ -2080,10 +2179,9 @@ def _contract_replan(runtime, snapshot, unit, value):
         raw = row["request"]
         excluded = []
         if raw["role"] == "handoff_audit":
-            excluded = [
-                (_job(runtime, snapshot, key).get("receipt") or {}).get("provider_family")
-                for key in raw["dependencies"]
-            ]
+            excluded = set().union(
+                *(_observed_families(_job(runtime, snapshot, key)) for key in raw["dependencies"])
+            )
         source = raw["inputs"][0]
         data = Path(source["path"]).read_bytes()
         if hashlib.sha256(data).hexdigest() != source["sha256"]:

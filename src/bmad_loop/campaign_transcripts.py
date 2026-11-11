@@ -117,7 +117,9 @@ def seal_source(path, root, *, maximum, prefix_bytes=None, complete_lines=False)
     """Copy and rehash the same descriptor prefix; live append is permitted."""
     if is_link_like(path):
         raise CampaignError("native history is redirected")
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    descriptor = os.open(
+        path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    )
     with os.fdopen(descriptor, "rb") as source:
         initial = os.fstat(source.fileno())
         selected = initial.st_size if prefix_bytes is None else prefix_bytes
