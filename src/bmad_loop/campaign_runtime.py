@@ -80,7 +80,9 @@ def store_for(project: Path) -> CampaignStore:
     return CampaignStore(runs.state_root() / "campaigns" / key)
 
 
-def create(project: Path, spec: CampaignSpec) -> tuple[CampaignStore, CampaignSnapshot]:
+def create(
+    project: Path, spec: CampaignSpec, *, prepare_only: bool = False
+) -> tuple[CampaignStore, CampaignSnapshot]:
     project = project.resolve()
     store = store_for(project)
     common = common_directory(project)
@@ -103,16 +105,22 @@ def create(project: Path, spec: CampaignSpec) -> tuple[CampaignStore, CampaignSn
         raise CampaignError("ambient transport override conflicts with native reflection")
     pol = dataclasses.replace(pol, mux=dataclasses.replace(pol.mux, backend=resolved_backend))
     profiles = runsetup.resolve_profiles(pol, project)
-    for role in set(dict(spec.roles)) | {
-        "planning",
-        "planning_review",
-        "triage",
-        "escalation",
-        "decision_review",
-        "conflict_repair",
-        "publication_review",
-    }:
-        for candidate in spec.candidates(role):
+    from .campaign_summary_routes import candidates as summary_candidates
+
+    for role in (
+        set(dict(spec.roles))
+        | {
+            "planning",
+            "planning_review",
+            "triage",
+            "escalation",
+            "decision_review",
+            "conflict_repair",
+            "publication_review",
+        }
+        | ({"summarization", "handoff_audit"} if spec.reasoning.summary_routes else set())
+    ):
+        for candidate in summary_candidates(spec, role):
             if candidate.profile:
                 profiles["campaign:" + candidate.profile] = get_profile(candidate.profile, project)
     from .cli import _launch_plugin_grants
@@ -139,6 +147,7 @@ def create(project: Path, spec: CampaignSpec) -> tuple[CampaignStore, CampaignSn
         root=str(project),
         remote_url=remote_url,
         config_snapshot={"policy": pol.to_dict(), "configuration_revision": 1},
+        phase="stopped" if prepare_only else "active",
     )
     snapshot.bindings["source_observations"] = graph.observations
     if spec.reasoning.enabled or spec.reasoning.capabilities:
@@ -204,6 +213,8 @@ def create(project: Path, spec: CampaignSpec) -> tuple[CampaignStore, CampaignSn
         spec, units=tuple(unit.spec for unit in snapshot.units.values())
     )
     add_event(snapshot, "campaign-created", selected_units=len(snapshot.units))
+    if prepare_only:
+        add_event(snapshot, "campaign-prepared", admissions_open=False)
     snapshot = store.create(snapshot)
     try:
         path, digest = template.save()
@@ -346,10 +357,12 @@ class CampaignRuntime:
         allowed_candidates: tuple[RoleCandidate, ...] | None = None,
         permissions: str | None = None,
         require_headless: bool = False,
+        summary_stage: str = "",
     ) -> RoleCandidate | None:
         from .campaign_route_readiness import permissions_for
+        from .campaign_summary_routes import selection_spec as summary_selection
 
-        selection_spec = snapshot.spec
+        selection_spec = summary_selection(snapshot.spec, role, summary_stage)
         if role == "execution" and role not in dict(selection_spec.roles):
             selection_spec = resolve_roles(selection_spec, self.template(snapshot).policy)
         rows = snapshot.bindings.get("capacity", {})
@@ -496,14 +509,18 @@ class CampaignRuntime:
             selection_spec,
             role,
             capacities,
-            selections={
-                tuple(key.split("\0")): count
-                for key, count in snapshot.bindings.get("role_selections", {}).items()
-            },
+            selections=(
+                {}
+                if summary_stage
+                else {
+                    tuple(key.split("\0")): count
+                    for key, count in snapshot.bindings.get("role_selections", {}).items()
+                }
+            ),
             spent_usd=snapshot.bindings.get("role_spend", {}).get(role, 0),
             allowed_candidates=launchable,
         )
-        if selected is not None:
+        if selected is not None and not summary_stage:
             from .campaign_reasoning_results import preferred_candidate
 
             eligible = tuple(
@@ -648,6 +665,10 @@ class CampaignRuntime:
 
     @capability_admission
     def proposals(self, snapshot: CampaignSnapshot) -> tuple[Proposal, ...]:
+        from .campaign_transfer import retired
+
+        if retired(snapshot):
+            return ()
         if self._units_settled(snapshot) and self.completion_ready(snapshot):
             # Let already-issued observations/metadata drain. Re-admitting a
             # periodic observation here can permanently outrun terminality on a
@@ -707,7 +728,12 @@ class CampaignRuntime:
             )
         ) and not self._pending(snapshot, "", "intake"):
             proposals.append(Proposal("intake", ""))
-        admission = admit(snapshot, now=now)
+        from .campaign_intake_baseline import admission_waits
+        from .campaign_intake_baseline import proposals as baseline_proposals
+
+        proposals.extend(baseline_proposals(snapshot, now=now))
+        baseline_waits = admission_waits(snapshot)
+        admission = admit(snapshot, now=now, blocked=baseline_waits)
         selected = set(admission.units)
         reserved = Counter(
             claim.resource
@@ -915,6 +941,9 @@ class CampaignRuntime:
                 )
                 continue
             from .campaign_handoff_flow import resume_proposal
+
+            if unit.state == UnitState.READY and key in baseline_waits:
+                continue
 
             continuation = resume_proposal(snapshot, unit, runtime=self)
             if continuation is not None:
@@ -1321,6 +1350,10 @@ class CampaignRuntime:
 
     @capability_admission
     def observe_workers(self, snapshot: CampaignSnapshot) -> tuple[Proposal, ...]:
+        from .campaign_transfer import retired
+
+        if retired(snapshot):
+            return ()
         from .campaign_handoff_flow import proposals as handoff_proposals
         from .campaign_history_warmup import proposals as warmup_proposals
         from .campaign_reasoning_flow import proposals as reasoning_proposals
@@ -1429,6 +1462,9 @@ class CampaignRuntime:
         return tuple(proposals)
 
     def control(self, snapshot: CampaignSnapshot, command: dict[str, Any]) -> None:
+        from .campaign_transfer import require_not_retired
+
+        require_not_retired(snapshot, operation="campaign control")
         kind, key = command["kind"], command.get("unit", "")
         if kind == "authorize-scope":
             from .campaign_scope_authority import apply
@@ -1717,6 +1753,12 @@ class CampaignRuntime:
     def perform(self, snapshot: CampaignSnapshot, action) -> Observation:
         if action.generation != snapshot.generation:
             return Observation("rejected", reason="stale effect generation")
+        from .campaign_transfer import retired
+
+        if retired(self.store.load(snapshot.id)):
+            return Observation(
+                "rejected", reason="Campaign ownership was transferred; effects are fenced"
+            )
         if action.kind == "history-warmup":
             from .campaign_history_warmup import perform
 
@@ -1767,6 +1809,12 @@ class CampaignRuntime:
         return handler(snapshot, action)
 
     def reconcile_action(self, snapshot: CampaignSnapshot, action) -> Observation:
+        from .campaign_transfer import retired
+
+        if retired(self.store.load(snapshot.id)):
+            return Observation(
+                "rejected", reason="Campaign ownership was transferred; effects are fenced"
+            )
         if action.kind == "history-warmup":
             from .campaign_history_warmup import perform
 
@@ -1880,6 +1928,14 @@ class CampaignRuntime:
             refused = self._launch_preparation_refusal(snapshot, action)
             if refused is not None:
                 return refused
+            waiting = self._launch_registration_wait(snapshot, action)
+            if waiting is not None:
+                if waiting.state != "waiting":
+                    return waiting
+                guarded = self._registration_retry_guard(snapshot, action)
+                if guarded is not None:
+                    return guarded
+                return self._perform_launch(snapshot, action)
             claim = snapshot.units[action.unit].claim
             if claim is None:
                 return Observation("unknown", reason="launch ownership missing")
@@ -1946,6 +2002,7 @@ class CampaignRuntime:
             "lifecycle",
             "planning-complete",
             "intake-control",
+            "intake-baseline",
             "intake-cancel",
             "intake-note",
             "intake-refresh",
@@ -2097,7 +2154,7 @@ class CampaignRuntime:
 
     @staticmethod
     def _reflection_fingerprint(unit, snapshot=None) -> str:
-        from .campaign_titles import group_navigation, unit_navigation
+        from .campaign_titles import group_key, group_title, unit_navigation, work_title
 
         return hashlib.sha256(
             json.dumps(
@@ -2107,8 +2164,9 @@ class CampaignRuntime:
                     "claim": dataclasses.asdict(unit.claim) if unit.claim else None,
                     "pr": unit.bindings.get("pr"),
                     "navigation": unit_navigation(unit, snapshot=snapshot),
-                    "group_navigation": group_navigation(snapshot, unit) if snapshot else None,
-                    "title": unit.spec.title,
+                    "group": group_key(snapshot, unit) if snapshot else None,
+                    "group_title": group_title(snapshot, unit) if snapshot else None,
+                    "title": work_title(unit, snapshot=snapshot),
                 },
                 sort_keys=True,
             ).encode()
@@ -2154,11 +2212,31 @@ class CampaignRuntime:
             state_dir=self.store.directory(snapshot.id) / "reflection",
         )
         mux = self._native_mux(snapshot)
-        result = reflect(snapshot, unit, unit.claim, provider=provider, mux=mux)
-        bridge = self._lifecycle_bridge(snapshot, mux=mux, provider=provider)
+        display_only = action.payload.get("display_only", False)
+        if display_only and action.payload.get("config_revision") != snapshot.config_revision:
+            raise CampaignError("Display reflection configuration changed")
+        result = reflect(
+            snapshot,
+            unit,
+            unit.claim,
+            provider=provider,
+            mux=mux,
+            display_only=display_only,
+            effect_id=action.id,
+        )
+        bridge = (
+            None if display_only else self._lifecycle_bridge(snapshot, mux=mux, provider=provider)
+        )
         try:
-            result["lifecycle"] = bridge.observe(
-                snapshot, unit, observer=self._hcom_observer(snapshot), projection=result["stage"]
+            result["lifecycle"] = (
+                {"state": "display-only"}
+                if bridge is None
+                else bridge.observe(
+                    snapshot,
+                    unit,
+                    observer=self._hcom_observer(snapshot),
+                    projection=result["stage"],
+                )
             )
         except Exception as exc:
             result["lifecycle"] = {
@@ -2406,6 +2484,7 @@ class CampaignRuntime:
 
     def _perform_capacity(self, snapshot, action) -> Observation:
         from .campaign_route_readiness import permissions_for
+        from .campaign_summary_routes import candidates as summary_candidates
 
         observed_at = self.clock()
         observations = []
@@ -2422,8 +2501,9 @@ class CampaignRuntime:
                 "conflict_repair",
                 "publication_review",
             }
+            | ({"summarization", "handoff_audit"} if spec.reasoning.summary_routes else set())
         ):
-            for candidate in spec.candidates(role):
+            for candidate in summary_candidates(spec, role):
                 identity = (candidate.profile, candidate.model)
                 readiness = {
                     "role": role,
@@ -2465,6 +2545,11 @@ class CampaignRuntime:
 
     def _perform_intake_control(self, snapshot, action) -> Observation:
         return Observation("confirmed", action.payload)
+
+    def _perform_intake_baseline(self, snapshot, action) -> Observation:
+        from .campaign_intake_baseline import perform
+
+        return perform(self, snapshot, action)
 
     def _perform_intake_note(self, snapshot, action) -> Observation:
         from .campaign_runtime_intake import disposition_intent
@@ -2552,8 +2637,8 @@ class CampaignRuntime:
         base = verify.rev_parse_revision(self.project, observation_ref)
         if snapshot.spec.paradev.reflect:
             from .campaign_paradev import ParadevWorkspaceProvider
-            from .campaign_reflection_flow import group_identity
-            from .campaign_titles import navigation_title
+            from .campaign_reflection_flow import new_group_identity
+            from .campaign_titles import work_title
 
             provider = ParadevWorkspaceProvider(
                 project_id=snapshot.spec.paradev.project_id,
@@ -2566,9 +2651,9 @@ class CampaignRuntime:
                 branch,
                 unit.spec.title,
                 action_id=action.id,
-                display_name=navigation_title(epics=(unit.spec.epic,), description=unit.spec.title),
+                display_name=work_title(unit, snapshot=snapshot),
                 target=snapshot.spec.target,
-                group=group_identity(unit.spec, snapshot.spec.paradev.group_by),
+                group=new_group_identity(snapshot, unit),
             )
             workspace = Path(binding.path)
             native = dataclasses.asdict(binding)
@@ -3408,8 +3493,84 @@ class CampaignRuntime:
             return Observation("unknown", reason="preparation refusal binding mismatch")
         return Observation("confirmed", {"not_launched": True, "preparation_refused": value})
 
+    def _registration_retry_guard(self, snapshot, action) -> Observation | None:
+        current = self.store.load(snapshot.id)
+        claim = snapshot.units[action.unit].claim
+        unit = current.units[action.unit]
+        if (
+            current.config_revision != snapshot.config_revision
+            or not claim
+            or not unit.claim
+            or dataclasses.asdict(unit.claim) != dataclasses.asdict(claim)
+        ):
+            return Observation("unknown", reason="registration wait ownership changed")
+        if current.phase != "active" or unit.hold:
+            return Observation("confirmed", {"not_launched": True})
+        return None
+
+    def _launch_registration_wait(self, snapshot, action, *, error=None) -> Observation | None:
+        """Retry only an explicit pre-request bridge wait, never a possible dispatch."""
+        from .campaign_headless import read_json
+        from .platform_util import is_link_like
+
+        directory = self.store.directory(snapshot.id) / "workers" / action.id
+        path = directory / "registration-wait.json"
+        consumed = directory / "registration-wait-consumed.json"
+        if error is None and (not path.exists() and not is_link_like(path)):
+            return None
+        if consumed.exists() or is_link_like(consumed):
+            if error is not None:
+                raise error
+            return None
+        if any(
+            (directory / name).exists() or is_link_like(directory / name)
+            for name in ("request.json", "startup.json", "receipt.json", "launch-intent.json")
+        ):
+            if error is not None:
+                raise error
+            # Normal startup reconciliation remains authoritative after dispatch.
+            return None
+        claim = snapshot.units[action.unit].claim
+        if (
+            is_link_like(directory)
+            or not claim
+            or claim.launch_id != action.id
+            or claim.generation != action.generation
+            or claim.quiescent
+        ):
+            return Observation(
+                "unknown", reason="registration wait conflicts with launch ownership"
+            )
+        expected = {
+            "schema_version": 1,
+            "campaign_id": snapshot.id,
+            "unit_id": action.unit,
+            "launch_id": action.id,
+            "generation": action.generation,
+            "attempt": claim.attempt,
+            "config_revision": snapshot.config_revision,
+            "payload_digest": hashlib.sha256(
+                json.dumps(action.payload, sort_keys=True).encode("utf-8")
+            ).hexdigest(),
+            "phase": "before_worker_request",
+            "reason": "managed-registration-busy",
+        }
+        if error is not None and not (path.exists() or is_link_like(path)):
+            directory.mkdir(parents=True, exist_ok=True)
+            atomic_write_text(path, json.dumps(expected, sort_keys=True), follow_symlinks=False)
+        value = read_json(path, limit=65536)
+        if value != expected or any(type(value.get(k)) is not type(v) for k, v in expected.items()):
+            return Observation("unknown", reason="registration wait binding mismatch")
+        return Observation(
+            "waiting",
+            {"registration_wait": value},
+            "Managed bridge registration busy before worker dispatch",
+            self.clock() + 1,
+        )
+
     def _perform_launch(self, snapshot, action) -> Observation:
         from . import campaign_hold
+        from .campaign_communication_runtime import RegistrationBusy
         from .campaign_execution import CampaignExecutionError
         from .platform_util import is_link_like
 
@@ -3418,6 +3579,10 @@ class CampaignRuntime:
             return prior
         try:
             prepared = self._prepare_launch(snapshot, action)
+        except RegistrationBusy as exc:
+            waiting = self._launch_registration_wait(snapshot, action, error=exc)
+            assert waiting is not None
+            return waiting
         except (CampaignError, CampaignExecutionError) as exc:
             # This helper cannot spawn. Once a request exists, however, absence
             # of startup is not proof of absence: preserve uncertain launches.
@@ -3459,8 +3624,22 @@ class CampaignRuntime:
         if isinstance(prepared, Observation):
             return prepared
         envelope, request, launch_env = prepared
+        waiting = self._launch_registration_wait(snapshot, action)
+        if waiting is not None:
+            if waiting.state != "waiting":
+                return waiting
+            # Seal consumption before request preparation can enter dispatch.
+            atomic_write_text(
+                envelope.directory / "registration-wait-consumed.json",
+                json.dumps(waiting.data["registration_wait"], sort_keys=True),
+                follow_symlinks=False,
+            )
         path = prepare_launch(envelope, request)
         unit = snapshot.units[action.unit]
+        if waiting is not None:
+            guarded = self._registration_retry_guard(snapshot, action)
+            if guarded is not None:
+                return guarded
         if campaign_hold.active(
             campaign_hold.channel(self.store.directory(snapshot.id), unit.id),
             campaign=snapshot.id,
@@ -5175,6 +5354,10 @@ class CampaignRuntime:
             from .campaign_runtime_intake import create_control
 
             create_control(snapshot, data)
+        elif kind == "intake-baseline":
+            from .campaign_intake_baseline import apply
+
+            apply(snapshot, action, observation)
         elif kind == "usage-hold":
             self._set_hold(unit, Hold("lifetime_budget", data["reason"], id=action.id))
         elif kind == "adopt-draft":

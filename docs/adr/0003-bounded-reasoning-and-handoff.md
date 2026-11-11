@@ -27,6 +27,12 @@ replaces the accepted contract, actual repository state or publication receipts.
 This decision extends the original campaign work; it does not defer its unresolved
 correctness, GitHub, Paradev or activation requirements.
 
+Session handoff preserves context within existing authority; it never transfers
+a repository branch between campaign owners. An archived BMAD-owned branch uses
+the [explicit predecessor release and successor adoption contract](0002-campaign-implementation.md#transfer-of-an-archived-bmad-owned-branch).
+Retain old optional-job attempts, receipts and histories without applying their
+results to the successor or treating a summary as proof that ownership ended.
+
 The initial extension landed in PR 18 alongside the original audit repairs. Follow
 the [G0–G8 traceability matrix](0002-campaign-implementation.md#implementation-goals-and-traceability)
 and keep implementation, normal-runtime coverage, native qualification and
@@ -82,11 +88,69 @@ workspace allocation and worker launch using the normal coordinator path, rather
 than injecting a workspace into every fixture. This regression is separate from
 actual native delivery and live-worker stop/resume qualification.
 
+Initial issue comparison is a required unit-bound triage job, rather than a new
+planning workspace or portfolio job. It compares the full initial issue against
+the committed selected specification and applies only to the captured version.
+No inferred equivalence, truncated input or successful process exit can settle the
+issue. The normal durable job lifecycle validates the structured verdict; changed
+sources and uncertain processes prevent application. Unavailable reasoning returns
+the issue to ordinary intake instead of indefinitely preventing story execution.
+Headless job completion also proves disposal of its owned native terminal while
+retaining logs and identity history. Quiescence alone must not strand a parked
+bootstrap terminal or authorize closing another session's pane.
+
 Optimize sequencing and useful parallelism through dependencies, ownership and
 token/session capacity. Preserve existing source initiatives/sprints and their
 GitHub mapping; introduce no calendar, dates, velocity or sprint-capacity model.
 
 ## Reasoning responsibilities
+
+### Accepted stage routing and incremental history extension
+
+The portable operations follow-up adds a frozen `reasoning.summary_routes`
+mapping for leaf, intermediate, final, constraint, recovery and their audit
+stages. Absent mapping preserves legacy behavior. Each mapped stage references
+an existing named pool, selected in configured order after exact qualification,
+launcher readiness, capacity freshness and resource admission. Role budgets
+still apply. A fallback does not reset lifetime attempts or weaken acceptance.
+
+| Stage                                                              | Ordered model preference                                                                        |
+| ------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------- |
+| Leaf extraction                                                    | Gemini Flash high; Grok 4.7 xhigh; Muse Wonder Full xhigh; Claude Sonnet high; Codex Terra high |
+| Intermediate/final, constraint reduction, missing-history recovery | Gemini Argon high; Grok 4.7 xhigh; Muse Wonder Full xhigh; Claude Opus max; Codex Sol ultra     |
+
+The owner's ordering explicitly places Terra below Sol. Require higher-order
+final synthesis even when one leaf fits. Reserve an independent audit family
+before admitting summary work, without occupying a live session slot. Retain
+all contributing families through retries and merges of summary trees; unavailable
+independence causes a visible wait, not relabeling. Model identifiers, effort,
+permissions and context limits require actual native and semantic qualification;
+the catalog alone is not proof. AGY requires a supported capacity observation or
+explicit capacity command; unknown capacity uses an eligible fallback.
+
+Freeze `reasoning.history_max_bytes` independently from model context limits:
+512 MiB per source by default, at most 1 GiB, with a separate 64 MiB record
+ceiling. Stream raw sealing and normalized event writes rather than retaining
+multiple full-stream buffers. A large scripted corpus proves chunking/reuse
+mechanics only; actual native fidelity remains bound to its earned corpus and
+route. Oversized or inaccessible ranges are explicit coverage debt.
+
+Managed headless warmup seals complete stream frames bound to the exact launch,
+generation and native process. Immutable prefix capture is separate from terminal
+export and cannot claim quiescence. Keep stable event IDs, tolerate appended bytes
+and partial final frames, and reject rewrites/truncation or changed process/file
+identity. Terminal capture reconciles every reused prefix against final bytes.
+Owner messages retain their provenance; injected controller prompts do not become
+owner instructions. Captured native input/output is not necessarily hidden native
+history. Final handoff still requires fenced predecessor writers and complete
+required obligations, with retained raw evidence and summary-tree retrieval.
+
+Folders/workspaces/tasks represent work; phase tabs and sessions represent its
+execution. Only sessions carry actual native hcom actor identities. Managed
+check-in addresses are controller bridges and explicitly report that distinction.
+Historical actors and closed endpoints remain separate from successor sessions.
+
+### Existing reasoning responsibilities
 
 | Purpose                           | Model proposal                                                                               | Deterministic application boundary                                                                                       |
 | --------------------------------- | -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
@@ -910,9 +974,11 @@ corrupt optional artifacts, stale extraction contracts, unavailable bindings and
 route changes. Exhausted maps advance optional pages without becoming semantic
 coverage; mandatory final extraction still includes their failed source ranges.
 Background jobs remain optional, resource-bound and lower priority than required
-reasoning work. Only trusted hook-bound native prefixes qualify for live warmup;
-active managed-headless streams retain their quiescent-export boundary. No
-native-store import writer or universal live-history capability is claimed.
+reasoning work. That qualification initially covered trusted hook-bound native
+prefixes only. The portable operations extension adds separately validated
+immutable managed-headless prefixes; final capture and writable continuation
+still require quiescence. No native-store import writer or universal live-history
+capability is claimed.
 
 The frozen scripted load qualification on `3efacd77` delivered 48 stories across
 24 active epics, reached eight verification slots, eight review slots and four
@@ -1272,6 +1338,24 @@ output ceiling and one structured-output attempt; model caps may lower the outpu
 allowance. Whole-job elapsed time and aggregate
 token/turn validation remain independent limits, including provider reasoning
 and any internal turns. Do not claim a per-request ceiling is an aggregate cap.
+
+The opt-in `claude-code-v2` no-tools recipe additionally requires native partial
+message events and exact stream-helper dependencies. Count distinct root model
+message IDs against the frozen job turn allowance; a StructuredOutput tool round
+does not start another model request. Accumulate each message's cumulative output
+usage once and reconcile it with terminal usage and native iterations when
+provided. Malformed, nested or incomplete accounting cannot earn qualification.
+Existing v1 recipes and proofs retain their original contract.
+
+The disposable worker incrementally reads bounded JSONL records every 100ms.
+Typed `max_tokens`, excess observed output or another model request beyond the
+allowance causes owned-process cancellation. This is reactive containment: a
+native continuation may start before cancellation reaches it. Partial usage
+remains a lower bound, never complete billing or successful qualification.
+Quota/authentication/transport failures retain their native cause even before
+the first model message. New v2 recipes require fresh transport qualification
+with matching stream and receipt evidence; no existing proof is promoted.
+
 Reducer grouping measures the exact native-event projection, including its
 source-input wrapper. The complete child summaries remain hash-bound and retained.
 This avoids rejecting a usable route because internal metadata omitted from the

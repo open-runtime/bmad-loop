@@ -7,14 +7,31 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+## [0.16.0] — 2026-11-11
+
 ### Added
 
+- Bound opt-in Claude summary requests with native stream accounting, typed limit cancellation and retained partial usage.
+- Prepare stopped successors and transfer exact preserved startup PRs from permanently retired campaigns without reopening archived sessions.
+- Audit and reconcile existing repository work with bounded parallel reasoning, independent review and preserved history.
+- Configure ordered summary routes per stage, mandatory final synthesis and independent audit-family reservation.
+- Capture immutable managed-session history prefixes for incremental continuation summaries.
+- Reconfigure startup routes and grouping explicitly while preserving prior configuration and prepared workspaces.
+- Refresh owned Paradev projections while a campaign is stopped.
 - Renew installed native route proofs explicitly for stopped campaigns before their first worker.
 - Configure the campaign's aggregate GitHub metadata budget independently of detail limits.
 - Configure aggregate PR discovery detail separately from individual PR and model limits.
 
 ### Fixed
 
+- Preserve registered bridge identities during refresh and defer mail observation for incomplete registrations.
+- Retry exact pre-worker managed-registration contention without duplicating actors or uncertain launches.
+- Keep truncated repository audits incomplete through resume, reconciliation and public status.
+- Recognize terminated Linux zombie descendants as dead while retaining PID-reuse and unreadable-process safeguards.
+- Compare initial mirrored issues with selected committed stories before allocating additional intake work; retain new requirements and bounded fallback.
+- Release completed owned headless terminals only after exact process, receipt and native-identity verification; preserve output and unrelated views.
+- Separate initiative/epic folders, story workspaces and session actor identities in Paradev reflection.
+- Preserve manual workspace, folder and task presentation changes during managed refreshes.
 - Renew startup routes after proved ended optional reasoning without resetting failures, attempts or usage.
 - Budget escaped semantic input, recognize verified whole-context citations, and preserve priority eligibility.
 - Stop blocked semantic pipeline siblings and settle observers of proven failed preparations.
@@ -7083,7 +7100,8 @@ enforced in CI.
   implementation phase, driven by a Python control loop with hook-based session transport and
   resumable on-disk run state.
 
-[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.15.8...HEAD
+[Unreleased]: https://github.com/open-runtime/bmad-loop/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.16.0
 [0.15.8]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.15.8
 [0.15.7]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.15.7
 [0.15.6]: https://github.com/open-runtime/bmad-loop/releases/tag/v0.15.6

@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Literal, Protocol
 
 from . import runs
-from .campaign_database import LEGACY_MARKER, MARKER, CampaignDatabase
+from .campaign_database import LEGACY_MARKER, MARKER, TRANSFER_MARKER, CampaignDatabase
 from .campaign_github import GithubGateway
 from .campaign_model import CampaignError, CampaignSnapshot, Hold, snapshot_from_dict
 from .campaign_store import add_event
@@ -150,7 +150,7 @@ def _native_items(
     if directory.is_symlink():
         raise MigrationError("native snapshot directory is symlinked")
     data, _ = _read_json(directory / "snapshot.json", bound=max_bytes)
-    if data in (MARKER, LEGACY_MARKER):
+    if data in (MARKER, LEGACY_MARKER, TRANSFER_MARKER):
         data = CampaignDatabase(directory).read_inventory(
             max_bytes=max_bytes, max_items=max_items, minimum_schema=data["schema_version"]
         )
@@ -160,17 +160,29 @@ def _native_items(
     if Path(snapshot.common_dir).resolve() != common:
         raise MigrationError("native campaign belongs to another common directory")
     items = []
+    retirement = snapshot.bindings.get("ownership_retirement") or {}
+    transfers = snapshot.bindings.get("ownership_transfers") or {}
     for unit in snapshot.units.values():
         if unit.claim and unit.claim.unit != unit.id:
             raise MigrationError("native worker claim belongs to another unit")
         details = {
             "campaign_id": snapshot.id,
+            "repository": snapshot.repository,
             "unit_id": unit.id,
             "hold": asdict(unit.hold) if unit.hold else None,
             "claim": asdict(unit.claim) if unit.claim else None,
             "workspace": unit.bindings.get("workspace"),
             "pr": unit.bindings.get("pr"),
-            "admissions_open": snapshot.phase == "active",
+            "issue": unit.bindings.get("issue"),
+            "issue_url": unit.bindings.get("issue_url"),
+            "shared_issue": snapshot.bindings.get("github_hierarchy", {}).get("story:" + unit.id),
+            "branch": unit.bindings.get("branch"),
+            "scopes": list(unit.spec.scopes),
+            "source": unit.spec.source,
+            "selector": unit.spec.selector,
+            "ownership_retirement": retirement,
+            "ownership_transfer": transfers.get(unit.id),
+            "admissions_open": snapshot.phase == "active" and not retirement,
         }
         items.append(
             MigrationItem(
@@ -180,7 +192,7 @@ def _native_items(
                 str(directory),
                 str(unit.state),
                 "unknown",
-                "owned" if unit.claim else "unknown",
+                "released" if unit.id in transfers else "owned" if unit.claim else "unknown",
                 (unit.id,),
                 details,
             )
@@ -218,7 +230,7 @@ def _native_items(
             "job_id": identity,
             "unit_id": request["unit"],
             "claim": claim,
-            "admissions_open": snapshot.phase == "active",
+            "admissions_open": snapshot.phase == "active" and not retirement,
         }
         items.append(
             MigrationItem(

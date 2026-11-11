@@ -39,6 +39,187 @@ validate unchanged retained semantic evidence without repeating its inference.
 Installed startup readiness does not establish actual parallel target delivery,
 identity reflection, outside-peer communication or live-worker drain/resume.
 
+### Portable operations extension — accepted 2026-11-11
+
+The next follow-up implements the following additional goals. Earlier release
+qualification does not establish these new behaviors. Preserve the existing REM
+pilot's evidence and selected branches; it remains stopped until affected startup
+and route qualifications pass. Its selected work is issues #1582 and #529.
+The owner-authorized November 10 cleanup archived its three workspaces and retained
+the selected branches in preservation draft PRs #2331 and #2332. Recovery must use
+verified adoption of those branches, not recreate deleted native identities or
+blindly resume a snapshot whose workspaces no longer exist. Those drafts contain
+specifications, not delivered implementations. Active unrelated REM sessions remain
+outside this recovery operation.
+
+| Goal                         | Contract and completion evidence                                                                                                                                                                                                                                            |
+| ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| P1 — Entity reflection       | Initiative-prefixed epic folders, stable story/worktree labels, phase tabs, actual session actors and explicitly labeled controller endpoints. Stopped reflection creates no workers or workspaces; preserve manual overrides and unrelated tags.                           |
+| P2 — Portable continuation   | Stage-specific ordered summary pools, stronger final synthesis, independent audit-family reservation, exact qualified fallbacks and incremental managed-history capture. Normal-runtime interruption recovery retains the same worktree/PR and every unresolved obligation. |
+| P3 — Repository organization | Separate audit/reconcile authority; complete issue/PR/milestone/ref/worktree inventory; automatic evidence-backed links, allowed labels, consolidation and duplicate/superseded closures. No branch, worktree or history deletion.                                          |
+| P4 — Startup configuration   | Explicit revision-checked route/grouping changes before unit work; immutable prior specifications, templates and capabilities; retain ended optional jobs and confirmed allocation/tracking history. Preview and apply never resume the campaign.                           |
+| P5 — Deployment and delivery | Deploy reviewed TeamRouter quota repair through maintained native setup, merge and install the reviewed BMAD follow-up, renew affected route proofs, migrate the stopped pilot, and deliver both selected REM stories through review, merge and tracking reconciliation.    |
+
+Native subagents implement reflection, handoff/history and repository audit in
+parallel; the primary owns shared configuration, integration, documentation and
+publication. Regressions remain zero-token. Bounded native qualification is a
+separate operation, with exact route/effort/permission and semantic evidence.
+Record implementation, normal-runtime tests, native proof and target delivery
+separately. Missing capacity or proof must remain visible rather than silently
+changing the requested configuration or claiming the whole extension complete.
+
+Repository audit is read-only remotely and may persist local evidence. Reconcile
+uses a frozen standing Organize-and-close policy, fresh object/ownership checks,
+independent semantic review and durable uncertain-write reconciliation. Preserve
+original issue text and review history. Consolidation must account for every
+requirement; PR closure must account for unique contributions and prove writer
+release. Milestone closure needs complete membership. Scope/source/code changes
+go through delivered planning or implementation PRs. Defaults bound one cycle to
+100 mutations and 20 closures, checkpointing excess work. Do not infer completion
+from age, inactivity or semantic similarity.
+
+Catalog completeness is separate from action-specific ownership-observer
+coverage. A truncated frozen inventory remains incomplete across audit, resume,
+reconciliation and status, including older ledgers that incorrectly recorded
+completion. It cannot admit new reasoning or remote mutations; obtaining complete
+coverage requires a new audit with sufficient bounds. Already issued native jobs
+and uncertain GitHub mutations retain read-only receipt/readback settlement and
+owned-controller closure, including while stopped. Preserve their original
+attempts, counters, errors and immutable intents; observation never replays a
+write or makes the incomplete audit complete. Missing ownership evidence still
+constrains only actions requiring that evidence when the catalog itself is complete.
+
+New campaigns use epic grouping; legacy snapshots with omitted grouping retain
+story grouping. Initiative grouping is also supported by this extension; sprint
+grouping requires a future explicit source identity and implies no calendar or
+capacity policy. Folder display names use native settings separately from stable
+membership tags. Only recorded BMAD-owned tags may change during regrouping.
+Session identity never becomes workspace identity. No cleanup of the existing
+pilot is authorized merely by its stale pending labels.
+
+Phase and actor identity belong to each terminal/session view. Preserve existing
+tab/pane layout and operator tab labels; a shared tab cannot represent a single
+actor when it contains multiple sessions. Historical phase views reattach exact
+retained terminals and never create a substitute live session.
+
+REM's committed 2026-11-10 owner policy removes mandatory cross-family publication
+review while retaining its native review cycle. The stopped pilot's revision 8
+predates that direction. Support explicit startup adoption through
+`--review-policy-source COMMIT:PATH`: bind a committed regular document in current
+local ancestry, permit only `github.require_independent_review`, append
+that exact decision source if absent, and archive the old/new value and source.
+All unit/attempt, hold, check, native-review and budget protections still apply.
+Ordinary route/group changes cannot change this policy or remove configured roles.
+
+#### Transfer of an archived BMAD-owned branch
+
+The supported operation provides startup-only transfer from an archived,
+stopped native BMAD campaign to a named successor. No unit writer may have
+attempted work; ended optional reasoning retains its independently validated
+request, receipt, grant and process history. It does not generalize factory migration or
+treat archived terminals, old PIDs, titles, disabled automations or a remote PR as
+an ownership release. Ordinary native observation never grants release authority;
+the bundled campaign observer reads the immutable predecessor retirement and
+combines it with fresh scoped native observations. Keep the operation separate from harness continuation and from the
+existing `release` command, which removes an operator hold.
+
+Sandbox qualification exercises ordinary preparation, archived native observations,
+SQLite transaction faults, older-reader refusal, named-successor adoption and
+ordinary scripted delivery. Native and GitHub services and coding sessions are
+scripted; these checks do not claim an operational campaign transfer. Each live
+operation must earn its own fresh preview, release and adoption evidence.
+
+Create the successor through an ordinary non-launching preparation path: parse,
+qualify and freeze its specification, then persist it stopped and unallocated.
+Do not create an active campaign and race a stop request. Transfer preview reads
+current authority and returns exact proposed coordinates without saving state,
+registering workspaces, submitting effects or calling a model. Applying the
+explicit transfer does not resume either campaign.
+
+The release record binds one predecessor campaign/unit and one successor
+campaign/unit, repository/common directory, selected source identities, preserved
+branch/head, positive PR number/node ID, target/base, native archive identity and
+preservation evidence. Preserve the original unit bindings, attempt counts,
+configuration, failed jobs, histories and source preimages. A preservation PR may
+have been created after the predecessor stopped: qualify its actual repository,
+branch and head rather than inventing a prior PR binding. PR-less transfer is
+outside this narrow contract. Neither transferred nor unfinished work becomes
+delivered or canceled merely to suppress its old writer.
+
+Fresh release qualification requires a stopped predecessor with no unit writer
+attempts, complete hot and cold job ownership, and no unresolved mutating effect.
+The first release permanently retires the whole predecessor, including unmapped
+work listed explicitly in preview; additional mappings can name only the same
+successor. Issued uncertainty follows its existing observation/reconciliation path; it is
+never relabeled never-issued. Pending reads retain their identities and history.
+Existing dirty or unpublished work must be preserved before release. An absent
+archived checkout needs its retained preservation evidence and current immutable
+branch identity; absence alone never proves a clean retirement. Inspect exact
+native project/workspace/terminal identities and other campaign claims covering
+the selected branch, checkout or ownership scope. Unrelated live REM sessions do
+not require a global drain, and no transfer command stops or moves them.
+
+The predecessor is the single release authority. Collect bounded observations
+before the write transaction, then recheck revisions and local bindings under the
+existing repository coordinator lock and store CAS. Commit an immutable release
+record, whole-campaign admission retirement and event naming the sole successor.
+A lost reply is resolved by reading that same record; repeating the operation cannot choose another recipient. A
+crash before successor adoption leaves the predecessor released, never silently
+reopened. Ordinary resume, operator-hold release and configuration changes cannot
+remove this exclusion. Current unit/session admission and mutating-effect guards
+must refuse the retired predecessor globally; ordinary saves cannot change its
+unit, configuration, job or effect authority. Read-only observations and retained
+history remain available.
+
+Storage compatibility is conditional, not a migration of every campaign. Keep
+ordinary creation and untouched stores at SQLite schema 3. A predecessor earning
+release authority commits its record, event and `PRAGMA user_version=4` in the
+same transaction, then publishes the schema-4 SQLite marker. Existing readers
+reject database version 4 even if a crash leaves marker 3. Updated readers accept
+that recoverable pair and complete marker publication; later commits and marker
+updates never downgrade version 4. Marker-only fencing is insufficient because
+inventory and history also open the database directly. All store, inventory,
+event, job and action-history paths must understand the conditional format.
+Legacy JSON authority uses the existing supported quiescent migration before
+transfer, rather than adding a release field that an old reader would ignore.
+
+A bundled campaign observer converts only these persisted releases and fresh
+scoped observations into the existing authenticated `ServiceInventory` contract.
+Its actor identifies the named successor unit and reports admissions closed,
+zero active scoped workers, preserved source/branch identity and released
+ownership only when proved. Fence and binding revisions derive from the immutable
+release, not unrelated event clocks. Existing adoption still checks current
+GitHub repository/PR/head/base, source authority, native ownership and preserved
+ancestry before each mutation or actor admission. It retains all acceptance,
+review, quota and publication gates. Caller-authored JSON cannot supply proof.
+
+When the old native workspace is archived, adoption allocates a new registered
+checkout on the preserved branch through the normal durable allocation action.
+The stock local workspace command supports an existing branch; use the exact
+branch without a namespace rewrite or an agent-launch flag. Reuse the allocation
+intent marker and exact UUID readback for lost acknowledgements. Confirm native
+project, checkout path, common directory, branch and head before source setup.
+Keep the predecessor UUID/path as historical coordinates; do not revive or rebind
+them. A current conflicting checkout or ambiguous allocation remains a visible
+refusal. Continue through the existing adopted-PR preparation and delivery flow.
+
+| Boundary            | Required zero-token acceptance                                                                                                                                                 |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Normal transfer     | Real fixture Git history and ordinary prepare/stop/release/adopt flow deliver through the same preservation PR without duplicate intake or implementation.                     |
+| Release authority   | Wrong repository/source/PR/head/revision, another recipient, dirty preservation and scoped live/unknown ownership refuse; unrelated live peers remain eligible.                |
+| Permanent exclusion | Predecessor resume, hold release, reconfigure and queued writer/publication effects cannot reclaim a released unit; failed attempts and original bindings remain unchanged.    |
+| Compatibility/crash | Old readers reject only upgraded campaigns; transaction rollback, database-4/marker-3 interruption, marker repair and subsequent saves preserve the release without downgrade. |
+| Native allocation   | Existing-branch creation and lost acknowledgements reconcile one new workspace UUID, preserve old history and never reuse or close another actor's session.                    |
+| Adoption freshness  | Moving source, PR, ref or ownership evidence invalidates the observation before mutation; provider output alone cannot waive ordinary adoption checks.                         |
+
+Use guard-removal ablations for every refusal. The planned core is a cohesive
+transfer module plus conditional store compatibility; shared runtime/CLI wiring
+owns permanent admission/effect exclusion and non-launching creation. Adoption
+and Paradev collaborators own the verified observer and allocation integration.
+Scripted qualification, installed-provider qualification and actual REM transfer
+are separate results; this contract authorizes implementation, not a claim that
+the preserved pilot has already transferred.
+
 ### Accepted completion extension — 2026-11-08
 
 Reconcile every earlier requirement against its ordinary CLI/runtime path, tests,
@@ -272,7 +453,10 @@ in ADR 0003. No hosted Linux/Windows qualification is inferred from these checks
 Installation and target-project delivery remain distinct obligations. The exact
 merged installation must retain its final interpreter/dependency paths, earn any
 changed native grants and pass provenance, process-identity and generic onboarding
-checks. Preserve old live/paused environments. The REM pilot requires maintained
+checks. Install with runtime constraints exported from that commit's frozen lock
+and the tested interpreter; a Git source pin alone permits dependency drift.
+Retain the export with installation evidence, and qualify dependency updates as
+separate candidates. Preserve old live/paused environments. The REM pilot requires maintained
 source configuration, actual full-graph dispatch validation, current ownership,
 selected acceptance and CI, native/independent reviews, merge, landing and tracking.
 Ticket-local dependency lists alone are insufficient: source import must include
@@ -1023,6 +1207,18 @@ digest, author, origin URL and observed content. Deduplicate identical versions;
 edits create new input. Suppress feedback from the campaign's own marked comments.
 Persist these inbox records separately from outbound action receipts.
 
+Before a selected story's first writer, compare its initial bound or exactly
+mirrored issue version with its committed specification through a bounded triage
+job in that story's workspace. Identity markers establish the match, not semantic
+coverage. With qualified triage reasoning enabled, only a current represented
+verdict with no missing requirements settles that version without an intake unit.
+Bind the comparison to issue version, source, head, graph and frozen configuration.
+Comments, later edits, ambiguous matches and additional requirements retain normal
+triage. Missing qualification, exhausted attempts or a bounded never-launched
+admission wait also fall back to normal triage. Live or uncertain jobs retain their
+claims. A pending comparison is visible and does not reserve an execution slot
+against unrelated stories; owner holds still prevent launch.
+
 Deterministic matching handles known bindings, duplicates and lifecycle facts.
 Semantic triage runs as a bounded coding-CLI session, using the normal completion
 contract and a validated result artifact. It proposes one of: attach to existing
@@ -1574,6 +1770,12 @@ do not create a coding agent to display history or keep one alive for its tab.
 Parked terminal-history retention is an optional later capability, not required
 for this PR. Record latest completed/failed phase per unit and preserve artifacts
 until the campaign retention policy permits removal.
+Headless completion additionally disposes only its exact owned native terminal
+after worker and descendant quiescence, matching receipt and containment evidence.
+Require daemon absence after disposal before acknowledging completion. Missing or
+replaced identities, uncertain acknowledgements and lingering terminals remain
+observable and recoverable; never close the workspace or unrelated panes. Native
+transcripts, output and completed-session identities survive terminal disposal.
 
 Hold/takeover first acknowledges a durable scheduler hold and suppresses all
 automatic nudges/retries/publication. It can permit direct input to the same
@@ -1621,6 +1823,24 @@ steering envelope. BMAD persists advisory mail before acknowledging it, freezes
 it at the next eligible stage boundary and records application only after owned
 stage completion. Unit mail targets coding stages; explicit job mail targets that
 reasoning job. A queued message cannot grant scope, bypass a hold or reopen work.
+
+Managed actor registration contention is retryable only at the evidenced boundary
+before a worker request exists. The controller seals campaign, unit, launch,
+generation, attempt, configuration revision and payload digest, reports a
+pre-worker wait, and reuses the existing actor and launch reservation. Reconciliation
+checks current ownership and controls before retrying. The proof is consumed before
+request preparation can dispatch; request, startup, receipt or launch-intent evidence
+preserves the existing unknown-launch containment. A failed proof write supplies no
+retry authority. Scripted regressions hold the real registration lock, exercise
+supervisor harvest/reconciliation, and cover lost replies, concurrent controls and
+uncertain dispatch without provider calls.
+Native reasoning jobs use the same typed wait without failing their attempt. Their
+existing immutable request/launch-intent journal supplies dispatch containment; a
+busy bridge never resets that journal or replaces the job claim.
+Indexing a registration intent never replaces an existing endpoint identity. An
+observer can encounter a newly indexed intent before its actor identity exists;
+it reports incomplete registration and preserves that room's mail and cursor until
+the identity is available. Existing actor records remain the recovery authority.
 
 The endpoint ledger, bounded shared-room poller and durable message ledger survive
 coordinator restart. They preserve uncertain replies, detect database replacement,

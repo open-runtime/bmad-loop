@@ -29,7 +29,13 @@ from .campaign_model import (
     scopes_overlap,
 )
 from .campaign_paradev import ParadevWorkspaceProvider, ReflectionError, WorkspaceBinding
-from .campaign_titles import group_navigation, issue_reference, navigation_title, unit_navigation
+from .campaign_titles import (
+    group_key,
+    group_title,
+    issue_reference,
+    unit_session_title,
+    work_title,
+)
 from .platform_util import atomic_write_text, is_link_like, safe_segment
 from .policy import Policy
 from .signals import SessionAttribution, _parse_event, is_session_event
@@ -208,6 +214,9 @@ def observe_adapter(
                 "pinned_session_id": handle.pinned_session_id,
                 "pane_target": handle.pane_target,
             }
+            history_binding = getattr(adapter, "live_history_binding", None)
+            if history_binding is not None:
+                payload["managed_history"] = history_binding(handle)
             target.parent.mkdir(parents=True, exist_ok=True)
             atomic_write_text(target, json.dumps(payload, sort_keys=True), follow_symlinks=False)
         except (OSError, ValueError, ReflectionError) as exc:
@@ -494,9 +503,35 @@ def _pr_url(unit: CampaignUnit) -> str:
 
 def group_identity(spec, group_by: str) -> str:
     """Flat managed groups retain source/initiative identity even with equal slugs."""
-    label = spec.epic if group_by == "epic" else spec.parent or spec.id
+    label = (
+        spec.initiative
+        if group_by == "initiative"
+        else spec.epic if group_by == "epic" else spec.parent or spec.id
+    )
     identity = json.dumps([spec.source, spec.initiative, label], separators=(",", ":"))
     return safe_segment(label)[:64] + "-" + hashlib.sha256(identity.encode()).hexdigest()[:16]
+
+
+def new_group_identity(snapshot, unit) -> str:
+    """Derive a new allocation from the same frozen identity used for regrouping."""
+    key = group_key(snapshot, unit)
+    identity = json.dumps(key, separators=(",", ":"))
+    return safe_segment(key[2])[:64] + "-" + hashlib.sha256(identity.encode()).hexdigest()[:16]
+
+
+def desired_group_identity(snapshot, unit) -> str:
+    """Keep legacy membership until an explicit configuration revision regroups it."""
+    native = workspace_binding(unit)
+    prior = unit.bindings.get("reflection", {}).get("workspace", {})
+    current = prior.get("group") or native.group
+    regroup = snapshot.bindings.get("paradev_regroup", {})
+    if (
+        regroup.get("config_revision") == snapshot.config_revision
+        and regroup.get("to_group_by") == snapshot.spec.paradev.group_by
+        and unit.id in regroup.get("previous_groups", {})
+    ):
+        return new_group_identity(snapshot, unit)
+    return current
 
 
 def reflect(
@@ -508,19 +543,24 @@ def reflect(
     mux: ParadevMultiplexer,
     run_directories: tuple[Path, ...] = (),
     show_history: bool = False,
+    preview: bool = False,
+    display_only: bool = False,
+    effect_id: str = "",
 ) -> dict:
     """Reconcile views of existing actors; never launch a terminal to show logs."""
     binding = workspace_binding(unit)
-    binding = dataclasses.replace(
-        binding, group=group_identity(unit.spec, snapshot.spec.paradev.group_by)
-    )
+    binding = dataclasses.replace(binding, group=desired_group_identity(snapshot, unit))
     projection = (
-        stage_binding(snapshot, unit, claim, mux=mux, run_directories=run_directories)
-        if claim
-        else {"state": "pending", "windows": []}
+        unit.bindings.get("reflection", {}).get("stage", {"state": "pending", "windows": []})
+        if display_only
+        else (
+            stage_binding(snapshot, unit, claim, mux=mux, run_directories=run_directories)
+            if claim
+            else {"state": "pending", "windows": []}
+        )
     )
-    navigation = unit_navigation(unit, projection, snapshot=snapshot)
-    title = navigation_title(**navigation, description=unit.spec.title)
+    projection = json.loads(json.dumps(projection))
+    title = work_title(unit, snapshot=snapshot)
     metadata = provider.reflect(
         binding,
         campaign_id=snapshot.id,
@@ -530,9 +570,18 @@ def reflect(
         pr_url=_pr_url(unit),
         held=unit.hold is not None,
         title=title,
-        group_title=navigation_title(**group_navigation(snapshot, unit, projection=projection)),
-        group_fields=group_navigation(snapshot, unit, projection=projection),
+        group_title=group_title(snapshot, unit),
+        previous=unit.bindings.get("reflection", {}).get("workspace"),
+        preview=preview,
+        effect_id=effect_id,
     )
+    if preview:
+        return {
+            "schema_version": 1,
+            "workspace": metadata,
+            "stage": projection,
+            "task": {"state": "preview", "title": title},
+        }
     task = {"state": "off"}
     if snapshot.spec.paradev.tasks:
         try:
@@ -545,22 +594,26 @@ def reflect(
                 )
                 if value
             )
+            details = {}
             task_id = provider.reflect_task(
                 binding,
                 campaign_id=snapshot.id,
                 title=title,
                 state="held" if unit.hold else unit.state.value,
                 links=links,
+                create=not display_only,
+                previous_title=unit.bindings.get("reflection", {})
+                .get("workspace", {})
+                .get("title", ""),
+                details=details,
             )
-            task = {"state": "confirmed", "task_id": task_id}
+            task = {"state": "confirmed", "task_id": task_id, **details}
         except ReflectionError as exc:
             task = {"state": "pending", "detail": str(exc)}
     for window in projection["windows"]:
         if window["state"] in ("active", "launching"):
-            terminal_navigation = unit_navigation(
-                unit, {**projection, "windows": [window]}, snapshot=snapshot
-            )
-            prefix = navigation_title(**terminal_navigation)
+            historical = bool(claim and claim.quiescent)
+            prefix = unit_session_title(unit, window, snapshot=snapshot, historical=historical)
             observed = provider.bind_terminal(
                 binding,
                 mux,
@@ -568,11 +621,9 @@ def reflect(
                 phase=window.get("phase", "unknown"),
                 attempt=claim.attempt if claim else unit.attempt,
                 agent=(window.get("native") or {}).get("definitionId") or "pending",
-                title=navigation_title(
-                    **terminal_navigation,
-                    description=f"{unit.spec.title} · {window.get('phase', 'unknown')} · attempt {claim.attempt if claim else unit.attempt}",
-                ),
+                title=prefix,
                 navigation_prefix=prefix,
+                ensure_pane=not display_only,
             )
             window.update(observed)
         elif show_history and claim and claim.quiescent and Path(window["log_path"]).is_file():

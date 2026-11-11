@@ -22,6 +22,10 @@ WORKSPACE_WAIT = "Waiting for an owned Paradev workspace; unit allocation will r
 
 def admission_reason(snapshot, unit_id):
     """Controls prevent new reasoning sessions, never observation of existing ones."""
+    from .campaign_transfer import retired
+
+    if retired(snapshot):
+        return "campaign ownership was transferred"
     if snapshot.phase != "active":
         return "campaign is not active"
     unit = snapshot.units.get(unit_id)
@@ -127,7 +131,7 @@ def presentation(snapshot, request=None):
     if not snapshot.spec.paradev.reflect:
         return None
     from .campaign_reflection_flow import workspace_binding
-    from .campaign_titles import navigation_title, unit_navigation
+    from .campaign_titles import work_title
 
     unit_id = request.unit if request is not None else ""
     units = (
@@ -140,19 +144,13 @@ def presentation(snapshot, request=None):
     for unit in units:
         if unit.bindings.get("native"):
             binding = workspace_binding(unit)
-            navigation = (
-                {**unit_navigation(unit, snapshot=snapshot), "names": ()}
-                if unit_id in snapshot.units
-                else {"epics": ("unbound",), "issues": ("none",), "prs": ("none",)}
-            )
             return {
                 "workspace": binding.path,
                 "workspace_id": binding.workspace_id,
-                "navigation_prefix": navigation_title(
-                    names=navigation.get("names", ()),
-                    epics=navigation.get("epics", ()),
-                    issues=navigation.get("issues", ()),
-                    prs=navigation.get("prs", ()),
+                "navigation_prefix": (
+                    work_title(unit, snapshot=snapshot)
+                    if unit_id in snapshot.units
+                    else "Portfolio"
                 ),
             }
     return None
@@ -261,6 +259,16 @@ def proposals(runtime, snapshot) -> tuple[Proposal, ...]:
             or sessions >= snapshot.spec.resources.max_sessions
         ):
             continue
+        from .campaign_summary_routes import validate_request
+
+        try:
+            stage = validate_request(snapshot, request)
+        except CampaignError as exc:
+            if row.get("reason") != str(exc) and not pending(snapshot, job_id, "reasoning-wait"):
+                result.append(
+                    Proposal("reasoning-wait", request.unit, {"job_id": job_id, "reason": str(exc)})
+                )
+            continue
         candidate = runtime._role(
             snapshot,
             request.role,
@@ -268,6 +276,7 @@ def proposals(runtime, snapshot) -> tuple[Proposal, ...]:
             allowed_candidates=request.candidates,
             permissions="reasoning",
             require_headless=True,
+            **({"summary_stage": stage} if stage else {}),
         )
         if candidate is None or candidate not in request.candidates:
             continue
@@ -419,6 +428,7 @@ def _confirmed_preparation_failure(snapshot, row):
 
 
 def perform(runtime, snapshot, action, *, reconcile: bool = False) -> Observation:
+    from .campaign_communication_runtime import RegistrationBusy
     from .campaign_headless import capability_for, readonly_grants
 
     row = _effect_row(runtime, snapshot, action)
@@ -493,17 +503,14 @@ def perform(runtime, snapshot, action, *, reconcile: bool = False) -> Observatio
                 )
                 view = claim.get("presentation")
                 if managed_binding and view:
-                    from .campaign_titles import navigation_title, unit_navigation
+                    from .campaign_titles import work_title
 
-                    nav = (
-                        unit_navigation(snapshot.units[request.unit], snapshot=snapshot)
-                        if request.unit in snapshot.units
-                        else {}
-                    )
                     view = {
                         **view,
-                        "navigation_prefix": navigation_title(
-                            **{**nav, "names": (managed_binding["name"],)}
+                        "navigation_prefix": (
+                            work_title(snapshot.units[request.unit], snapshot=snapshot)
+                            if request.unit in snapshot.units
+                            else "Portfolio"
                         ),
                     }
                 deferred = _launch_guard(runtime, snapshot, row, action, path)
@@ -523,6 +530,28 @@ def perform(runtime, snapshot, action, *, reconcile: bool = False) -> Observatio
                     **({"managed_binding": managed_binding} if managed_binding else {}),
                     **({"steering": mail} if mail else {}),
                 )
+            except RegistrationBusy as exc:
+                if any(
+                    (path.parent / name).exists() or is_link_like(path.parent / name)
+                    for name in (
+                        "request.json",
+                        "launch-intent.json",
+                        "startup.json",
+                        "receipt.json",
+                    )
+                ):
+                    return Observation("unknown", reason=str(exc), retry_at=runtime.clock() + 5)
+                deferred = _launch_guard(runtime, snapshot, row, action, path)
+                if deferred is not None:
+                    return deferred
+                # The native runner already journals dispatch; retrying this
+                # exact pre-request job needs no second launch authority.
+                return Observation(
+                    "waiting",
+                    {"registration_wait": {"phase": "before_native_request"}},
+                    "Managed bridge registration busy before native reasoning dispatch",
+                    runtime.clock() + 1,
+                )
             except (CampaignError, OSError, ValueError) as exc:
                 # No launch has been attempted; this is a typed preparation
                 # failure, not evidence that a previously started process died.
@@ -532,6 +561,15 @@ def perform(runtime, snapshot, action, *, reconcile: bool = False) -> Observatio
         deferred = _launch_guard(runtime, snapshot, row, action, path)
         if deferred is not None:
             return deferred
+        if not (path.parent / "launch-intent.json").exists() and not is_link_like(
+            path.parent / "launch-intent.json"
+        ):
+            from .campaign_summary_routes import validate_request
+
+            try:
+                validate_request(snapshot, request)
+            except (CampaignError, OSError, ValueError) as exc:
+                return Observation("confirmed", {"state": "preparation_failed", "reason": str(exc)})
         try:
             observed = (
                 runner.observe(path)
@@ -577,22 +615,19 @@ def perform(runtime, snapshot, action, *, reconcile: bool = False) -> Observatio
                 unit=request.unit or "@campaign",
                 job=row["id"],
             )
-    if observed["state"] == "running" and claim.get("presentation"):
+    if observed["state"] in {"running", "finished"} and claim.get("presentation"):
         view = presentation(snapshot, request)
         if view is not None:
             if observed.get("managed_communication"):
-                from .campaign_titles import navigation_title, unit_navigation
+                from .campaign_titles import work_title
 
-                nav = (
-                    unit_navigation(snapshot.units[request.unit], snapshot=snapshot)
+                view["navigation_prefix"] = (
+                    work_title(snapshot.units[request.unit], snapshot=snapshot)
                     if request.unit in snapshot.units
-                    else {}
-                )
-                view["navigation_prefix"] = navigation_title(
-                    **{**nav, "names": (observed["managed_communication"]["name"],)}
+                    else "Portfolio"
                 )
             observed["presentation_status"] = runner.refresh_presentation(
-                path, view["navigation_prefix"]
+                path, view["navigation_prefix"], historical=observed["state"] == "finished"
             )
     if observed["state"] == "unknown":
         return Observation(
@@ -641,7 +676,7 @@ def apply(runtime, snapshot, action, observation) -> None:
         row["claim"]["managed_communication"] = data["managed_communication"]
     if action.kind == "reasoning-wait":
         if not live(row):
-            row["reason"] = WORKSPACE_WAIT
+            row["reason"] = action.payload.get("reason", WORKSPACE_WAIT)
     elif action.kind == "reasoning-stale":
         if live(row):
             raise CampaignError("cannot invalidate a live reasoning claim")

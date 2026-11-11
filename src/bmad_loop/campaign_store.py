@@ -21,7 +21,13 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .campaign_database import LEGACY_MARKER, MARKER, CampaignDatabase, EventJournal
+from .campaign_database import (
+    LEGACY_MARKER,
+    MARKER,
+    TRANSFER_MARKER,
+    CampaignDatabase,
+    EventJournal,
+)
 from .campaign_model import (
     CampaignError,
     CampaignSnapshot,
@@ -110,6 +116,10 @@ class CampaignStore:
 
     def create(self, snapshot: CampaignSnapshot) -> CampaignSnapshot:
         snapshot = self._normalize(snapshot)
+        if snapshot.bindings.get("ownership_transfers") or snapshot.bindings.get(
+            "ownership_retirement"
+        ):
+            raise CampaignError("ownership retirement requires explicit transfer release")
         from .campaign_acceptance import ensure
 
         for unit in snapshot.units.values():
@@ -149,7 +159,7 @@ class CampaignStore:
             if path.is_symlink() or path.parent.is_symlink():
                 raise CampaignError("campaign snapshot path is symlinked")
             value = json.loads(path.read_text(encoding="utf-8"))
-            if value in (MARKER, LEGACY_MARKER):
+            if value in (MARKER, LEGACY_MARKER, TRANSFER_MARKER):
                 database = CampaignDatabase(path.parent)
                 value, count = database.read(minimum_schema=value["schema_version"])
                 snapshot = snapshot_from_dict(value)
@@ -180,10 +190,39 @@ class CampaignStore:
         expected_generation: int | None = None,
     ) -> CampaignSnapshot:
         """CAS commit; authority and outbound intents replace as one document."""
+        return self._save(snapshot, expected_revision, expected_generation=expected_generation)
+
+    def _save_transfer(self, snapshot, expected_revision, *, record, successor_revision):
+        """Internal release transaction; ordinary save cannot mint this authority."""
+        return self._save(
+            snapshot,
+            expected_revision,
+            transfer_record=record,
+            successor_revision=successor_revision,
+        )
+
+    def _save(
+        self,
+        snapshot,
+        expected_revision,
+        *,
+        expected_generation=None,
+        transfer_record=None,
+        successor_revision=None,
+    ):
         snapshot = self._normalize(snapshot)
         directory = self.directory(snapshot.id)
         with file_lock(self.root / ".state.lock"):
             previous = self.load(snapshot.id)
+            from .campaign_transfer import validate_transfer_preservation
+
+            validate_transfer_preservation(previous, snapshot, release_record=transfer_record)
+            if transfer_record is not None:
+                if not isinstance(previous.events, EventJournal):
+                    raise CampaignError("startup transfer requires explicit SQLite state migration")
+                successor = self.load(transfer_record["successor"])
+                if successor.revision != successor_revision:
+                    raise RevisionConflict("startup transfer successor revision changed")
             from .campaign_acceptance import ensure
 
             for key, unit in snapshot.units.items():
@@ -301,6 +340,7 @@ class CampaignStore:
                     revision=expected_revision,
                     event_count=len(previous.events),
                     events=list(candidate.events[len(previous.events) :]),
+                    transfer=transfer_record is not None,
                 )
                 candidate.outbox = [row for row in candidate.outbox if row.id not in archived]
                 candidate.events = EventJournal(database, len(candidate.events))
@@ -310,8 +350,9 @@ class CampaignStore:
                     if row["state"] not in {"applied", "stale", "canceled"}
                 }
                 marker_path = directory / "snapshot.json"
-                if json.loads(marker_path.read_text(encoding="utf-8")) != MARKER:
-                    self._write(marker_path, MARKER)
+                marker = TRANSFER_MARKER if database.schema_version == 4 else MARKER
+                if json.loads(marker_path.read_text(encoding="utf-8")) != marker:
+                    self._write(marker_path, marker)
             else:
                 self._write(directory / "snapshot.json", snapshot_to_dict(candidate))
         self.project_events(candidate)

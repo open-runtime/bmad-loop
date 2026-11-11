@@ -30,6 +30,7 @@ def campaign_spec(tmp_path):
 def runtime(tmp_path, monkeypatch):
     import bmad_loop
     from bmad_loop import campaign_preflight
+    from bmad_loop.campaign_supervisor import Observation, Proposal
 
     store = CampaignStore(tmp_path / "campaign-state")
     spec = spec_from_dict(
@@ -74,8 +75,11 @@ def runtime(tmp_path, monkeypatch):
             calls.append(("reconcile", campaign_id))
             return self.store.load(campaign_id)
 
-    def create(project, spec):
+    def create(project, spec, *, prepare_only=False):
         calls.append(("create", project, spec))
+        if prepare_only:
+            snapshot.phase = "stopped"
+            return store, store.save(snapshot, snapshot.revision)
         return store, snapshot
 
     runtime_module = types.ModuleType("bmad_loop.campaign_runtime")
@@ -84,6 +88,8 @@ def runtime(tmp_path, monkeypatch):
     runtime_module.store_for = lambda project: store
     supervisor_module = types.ModuleType("bmad_loop.campaign_supervisor")
     supervisor_module.CampaignSupervisor = Supervisor
+    supervisor_module.Observation = Observation
+    supervisor_module.Proposal = Proposal
     monkeypatch.setitem(sys.modules, "bmad_loop.campaign_runtime", runtime_module)
     monkeypatch.setitem(sys.modules, "bmad_loop.campaign_supervisor", supervisor_module)
     monkeypatch.setattr(bmad_loop, "campaign_runtime", runtime_module, raising=False)
@@ -236,6 +242,18 @@ def test_failed_preflight_prevents_run_creation(campaign_spec, runtime, monkeypa
     assert cli.main(["campaign", "run", str(campaign_spec), "--json"]) == 1
     assert json.loads(capsys.readouterr().out)["ok"] is False
     assert not any(call[0] in {"create", "run"} for call in calls)
+
+
+def test_prepare_only_returns_persisted_stopped_campaign_without_starting_runtime(
+    campaign_spec, runtime, capsys
+):
+    store, snapshot, calls = runtime
+    assert cli.main(["campaign", "run", str(campaign_spec), "--prepare-only", "--json"]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["campaign"]["phase"] == "stopped"
+    saved = store.load(snapshot.id)
+    assert saved.phase == "stopped" and not saved.outbox
+    assert [call[0] for call in calls] == ["create"]
 
 
 def test_status_and_list_are_observer_projections_without_private_config(runtime, capsys):

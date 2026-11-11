@@ -12,6 +12,8 @@ import hashlib
 import json
 import os
 import stat
+import tempfile
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -46,6 +48,132 @@ def blob(root: Path, content: bytes, *, suffix: str = ".json") -> Path:
         atomic_write_bytes(path, content, follow_symlinks=False)
         path.chmod(0o600)
     return path
+
+
+def stream_blob(root: Path, chunks, *, suffix=".jsonl", maximum=None):
+    """Publish a bounded immutable stream without assembling it in memory."""
+    if suffix not in {".json", ".jsonl", ".txt"} or is_link_like(root):
+        raise CampaignError("invalid history artifact directory or suffix")
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor, name = tempfile.mkstemp(prefix=".history-", dir=root)
+    temporary = Path(name)
+    checksum, size = hashlib.sha256(), 0
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            for chunk in chunks:
+                size += len(chunk)
+                if maximum is not None and size > maximum:
+                    raise CampaignError("history stream exceeds its explicit byte bound")
+                checksum.update(chunk)
+                output.write(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+        sha = checksum.hexdigest()
+        target = root / (sha + suffix)
+        if is_link_like(target):
+            raise CampaignError("history artifact is redirected")
+        try:
+            os.link(temporary, target)
+        except FileExistsError:
+            if target.stat().st_size != size or stream_hash(target) != sha:
+                raise CampaignError("immutable history artifact identity changed")
+        return target, sha, size
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+@contextmanager
+def regular_reader(path):
+    if is_link_like(path):
+        raise CampaignError("history stream is redirected")
+    descriptor = os.open(
+        path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    )
+    with os.fdopen(descriptor, "rb") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise CampaignError("history stream is not a regular file")
+        yield stream
+
+
+def stream_hash(path, length=None):
+    if is_link_like(path):
+        raise CampaignError("history stream is redirected")
+    checksum = hashlib.sha256()
+    with regular_reader(path) as stream:
+        remaining = length
+        while remaining is None or remaining:
+            chunk = stream.read(1024 * 1024 if remaining is None else min(1024 * 1024, remaining))
+            if not chunk:
+                if remaining:
+                    raise CampaignError("history stream was truncated")
+                break
+            checksum.update(chunk)
+            if remaining is not None:
+                remaining -= len(chunk)
+    return checksum.hexdigest()
+
+
+def seal_source(path, root, *, maximum, prefix_bytes=None, complete_lines=False):
+    """Copy and rehash the same descriptor prefix; live append is permitted."""
+    if is_link_like(path):
+        raise CampaignError("native history is redirected")
+    descriptor = os.open(
+        path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    )
+    with os.fdopen(descriptor, "rb") as source:
+        initial = os.fstat(source.fileno())
+        selected = initial.st_size if prefix_bytes is None else prefix_bytes
+        if (
+            not stat.S_ISREG(initial.st_mode)
+            or type(selected) is not int
+            or selected < 0
+            or selected > initial.st_size
+            or selected > maximum
+        ):
+            raise CampaignError("native history is not regular or exceeds capture bound")
+        if complete_lines and selected:
+            cursor = selected
+            while cursor:
+                start = max(0, cursor - 1024 * 1024)
+                source.seek(start)
+                block = source.read(cursor - start)
+                newline = block.rfind(b"\n")
+                if newline >= 0:
+                    selected = start + newline + 1
+                    break
+                cursor = start
+            else:
+                selected = 0
+        source.seek(0)
+
+        def chunks():
+            remaining = selected
+            while remaining:
+                chunk = source.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    raise CampaignError("native history prefix was truncated")
+                remaining -= len(chunk)
+                yield chunk
+
+        target, checksum, size = stream_blob(root, chunks(), maximum=maximum)
+        source.seek(0)
+        verified = hashlib.sha256()
+        for chunk in chunks():
+            verified.update(chunk)
+        if verified.hexdigest() != checksum:
+            raise CampaignError("native history prefix changed while sealing")
+    current = path.stat()
+    if (current.st_dev, current.st_ino) != (initial.st_dev, initial.st_ino):
+        raise CampaignError("native history file identity changed while sealing")
+    return target, checksum, size, [initial.st_dev, initial.st_ino]
+
+
+def record_lines(path, maximum):
+    with regular_reader(path) as stream:
+        while line := stream.readline(maximum + 1):
+            if len(line) > maximum:
+                raise CampaignError("native history record exceeds bound")
+            yield line
 
 
 def text_content(value: Any) -> str:
@@ -267,126 +395,137 @@ def snapshot_history(
     max_bytes: int = 1024 * 1024 * 1024,
     max_record_bytes: int = 64 * 1024 * 1024,
     prefix_bytes: int | None = None,
+    source_identity: str = "",
 ) -> HistorySnapshot:
     """Seal an append-only prefix, validating the same bytes again before publishing."""
-    if harness not in READER_VERSIONS or not session_id or max_bytes < 1 or is_link_like(path):
+    if (
+        harness not in READER_VERSIONS
+        or not session_id
+        or max_bytes < 1
+        or is_link_like(path)
+        or (source_identity and harness != "managed-headless")
+    ):
         raise CampaignError("invalid native history binding")
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    with os.fdopen(descriptor, "rb") as stream:
-        initial = os.fstat(stream.fileno())
-        selected = initial.st_size if prefix_bytes is None else prefix_bytes
-        if (
-            not stat.S_ISREG(initial.st_mode)
-            or type(selected) is not int
-            or selected < 1
-            or selected > initial.st_size
-            or selected > max_bytes
-        ):
-            raise CampaignError("native history is not regular or exceeds capture bound")
-        raw = stream.read(selected)
-        stream.seek(0)
-        if stream.read(selected) != raw or os.fstat(stream.fileno()).st_size < selected:
-            raise CampaignError("native history prefix changed while sealing")
-    current = path.stat()
-    if (current.st_dev, current.st_ino) != (initial.st_dev, initial.st_ino):
-        raise CampaignError("native history file identity changed while sealing")
-    source_id = digest([harness, session_id, str(path.resolve()), READER_VERSIONS[harness]])
-    raw_path = blob(artifact_root, raw, suffix=".jsonl")
-    rows, owners, seen, warnings = [], [], {}, []
+    raw_path, raw_sha, raw_size, _ = seal_source(
+        path, artifact_root, maximum=max_bytes, prefix_bytes=prefix_bytes
+    )
+    if raw_size < 1:
+        raise CampaignError("native history is not regular or exceeds capture bound")
+    source_id = digest(
+        [harness, session_id, source_identity or str(path.resolve()), READER_VERSIONS[harness]]
+    )
+    owners, seen, warnings = [], {}, []
+    count = 0
     parent_session = ""
     declared_ancestors = set()
     lineage_verified = False
     offset = complete = 0
-    for line_number, line in enumerate(raw.splitlines(keepends=True), 1):
-        end = offset + len(line)
-        if len(line) > max_record_bytes:
-            raise CampaignError("native history record exceeds bound")
-        if not line.endswith(b"\n"):
-            warnings.append(f"incomplete append tail at byte {offset}")
-            break
-        try:
-            row = json.loads(line)
-        except (ValueError, UnicodeError) as exc:
-            raise CampaignError(f"invalid native history record at byte {offset}") from exc
-        if not isinstance(row, dict):
-            raise CampaignError("native history record is not an object")
-        for subindex, item in enumerate(_records(row, harness)):
-            bound_session = session_id
-            if harness == "codex" and item.get("type") == "session_meta":
-                metadata = item.get("payload") or {}
-                identity = metadata.get("id")
-                if not isinstance(identity, str) or not identity:
-                    raise CampaignError("Codex session metadata lacks an identity")
-                origin = metadata.get("source") or {}
-                subagent = origin.get("subagent", {}) if isinstance(origin, dict) else {}
-                spawn = subagent.get("thread_spawn", {}) if isinstance(subagent, dict) else {}
-                declared_parent = (
-                    metadata.get("forked_from_id") or spawn.get("parent_thread_id") or ""
-                )
-                if (
-                    metadata.get("forked_from_id")
-                    and spawn.get("parent_thread_id")
-                    and metadata["forked_from_id"] != spawn["parent_thread_id"]
-                ):
-                    raise CampaignError("Codex fork metadata has conflicting parent identity")
-                if identity == session_id:
-                    if lineage_verified and declared_parent != parent_session:
-                        raise CampaignError("Codex session lineage changed within archive")
-                    lineage_verified = True
-                    parent_session = declared_parent
-                elif not lineage_verified or identity not in declared_ancestors:
-                    raise CampaignError("Codex inherited metadata lacks declared ancestor binding")
-                if declared_parent:
-                    if declared_parent == session_id or not isinstance(declared_parent, str):
-                        raise CampaignError("invalid Codex fork ancestry")
-                    declared_ancestors.add(declared_parent)
-                bound_session = identity
-            record = read_record(harness, item, bound_session)
-            if harness == "codex":
-                record = replace(
+
+    def event_chunks():
+        nonlocal offset, complete, count, parent_session, lineage_verified
+        for line_number, line in enumerate(record_lines(raw_path, max_record_bytes), 1):
+            end = offset + len(line)
+            if len(line) > max_record_bytes:
+                raise CampaignError("native history record exceeds bound")
+            if not line.endswith(b"\n"):
+                warnings.append(f"incomplete append tail at byte {offset}")
+                break
+            try:
+                row = json.loads(line)
+            except (ValueError, UnicodeError, RecursionError) as exc:
+                raise CampaignError(f"invalid native history record at byte {offset}") from exc
+            if not isinstance(row, dict):
+                raise CampaignError("native history record is not an object")
+            for subindex, item in enumerate(_records(row, harness)):
+                bound_session = session_id
+                if harness == "codex" and item.get("type") == "session_meta":
+                    metadata = item.get("payload") or {}
+                    identity = metadata.get("id")
+                    if not isinstance(identity, str) or not identity:
+                        raise CampaignError("Codex session metadata lacks an identity")
+                    origin = metadata.get("source") or {}
+                    subagent = origin.get("subagent", {}) if isinstance(origin, dict) else {}
+                    spawn = subagent.get("thread_spawn", {}) if isinstance(subagent, dict) else {}
+                    declared_parent = (
+                        metadata.get("forked_from_id") or spawn.get("parent_thread_id") or ""
+                    )
+                    if (
+                        metadata.get("forked_from_id")
+                        and spawn.get("parent_thread_id")
+                        and metadata["forked_from_id"] != spawn["parent_thread_id"]
+                    ):
+                        raise CampaignError("Codex fork metadata has conflicting parent identity")
+                    if identity == session_id:
+                        if lineage_verified and declared_parent != parent_session:
+                            raise CampaignError("Codex session lineage changed within archive")
+                        lineage_verified = True
+                        parent_session = declared_parent
+                    elif not lineage_verified or identity not in declared_ancestors:
+                        raise CampaignError(
+                            "Codex inherited metadata lacks declared ancestor binding"
+                        )
+                    if declared_parent:
+                        if declared_parent == session_id or not isinstance(declared_parent, str):
+                            raise CampaignError("invalid Codex fork ancestry")
+                        declared_ancestors.add(declared_parent)
+                    bound_session = identity
+                record = read_record(harness, item, bound_session)
+                if harness == "codex":
+                    record = replace(
+                        record,
+                        metadata={
+                            **(record.metadata or {}),
+                            "native_payload_sha256": digest(item.get("payload", {})),
+                        },
+                    )
+                if parent_session:
+                    record = replace(
+                        record,
+                        owner_input=False,
+                        metadata={
+                            **(record.metadata or {}),
+                            "parent_session_id": parent_session,
+                            "input_origin": "subagent-context",
+                        },
+                    )
+                sha = digest(item)
+                event_id = digest([source_id, offset, subindex, sha])
+                key = (record.kind, record.native_id, sha)
+                duplicate = seen.get(key, "") if record.native_id else ""
+                if record.native_id and not duplicate:
+                    seen[key] = event_id
+                event = HistoryEvent(
+                    event_id,
+                    source_id,
+                    session_id,
+                    offset,
+                    end,
+                    line_number,
+                    sha,
                     record,
-                    metadata={
-                        **(record.metadata or {}),
-                        "native_payload_sha256": digest(item.get("payload", {})),
-                    },
+                    duplicate,
                 )
-            if parent_session:
-                record = replace(
-                    record,
-                    owner_input=False,
-                    metadata={
-                        **(record.metadata or {}),
-                        "parent_session_id": parent_session,
-                        "input_origin": "subagent-context",
-                    },
-                )
-            sha = digest(item)
-            event_id = digest([source_id, offset, subindex, sha])
-            key = (record.kind, record.native_id, sha)
-            duplicate = seen.get(key, "") if record.native_id else ""
-            if record.native_id and not duplicate:
-                seen[key] = event_id
-            event = HistoryEvent(
-                event_id, source_id, session_id, offset, end, line_number, sha, record, duplicate
-            )
-            rows.append(asdict(event))
-            if record.owner_input and not duplicate:
-                owners.append(event_id)
-        offset = complete = end
-    events = b"".join(encoded(row) + b"\n" for row in rows)
-    events_path = blob(artifact_root, events, suffix=".jsonl")
+                count += 1
+                yield encoded(asdict(event)) + b"\n"
+                if record.owner_input and not duplicate:
+                    owners.append(event_id)
+            offset = complete = end
+
+    events_path, events_sha, _ = stream_blob(
+        artifact_root, event_chunks(), maximum=max_bytes * 8 + 128 * 1024 * 1024
+    )
     result = HistorySnapshot(
         source_id,
         harness,
         session_id,
         READER_VERSIONS[harness],
         str(raw_path),
-        hashlib.sha256(raw).hexdigest(),
+        raw_sha,
         str(events_path),
-        hashlib.sha256(events).hexdigest(),
-        len(raw),
+        events_sha,
+        raw_size,
         complete,
-        len(rows),
+        count,
         tuple(owners),
         tuple(warnings),
         parent_session,
@@ -400,14 +539,15 @@ def load_events(snapshot: HistorySnapshot) -> tuple[HistoryEvent, ...]:
     path = Path(snapshot.events_path)
     if is_link_like(path):
         raise CampaignError("history index is redirected")
-    data = path.read_bytes()
-    if hashlib.sha256(data).hexdigest() != snapshot.events_sha256:
+    if stream_hash(path) != snapshot.events_sha256:
         raise CampaignError("history index hash differs from sealed manifest")
     events = []
-    for line in data.splitlines():
+    for line in record_lines(path, 512 * 1024 * 1024):
         row = json.loads(line)
         row["record"] = NormalizedRecord(**row["record"])
         events.append(HistoryEvent(**row))
+    if stream_hash(path) != snapshot.events_sha256:
+        raise CampaignError("history index changed while loading")
     return tuple(events)
 
 

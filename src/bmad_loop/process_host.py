@@ -197,7 +197,12 @@ class PosixProcessHost(ProcessHost):
             return None
 
     def liveness_of(self, pid: int, identity: float | None) -> str:
-        """Interpret macOS's versioned stamp without guessing a legacy epoch.
+        """Recognize terminated Linux tasks and versioned macOS birth stamps.
+
+        A Linux zombie retains its PID and immutable birth identity until its
+        parent reaps it, but can no longer run or write. Only a complete parsed
+        stat record proves this; unreadable observations retain the existing
+        identity/unknown decision below.
 
         New macOS stamps encode immutable kernel birth time as a negative float.
         Positive stamps came from psutil's clock-adjusted epoch API; their original
@@ -206,6 +211,10 @@ class PosixProcessHost(ProcessHost):
         identity retains the separate legacy pid-only contract. -1/-2 remain the
         invalid/unreadable pid-file sentinels, outside the valid stamp domain.
         """
+        if pid > 0 and sys.platform.startswith("linux"):
+            observed = _proc_identity_state(pid)
+            if observed is not None and observed[1] in {"Z", "X"}:
+                return "dead"
         if sys.platform != "darwin" or identity is None:
             return super().liveness_of(pid, identity)
         if pid <= 0 or not math.isfinite(identity) or -2 <= identity <= 0:
@@ -328,6 +337,12 @@ def _proc_starttime(pid: int) -> float | None:
     comm field (2) is wrapped in parens and may itself contain spaces/parens, so we
     split on the last ``)`` before tokenizing the rest. ``None`` if the process is
     gone or unreadable."""
+    observed = _proc_identity_state(pid)
+    return observed[0] if observed is not None else None
+
+
+def _proc_identity_state(pid: int) -> tuple[float, str] | None:
+    """Read birth identity and execution state from the same Linux stat record."""
     try:
         proc = Path("/proc")  # portability: Linux-only, guarded by identity()'s platform check
         stat = proc.joinpath(str(pid), "stat").read_text(encoding="utf-8")
@@ -335,7 +350,8 @@ def _proc_starttime(pid: int) -> float | None:
         return None
     try:
         after_comm = stat[stat.rindex(")") + 1 :].split()
-        return float(after_comm[19])  # field 22 = index 19 after the comm token
+        # Fields 22 and 3, respectively, after the parenthesized comm token.
+        return float(after_comm[19]), after_comm[0]
     except (ValueError, IndexError):
         return None
 

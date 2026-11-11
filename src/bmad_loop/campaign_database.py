@@ -23,6 +23,8 @@ from .campaign_model import CampaignError
 STORAGE_SCHEMA_VERSION = 3
 MARKER = {"schema_version": STORAGE_SCHEMA_VERSION, "storage": "sqlite"}
 LEGACY_MARKER = {"schema_version": 2, "storage": "sqlite"}
+TRANSFER_SCHEMA_VERSION = 4
+TRANSFER_MARKER = {"schema_version": TRANSFER_SCHEMA_VERSION, "storage": "sqlite"}
 
 
 def encode(value: Any) -> str:
@@ -35,6 +37,7 @@ class CampaignDatabase:
     def __init__(self, directory: Path):
         self.directory = directory
         self.path = directory / "campaign.sqlite"
+        self.schema_version: int | None = None
 
     def _check_paths(self, *, missing: bool = False) -> None:
         if self.directory.is_symlink() or not self.directory.is_dir():
@@ -59,11 +62,14 @@ class CampaignDatabase:
                 connection.execute("PRAGMA busy_timeout=10000")
                 if not write:
                     connection.execute("PRAGMA query_only=ON")
-                if connection.execute("PRAGMA user_version").fetchone()[0] not in {
+                version = connection.execute("PRAGMA user_version").fetchone()[0]
+                if version not in {
                     2,
                     STORAGE_SCHEMA_VERSION,
+                    TRANSFER_SCHEMA_VERSION,
                 }:
                     raise CampaignError("unsupported campaign database schema")
+                self.schema_version = version
                 yield connection
             finally:
                 connection.close()
@@ -213,9 +219,12 @@ class CampaignDatabase:
             if connection.execute("PRAGMA user_version").fetchone()[0] < minimum_schema:
                 raise CampaignError("campaign marker requires a newer database schema")
             row = connection.execute(
-                "WITH projection(value) AS (SELECT json_remove(payload, "
+                "WITH projection(value) AS (SELECT json_set(json_remove(payload, "
                 "'$.bindings','$.outbox','$.events','$.config_snapshot',"
-                "'$.processed_commands','$.jobs') FROM authority WHERE id=1) "
+                "'$.processed_commands','$.jobs'), '$.bindings', json_object("
+                "'github_hierarchy', coalesce(json_extract(payload, '$.bindings.github_hierarchy'), json('{}')),"
+                "'ownership_retirement', coalesce(json_extract(payload, '$.bindings.ownership_retirement'), json('{}')),"
+                "'ownership_transfers', coalesce(json_extract(payload, '$.bindings.ownership_transfers'), json('{}')))) FROM authority WHERE id=1) "
                 "SELECT length(CAST(value AS BLOB)), "
                 "CASE WHEN length(CAST(value AS BLOB))<=? THEN value END FROM projection",
                 (max_bytes,),
@@ -269,6 +278,7 @@ class CampaignDatabase:
         revision: int,
         event_count: int,
         events: list[dict[str, Any]],
+        transfer: bool = False,
     ) -> set[str]:
         with self.connect(write=True) as connection:
             with connection:
@@ -316,7 +326,13 @@ class CampaignDatabase:
                 )
                 # Old schema-2 readers must refuse authority whose terminal
                 # records now require indexed historical reads.
-                connection.execute("PRAGMA user_version=3")
+                version = connection.execute("PRAGMA user_version").fetchone()[0]
+                if transfer or version == TRANSFER_SCHEMA_VERSION:
+                    connection.execute("PRAGMA user_version=4")
+                    self.schema_version = TRANSFER_SCHEMA_VERSION
+                else:
+                    connection.execute("PRAGMA user_version=3")
+                    self.schema_version = STORAGE_SCHEMA_VERSION
         return {row["id"] for row in archived} | archived_effects
 
     def actions(self, **query: Any) -> list[dict[str, Any]]:

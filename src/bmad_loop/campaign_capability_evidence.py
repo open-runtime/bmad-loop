@@ -147,12 +147,40 @@ def _validate(capability, candidate) -> None:
         covered_output = report.get("coverage", {}).get("configured_output_tokens")
     limits = envelope["request"]["limits"]
     if "native_limits" in capability:
-        from .campaign_native_limits import environment
+        from .campaign_native_limits import environment, streaming
 
         if receipt.get("native_request_limits") != environment(capability, limits["output_tokens"]):
             raise CampaignError(
                 "Native qualification did not apply its requested output/retry limits"
             )
+        if streaming(capability):
+            from .campaign_headless_worker import _wire_output_limit
+            from .campaign_jobs import JobLimits
+            from .campaign_native_stream import ClaudeStream
+            from .campaign_transcripts import regular_reader
+
+            stream = ClaudeStream(
+                output_tokens=limits["output_tokens"],
+                max_messages=limits["max_turns"],
+                max_bytes=_wire_output_limit(
+                    capability["protocol"],
+                    capability["permissions"],
+                    envelope["input"]["bytes"],
+                    JobLimits(**limits),
+                ),
+            )
+            with regular_reader(path.parent / "stdout.jsonl") as source:
+                stream.read(source, final=True)
+            if (
+                stream.limit_kind
+                or receipt.get("native_stream_accounting") != stream.receipt()
+                or not stream.receipt()["terminal_usage_complete"]
+                or receipt.get("session_id") != stream.session
+                or receipt.get("usage", {}).get("output_tokens") != stream.terminal_output
+            ):
+                raise CampaignError(
+                    "Native qualification lacks exact streaming accounting evidence"
+                )
     # The worker writes its native receipt before process exit. The owning
     # observer adds quiescence and window-death evidence after independent readback.
     projected = {"quiescent", "completion_evidence", "presentation_status"}

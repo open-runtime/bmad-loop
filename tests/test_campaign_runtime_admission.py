@@ -190,10 +190,13 @@ def test_repository_inventory_refuses_foreign_imported_tracker(project, tmp_path
 
 def test_never_submitted_merge_wait_reenters_fresh_gate(project, tmp_path, monkeypatch):
     from bmad_loop.campaign_github import MutationIntent
-    from bmad_loop.campaign_model import OutboxAction
+    from bmad_loop.campaign_model import CampaignUnit, OutboxAction, UnitSpec
     from bmad_loop.campaign_supervisor import Observation
 
     runtime, snapshot, _, _ = configured(project, tmp_path)
+    unit = CampaignUnit(UnitSpec("unit", "source", "epic", "Unit"))
+    snapshot.units[unit.id] = unit
+    snapshot.spec = dataclasses.replace(snapshot.spec, units=(unit.spec,))
     intent = MutationIntent(
         "merge-action", "merge", "PUT", "repos/org/repo/pulls/1/merge-async", {"sha": "head"}
     )
@@ -213,6 +216,7 @@ def test_never_submitted_merge_wait_reenters_fresh_gate(project, tmp_path, monke
         lambda current, pending: observed.append(pending.id)
         or Observation("waiting", reason="CI pending"),
     )
+    runtime.store.create(snapshot)
     result = runtime.reconcile_action(snapshot, action)
     assert result.state == "waiting" and observed == ["merge-action"]
 

@@ -413,7 +413,10 @@ def _prepared_unit(
         key: value
         for key, value in unit.bindings.items()
         if key
-        not in ({"intake_control", "reflection"} | ({"hierarchy_ready"} if tracking else set()))
+        not in (
+            {"intake_control", "reflection", "reflection_history"}
+            | ({"hierarchy_ready"} if tracking else set())
+        )
     }
     if set(receipt) != fields or retained != receipt:
         raise CampaignError("prepared workspace bindings differ from the confirmed receipt")
@@ -424,8 +427,28 @@ def _prepared_unit(
             for row in actions(snapshot, kinds=("reflection",), unit=unit.id)
             if row.state == "confirmed"
         ]
+        history = unit.bindings.get("reflection_history", [])
+        if history and (
+            not isinstance(history, list)
+            or len(history) > 20
+            or len(history) >= len(confirmations)
+            or history != [row.receipt for row in confirmations[:-1]][-len(history) :]
+        ):
+            raise CampaignError("prepared reflection history differs from confirmed receipts")
+        from .campaign_reflection_flow import desired_group_identity
+
         native = receipt["native"]
         workspace_projection = reflected.get("workspace") if isinstance(reflected, dict) else None
+        groups = {desired_group_identity(snapshot, unit)}
+        regroup = snapshot.bindings.get("paradev_regroup", {})
+        if (
+            regroup.get("config_revision") == snapshot.config_revision
+            and regroup.get("to_group_by") == snapshot.spec.paradev.group_by
+            and unit.id in regroup.get("previous_groups", {})
+        ):
+            # The prior confirmed view remains valid while the explicit display
+            # migration is pending; it has no execution or grouping authority.
+            groups.add(regroup["previous_groups"][unit.id])
         if (
             not snapshot.spec.paradev.reflect
             or not confirmations
@@ -434,7 +457,12 @@ def _prepared_unit(
             or not isinstance(native, dict)
             or not isinstance(workspace_projection, dict)
             or reflected.get("stage") != {"state": "pending", "windows": []}
-            or any(workspace_projection.get(key) != value for key, value in native.items())
+            or any(
+                workspace_projection.get(key) != value
+                for key, value in native.items()
+                if key != "group"
+            )
+            or workspace_projection.get("group") not in groups
             or workspace_projection.get("campaign_id") != snapshot.id
             or workspace_projection.get("phase") != "draft"
             or workspace_projection.get("attempt") != 0
@@ -585,7 +613,10 @@ def _optional_reasoning(snapshot, directory, rows):
         if revision not in routes_by_revision:
             preserved = [
                 record
-                for record in snapshot.bindings.get("capability_requalifications", [])
+                for record in (
+                    snapshot.bindings.get("capability_requalifications", [])
+                    + snapshot.bindings.get("configuration_revisions", [])
+                )
                 if record.get("previous_config_revision") == revision
             ]
             if len(preserved) != 1:
@@ -932,6 +963,12 @@ def requalify(
         previous_manifest_digest = _preserve_manifest(previous_manifest, previous_routes)
         manifest_digest = _preserve_manifest(manifest, routes)
         previous_revision = snapshot.config_revision
+        regroup = snapshot.bindings.get("paradev_regroup", {})
+        if (
+            regroup.get("config_revision") == snapshot.config_revision
+            and regroup.get("to_group_by") == snapshot.spec.paradev.group_by
+        ):
+            snapshot.bindings["paradev_regroup"] = {**regroup, "config_revision": revision}
         snapshot.config_revision = revision
         snapshot.config_snapshot["configuration_revision"] = revision
         snapshot.config_snapshot["reasoning_capabilities"] = routes

@@ -6,6 +6,7 @@ guides below go deeper, roughly in the order you'll need them.
 ## Using bmad-loop
 
 - **[Native development campaigns](campaign-guide.md)** — parallel unit scheduling, planning, draft PR delivery, GitHub synchronization and native Paradev reflection.
+- **[Repository organization](repository-operations.md)** — inventory existing work, review consolidation proposals and reconcile within a frozen owner policy.
 - **[The open-runtime fork](fork-guide.md)** — fork capabilities, parallel epic runs, TeamRouter routing, and installing this fork.
 - **[Setup guide](setup-guide.md)** — install the tools, pick a CLI, initialize a project, pass preflight, and uninstall.
 - **[TUI guide](tui-guide.md)** — the dashboard: layout, key bindings, the settings editor, and troubleshooting.

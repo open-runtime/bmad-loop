@@ -6,13 +6,15 @@ import pytest
 
 from bmad_loop import campaign_handoff_flow as flow
 from bmad_loop.campaign_fidelity import (
+    FINAL_AUDIT_PROMPT_VERSION,
     HISTORY_AUDIT_PROMPT_VERSION,
+    contract_header,
     route_binding,
     semantic_contract,
 )
 from bmad_loop.campaign_headless import file_digest, read_json, write_json
 from bmad_loop.campaign_jobs import digest
-from bmad_loop.campaign_model import RoleCandidate
+from bmad_loop.campaign_model import ReasoningSpec, RoleCandidate
 from bmad_loop.campaign_summary import (
     EXTRACT_PROMPT_VERSION,
     REDUCE_PROMPT_VERSION,
@@ -130,7 +132,9 @@ def test_legacy_generic_semantic_proof_does_not_grant_new_exact_route(proof):
 def test_automatic_summary_route_requires_its_own_purpose_proof(proof, monkeypatch):
     cap, _ = proof
     candidate = RoleCandidate("codex", "gpt-test", "high", "openai")
-    snapshot = SimpleNamespace(spec=SimpleNamespace(candidates=lambda _: (candidate,)))
+    snapshot = SimpleNamespace(
+        spec=SimpleNamespace(candidates=lambda _: (candidate,), reasoning=ReasoningSpec())
+    )
     runtime = SimpleNamespace(clock=lambda: 100)
     monkeypatch.setattr(flow, "_cap", lambda *args: cap)
     assert flow._summary_route(runtime, snapshot, "summarization")[0] == candidate
@@ -309,6 +313,40 @@ def test_editing_audit_schema_manifest_cannot_relabel_independent_native_receipt
     assert receipt_path.read_bytes() == native_bytes
 
 
+def test_final_audit_binds_final_prompt_not_history_audit(proof):
+    from pathlib import Path
+
+    _, expected = contract_header("handoff_final_audit", flow.AUDIT_SCHEMA)
+    assert expected["audit_prompt_version"] == FINAL_AUDIT_PROMPT_VERSION
+    _, audit = contract_header("handoff_audit", flow.AUDIT_SCHEMA)
+    assert audit["audit_prompt_version"] == HISTORY_AUDIT_PROMPT_VERSION
+    cap, path = proof
+    evidence = read_json(path)
+    bindings = [route_binding(cap, "handoff_final_audit")]
+    evidence.update(
+        route_bindings=bindings,
+        audit_schema_digest=digest(flow.AUDIT_SCHEMA),
+        audit_prompt_version=HISTORY_AUDIT_PROMPT_VERSION,
+    )
+    receipt_path = Path(evidence["independent_review"]["native_receipt_path"])
+    receipt = read_json(receipt_path)
+    receipt["result"].update(
+        route_bindings_digest=digest(bindings),
+        audit_prompt_version=HISTORY_AUDIT_PROMPT_VERSION,
+        semantic_contract_digests={
+            "handoff_final_audit": digest(
+                semantic_contract("handoff_final_audit", flow.AUDIT_SCHEMA)
+            )
+        },
+    )
+    write_json(receipt_path, receipt)
+    evidence["independent_review"]["sha256"] = file_digest(receipt_path)
+    write_json(path, evidence)
+    cap["semantic_qualification"]["proofs"][0]["sha256"] = file_digest(path)
+    with pytest.raises(flow.HandoffRouteWait, match="does not match|audit prompt"):
+        flow.validate_fidelity_qualification(cap, purpose="handoff_final_audit")
+
+
 def test_map_proof_ignores_unused_audit_schema_and_reducer_prompt(proof, monkeypatch):
     from bmad_loop import campaign_summary as summary
 
@@ -346,3 +384,45 @@ def test_specialized_native_schema_change_cannot_borrow_generic_semantic_proof(
     with pytest.raises(flow.HandoffRouteWait, match="does not match"):
         flow.validate_fidelity_qualification(cap, purpose="handoff_map")
     assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "models",
+    [
+        ["claude-independent", "gpt-helper"],
+        ["claude-independent", "unknown-model"],
+        "claude-independent",
+        [None],
+        None,
+    ],
+)
+def test_semantic_proof_rejects_intersecting_or_unknown_auxiliary_families(proof, models):
+    from pathlib import Path
+
+    cap, path = proof
+    evidence = read_json(path)
+    receipt_path = Path(evidence["independent_review"]["native_receipt_path"])
+    receipt = read_json(receipt_path)
+    receipt["observed_models"] = models
+    write_json(receipt_path, receipt)
+    evidence["independent_review"]["sha256"] = file_digest(receipt_path)
+    write_json(path, evidence)
+    cap["semantic_qualification"]["proofs"][0]["sha256"] = file_digest(path)
+    with pytest.raises(flow.HandoffRouteWait, match="contributor|independent|Independent"):
+        flow.validate_fidelity_qualification(cap, purpose="handoff_map")
+
+
+@pytest.mark.parametrize("models", [[], ["claude-independent", "grok-helper"]])
+def test_semantic_proof_accepts_known_distinct_auxiliary_families(proof, models):
+    from pathlib import Path
+
+    cap, path = proof
+    evidence = read_json(path)
+    receipt_path = Path(evidence["independent_review"]["native_receipt_path"])
+    receipt = read_json(receipt_path)
+    receipt["observed_models"] = models
+    write_json(receipt_path, receipt)
+    evidence["independent_review"]["sha256"] = file_digest(receipt_path)
+    write_json(path, evidence)
+    cap["semantic_qualification"]["proofs"][0]["sha256"] = file_digest(path)
+    flow.validate_fidelity_qualification(cap, purpose="handoff_map")

@@ -188,6 +188,36 @@ def _sources(runtime, snapshot, unit):
         allowed = {runs.run_dir_for(Path(claim.workspace), claim.run_id), directory / claim.run_id}
         if not run_dir.is_absolute() or run_dir not in allowed:
             raise CampaignError("Native handle run directory is not owned by this claim")
+        managed = handle.get("managed_history")
+        if managed:
+            path = Path(managed.get("headless_request", ""))
+            identifier = hashlib.sha256(handle["task_id"].encode()).hexdigest()[:24]
+            expected_path = (
+                directory / "native" / run_dir.name / "headless" / identifier / "request.json"
+            )
+            if path != expected_path:
+                raise CampaignError("Managed history request is outside its exact worker stage")
+            envelope = read_json(path)
+            coordinates = envelope.get("request", {}).get("coordinates", {})
+            if (
+                envelope.get("launch_id") != handle["task_id"]
+                or envelope.get("generation") != claim.generation
+                or coordinates.get("campaign") != snapshot.id
+                or coordinates.get("unit") != unit.id
+                or coordinates.get("config_revision") != snapshot.config_revision
+            ):
+                raise CampaignError(
+                    "Managed live history belongs to another worker or configuration"
+                )
+            result.append(
+                {
+                    "path": str(path.parent / "stdout.jsonl"),
+                    "harness": "managed-headless",
+                    "session_id": "headless:" + handle["task_id"],
+                    "managed_history": managed,
+                }
+            )
+            continue
         identity = _hook_identity(
             {
                 "env": {
@@ -224,13 +254,14 @@ def _prefix_matches(old, new):
     """Compare immutable raw bytes, including complete records and a partial tail."""
     if old["source_id"] != new["source_id"] or old["captured_bytes"] > new["captured_bytes"]:
         return False
+    from .campaign_transcripts import stream_hash
+
     raw = Path(new["raw_path"])
     # read_json/snapshot_history own these immutable blobs; verify both hashes
     # rather than trusting event IDs to authorize obsolete summary facts.
-    data = raw.read_bytes()
     return (
-        hashlib.sha256(data).hexdigest() == new["raw_sha256"]
-        and hashlib.sha256(data[: old["captured_bytes"]]).hexdigest() == old["raw_sha256"]
+        stream_hash(raw) == new["raw_sha256"]
+        and stream_hash(raw, length=old["captured_bytes"]) == old["raw_sha256"]
     )
 
 
@@ -280,8 +311,11 @@ def reusable(runtime, snapshot, unit, sources):
             or not request.coordinates.get("history_warmup")
         ):
             continue
-        if len(request.candidates) != 1 or request.candidates[0] not in snapshot.spec.candidates(
-            "summarization"
+        from .campaign_summary_routes import candidates as summary_candidates
+        from .campaign_summary_routes import enabled
+
+        if len(request.candidates) != 1 or request.candidates[0] not in summary_candidates(
+            snapshot.spec, "summarization", "leaf" if enabled(snapshot.spec) else ""
         ):
             rejected.append(key)
             continue
@@ -328,7 +362,19 @@ def reusable(runtime, snapshot, unit, sources):
             )
         if valid:
             try:
-                completed.append((spec, _applied(row)))
+                result = _applied(row)
+                if enabled(snapshot.spec):
+                    from .campaign_handoff_flow import _audit_limits
+
+                    source_limit, artifact_limit, _ = _audit_limits(
+                        snapshot, index.get("audit_family", "")
+                    )
+                    if spec.input_tokens > source_limit or len(encoded(result)) > artifact_limit:
+                        # Optional work remains archived, but cannot force an
+                        # unauditable mandatory handoff. Re-extract exact sources.
+                        rejected.append(key)
+                        continue
+                completed.append((spec, result))
             except (CampaignError, OSError, ValueError):
                 rejected.append(key)
         else:
@@ -337,7 +383,7 @@ def reusable(runtime, snapshot, unit, sources):
 
 
 def perform(runtime, snapshot, action):
-    from .campaign_handoff_flow import _budget, _job, _summary_route
+    from .campaign_handoff_flow import _job, _stage_coordinates, _summary_budget, _summary_route
     from .campaign_summary import (
         SummaryJobSpec,
         load_input,
@@ -362,14 +408,13 @@ def perform(runtime, snapshot, action):
         "pending_jobs": [],
     }
     try:
-        candidate, cap = _summary_route(runtime, snapshot, "summarization")
+        index = _index(runtime, snapshot, unit)
+        routing = {"all_jobs": index["jobs"], "audit_family": index.get("audit_family", "")}
+        candidate, cap = _summary_route(runtime, snapshot, "summarization", routing)
         bindings = _sources(runtime, snapshot, unit)
         if not bindings:
-            state["detail"] = (
-                "No exact hook-backed native transcript; active managed streams require quiescent export"
-            )
+            state["detail"] = "No exact native transcript or managed live request binding"
             return Observation("confirmed", {"state": state, "requests": []})
-        index = _index(runtime, snapshot, unit)
         if len(index["jobs"]) >= MAX_INDEX_JOBS:
             raise CampaignError(
                 "History warmup cache reached its bounded job index; final capture remains available"
@@ -410,13 +455,24 @@ def perform(runtime, snapshot, action):
             path = Path(binding["path"])
             if path.stat().st_size < MIN_BYTES:
                 continue
-            sources.append(
-                dataclasses.asdict(
-                    snapshot_history(
-                        path, binding["harness"], binding["session_id"], root / "sources"
-                    )
+            if binding.get("managed_history"):
+                from .campaign_managed_history import snapshot_managed_prefix
+
+                source = snapshot_managed_prefix(
+                    binding["managed_history"]["headless_request"],
+                    binding["managed_history"],
+                    root / "sources",
+                    max_bytes=snapshot.spec.reasoning.history_max_bytes,
                 )
-            )
+            else:
+                source = snapshot_history(
+                    path,
+                    binding["harness"],
+                    binding["session_id"],
+                    root / "sources",
+                    max_bytes=snapshot.spec.reasoning.history_max_bytes,
+                )
+            sources.append(dataclasses.asdict(source))
         completed, rejected = reusable(
             runtime,
             snapshot,
@@ -464,14 +520,18 @@ def perform(runtime, snapshot, action):
                 break
             selected.append(event)
             size += length
-        planned = plan_remaining_maps(
-            tuple(selected), completed, _budget(candidate, cap), root / "maps"
-        )
+        budget, artifact_limit = _summary_budget(runtime, snapshot, routing, candidate, cap)
+        planned = plan_remaining_maps(tuple(selected), completed, budget, root / "maps")
         indexed = set(index["jobs"])
         planned = tuple(
-            dataclasses.replace(spec, id=identifier)
+            dataclasses.replace(spec, id=identifier, artifact_bytes=artifact_limit)
             for spec in planned
-            if (identifier := digest([state["id"], spec.id, snapshot.config_revision]))
+            if (
+                identifier := digest(
+                    [state["id"], spec.id, snapshot.config_revision]
+                    + ([artifact_limit] if artifact_limit else [])
+                )
+            )
             not in indexed
         )
         limit = min(BATCH_SIZE, MAX_INDEX_JOBS - len(indexed))
@@ -484,6 +544,7 @@ def perform(runtime, snapshot, action):
                 "handoff_map",
                 "summarization",
                 {
+                    **_stage_coordinates(runtime, snapshot, routing, candidate, "leaf"),
                     "head": "",
                     "base": "",
                     "graph_revision": snapshot.graph_revision,
@@ -527,11 +588,16 @@ def perform(runtime, snapshot, action):
             "sources": sources,
             "sizes": sizes if changed else prior_sizes,
             "backlog": backlog,
+            "audit_family": (
+                requests[0]["coordinates"].get("audit_family", "")
+                if requests
+                else index.get("audit_family", "")
+            ),
         }
         index_path = blob(root, encoded(index), suffix=".json")
         state.update(
             state="prepared" if requests else "available",
-            detail="Sealed hook-backed prefixes only; final capture and audit remain required",
+            detail="Sealed owned history prefixes; final capture and audit remain required",
             index_path=str(index_path),
             index_sha256=digest(index),
             pending_jobs=[row["id"] for row in requests],

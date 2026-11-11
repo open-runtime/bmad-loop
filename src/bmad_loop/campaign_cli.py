@@ -48,6 +48,7 @@ def register(subparsers: Any) -> None:
         ("steer", "queue advisory instructions for the next safe stage boundary"),
         ("handoff", "queue continuation through approved harness candidates"),
         ("migrate-state", "migrate quiescent campaign storage with a preserved backup"),
+        ("reconfigure", "change qualified startup routes and grouping while retaining history"),
         (
             "requalify",
             "renew installed route proofs for a stopped campaign before its first unit worker",
@@ -58,8 +59,13 @@ def register(subparsers: Any) -> None:
         ("authorize-scope", "authorize exact acceptance reductions in a delivered revised plan"),
         ("attach", "attach the existing owned unit terminal"),
         ("reconcile", "refresh an existing campaign without starting workers"),
+        ("reflect", "refresh existing native display labels in a stopped campaign"),
         ("adoption-proposal", "inspect exact existing PR and service handoff coordinates"),
         ("adopt", "queue an owner-authorized, independently fenced existing PR handoff"),
+        (
+            "transfer",
+            "retire a stopped startup campaign and transfer a preserved PR to a prepared successor",
+        ),
         ("provenance", "verify the currently loaded installation and exact fork commit"),
     ):
         child = commands.add_parser(command, help=help_text)
@@ -133,6 +139,15 @@ def register(subparsers: Any) -> None:
             child.add_argument("--manifest", required=True, metavar="FILE")
         if command == "adoption-proposal":
             child.add_argument("--pr", required=True, type=int, metavar="NUMBER")
+        if command == "transfer":
+            child.add_argument("--unit", required=True)
+            child.add_argument("--successor", required=True)
+            child.add_argument("--successor-unit", required=True)
+            child.add_argument("--pr", required=True, type=int)
+            child.add_argument("--expected-revision", required=True, type=int)
+            child.add_argument("--expected-successor-revision", required=True, type=int)
+            child.add_argument("--reason", required=True)
+            child.add_argument("--preview", action="store_true")
         if command == "hold":
             child.add_argument("--reason", required=True)
         if command == "steer":
@@ -140,6 +155,10 @@ def register(subparsers: Any) -> None:
             child.add_argument("--text", required=True)
             child.add_argument("--job", default="")
             child.add_argument("--request-id", default="")
+        if command == "reflect":
+            child.add_argument("--unit", default="", metavar="UNIT")
+            child.add_argument("--preview", action="store_true")
+            child.add_argument("--expected-revision", type=int)
         if command == "authorize-scope":
             child.add_argument("--expected-revision", required=True, type=int)
             child.add_argument("--reason", required=True)
@@ -147,6 +166,17 @@ def register(subparsers: Any) -> None:
             child.add_argument("--capabilities", required=True, metavar="FILE")
             child.add_argument("--expected-revision", required=True, type=int)
             child.add_argument("--reason", required=True)
+        if command == "reconfigure":
+            child.add_argument("--spec", required=True, metavar="FILE")
+            child.add_argument(
+                "--review-policy-source",
+                default="",
+                metavar="COMMIT:PATH",
+                help="explicitly adopt a committed owner publication-family policy before any unit starts",
+            )
+            child.add_argument("--expected-revision", required=True, type=int)
+            child.add_argument("--reason", required=True)
+            child.add_argument("--preview", action="store_true")
         if command == "stop":
             child.add_argument(
                 "--terminate-workers",
@@ -192,13 +222,18 @@ def register(subparsers: Any) -> None:
         if command == "run":
             child.add_argument("--paradev-reflect", action="store_true", default=None)
             child.add_argument("--paradev-project", metavar="PROJECT_ID")
+            child.add_argument(
+                "--prepare-only",
+                action="store_true",
+                help="persist a stopped campaign without allocating workspaces or launching sessions",
+            )
 
 
 def _result(command: str, *, ok: bool = True, **fields: Any) -> dict[str, Any]:
     return {"schema_version": SCHEMA_VERSION, "command": f"campaign.{command}", "ok": ok, **fields}
 
 
-def _job_document(row, *, details=False):
+def _job_document(row, *, details=False, launch_wait=None):
     from .sanitize import scrub_json
 
     result = {
@@ -239,6 +274,7 @@ def _job_document(row, *, details=False):
         or claim.get("presentation_status"),
     }
     result["communication"] = claim.get("managed_communication")
+    result["launch_wait"] = launch_wait
     if details:
         receipt = row.get("receipt") or {}
         result["receipt"] = {
@@ -329,18 +365,45 @@ def _checkpoint_document(snapshot, unit, now: float) -> dict[str, Any]:
     return value
 
 
+def _registration_wait(snapshot, claim):
+    """Project the last acknowledged pre-dispatch wait, not a live session."""
+    if not claim or claim.get("status") != "prepared":
+        return None
+    reasons = {
+        "before_worker_request": "Managed bridge registration busy before worker dispatch",
+        "before_native_request": "Managed bridge registration busy before native reasoning dispatch",
+    }
+    for action in snapshot.outbox:
+        proof = action.receipt.get("registration_wait")
+        if (
+            action.id == claim.get("launch_id")
+            and action.state == "sent_unknown"
+            and isinstance(proof, dict)
+            and isinstance(proof.get("phase"), str)
+            and action.error == reasons.get(proof["phase"])
+        ):
+            return {
+                "launch_id": action.id,
+                "phase": proof["phase"],
+                "reason": "managed-registration-busy",
+                "retry_at": action.next_retry_at,
+            }
+    return None
+
+
 def status_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
     from .campaign_action_history import counts as action_counts
 
     """Project execution identities; omit private configuration and evidence."""
     from .campaign_external_provenance import summary as external_provenance_summary
+    from .campaign_intake_baseline import admission_waits
     from .campaign_metrics import document as timing_document
     from .campaign_operator import diagnostics
     from .campaign_scheduler import admit
     from .sanitize import scrub_json, scrub_text
 
     units = []
-    admission = admit(snapshot)
+    admission = admit(snapshot, blocked=admission_waits(snapshot))
     inventory = snapshot.bindings.get("inventory", {})
     discovery_wait = (
         (
@@ -397,6 +460,7 @@ def status_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
                 "resolution_attempts": unit.resolution_attempts,
                 "hold": hold,
                 "claim": claim,
+                "launch_wait": _registration_wait(snapshot, claim),
                 "retry_at": unit.retry_at,
                 "acceptance": scrub_json(
                     {
@@ -489,6 +553,17 @@ def status_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
         "repository": snapshot.repository,
         "target": snapshot.spec.target,
         "phase": snapshot.phase,
+        **(
+            {
+                "ownership_retirement": {
+                    "state": "retired",
+                    "successor": snapshot.bindings["ownership_retirement"]["successor"],
+                    "released_units": sorted(snapshot.bindings.get("ownership_transfers", {})),
+                }
+            }
+            if snapshot.bindings.get("ownership_retirement")
+            else {}
+        ),
         "revision": snapshot.revision,
         "generation": snapshot.generation,
         "graph_revision": snapshot.graph_revision,
@@ -571,7 +646,10 @@ def status_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
             ),
         },
         "units": units,
-        "jobs": [_job_document(row) for row in list(snapshot.jobs.values())[:100]],
+        "jobs": [
+            _job_document(row, launch_wait=_registration_wait(snapshot, row.get("claim")))
+            for row in list(snapshot.jobs.values())[:100]
+        ],
         "jobs_truncated": len(snapshot.jobs) > 100,
         "reasoning": {
             "enabled": snapshot.spec.reasoning.enabled,
@@ -762,6 +840,9 @@ def dispatch(args: argparse.Namespace) -> int:
             spec.github.allow_publication_wait and observed.get("can_start") is True
         ):
             return _emit(args, {**observed, "command": "campaign.run"})
+        if args.prepare_only:
+            store, snapshot = campaign_runtime.create(project, spec, prepare_only=True)
+            return _emit(args, _result(command, campaign=status_document(snapshot)))
         store, snapshot = campaign_runtime.create(project, spec)
         runtime = _runtime(campaign_runtime, project, store)
         supervisor = CampaignSupervisor(store, runtime)
@@ -775,6 +856,42 @@ def dispatch(args: argparse.Namespace) -> int:
         )
     campaign_id = args.campaign_id
     snapshot = store.load(campaign_id)
+    from .campaign_transfer import require_not_retired
+
+    if command not in {"status", "history", "jobs", "messages", "endpoints", "transfer"}:
+        try:
+            require_not_retired(snapshot, operation=command)
+        except CampaignError as exc:
+            return _emit(args, _result(command, ok=False, problems=[str(exc)]))
+    if command == "transfer":
+        from .campaign_transfer import TransferRequest, preview, release
+
+        request = TransferRequest(
+            predecessor=campaign_id,
+            unit=args.unit,
+            successor=args.successor,
+            successor_unit=args.successor_unit,
+            pr_number=args.pr,
+            expected_revision=args.expected_revision,
+            expected_successor_revision=args.expected_successor_revision,
+            reason=args.reason,
+        )
+        try:
+            report = (preview if args.preview else release)(store, request, project=project)
+        except (CampaignError, OSError, ValueError) as exc:
+            return _emit(args, _result(command, ok=False, problems=[str(exc)]))
+        return _emit(args, _result(command, **report))
+    if command == "reflect":
+        from .campaign_reflect import refresh
+
+        report = refresh(
+            store,
+            campaign_id,
+            unit_id=args.unit,
+            preview=args.preview,
+            expected_revision=args.expected_revision,
+        )
+        return _emit(args, _result(command, **report))
     if command == "status":
         return _emit(args, _result(command, campaign=status_document(snapshot)))
     if command == "endpoints":
@@ -844,6 +961,25 @@ def dispatch(args: argparse.Namespace) -> int:
     if command == "migrate-state":
         migrated = store.migrate_state(campaign_id)
         return _emit(args, _result(command, campaign=status_document(migrated)))
+    if command == "reconfigure":
+        import tomllib
+
+        from .campaign_reconfiguration import reconfigure
+
+        with Path(args.spec).expanduser().open("rb") as stream:
+            proposed = tomllib.load(stream)
+        result = reconfigure(
+            store,
+            campaign_id,
+            proposed,
+            expected_revision=args.expected_revision,
+            reason=args.reason,
+            preview=args.preview,
+            review_policy_source=args.review_policy_source,
+        )
+        if isinstance(result, dict):
+            return _emit(args, _result(command, proposal=result))
+        return _emit(args, _result(command, campaign=status_document(result)))
     if command == "requalify":
         from .campaign_requalification import requalify
 
@@ -867,7 +1003,14 @@ def dispatch(args: argparse.Namespace) -> int:
             args,
             _result(
                 command,
-                jobs=[_job_document(row, details=args.details) for row in rows],
+                jobs=[
+                    _job_document(
+                        row,
+                        details=args.details,
+                        launch_wait=_registration_wait(snapshot, row.get("claim")),
+                    )
+                    for row in rows
+                ],
                 next_after=rows[-1]["id"] if rows else args.after,
                 has_more=len(rows) == args.limit,
             ),

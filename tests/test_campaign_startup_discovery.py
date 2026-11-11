@@ -15,6 +15,7 @@ import threading
 import time
 from urllib.parse import parse_qs, urlencode, urlsplit
 
+import pytest
 from campaign_runtime_watchdog import ProgressWatchdog
 from conftest import git
 from test_campaign_headless import prepared as prepared
@@ -23,6 +24,7 @@ from test_campaign_runtime import diagnose
 from test_campaign_runtime import production_case as production_case
 
 from bmad_loop import campaign_native_inventory, campaign_paradev, campaign_runtime
+from bmad_loop.adapters import paradev_host
 from bmad_loop.campaign_github import ApiResponse
 from bmad_loop.campaign_model import ParadevSpec, ReasoningSpec, RoleSpec
 from bmad_loop.campaign_store import CampaignStore
@@ -45,12 +47,15 @@ def test_startup_recovers_complete_discovery_before_allocating_or_planning(
             super().__init__(*args)
             self.lock = threading.RLock()
             self.errors = []
+            self.daemon_reads = 0
 
-        def rpc(self, procedure, payload=None):
+        def rpc(self, procedure, payload=None, mutate=False):
             with self.lock:
                 if procedure == "terminal.list":
                     return {"sessions": []}
-                return super().rpc(procedure, payload)
+                if procedure == "terminal.daemon.listSessions":
+                    self.daemon_reads += 1
+                return super().rpc(procedure, payload, mutate=mutate)
 
         def cli(self, args):
             # The base host fixture is serial. A service must assign unique
@@ -65,8 +70,20 @@ def test_startup_recovers_complete_discovery_before_allocating_or_planning(
                     raise
 
     host = Host(case.repo, root)
+
+    # A developer's installed host must not mask an unpatched native client.
+    # Isolate this client's discovery only, without changing process HOME.
+    class HostPath(type(tmp_path)):
+        @classmethod
+        def home(cls):
+            return cls(tmp_path / "absent-native-host")
+
+    monkeypatch.setattr(paradev_host, "Path", HostPath)
+    with pytest.raises(paradev_host.HostError, match="HOST_MANIFEST_NOT_UNIQUE"):
+        paradev_host.Host()
     monkeypatch.setattr(campaign_paradev, "Host", lambda: host)
     monkeypatch.setattr(campaign_native_inventory, "Host", lambda: host)
+    monkeypatch.setattr(paradev_host, "Host", lambda: host)
     # Configure a new campaign through the real create path; the existing
     # production fixture supplies the source checkout and child/service seams.
     manifest = tmp_path / "qualified-fixture-capabilities.json"
@@ -96,6 +113,8 @@ def test_startup_recovers_complete_discovery_before_allocating_or_planning(
     monkeypatch.setenv("BMAD_LOOP_MUX_BACKEND", "paradev")
     store, snapshot = campaign_runtime.create(case.repo, spec)
     runtime.store = store
+    # Exercise the actual lazy backend client before any long supervisor wait.
+    assert runtime._native_mux(snapshot)._host() is host
     # Ordinary persistence exceeds the old native snapshot byte limit. The
     # migration inventory must read bounded ownership, not recursively load it.
     snapshot.bindings["historical-unrelated-observation"] = "x" * (4 * 1024 * 1024 + 1)
@@ -225,6 +244,7 @@ def test_startup_recovers_complete_discovery_before_allocating_or_planning(
             # normal unit proposals allocate and launch the scripted workers.
             started = set()
             semantic_created = False
+            daemon_reads_before_workers = host.daemon_reads
             while started != {"source:project:first", "source:project:second"}:
                 assert not watchdog.check(snapshot, now=time.monotonic()), diagnose(snapshot)
                 observations = tuple(
@@ -246,6 +266,7 @@ def test_startup_recovers_complete_discovery_before_allocating_or_planning(
                     }
                 threading.Event().wait(0.01)
             assert snapshot.bindings["capacity"]["observations"]
+            assert host.daemon_reads > daemon_reads_before_workers
             assert len(host.workspaces) == 2
             assert semantic_created and snapshot.jobs
             assert all(not row.get("claim") for row in snapshot.jobs.values())

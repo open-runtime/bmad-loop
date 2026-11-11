@@ -792,6 +792,35 @@ class ParadevMultiplexer(TerminalMultiplexer):
             if row is not None and row["state"] not in FINAL_STATES:
                 self._set_state(row, "disposed")
 
+    def dispose_completed_window(self, session, window_id):
+        """Confirm disposal after the caller proves its worker and descendants dead.
+
+        Worker exit deliberately leaves a parked PTY. Reuse exact, idempotent
+        disposal and retain native identity, transcript and registry history;
+        never treat an exited worker or a kill acknowledgement as PTY absence.
+        This optional headless lifecycle hook does not close panes or workspaces.
+        """
+        with self._lock():
+            row = self._read("windows", window_id)
+        if row is None or row.get("session") != session:
+            raise ParadevTransportError("Completed terminal lacks its exact owned session binding")
+        bootstrap = self._bootstrap(window_id)
+        if (
+            bootstrap is None
+            or bootstrap.get("terminalId") != window_id
+            or bootstrap.get("workspaceId") != row["workspace"]
+            or not (self._launch_dir(window_id) / "exit.json").exists()
+        ):
+            raise ParadevTransportError("Completed terminal lacks its owned bootstrap exit record")
+        self.kill_window(window_id)
+        with self._lock():
+            row = self._read("windows", window_id)
+        return (
+            row is not None
+            and row["state"] in ("gone", "disposed")
+            and window_id not in self._daemon()
+        )
+
     def _address(self, target):
         with self._lock():
             row = self._window(target)

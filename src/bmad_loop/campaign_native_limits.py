@@ -15,6 +15,16 @@ CLAUDE_LIMITS = {
     "output_tokens": "job-limit",
     "structured_output_retries": 1,
 }
+CLAUDE_STREAM_LIMITS = {
+    **CLAUDE_LIMITS,
+    "kind": "claude-code-v2",
+    "streaming": "message-usage-v1",
+    "message_limit": "job-turn-limit",
+}
+
+
+def streaming(capability):
+    return capability.get("native_limits") == CLAUDE_STREAM_LIMITS
 
 
 def validate(capability, *, verify_files=True):
@@ -24,11 +34,25 @@ def validate(capability, *, verify_files=True):
     limits = capability["native_limits"]
     if (
         not isinstance(limits, dict)
-        or limits != CLAUDE_LIMITS
+        or limits not in (CLAUDE_LIMITS, CLAUDE_STREAM_LIMITS)
         or type(limits.get("structured_output_retries")) is not int
         or capability.get("protocol") != "claude-stream"
     ):
         raise CampaignError("Unsupported native request-limit contract")
+    if streaming(capability):
+        argv = capability.get("argv", [])
+        if (
+            capability.get("permissions") != "no-tools"
+            or argv.count("--include-partial-messages") != 1
+            or not any(flag in argv for flag in ("--print", "-p"))
+            or not any(
+                left == "--output-format" and right == "stream-json"
+                for left, right in zip(argv, argv[1:])
+            )
+        ):
+            raise CampaignError(
+                "Native streaming limits require the no-tools partial-message recipe"
+            )
     from .campaign_headless import file_digest
 
     dependencies = {
@@ -36,7 +60,10 @@ def validate(capability, *, verify_files=True):
         for row in capability.get("dependencies", [])
         if isinstance(row, dict)
     }
-    for name in ("campaign_native_limits.py", "campaign_headless_worker.py"):
+    names = ["campaign_native_limits.py", "campaign_headless_worker.py"]
+    if streaming(capability):
+        names.append("campaign_native_stream.py")
+    for name in names:
         path = Path(__file__).resolve().with_name(name)
         if str(path) not in dependencies or (
             verify_files and dependencies[str(path)] != file_digest(path)

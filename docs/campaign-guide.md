@@ -31,6 +31,11 @@ model-route capacity, merge rules and optional reflection capabilities. Its
 planning, execution, publication and reflection verdicts are separate. A failed
 capability keeps the project from activating.
 
+Use `campaign run campaign.toml --prepare-only` to create a stopped campaign after
+normal preflight. Its first saved state already has admissions closed, and no
+supervisor, workspace or coding session starts. This prepares a named successor
+for ownership transfer without racing a subsequent stop command.
+
 For configured sources, preflight and creation fetch an isolated observation of
 the current target and compare selected native source, configuration and scheduler
 metadata. Changed, deleted or unmerged planning files require updating the project
@@ -312,6 +317,13 @@ Conflicting identities or unresolved prior writes pause reconciliation instead
 of creating duplicate parents or moving existing work.
 
 GitHub intake observes selected issues or all open and newly edited issues.
+When bounded triage reasoning is enabled and qualified, the first issue version
+bound to a selected story is compared with that story's committed specification
+in its existing workspace before coding. A validated finding that all requirements
+are represented avoids an additional intake workspace. Comments, later edits and
+new requirements still enter normal triage. Missing capacity or qualification falls
+back to normal intake; status exposes a pending comparison and other stories can
+continue. A mirror marker or matching issue identity alone never proves coverage.
 Repository discovery includes existing PRs, branches and accessible local work.
 Triage proposes attachment, same-PR repair, new planning work, duplicate links,
 clarification or a hold. An incoming issue is evidence and product intent;
@@ -532,6 +544,71 @@ Legacy live policy reload cannot replace that snapshot. Internal child rollback
 hands recovery to the campaign before destructive resets or ledger restoration;
 checkpoint ancestry and pending pushes must reconcile before another attempt.
 
+### Ordered continuation summaries
+
+An optional `reasoning.summary_routes` table assigns a named pool to each of
+eight stages. All eight entries are required when the table is present. Pools
+are tried in their configured order after exact semantic/native qualification,
+launcher readiness, fresh capacity and resource checks. Unqualified candidates
+remain visible exclusions; declaring a model never grants launch permission.
+Without this table, existing summarization role behavior is preserved.
+
+```toml
+[reasoning.summary_routes]
+leaf = "history_leaf"
+intermediate = "history_synthesis"
+final = "history_synthesis"
+constraint = "history_synthesis"
+recovery = "history_synthesis"
+audit = "history_synthesis"
+constraint_audit = "history_synthesis"
+recovery_audit = "history_synthesis"
+
+[role_pools.history_leaf]
+candidates = [
+  { profile = "antigravity", model = "gemini-3.8-flash-high", effort = "high" },
+  { profile = "grok", model = "grok-4.7", effort = "xhigh" },
+  { profile = "muse", model = "muse-wonder-full-1.0", effort = "xhigh" },
+  { profile = "claude", model = "claude-sonnet-5-5", effort = "high" },
+  { profile = "codex", model = "gpt-6.1-terra", effort = "high" },
+]
+
+[role_pools.history_synthesis]
+candidates = [
+  { profile = "antigravity", model = "gemini-4-argon-high", effort = "high" },
+  { profile = "grok", model = "grok-4.7", effort = "xhigh" },
+  { profile = "muse", model = "muse-wonder-full-1.0", effort = "xhigh" },
+  { profile = "claude", model = "claude-opus-5-5", effort = "max" },
+  { profile = "codex", model = "gpt-6.1-sol", effort = "ultra" },
+]
+```
+
+These preferences require local qualification for the exact route, effort,
+permissions and purpose. Use a supported capacity observer or an explicit
+`capacity_command` for AGY; unknown allowance selects an eligible fallback.
+Existing role and shared-session limits also constrain these jobs.
+
+A higher-order final synthesis runs even when only one leaf summary remains.
+Before extraction begins, the coordinator reserves an independent qualified
+audit family without consuming a live session slot. That family cannot author
+the summary it audits. All contributing families remain recorded across retries;
+lost independence produces a visible wait, never a lower-quality implicit route.
+
+`reasoning.history_max_bytes` bounds each captured source stream (512 MiB by
+default, at most 1 GiB). It is frozen independently of per-model input and output
+limits. Large history is sealed and parsed incrementally, then partitioned into
+bounded summary jobs; a single native record remains limited to 64 MiB. Oversized
+sources produce explicit coverage failures. These are byte limits, not token
+counts or a claim that one model can ingest the entire conversation.
+
+Managed headless sessions can expose immutable prefixes of complete stream
+frames while still live. Optional warmup summarizes those prefixes within the
+same resource budgets; final capture verifies every reused prefix against the
+terminal stream. Interrupted or incomplete frames do not become history facts.
+Native owner records retain their provenance, and controller prompts cannot
+become owner decisions. Final continuation still requires predecessor quiescence,
+current obligations, independent audits and the same owned worktree/branch/PR.
+
 ## Paradev reflection and hcom
 
 Install the optional `paradev` extra and enable `[paradev] reflect = true` with a
@@ -545,32 +622,35 @@ location. It must resolve outside every editing worktree; invalid or relative
 paths are refused. Keep the selected state location stable while sessions are live
 and preserve it when reconciling a retained terminal.
 
-Story or epic grouping can place multiple unit workspaces under one group.
+Epic grouping is the default for new campaigns, with the initiative included in
+the folder name. Story and initiative grouping are also available. Old persisted
+specifications retain their original grouping, including the historical story
+default when the field was omitted.
 Phase tabs attach actual worker PTYs and retain unit/attempt identities. Missing
 panes, unavailable host observations and pending native registration do not
 permit a replacement launch. Managed presentation preserves operator layout and
 user-owned workspace content.
 
-Managed workspace, task and terminal titles start with the observed hcom name,
-epic, issue and PR: `@tina · E:epic · I:#42 · PR:#18 · description`. Missing
-bindings display `pending`; no name is inferred from a model or another worker.
+Workspace titles describe durable work: issue number, story identifier, description
+and the actual PR when one exists. Tasks retain the requirement and its links.
+Neither workspaces nor folders claim an hcom identity. Session views show the
+actual actor, role, model and attempt; managed check-in addresses are explicitly
+identified as controller bridges. Unknown actor and nonexistent PR fields are
+omitted from work labels rather than displayed as `pending` or `?`.
 Confirmed campaign story issues appear before hierarchy setup finishes, even
 when their per-unit issue binding is still pending. This changes navigation only;
 the remaining hierarchy and admission checks still apply.
-Groups aggregate their members' actors/issues/PRs, with counts when the bounded
-label omits additional members. Stable workspace and group identities survive
-renaming. Actor changes and discovered GitHub links refresh the labels, including
-quiescent group members; native tasks also receive the linked PR URL.
+Groups use native folder display names independently of their stable membership
+tags. Actor changes do not rename the story workspace. Discovered GitHub links
+refresh work labels and native task links, including quiescent group members.
 
-Campaign-created tabs inherit terminal titles. Existing manually titled tabs
-retain their operator label and can mask a terminal's automatic tab title.
-Operator terminal text follows the managed navigation prefix. Native tags are
-lowercased and limited to 64 UTF-16 units, including their ownership marker.
-Group labels shorten field values to fit, using `?` for unknown bindings and an
-ellipsis for shortened values; full titles retain longer labels. Existing
-operator tags are preserved, and a full 32-tag set reports a projection wait.
-Earlier-sorting operator tags can still determine the sidebar folder,
-which reflection reports as `operator-tag-precedence`.
+Phase tabs describe their purpose; existing manually titled views retain their
+operator labels. Native tags are limited to 64 UTF-16 units while folder display
+names have their own larger limit. Existing operator tags and folder ordering
+are preserved; a full 32-tag set reports a projection wait. Operator folder
+precedence can still determine placement and is reported explicitly. The native
+folder API lacks conditional updates, so a concurrent manual rename cannot be
+made atomic with a managed refresh.
 Managed titles follow the native host's normalization of replacement characters
 and Braille spinner glyphs; other Unicode text is retained.
 
@@ -619,6 +699,20 @@ Acceptance, inclusion in a completed stage and compliance are distinct: an
 for pending, applied or closed receipts. Oversized messages are rejected; mail
 that cannot fit a reasoning request remains queued.
 
+A busy managed-registration lock before any worker request is sealed produces a
+visible `launch_wait` in campaign status and an `effect-wait` history event.
+The controller retries the same launch, attempt and actor after contention clears;
+a bridge address alone does not mean a coding session is running. The retry requires
+an exact durable pre-request proof and fresh ownership, stop and hold checks.
+Before request preparation, the controller consumes that proof. Existing requests,
+launch intents or consumed proofs retain ordinary uncertain-launch reconciliation;
+absence of a startup file never authorizes another dispatch.
+Reasoning jobs expose the same wait without consuming a failed attempt and retain
+their existing native request/launch-intent recovery boundary.
+During initial actor registration, communication status can temporarily report an
+incomplete identity. The room's messages and cursor remain unchanged until the
+original registration finishes; refreshing an existing actor preserves its identity.
+
 Closed endpoints never restart a writer. Lost acknowledgements, unknown owners
 and a replaced room database remain explicit errors. Completion/drain waits for
 owned bridge closure. Managed communication uses the installed hcom service and
@@ -646,6 +740,8 @@ bmad-loop campaign history CAMPAIGN_ID --unit QUALIFIED_UNIT --role review --aft
 bmad-loop campaign handoff CAMPAIGN_ID --unit QUALIFIED_UNIT --profile codex --reason "capacity wait" --json
 bmad-loop campaign migrate-state CAMPAIGN_ID --json
 bmad-loop campaign requalify CAMPAIGN_ID --capabilities /path/to/earned-capabilities.json --expected-revision REVISION --reason "Renew installed routes before first worker" --json
+bmad-loop campaign reconfigure CAMPAIGN_ID --spec campaign.toml --expected-revision REVISION --reason "Update qualified startup routes and grouping" --preview --json
+bmad-loop campaign reflect CAMPAIGN_ID --preview --json
 bmad-loop campaign hold CAMPAIGN_ID --unit QUALIFIED_UNIT --reason "Inspect this change" --json
 bmad-loop campaign release CAMPAIGN_ID --unit QUALIFIED_UNIT --json
 bmad-loop campaign stop CAMPAIGN_ID --json
@@ -668,6 +764,29 @@ with the same contracts and the current campaign revision. It preserves prior
 proofs and configuration templates, leaves the campaign stopped, and does not
 reload project policy. Campaigns with launched workers or PR publication history
 require their original qualified installation; this command refuses those cases.
+
+`reconfigure` explicitly changes qualified route pools, summary-stage mappings or
+grouping at the same stopped startup boundary. It preserves source scope,
+acceptance, worker policy, grants, configured reviews and resource limits. Supply the updated full campaign
+specification and exact current revision; `--preview` validates and shows the
+change without publishing a revision. Applying without `--preview` writes an
+immutable configuration revision while preserving prior specifications, templates,
+capabilities, attempts and workspace identities. It does not resume the campaign.
+
+An owner may separately adopt a changed publication-family policy before any
+unit starts by adding `--review-policy-source FULL_COMMIT:relative/decision.md`.
+The exact committed regular document must belong to the project's current
+ancestry. This explicit operation may change only
+`github.require_independent_review` and adds that exact document to decision
+sources if absent. It preserves required checks, native reviews, holds, budgets and all
+other policy. The prior value and complete source document remain in the
+configuration history. Repository prose alone cannot trigger this exception.
+
+`reflect` refreshes existing bound workspace, task and session views while stopped.
+It launches no workers, creates no workspaces and leaves unbound tasks explicit.
+Preview reads the exact proposed display changes. An ordinary refresh preserves
+membership; a separately recorded configuration regroup replaces only the old
+BMAD-owned membership tag. Manual labels and unrelated tags remain intact.
 
 An allocated draft can also renew after `reconcile` settles its workspace
 preparation under the upgraded installation. Its recorded bootstrap commit must
@@ -780,6 +899,30 @@ or fabricate service responses. Existing registered Paradev workspaces can be
 linked through exact project, UUID and Git identity without rearranging their
 operator layout.
 
+For an archived BMAD startup campaign that never launched a unit worker, the
+built-in transfer path can establish this ownership release. First prepare a
+stopped successor, then inspect the exact retirement:
+
+```bash
+bmad-loop campaign transfer OLD_ID --unit OLD_UNIT --successor NEW_ID --successor-unit NEW_UNIT --pr 42 --expected-revision OLD_REVISION --expected-successor-revision NEW_REVISION --reason "Continue the preserved startup work" --preview --json
+```
+
+Apply the same command without `--preview` after reviewing its scope. It permanently
+retires the entire predecessor's admissions, including unmapped intake units;
+unit states, source specifications, PR history and unresolved work remain intact.
+Only further explicit transfers to the same successor are allowed. This operation
+requires confirmed native archival, exact preserved branch/head/source, complete
+reasoning-process quiescence and no overlapping active owner. It never stops
+another campaign or deletes a branch, worktree or session. Attempted unit workers
+and missing preservation proof require another qualified recovery route.
+
+Use `adoption-proposal NEW_ID --unit NEW_UNIT --pr 42 --observer campaign` and the
+ordinary reviewed adoption manifest next. This observer reads the committed
+retirement directly, rather than trusting a supplied fence or old PID. Adoption
+allocates a new owned native workspace on the existing branch with recoverable
+allocation identity. The archived UUID stays historical. Both transfer and adoption
+leave the successor stopped; resume it explicitly after its normal readiness gates.
+
 A handoff provider is an installed callable
 `(project: Path, common_dir: Path) -> ServiceInventory`. Explicit observer
 selection freezes its distribution, version and module file hash. Its selected
@@ -809,18 +952,28 @@ bmad-loop campaign provenance --expected-commit FULL_MERGED_SHA --json
 
 A pinned Git installation records its commit. An editable installation also
 requires a clean matching checkout. A wheel installed from an ordinary directory
-does not prove its build commit through its version number. Install the exact
-merged fork commit with the optional transport extra before activation:
+does not prove its build commit through its version number. A Git commit pin
+alone does not freeze dependency resolution. From a clean checkout of the exact
+merged commit, export its locked runtime constraints and use the tested Python
+interpreter when installing the optional transport extra:
 
 ```bash
 BMAD_RELEASE_ROOT="$HOME/.local/share/uv/bmad-loop-releases/FULL_MERGED_SHA"
+BMAD_RELEASE_PYTHON="/absolute/path/to/tested/python"
+mkdir -p "$BMAD_RELEASE_ROOT"
+uv export --frozen --all-extras --no-dev --no-emit-project --no-hashes \
+  --output-file "$BMAD_RELEASE_ROOT/constraints.txt"
 env UV_TOOL_DIR="$BMAD_RELEASE_ROOT/tools" UV_TOOL_BIN_DIR="$BMAD_RELEASE_ROOT/bin" \
-  uv tool install "bmad-loop[tui,paradev,non-linux] @ git+https://github.com/open-runtime/bmad-loop.git@FULL_MERGED_SHA"
+  uv tool install --python "$BMAD_RELEASE_PYTHON" --constraints "$BMAD_RELEASE_ROOT/constraints.txt" \
+  "bmad-loop[tui,paradev,non-linux] @ git+https://github.com/open-runtime/bmad-loop.git@FULL_MERGED_SHA"
 "$BMAD_RELEASE_ROOT/bin/bmad-loop" campaign provenance --expected-commit FULL_MERGED_SHA --json
 ```
 
 Use a new permanent release directory; do not replace an environment used by
-older live or paused workers. On macOS, `non-linux` supplies psutil for authenticated
+older live or paused workers. Retain the exported constraints with installation
+evidence. A dependency update is a separate candidate requiring affected checks;
+do not silently resolve newer native extensions during activation.
+On macOS, `non-linux` supplies psutil for authenticated
 process identities. Qualify installed native paths before switching the future
 global entry. The default uv registry can still describe the preserved old tool;
 inspect or upgrade the new release with its explicit `UV_TOOL_DIR` and
@@ -1042,6 +1195,16 @@ stable. A changed executable, dependency or native output schema requires renewe
 qualification. Claude's native rate-limit telemetry remains a quota outcome even
 when its final result only reports a generic error. Provider exhaustion does not
 justify changing accounts or loosening a route's permissions.
+
+Claude no-tools proposals may opt into the separately qualified
+`claude-code-v2` native-limit contract. It requires `--include-partial-messages`,
+counts distinct root model requests against the job turn allowance and checks
+cumulative per-message output against the final native usage. Typed output-limit
+events or excess observed requests/output trigger owned-process cancellation.
+The worker checks every 100ms; this is reactive containment, so a native retry
+may already have started. Partial usage stays a lower bound and cannot earn a
+successful grant. Existing recipes remain unchanged. Adding v2 requires fresh
+qualification binding the exact launcher, helper, stream and completed receipt.
 
 `bmad-loop campaign trial-handoff SNAPSHOTS --capability CAPABILITY --directory PRIVATE_DIRECTORY --parallel 4 --json`
 exercises sealed history through qualified native map/reduce jobs and production

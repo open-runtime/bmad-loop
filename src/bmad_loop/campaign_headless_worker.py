@@ -84,6 +84,7 @@ def child_main(path: Path) -> int:
     known = {}
     reason = ""
     limit_kind = ""
+    stream = None
     started = time.monotonic()
 
     def stopped():
@@ -227,9 +228,20 @@ def child_main(path: Path) -> int:
             request.limits,
         )
         receipt["wire_output_limit_bytes"] = wire_limit
+        from .campaign_native_limits import streaming
+
+        if streaming(capability):
+            from .campaign_native_stream import ClaudeStream
+
+            stream = ClaudeStream(
+                output_tokens=request.limits.output_tokens,
+                max_messages=request.limits.max_turns,
+                max_bytes=wire_limit,
+            )
         with (
             (directory / "input.txt").open("rb") as source,
             (directory / "stdout.jsonl").open("wb") as stdout,
+            (directory / "stdout.jsonl").open("rb") as stream_source,
             (directory / "stderr.log").open("wb") as stderr,
         ):
             process = subprocess.Popen(
@@ -247,9 +259,15 @@ def child_main(path: Path) -> int:
             known[process.pid] = stamp
             while True:
                 record_tree()
+                if stream is not None:
+                    stream.read(stream_source)
+                    if stream.limit_kind:
+                        reason, limit_kind = "limit", stream.limit_kind
                 if process.poll() is not None:
                     break
-                if stopped():
+                if reason:
+                    pass
+                elif stopped():
                     reason = "canceled"
                 elif time.monotonic() - started > request.limits.timeout_s:
                     reason = "limit"
@@ -268,6 +286,12 @@ def child_main(path: Path) -> int:
             # processes behind. The qualified no-tools route has no owned daemon.
             kill_tree(process, known=known)
             record_tree()
+            if stream is not None and not reason:
+                # Drain only unread bytes after exact owned processes stop;
+                # a fast exit or unterminated last record cannot skip checking.
+                stream.read(stream_source, final=True)
+                if stream.limit_kind:
+                    reason, limit_kind = "limit", stream.limit_kind
         # Exit may occur between polls, after emitting a complete oversized
         # frame. Recheck immutable final streams and the whole-job deadline
         # after descendants drain; a fast exit cannot bypass these bounds.
@@ -346,6 +370,8 @@ def child_main(path: Path) -> int:
         if process is not None:
             kill_tree(process, known=known)
         record_tree()
+        if stream is not None:
+            receipt["native_stream_accounting"] = stream.receipt()
         receipt["processes_quiescent"] = all(
             host.liveness_of(pid, stamp) == "dead" for pid, stamp in known.items()
         )

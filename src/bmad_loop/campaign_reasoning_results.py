@@ -165,6 +165,11 @@ def apply_result(runtime, snapshot, row: dict[str, Any]) -> None:
     ):
         raise CampaignError("semantic application needs current validated result")
     result = row["result"]
+    if request.coordinates.get("intake_baseline"):
+        from .campaign_intake_baseline import apply_result as baseline_result
+
+        baseline_result(snapshot, request, result)
+        return
     if request.purpose in {"handoff_map", "handoff_reduce"}:
         from .campaign_summary import validate_job_result
 

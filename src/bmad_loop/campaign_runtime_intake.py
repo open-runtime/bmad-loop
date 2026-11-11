@@ -367,6 +367,12 @@ def proposals(snapshot: CampaignSnapshot, candidate: RoleCandidate | None) -> tu
 
 def create_control(snapshot: CampaignSnapshot, payload: Mapping[str, Any]) -> str:
     versions = list(payload["input_versions"])
+    from .campaign_intake_baseline import deferred_versions
+
+    if set(versions) & deferred_versions(snapshot):
+        # A previously prepared allocation must not race the source-aware
+        # initial reconciliation; none of its inputs is consumed here.
+        return ""
     key = "campaign:" + snapshot.id + ":intake:" + str(payload["packet_id"])[:16]
     if key in snapshot.units:
         existing = control(snapshot.units[key])

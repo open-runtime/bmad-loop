@@ -1,0 +1,1579 @@
+"""Repository workflow through real qualified child transport; zero LLM tokens."""
+
+from __future__ import annotations
+
+import copy
+import json
+import sys
+import time
+from dataclasses import asdict, replace
+from pathlib import Path
+from urllib.parse import urlsplit
+
+import pytest
+from test_campaign_headless import ChildMux, fixture_capability
+
+from bmad_loop import cli
+from bmad_loop.campaign_capacity import CapacityObservation
+from bmad_loop.campaign_github import ApiResponse, GithubError, GithubGateway, UncertainMutation
+from bmad_loop.campaign_headless import HeadlessRunner, file_digest
+from bmad_loop.campaign_jobs import digest
+from bmad_loop.campaign_model import CampaignError, RoleCandidate
+from bmad_loop.repo_actions import readback, semantic_details, validate_action, validate_review
+from bmad_loop.repo_inventory import RepoInventory, intent_blocks
+from bmad_loop.repo_jobs import RepoJobs
+from bmad_loop.repo_policy import RepoPolicy, load_policy, policy_from_dict
+from bmad_loop.repo_runtime import RepoRuntime
+from bmad_loop.repo_store import RepoStore
+
+
+class Github:
+    def __init__(self):
+        self.rows = {
+            n: {
+                "id": 100 + n,
+                "number": n,
+                "title": "same obligation",
+                "body": "Preserve the exact requirement",
+                "state": "open",
+                "updated_at": "2026-11-01T00:00:00Z",
+                "labels": [],
+                "comments": 0,
+                "html_url": f"https://github.com/a/b/issues/{n}",
+            }
+            for n in (1, 2)
+        }
+        self.comments = {1: [], 2: []}
+        self.milestones = {}
+        self.requests = []
+        self.lose_ack = False
+
+    def request(self, method, path, payload=None):
+        self.requests.append((method, path, copy.deepcopy(payload)))
+        clean = urlsplit(path).path
+        if method == "GET":
+            if clean == "repos/a/b":
+                data = {"id": 9, "full_name": "a/b"}
+            elif clean == "repos/a/b/issues":
+                data = list(self.rows.values())
+            elif clean == "repos/a/b/pulls":
+                data = []
+            elif clean == "repos/a/b/milestones":
+                data = list(self.milestones.values())
+            else:
+                number = int(clean.split("/")[4])
+                if "/milestones/" in clean:
+                    data = self.milestones[number]
+                elif clean.endswith("/comments"):
+                    data = self.comments[number]
+                elif clean.endswith("/events"):
+                    data = []
+                elif clean.endswith("/labels"):
+                    data = self.rows[number]["labels"]
+                else:
+                    data = self.rows[number]
+            return ApiResponse(200, copy.deepcopy(data), {})
+        number = int(clean.split("/")[4])
+        if clean.endswith("/comments"):
+            data = {"id": 500 + len(self.comments[number]), "body": payload["body"]}
+            self.comments[number].append(data)
+            self.rows[number]["comments"] += 1
+        elif clean.endswith("/labels"):
+            self.rows[number]["labels"] += [{"name": name} for name in payload["labels"]]
+            data = self.rows[number]["labels"]
+        else:
+            self.rows[number].update(payload)
+            if "milestone" in payload:
+                self.rows[number]["milestone"] = self.milestones[payload["milestone"]]
+            data = self.rows[number]
+        self.rows[number]["updated_at"] = "2026-11-02T00:00:00Z"
+        if self.lose_ack:
+            self.lose_ack = False
+            raise UncertainMutation("lost acknowledgement")
+        return ApiResponse(201, copy.deepcopy(data), {})
+
+
+@pytest.fixture
+def routes(tmp_path):
+    caps = {}
+    candidates = {}
+    for role, model, family in (
+        ("proposer", "gpt-test", "openai"),
+        ("reviewer", "claude-test", "anthropic"),
+    ):
+        script = tmp_path / f"{role}.py"
+        script.write_text(
+            """import json,sys
+text=sys.stdin.read()
+source=next(json.loads(line) for line in text.splitlines() if line.startswith('{"source_id"'))
+value=json.loads(source['content'])
+if 'shard' in value:
+    actions=[]
+    if 'issue:2' in value['shard']:
+        if 'milestone:3' in value.get('index', {}):
+            actions=[dict(kind='assign_milestone',source='issue:2',target='milestone:3',labels=[],reason='Existing milestone organizes this unassigned obligation')]
+        else:
+            actions=[dict(kind='close_duplicate',source='issue:2',target='issue:1',labels=[],reason='All original requirements and discussion are retained at the open successor')]
+    result=dict(actions=actions,planning_required=[])
+else:
+    result=dict(accepted=True,action_digest=value['action_digest'],evidence_digest=value['evidence_digest'],covered_blocks=list(value['intent_blocks']),reason='Exact obligations preserved')
+print(json.dumps(dict(type='system',model=sys.argv[1],session_id='scripted-repo')))
+print(json.dumps(dict(type='result',structured_output=result,usage=dict(input_tokens=100,output_tokens=30))))
+""",
+            encoding="utf-8",
+        )
+        candidate = RoleCandidate(
+            "codex" if role == "proposer" else "claude", model, "high", family
+        )
+        binary = Path(sys.executable).resolve()
+        cap = {
+            "schema_version": 1,
+            "platform": sys.platform,
+            "profile": candidate.profile,
+            "model": model,
+            "protocol": "bmad-test-v1",
+            "cli_version": "fixture-v1",
+            "binary": str(binary),
+            "binary_sha256": file_digest(binary),
+            "dependencies": [{"path": str(script), "sha256": file_digest(script)}],
+            "argv": [str(binary), str(script), model],
+            "efforts": ["high"],
+            "permissions": "no-tools",
+            "process_containment": "foreground-contained",
+            "input_mode": "text-stdin",
+            "tokenizer": "utf8-byte-upper-bound",
+            "context_tokens": 200000,
+            "input_tokens": 100000,
+            "output_tokens": 4096,
+            "reserved_tokens": 4096,
+            "max_turns": 1,
+        }
+        caps[role] = fixture_capability(tmp_path, cap, candidate)
+        candidates[role] = candidate
+    return caps, candidates
+
+
+@pytest.fixture
+def workflow(project, routes, monkeypatch):
+    project = project.project
+    monkeypatch.setenv("BMAD_LOOP_STATE_DIR", str(project.parent / "native-state"))
+    caps, candidates = routes
+    policy = RepoPolicy(
+        "a/b",
+        "/qualified/capabilities.json",
+        candidates["proposer"],
+        candidates["reviewer"],
+        "owner",
+        labels=("organized",),
+    )
+    transport = Github()
+    gateway = GithubGateway(transport, "a/b")
+    store = RepoStore(project)
+    state = store.create(json.loads(json.dumps(asdict(policy))), caps, digest(asdict(policy)))
+    collector = RepoInventory(project, gateway, policy)
+    real_git = collector._git
+
+    def git(*args):
+        if args[:2] == ("remote", "get-url"):
+            return "https://github.com/a/b.git"
+        if args[0] == "ls-remote":
+            return ""
+        return real_git(*args)
+
+    monkeypatch.setattr(collector, "_git", git)
+    runner = HeadlessRunner(ChildMux())
+
+    def capacity(*args):
+        now = time.time()
+        return CapacityObservation(
+            True, slots=1, model_access=True, observed_at=now, expires_at=now + 60
+        )
+
+    jobs = RepoJobs(store, policy, runner=runner, capacity=capacity)
+    runtime = RepoRuntime(store, state, gateway=gateway, inventory=collector, jobs=jobs)
+    yield runtime, transport
+    for process in runner.mux.processes.values():
+        process.wait(timeout=10)
+
+
+def test_actual_scripted_audit_review_reconcile_and_retained_history(workflow):
+    runtime, transport = workflow
+    runtime.audit()
+    assert runtime.state["phase"] == "ready", runtime.state
+    assert len(runtime.state["jobs"]) == 2
+    assert all(row["state"] == "completed" for row in runtime.state["jobs"].values())
+    assert not any(method != "GET" for method, _, _ in transport.requests)
+    assert runtime.state["actions"][0]["state"] == "approved", runtime.state["actions"]
+    runtime.reconcile()
+    assert runtime.state["phase"] == "complete", runtime.state
+    assert transport.rows[2]["state"] == "closed"
+    assert transport.rows[1]["state"] == "open"
+    assert "Preserve the exact requirement" in transport.comments[1][0]["body"]
+    assert runtime.state["mutations"] == 2 and runtime.state["closures"] == 1
+    assert runtime.store.load(runtime.state["id"])["actions"] == runtime.state["actions"]
+    history = runtime.store.history(runtime.state["id"])
+    assert len([row for row in history if row["kind"] == "action-submitting"]) == 2
+    assert all(
+        not any(process.poll() is None for process in runtime.jobs.runner.mux.processes.values())
+        for _ in [0]
+    )
+
+
+def approved(workflow):
+    runtime, transport = workflow
+    # Seam tests obtain approval through real proposal/review jobs, never by
+    # manufacturing a state-only authorization receipt.
+    runtime.audit()
+    assert runtime.state["actions"][0]["state"] == "approved"
+    return runtime, transport
+
+
+def test_unknown_post_readback_does_not_replay_and_finishes_same_action(workflow):
+    runtime, transport = approved(workflow)
+    transport.lose_ack = True
+    runtime.reconcile()
+    assert runtime.state["phase"] == "held"
+    assert runtime.state["actions"][0]["steps"][0]["state"] == "sent_unknown"
+    runtime.reconcile()
+    assert runtime.state["phase"] == "complete"
+    assert len([row for row in transport.requests if row[0] == "POST"]) == 1
+
+
+@pytest.mark.parametrize("change", ["body", "updated_at", "protected", "identity"])
+def test_fresh_changed_object_prevents_all_mutations(workflow, change):
+    runtime, transport = approved(workflow)
+    if change == "protected":
+        transport.rows[2]["labels"] = [{"name": "bmad:hold"}]
+    elif change == "identity":
+        transport.rows[2]["id"] = 999
+    else:
+        transport.rows[2][change] = "new owner content"
+    runtime.reconcile()
+    assert runtime.state["actions"][0]["state"] == "held"
+    assert not any(row[0] != "GET" for row in transport.requests)
+
+
+def test_stop_then_resume_preserves_job_and_action_identity(workflow):
+    runtime, transport = workflow
+    runtime.store.stop(runtime.state["id"])
+    runtime.audit()
+    assert runtime.state["phase"] == "stopped" and not runtime.state["jobs"]
+    runtime.store.stop(runtime.state["id"], False)
+    runtime.audit()
+    job_ids = set(runtime.state["jobs"])
+    runtime.store.stop(runtime.state["id"])
+    runtime.reconcile()
+    assert runtime.state["phase"] == "stopped"
+    assert not any(row[0] != "GET" for row in transport.requests)
+    runtime.store.stop(runtime.state["id"], False)
+    runtime.reconcile()
+    assert runtime.state["phase"] == "complete" and set(runtime.state["jobs"]) == job_ids
+
+
+def test_budget_has_no_partial_closure_after_exhaustion(workflow):
+    runtime, transport = approved(workflow)
+    runtime.policy = replace(runtime.policy, max_mutations=1, max_closures=1)
+    runtime.reconcile()
+    assert runtime.state["mutations"] == 1
+    assert transport.rows[2]["state"] == "open"
+    assert runtime.state["actions"][0]["state"] == "held"
+
+
+@pytest.mark.parametrize("bad", [0, -1, True, 1.5, "100"])
+def test_policy_refuses_invalid_budget(bad):
+    policy = RepoPolicy(
+        "a/b",
+        "/cap.json",
+        RoleCandidate("codex", "gpt-test", "high", "openai"),
+        RoleCandidate("claude", "claude-test", "high", "anthropic"),
+        "owner",
+    )
+    raw = asdict(policy)
+    raw["max_mutations"] = bad
+    with pytest.raises(CampaignError):
+        policy_from_dict(raw)
+
+
+def test_full_public_cli_parser_remains_usable(capsys):
+    with pytest.raises(SystemExit) as raised:
+        cli.main(["--help"])
+    assert raised.value.code == 0
+    assert "repo" in capsys.readouterr().out
+    with pytest.raises(SystemExit) as raised:
+        cli.main(["repo", "audit", "--help"])
+    assert raised.value.code == 0
+    assert "--policy" in capsys.readouterr().out
+
+
+def test_status_history_stop_and_stale_revision_through_real_cli(workflow, capsys):
+    runtime, _ = workflow
+    project, identity = str(runtime.store.project), runtime.state["id"]
+    assert cli.main(["repo", "status", identity, "--project", project, "--json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["id"] == identity and report["revision"] == 1
+    assert (
+        cli.main(
+            [
+                "repo",
+                "reconcile",
+                identity,
+                "--project",
+                project,
+                "--expected-revision",
+                "42",
+                "--json",
+            ]
+        )
+        == 1
+    )
+    assert not capsys.readouterr().out
+    assert cli.main(["repo", "stop", identity, "--project", project, "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["stop_requested"]
+    assert cli.main(["repo", "history", identity, "--project", project, "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["events"][-1]["kind"] == "stop-requested"
+
+
+@pytest.fixture
+def decision():
+    transport = Github()
+    source = {
+        "kind": "issue",
+        "record": transport.rows[2],
+        "comments": [{"id": 1, "body": "Do not lose this owner request"}],
+        "events": [],
+    }
+    target = {"kind": "issue", "record": transport.rows[1], "comments": [], "events": []}
+    action = {
+        "kind": "close_duplicate",
+        "source": "issue:2",
+        "target": "issue:1",
+        "labels": [],
+        "reason": "Duplicate intent preserved",
+    }
+    evidence = {"source": source, "target": target, "catalog_complete": True, "pulls": []}
+    policy = RepoPolicy(
+        "a/b",
+        "/cap.json",
+        RoleCandidate("codex", "gpt-test", "high", "openai"),
+        RoleCandidate("claude", "claude-test", "high", "anthropic"),
+        "owner",
+    )
+    review = {
+        "accepted": True,
+        "action_digest": digest(action),
+        "evidence_digest": digest(evidence),
+        "covered_blocks": list(intent_blocks(source)),
+        "reason": "verified",
+    }
+    return action, evidence, policy, review
+
+
+@pytest.mark.parametrize(
+    "change",
+    ["missing_block", "duplicate_block", "foreign_block", "action", "evidence", "rejected"],
+)
+def test_exact_independent_coverage_refusals(decision, change):
+    action, evidence, _, review = decision
+    if change == "missing_block":
+        review["covered_blocks"].pop()
+    elif change == "duplicate_block":
+        review["covered_blocks"].append(review["covered_blocks"][0])
+    elif change == "foreign_block":
+        review["covered_blocks"][0] = "invented"
+    elif change == "action":
+        review["action_digest"] = "other"
+    elif change == "evidence":
+        review["evidence_digest"] = "other"
+    else:
+        review["accepted"] = False
+    with pytest.raises(CampaignError, match="Independent review"):
+        validate_review(action, evidence, review)
+
+
+@pytest.mark.parametrize(
+    "change", ["incomplete", "protected", "target_protected", "open_pr", "foreign_label", "delete"]
+)
+def test_deterministic_action_authority(decision, change):
+    action, evidence, policy, _ = decision
+    if change == "incomplete":
+        evidence["catalog_complete"] = False
+    elif change in {"protected", "target_protected"}:
+        evidence["source" if change == "protected" else "target"]["record"]["labels"] = [
+            {"name": "bmad:hold"}
+        ]
+    elif change == "open_pr":
+        evidence["pulls"] = [{"record": {"state": "open", "body": "Implements #2"}}]
+    elif change == "foreign_label":
+        action.update(kind="label", target="", labels=["unauthorized"])
+    else:
+        action["kind"] = "delete"
+    with pytest.raises(CampaignError):
+        validate_action(action, evidence, policy)
+
+
+@pytest.mark.parametrize(
+    "proof",
+    [
+        None,
+        {"complete": False},
+        {"complete": True, "provider": {}},
+        {"complete": True, "provider": {"name": "native"}, "services": []},
+    ],
+)
+def test_existing_pr_without_positive_release_is_held(decision, proof):
+    action, evidence, policy, _ = decision
+    evidence["source"]["kind"] = "pr"
+    with pytest.raises(CampaignError, match="release|release proof"):
+        validate_action(action, evidence, policy, owners=proof)
+
+
+def test_milestone_requires_complete_closed_members(decision):
+    action, evidence, policy, _ = decision
+    action.update(kind="close_completed_milestone", target="")
+    evidence.update(target=None)
+    evidence["source"].update(kind="milestone", members=[{"state": "closed"}])
+    evidence["source"]["record"].update(closed_issues=1, open_issues=0)
+    validate_action(action, evidence, policy)
+    evidence["source"]["members"].append({"state": "open"})
+    with pytest.raises(CampaignError, match="membership"):
+        validate_action(action, evidence, policy)
+
+
+def test_forged_marker_cannot_be_stripped_from_fresh_evidence(decision):
+    _, evidence, _, _ = decision
+    old = evidence["source"]
+    changed = copy.deepcopy(old)
+    changed["comments"].append({"id": 77, "body": "<!-- bmad-repo:fake:fake --> Owner requirement"})
+    assert semantic_details(changed, []) != semantic_details(old, [])
+    assert semantic_details(changed, [{"id": 77, "body": "different"}]) != semantic_details(old, [])
+
+
+def test_unknown_absence_never_confirms_an_effect(decision):
+    transport = Github()
+    gateway = GithubGateway(transport, "a/b")
+    intent = {
+        "kind": "repo_comment",
+        "path": "repos/a/b/issues/1/comments",
+        "marker": "unique",
+        "payload": {"body": "unique body"},
+        "coordinates": {"object_path": "repos/a/b/issues/2", "id": 102},
+    }
+    assert readback(intent, gateway) is None
+    transport.comments[1].append({"id": 5, "body": "unique body"})
+    assert readback(intent, gateway)["id"] == 5
+    transport.rows[2]["id"] = 900
+    with pytest.raises(CampaignError, match="identity"):
+        readback(intent, gateway)
+
+
+def test_policy_load_validates_real_qualified_routes_and_family_separation(tmp_path, routes):
+    caps, candidates = routes
+    capability_path = tmp_path / "capabilities.json"
+    capability_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "routes": {cap["profile"] + ":" + cap["model"]: cap for cap in caps.values()},
+            }
+        ),
+        encoding="utf-8",
+    )
+    policy = RepoPolicy(
+        "a/b", str(capability_path), candidates["proposer"], candidates["reviewer"], "owner"
+    )
+    path = tmp_path / "policy.json"
+    path.write_text(json.dumps(asdict(policy)), encoding="utf-8")
+    raw, selected, sha = load_policy(path)
+    assert selected == caps and sha == digest(raw)
+    path.write_text(
+        json.dumps(asdict(replace(policy, reviewer=candidates["proposer"]))), encoding="utf-8"
+    )
+    with pytest.raises(CampaignError, match="distinct"):
+        load_policy(path)
+
+
+def test_cas_and_immutable_evidence_are_real_sqlite_authority(workflow):
+    runtime, _ = workflow
+    old = copy.deepcopy(runtime.state)
+    runtime.store.save(runtime.state, "changed")
+    with pytest.raises(CampaignError, match="revision"):
+        runtime.store.save(old, "stale")
+    reference = runtime.store.artifact(runtime.state["id"], "proof", {"a": 1})
+    Path(reference["path"]).write_text('{"a": 2}', encoding="utf-8")
+    with pytest.raises(CampaignError, match="changed"):
+        runtime.store.read(reference)
+
+
+def test_batch_runs_independent_shards_with_one_durable_writer_and_shared_limit(
+    workflow, monkeypatch
+):
+    runtime, _ = workflow
+    jobs = runtime.jobs
+    jobs.policy = replace(jobs.policy, max_sessions=2)
+
+    def capacity(*args):
+        now = time.time()
+        return CapacityObservation(
+            True, slots=3, model_access=True, observed_at=now, expires_at=now + 60
+        )
+
+    jobs.capacity = capacity
+    mux = jobs.runner.mux
+    start = mux.new_window
+    peaks = []
+
+    def tracked(*args):
+        result = start(*args)
+        peaks.append(sum(process.poll() is None for process in mux.processes.values()))
+        return result
+
+    monkeypatch.setattr(mux, "new_window", tracked)
+    from bmad_loop.repo_actions import PROPOSAL_SCHEMA
+
+    tasks = [
+        (f"shard-{number}", "proposer", {"shard": {}}, "Inspect this shard", PROPOSAL_SCHEMA)
+        for number in range(5)
+    ]
+    results = jobs.run_many(runtime.state, tasks)
+    assert len(results) == 5 and max(peaks) == 2
+    assert len(runtime.store.load(runtime.state["id"])["jobs"]) == 5
+
+
+def test_unknown_capacity_wait_resumes_without_spending_native_attempt(workflow):
+    runtime, _ = workflow
+    capacity = runtime.jobs.capacity
+    runtime.jobs.capacity = lambda *args: CapacityObservation(False, reason="quota unknown")
+    runtime.audit()
+    assert runtime.state["phase"] == "capacity_wait"
+    assert not runtime.jobs.runner.mux.processes
+    first = list(runtime.state["jobs"].values())[0]
+    assert first["attempt"] == 1
+    runtime.jobs.capacity = capacity
+    runtime.state["resume_epoch"] = 1
+    runtime.audit()
+    assert runtime.state["phase"] == "ready"
+    assert first["attempt"] == 1
+
+
+def test_quiescent_quota_attempts_preserved_and_capped_across_resume(workflow, monkeypatch):
+    runtime, _ = workflow
+    original = runtime.jobs.runner.observe
+
+    def quota(path):
+        result = original(path)
+        if result["state"] == "finished":
+            result["receipt"]["outcome"] = "quota"
+        return result
+
+    monkeypatch.setattr(runtime.jobs.runner, "observe", quota)
+    runtime.audit()
+    row = list(runtime.state["jobs"].values())[0]
+    first_path = row["path"]
+    assert runtime.state["phase"] == "capacity_wait" and row["attempt"] == 1
+    runtime.state["resume_epoch"] = 1
+    runtime.audit()
+    assert runtime.state["phase"] == "capacity_wait" and row["attempt"] == 2
+    assert row["path"] != first_path and row["history"][0]["path"] == first_path
+    runtime.state["resume_epoch"] = 2
+    runtime.audit()
+    assert runtime.state["phase"] == "held" and row["attempt"] == 2
+    assert len(runtime.jobs.runner.mux.processes) == 2
+
+
+@pytest.mark.parametrize("models", [["gpt-test", "unknown-author"], ["gpt-test", "claude-test"]])
+def test_auxiliary_author_debt_preserved_without_granting_independent_review(
+    workflow, monkeypatch, models
+):
+    runtime, transport = workflow
+    original = runtime.jobs.runner.observe
+
+    def changed(path):
+        result = original(path)
+        if result["state"] == "finished" and result["receipt"]["observed_model"] == "gpt-test":
+            result["receipt"]["observed_models"] = models
+        return result
+
+    monkeypatch.setattr(runtime.jobs.runner, "observe", changed)
+    runtime.audit()
+    assert runtime.state["phase"] == "ready"
+    assert all(row["state"] == "completed" for row in runtime.state["jobs"].values())
+    assert len(runtime.state["jobs"]) == 1
+    assert runtime.state["actions"][0]["state"] == "held"
+    assert not any(method != "GET" for method, _, _ in transport.requests)
+
+
+def test_known_auxiliary_proposer_succeeds_with_independent_reviewer(workflow, monkeypatch):
+    runtime, _ = workflow
+    original = runtime.jobs.runner.observe
+
+    def changed(path):
+        result = original(path)
+        if result["state"] == "finished" and result["receipt"]["observed_model"] == "gpt-test":
+            result["receipt"]["observed_models"] = ["gpt-test", "gemini-test"]
+        return result
+
+    monkeypatch.setattr(runtime.jobs.runner, "observe", changed)
+    runtime.audit()
+    assert runtime.state["actions"][0]["state"] == "approved"
+    proposer = next(row for row in runtime.state["jobs"].values() if row["role"] == "proposer")
+    assert proposer["families"] == ["google", "openai"]
+
+
+def test_reviewer_auxiliary_cannot_review_its_own_family_work(workflow, monkeypatch):
+    runtime, _ = workflow
+    original = runtime.jobs.runner.observe
+
+    def changed(path):
+        result = original(path)
+        if result["state"] == "finished" and result["receipt"]["observed_model"] == "claude-test":
+            result["receipt"]["observed_models"] = ["claude-test", "gpt-test"]
+        return result
+
+    monkeypatch.setattr(runtime.jobs.runner, "observe", changed)
+    runtime.audit()
+    assert runtime.state["actions"][0]["state"] == "held"
+    assert "intersects" in runtime.state["actions"][0]["reason"]
+
+
+def test_unknown_primary_native_model_refuses_proposal(workflow, monkeypatch):
+    runtime, _ = workflow
+    original = runtime.jobs.runner.observe
+
+    def changed(path):
+        result = original(path)
+        if result["state"] == "finished":
+            result["receipt"]["observed_model"] = "unknown-primary"
+        return result
+
+    monkeypatch.setattr(runtime.jobs.runner, "observe", changed)
+    runtime.audit()
+    assert runtime.state["phase"] == "held" and not runtime.state["actions"]
+
+
+def test_existing_milestone_assignment_through_independent_native_review(workflow):
+    runtime, transport = workflow
+    transport.milestones[3] = {
+        "id": 303,
+        "number": 3,
+        "title": "Existing milestone",
+        "state": "open",
+        "updated_at": "2026-11-01T00:00:00Z",
+        "html_url": "https://github.com/a/b/milestone/3",
+        "open_issues": 0,
+        "closed_issues": 0,
+    }
+    runtime.audit()
+    assert runtime.state["actions"][0]["state"] == "approved", runtime.state["actions"]
+    runtime.reconcile()
+    assert runtime.state["phase"] == "complete", runtime.state
+    assert transport.rows[2]["milestone"]["id"] == 303
+    assert transport.rows[2]["body"] == "Preserve the exact requirement"
+    assert runtime.state["mutations"] == 1 and runtime.state["closures"] == 0
+
+
+def test_milestone_assignment_cannot_replace_existing_owner_choice(decision):
+    action, evidence, policy, _ = decision
+    action.update(kind="assign_milestone", target="milestone:3")
+    evidence["target"].update(kind="milestone")
+    evidence["source"]["record"]["milestone"] = {"number": 4}
+    with pytest.raises(CampaignError, match="unassigned"):
+        validate_action(action, evidence, policy)
+
+
+def test_real_cli_audit_and_reconcile_use_qualified_child_workflow(
+    workflow, tmp_path, monkeypatch, capsys
+):
+    from bmad_loop import repo_cli
+
+    original, transport = workflow
+    manifest = tmp_path / "routes.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "routes": {
+                    cap["profile"] + ":" + cap["model"]: cap
+                    for cap in original.state["capabilities"].values()
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    policy = replace(original.policy, capabilities=str(manifest))
+    policy_path = tmp_path / "repo-policy.json"
+    policy_path.write_text(json.dumps(asdict(policy)), encoding="utf-8")
+
+    def runtime(store, state):
+        jobs = RepoJobs(store, policy, runner=original.jobs.runner, capacity=original.jobs.capacity)
+        return RepoRuntime(
+            store, state, gateway=original.gateway, inventory=original.inventory, jobs=jobs
+        )
+
+    monkeypatch.setattr(repo_cli, "RepoRuntime", runtime)
+    project = str(original.store.project)
+    assert (
+        cli.main(["repo", "audit", "--project", project, "--policy", str(policy_path), "--json"])
+        == 0
+    )
+    report = json.loads(capsys.readouterr().out)
+    assert report["phase"] == "ready" and report["id"] != original.state["id"]
+    assert all(method == "GET" for method, _, _ in transport.requests)
+    assert (
+        cli.main(
+            [
+                "repo",
+                "reconcile",
+                report["id"],
+                "--project",
+                project,
+                "--expected-revision",
+                str(report["revision"]),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out)["phase"] == "complete"
+
+
+def test_stop_arriving_during_fresh_observation_wins_admission(workflow, monkeypatch):
+    runtime, transport = approved(workflow)
+    fresh = runtime._fresh
+
+    def stop_after_read(row):
+        value = fresh(row)
+        runtime.store.stop(runtime.state["id"])
+        return value
+
+    monkeypatch.setattr(runtime, "_fresh", stop_after_read)
+    runtime.reconcile()
+    assert runtime.state["phase"] == "stopped"
+    assert runtime.state["mutations"] == 0
+    assert not any(method != "GET" for method, _, _ in transport.requests)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "liveness",
+        "ownership",
+        "fence_revision",
+        "binding_revision",
+        "head",
+        "pr_node_id",
+        "admissions_open",
+        "active_workers",
+    ],
+)
+def test_exact_writer_release_refuses_each_missing_coordinate(decision, project, field):
+    from bmad_loop.verify import git_bytes
+
+    action, evidence, policy, _ = decision
+    head = git_bytes(project.project, "rev-parse", "HEAD").stdout.decode().strip()
+    for name in ("source", "target"):
+        evidence[name].update(kind="pr")
+        evidence[name]["record"].update(
+            head={"sha": head, "ref": "owned"},
+            base={"sha": head, "ref": "main"},
+            node_id="native-pr",
+        )
+    details = {
+        "repository": "a/b",
+        "pr_number": 2,
+        "pr_node_id": "native-pr",
+        "head": head,
+        "base": head,
+        "branch": "owned",
+        "fence_revision": "fence1",
+        "binding_revision": "binding1",
+        "admissions_open": False,
+        "active_workers": 0,
+        "preserved_clean": True,
+        "resumable_binding_verified": True,
+    }
+    actor = {"revision": "actor1", "liveness": "dead", "ownership": "unowned", "details": details}
+    owners = {
+        "complete": True,
+        "provider": {"name": "installed"},
+        "services": [{"items": [actor]}],
+        "items": [actor],
+    }
+    validate_action(action, evidence, policy, owners=owners, project=project.project)
+    if field in {"liveness", "ownership"}:
+        actor[field] = "unknown"
+    else:
+        details.pop(field)
+    with pytest.raises(CampaignError, match="released"):
+        validate_action(action, evidence, policy, owners=owners, project=project.project)
+
+
+def test_unknown_launch_is_observed_without_replacement(workflow, monkeypatch):
+    runtime, _ = workflow
+    runner = runtime.jobs.runner
+    actual_start, actual_observe = runner.launch, runner.observe
+
+    def unknown_start(*args, **kwargs):
+        actual_start(*args, **kwargs)
+        return {"state": "unknown"}
+
+    monkeypatch.setattr(runner, "launch", unknown_start)
+    monkeypatch.setattr(runner, "observe", lambda path: {"state": "unknown"})
+    runtime.audit()
+    assert runtime.state["phase"] == "held"
+    runtime.audit()
+    assert len(runner.mux.processes) == 1 and not runtime.state["actions"]
+    for process in runner.mux.processes.values():
+        process.wait(timeout=10)
+    monkeypatch.setattr(runner, "launch", actual_start)
+    monkeypatch.setattr(runner, "observe", actual_observe)
+    runtime.audit()
+    assert runtime.state["phase"] == "ready"
+    assert len(runner.mux.processes) == 2
+
+
+@pytest.mark.parametrize("binding", ["direct", "shared"])
+def test_native_issue_owner_without_pr_is_retained_and_blocks_only_its_issue(
+    workflow, decision, binding
+):
+    from bmad_loop.campaign_model import CampaignSnapshot, CampaignSpec, CampaignUnit, UnitSpec
+    from bmad_loop.campaign_runtime import store_for
+
+    runtime, _ = workflow
+    spec = UnitSpec("s:project:u", "s", "epic", "Owned work")
+    unit = CampaignUnit(spec)
+    snapshot = CampaignSnapshot(
+        "repo-owned-fixture",
+        "a/b",
+        CampaignSpec("Existing", units=(spec,)),
+        {spec.id: unit},
+        common_dir=str(runtime.store.common),
+        root=str(runtime.store.project),
+        phase="stopped",
+    )
+    issue = {
+        "kind": "issue",
+        "number": 2,
+        "database_id": 102,
+        "url": "https://github.com/a/b/issues/2",
+    }
+    if binding == "direct":
+        unit.bindings["issue"] = issue
+    else:
+        snapshot.bindings["github_hierarchy"] = {"story:" + unit.id: issue}
+    campaign_store = store_for(runtime.store.project)
+    campaign_store.create(snapshot)
+    database = campaign_store.root / snapshot.id / "campaign.sqlite"
+    before = file_digest(database)
+    observed = runtime.inventory.collect()
+    entry = next(row for row in observed["owners"]["items"] if row["kind"] == "native-unit")
+    assert entry["details"]["shared_issue" if binding == "shared" else "issue"]["number"] == 2
+    assert entry["details"]["pr"] is None
+    action, evidence, policy, _ = decision
+    with pytest.raises(CampaignError, match="campaign owns"):
+        validate_action(action, evidence, policy, owners=observed["owners"])
+    unowned = copy.deepcopy(evidence)
+    unowned["source"]["record"].update(id=107, number=7)
+    validate_action({**action, "source": "issue:7"}, unowned, policy, owners=observed["owners"])
+    assert file_digest(database) == before
+
+
+def test_partial_audit_with_approved_subset_cannot_reconcile(workflow):
+    runtime, transport = approved(workflow)
+    runtime.state.update(audit_complete=False, phase="held", reason="remaining shard not reviewed")
+    with pytest.raises(CampaignError, match="Incomplete audit"):
+        runtime.reconcile()
+    assert not any(method != "GET" for method, _, _ in transport.requests)
+
+
+@pytest.mark.parametrize("objects", [0, 1])
+def test_truncated_inventory_never_finishes_or_launches_reasoning(workflow, objects):
+    from bmad_loop.repo_runtime import status
+
+    runtime, transport = workflow
+    runtime.inventory.policy = replace(
+        runtime.policy, metadata_bytes=1 if objects == 0 else 64 * 1024 * 1024, max_objects=1
+    )
+    runtime.audit()
+    frozen = copy.deepcopy(runtime.state["inventory"])
+    catalog = runtime.store.read(frozen)
+    assert len(catalog["objects"]) == objects and catalog["complete"] is False
+    assert "catalog_bound" in catalog["unavailable"]
+    assert runtime.state["phase"] == "held"
+    assert runtime.state["audit_complete"] is False
+    assert runtime.state["jobs"] == {}
+    for operation in (runtime.audit, runtime.reconcile):
+        operation()
+        document = status(runtime.state)
+        assert document["phase"] == "held"
+        assert document["audit_complete"] is False
+        assert document["inventory_coverage"]["complete"] is False
+        assert document["inventory_coverage"]["objects"] == objects
+        assert "catalog_bound" in document["inventory_coverage"]["unavailable"]
+        assert "new audit" in document["reason"]
+        assert runtime.state["inventory"] == frozen
+    assert not runtime.state["jobs"]
+    assert not any(method != "GET" for method, _, _ in transport.requests)
+
+
+@pytest.mark.parametrize("phase", ["ready", "complete"])
+@pytest.mark.parametrize("objects", [0, 1])
+def test_legacy_truncated_inventory_is_rechecked_by_status_and_reconcile(
+    workflow, phase, objects, capsys
+):
+    runtime, transport = workflow
+    runtime.inventory.policy = replace(
+        runtime.policy, metadata_bytes=1 if objects == 0 else 64 * 1024 * 1024, max_objects=1
+    )
+    catalog = runtime.inventory.collect()
+    assert len(catalog["objects"]) == objects and catalog["complete"] is False
+    runtime.state.update(
+        inventory=runtime.store.artifact(runtime.state["id"], "inventory", catalog),
+        audit_complete=True,
+        phase=phase,
+    )
+    runtime.store.save(runtime.state, "legacy-completion-fixture")
+    before = copy.deepcopy(runtime.store.load(runtime.state["id"]))
+    code = cli.main(
+        [
+            "repo",
+            "status",
+            runtime.state["id"],
+            "--project",
+            str(runtime.store.project),
+            "--json",
+        ]
+    )
+    document = json.loads(capsys.readouterr().out)
+    assert code == 1 and document["phase"] == "held"
+    assert document["audit_complete"] is False
+    assert document["inventory_coverage"]["complete"] is False
+    assert "catalog_bound" in document["reason"]
+    assert runtime.store.load(runtime.state["id"]) == before  # Status is observation only.
+    runtime.reconcile()
+    assert runtime.state["phase"] == "held" and runtime.state["audit_complete"] is False
+    assert runtime.state["inventory"] == before["inventory"]
+    assert not any(method != "GET" for method, _, _ in transport.requests)
+
+
+def legacy_incomplete_inventory(runtime):
+    # Keep producer-created intents/receipts, reproducing a legacy checkpoint
+    # that claimed coverage over a truncated catalog. Never edit an artifact.
+    catalog = runtime.store.read(runtime.state["inventory"])
+    catalog.update(complete=False, unavailable=["catalog_bound"])
+    runtime.state.update(
+        inventory=runtime.store.artifact(runtime.state["id"], "inventory", catalog),
+        audit_complete=True,
+    )
+    runtime.store.save(runtime.state, "legacy-truncated-checkpoint-fixture")
+    return copy.deepcopy(runtime.state["inventory"])
+
+
+@pytest.mark.parametrize("outcome", ["confirmed", "absent", "error"])
+@pytest.mark.parametrize("stopped", [False, True])
+def test_incomplete_catalog_observes_issued_write_without_replaying_or_continuing(
+    workflow, monkeypatch, outcome, stopped
+):
+    from bmad_loop.repo_runtime import status
+
+    runtime, transport = approved(workflow)
+    transport.lose_ack = True
+    runtime.reconcile()
+    row = runtime.state["actions"][0]
+    assert [step["state"] for step in row["steps"]] == ["sent_unknown", "prepared"]
+    frozen = legacy_incomplete_inventory(runtime)
+    counts = (runtime.state["mutations"], runtime.state["closures"])
+    submitted = copy.deepcopy(row["steps"][0])
+    prepared = copy.deepcopy(row["steps"][1])
+    requests = len(transport.requests)
+    if outcome == "absent":
+        transport.comments[1].clear()
+    elif outcome == "error":
+        original = transport.request
+
+        def failing(method, path, payload=None):
+            if method == "GET" and urlsplit(path).path.endswith("/comments"):
+                raise GithubError("readback unavailable")
+            return original(method, path, payload)
+
+        monkeypatch.setattr(transport, "request", failing)
+    if stopped:
+        runtime.store.stop(runtime.state["id"])
+    runtime.reconcile()
+    document = status(runtime.state)
+    assert document["phase"] in {"held", "stopped", "observation_wait"}
+    assert document["audit_complete"] is False
+    assert document["inventory_coverage"]["complete"] is False
+    assert runtime.state["inventory"] == frozen
+    assert (runtime.state["mutations"], runtime.state["closures"]) == counts
+    assert row["steps"][1] == prepared
+    assert all(method == "GET" for method, _, _ in transport.requests[requests:])
+    if outcome == "confirmed":
+        assert row["steps"][0]["state"] == "confirmed"
+        assert row["steps"][0]["observation"]["body"] == submitted["payload"]["body"]
+    else:
+        assert row["steps"][0] == submitted
+        assert row["state"] == "uncertain"
+        assert ("no replay" if outcome == "absent" else "readback unavailable") in document[
+            "reason"
+        ]
+    runtime.reconcile()
+    assert runtime.state["audit_complete"] is False and runtime.state["phase"] != "complete"
+    assert all(method == "GET" for method, _, _ in transport.requests[requests:])
+    assert (runtime.state["mutations"], runtime.state["closures"]) == counts
+
+
+@pytest.mark.parametrize("stopped", [False, True])
+def test_incomplete_catalog_settles_existing_managed_job_without_new_admission(
+    managed_repo, monkeypatch, stopped
+):
+    runtime, fake, communication, _ = managed_repo
+    runner = runtime.jobs.runner
+    launch, observe = runner.launch, runner.observe
+
+    def uncertain_launch(*args, **kwargs):
+        launch(*args, **kwargs)
+        return {"state": "unknown"}
+
+    monkeypatch.setattr(runner, "launch", uncertain_launch)
+    monkeypatch.setattr(runner, "observe", lambda path: {"state": "unknown"})
+    runtime.audit()
+    row = next(iter(runtime.state["jobs"].values()))
+    assert row["state"] == "unknown" and communication.manager(runtime.state).has_open()
+    for process in runner.mux.processes.values():
+        process.wait(timeout=10)
+    launch_id, attempts = row["launch_id"], row["attempt"]
+    frozen = legacy_incomplete_inventory(runtime)
+    if stopped:
+        runtime.store.stop(runtime.state["id"])
+    # An uncertain observation remains visible and does not close its actor.
+    runtime.audit()
+    assert "outcome uncertain" in runtime.state["reason"]
+    assert "catalog_bound" in runtime.state["reason"]
+    assert communication.manager(runtime.state).has_open()
+    assert runtime.state["audit_complete"] is False
+    monkeypatch.setattr(runner, "observe", observe)
+
+    def forbidden_launch(*args, **kwargs):
+        pytest.fail("Incomplete catalog launched a new native job")
+
+    monkeypatch.setattr(runner, "launch", forbidden_launch)
+    runtime.audit()
+    assert row["state"] == "completed" and row["verified_quiescent"] is True
+    assert row["launch_id"] == launch_id and row["attempt"] == attempts
+    assert len(runner.mux.processes) == 1 and fake.count("start") == fake.count("stop") == 1
+    assert not communication.manager(runtime.state).has_open()
+    assert not runtime.state["actions"]
+    assert runtime.state["audit_complete"] is False
+    assert runtime.state["phase"] == ("stopped" if stopped else "held")
+    assert runtime.state["inventory"] == frozen
+
+
+@pytest.mark.parametrize("damage", ["missing", "corrupt", "malformed"])
+def test_unavailable_inventory_keeps_issued_write_readback(workflow, damage, monkeypatch, capsys):
+    from bmad_loop import repo_cli
+    from bmad_loop.repo_runtime import status
+
+    runtime, transport = approved(workflow)
+    transport.lose_ack = True
+    runtime.reconcile()
+    row = runtime.state["actions"][0]
+    prepared = copy.deepcopy(row["steps"][1])
+    frozen = copy.deepcopy(runtime.state["inventory"])
+    path = Path(frozen["path"])
+    if damage == "missing":
+        path.unlink()
+    else:
+        path.write_text("{" if damage == "malformed" else "{}", encoding="utf-8")
+    runtime.store.stop(runtime.state["id"])
+    before = len(transport.requests)
+    # Exercise both settlement and the CLI's second evidence read for reporting.
+    monkeypatch.setattr(
+        repo_cli,
+        "RepoRuntime",
+        lambda store, state: RepoRuntime(
+            store, state, gateway=runtime.gateway, inventory=runtime.inventory, jobs=runtime.jobs
+        ),
+    )
+    assert (
+        cli.main(
+            [
+                "repo",
+                "reconcile",
+                runtime.state["id"],
+                "--project",
+                str(runtime.store.project),
+                "--expected-revision",
+                str(runtime.state["revision"]),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    cli_document = json.loads(capsys.readouterr().out)
+    runtime.state = runtime.store.load(runtime.state["id"])
+    row = runtime.state["actions"][0]
+    document = status(runtime.state)
+    assert document["phase"] == "stopped" and document["audit_complete"] is False
+    assert document["inventory_coverage"]["complete"] is None
+    assert "Audit" in document["reason"] and "evidence" in document["reason"]
+    assert cli_document["phase"] == "stopped" and cli_document["audit_complete"] is False
+    assert cli_document["inventory_coverage"]["complete"] is None
+    assert "evidence" in cli_document["reason"]
+    assert row["steps"][0]["state"] == "confirmed" and row["steps"][1] == prepared
+    assert all(method == "GET" for method, _, _ in transport.requests[before:])
+    assert runtime.state["inventory"] == frozen and runtime.state["mutations"] == 1
+
+
+def test_incomplete_catalog_holds_next_independent_label_after_issued_readback(workflow, tmp_path):
+    runtime, transport = workflow
+    cap = runtime.state["capabilities"]["proposer"]
+    script = Path(cap["dependencies"][0]["path"])
+    text = script.read_text(encoding="utf-8")
+    start, end = text.index("    actions=[]"), text.index("    result=dict(actions=actions")
+    script.write_text(
+        text[:start]
+        + "    actions=[dict(kind='label',source=key,target='',labels=['organized'],reason='Organize this issue') for key in value['shard']]\n"
+        + text[end:],
+        encoding="utf-8",
+    )
+    cap["dependencies"][0]["sha256"] = file_digest(script)
+    runtime.state["capabilities"]["proposer"] = fixture_capability(
+        tmp_path, cap, runtime.policy.proposer
+    )
+    runtime.audit()
+    assert len(runtime.state["actions"]) == 2
+    assert all(row["state"] == "approved" for row in runtime.state["actions"])
+    transport.lose_ack = True
+    runtime.reconcile()
+    first, second = runtime.state["actions"]
+    assert first["steps"][0]["state"] == "sent_unknown"
+    pending = copy.deepcopy(second["steps"])
+    frozen = legacy_incomplete_inventory(runtime)
+    count = len(transport.requests)
+    runtime.reconcile()
+    assert first["steps"][0]["state"] == "confirmed"
+    assert second["steps"] == pending and second["state"] == "held"
+    assert runtime.state["mutations"] == 1 and runtime.state["closures"] == 0
+    assert all(method == "GET" for method, _, _ in transport.requests[count:])
+    assert runtime.state["audit_complete"] is False and runtime.state["phase"] == "held"
+    assert runtime.state["inventory"] == frozen
+
+
+def test_incomplete_ownership_does_not_hide_complete_catalog_or_block_safe_assignment(
+    workflow, monkeypatch
+):
+    from bmad_loop.repo_runtime import status
+
+    runtime, transport = workflow
+    transport.milestones[3] = {
+        "id": 303,
+        "number": 3,
+        "title": "Existing milestone",
+        "state": "open",
+        "updated_at": "2026-11-01T00:00:00Z",
+        "html_url": "https://github.com/a/b/milestone/3",
+        "open_issues": 0,
+        "closed_issues": 0,
+    }
+    monkeypatch.setattr(
+        runtime.inventory,
+        "owners",
+        lambda: {"complete": False, "unavailable": ["external-service-unavailable"]},
+    )
+    runtime.audit()
+    assert runtime.state["phase"] == "ready"
+    document = status(runtime.state)
+    assert document["audit_complete"] is True
+    assert document["inventory_coverage"]["complete"] is True
+    assert document["inventory_coverage"]["ownership_complete"] is False
+    runtime.reconcile()
+    assert runtime.state["phase"] == "complete"
+    assert transport.rows[2]["milestone"]["number"] == 3
+
+
+def test_cli_resume_stop_projects_legacy_complete_inventory(workflow, monkeypatch, capsys):
+    runtime, _ = workflow
+    catalog = runtime.inventory.collect()
+    runtime.state.update(
+        inventory=runtime.store.artifact(runtime.state["id"], "inventory", catalog),
+        audit_complete=True,
+        phase="ready",
+    )
+    runtime.store.save(runtime.state, "legacy-complete-fixture")
+    original = RepoRuntime.audit
+
+    def stop_before_audit(current):
+        current.store.stop(current.state["id"])
+        return original(current)
+
+    monkeypatch.setattr(RepoRuntime, "audit", stop_before_audit)
+    assert (
+        cli.main(
+            [
+                "repo",
+                "resume",
+                runtime.state["id"],
+                "--project",
+                str(runtime.store.project),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    document = json.loads(capsys.readouterr().out)
+    assert document["phase"] == "stopped" and document["reason"] == ""
+    assert document["inventory_coverage"]["complete"] is True
+    assert document["audit_complete"] is True
+    assert not runtime.store.load(runtime.state["id"])["jobs"]
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin", reason="Real read-only fixture uses maintained macOS sandbox"
+)
+def test_qualified_readonly_route_prepares_outside_its_evidence_workspace(
+    workflow, tmp_path, monkeypatch
+):
+    import test_campaign_execution_qualification as writer_module
+    import test_campaign_readonly_qualification as readonly_module
+
+    from bmad_loop import campaign_execution_qualification as qualification
+    from bmad_loop.campaign_headless import read_json, write_json
+    from bmad_loop.repo_actions import PROPOSAL_SCHEMA
+
+    runtime, _ = workflow
+    cap = runtime.state["capabilities"]["proposer"]
+    candidate = runtime.policy.proposer
+    base = (None, None, None, candidate, cap)
+    writer = writer_module.writer.__wrapped__(base, tmp_path)
+    proposal, candidate, proposal_cap = readonly_module.readonly.__wrapped__(writer, tmp_path)
+    script = tmp_path / "writer.py"
+    original = script.read_text(encoding="utf-8")
+    script.write_text(
+        """import json,re,sys
+from pathlib import Path
+text=Path(sys.argv[1]).read_text()
+if 'QUALIFICATION NONCE' not in text:
+    try: Path('forbidden-write.txt').write_text('escape')
+    except PermissionError: pass
+    else: raise AssertionError('read-only job could write evidence workspace')
+    print(json.dumps({'type':'system','model':'gpt-test','session_id':'readonly-audit'}))
+    print(json.dumps({'type':'result','structured_output':{'actions':[],'planning_required':[]},'usage':{'input_tokens':100,'output_tokens':20}}))
+    raise SystemExit(0)
+""" + original,
+        encoding="utf-8",
+    )
+    proposal_cap["dependencies"][0]["sha256"] = file_digest(script)
+    proposal.write_text(json.dumps(proposal_cap), encoding="utf-8")
+    # This controller seam uses synthetic qualification session evidence like
+    # fixture_writer_capability. Real Git readback and OS write-denial probing
+    # remain; the repository job below runs the actual sandboxed native child.
+    request, probe, grants = qualification.build(
+        tmp_path / "readonly-proof", candidate, proposal_cap, input_bytes=4096, output_tokens=4096
+    )
+    path = HeadlessRunner(ChildMux())._prepare(
+        tmp_path / "readonly-proof/job",
+        request,
+        candidate,
+        proposal_cap,
+        launch_id="writer-probe-" + probe["nonce"],
+        generation=1,
+        permissions="read-only-tools",
+        grants=grants,
+        probe=probe,
+    )
+    envelope = read_json(path)
+    receipt = {
+        "schema_version": 1,
+        "job_id": request.id,
+        "request_digest": envelope["request_digest"],
+        "launch_id": envelope["launch_id"],
+        "generation": 1,
+        "outcome": "completed",
+        "quiescent": True,
+        "processes_quiescent": True,
+        "completion_evidence": "owned-window-death-and-process-readback",
+        "input_complete": True,
+        "input_delivery": envelope["input"],
+        "session_id": "synthetic-readonly-proof",
+        "selected_model": candidate.model,
+        "observed_model": candidate.model,
+        "observed_models": [candidate.model],
+        "turns": 1,
+        "usage_known": True,
+        "usage": {"input_tokens": 1000, "output_tokens": 80},
+        "result": qualification.expected_result(probe),
+    }
+    write_json(path.parent / "receipt.json", receipt)
+    result = qualification.result(path, {"state": "finished", "receipt": receipt})
+    assert result["ok"], result
+    runtime.state["capabilities"]["proposer"] = read_json(Path(result["capability_path"]))
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    with monkeypatch.context() as isolated:
+        isolated.setenv("GIT_DIR", str(foreign / ".git"))
+        isolated.setenv("GIT_WORK_TREE", str(foreign))
+        runtime.jobs._prepare(
+            runtime.state,
+            (
+                "readonly",
+                "proposer",
+                {"shard": {}},
+                "Read this complete bounded evidence",
+                PROPOSAL_SCHEMA,
+            ),
+        )
+    assert not (foreign / ".git").exists()
+    result = runtime.jobs.run(
+        runtime.state,
+        "readonly",
+        "proposer",
+        {"shard": {}},
+        "Read this complete bounded evidence",
+        PROPOSAL_SCHEMA,
+    )
+    assert result == {"actions": [], "planning_required": []}
+    row = next(iter(runtime.state["jobs"].values()))
+    envelope = read_json(Path(row["path"]))
+    workspace = Path(envelope["grants"]["workspace"])
+    assert workspace == runtime.store.project
+    assert not Path(row["path"]).is_relative_to(workspace)
+    assert envelope["permissions"] == "read-only-tools"
+    assert envelope["grants"]["scopes"] == []
+    assert envelope["grants"]["read_only_paths"] == [envelope["request"]["inputs"][0]["path"]]
+
+
+def test_large_repository_index_uses_bounded_related_candidates_without_losing_sources():
+    from bmad_loop.repo_candidates import batches, wire_size
+
+    objects = {
+        f"issue:{number}": {
+            "kind": "issue",
+            "record": {
+                "number": number,
+                "id": number,
+                "title": f"Obligation unique{number} navigation",
+                "body": "See #1999" if number == 1 else "Complete requirement",
+                "state": "open",
+            },
+        }
+        for number in range(1, 2001)
+    }
+    assert wire_size(objects) > 131072
+    views = batches(objects, 131072, "a/b")
+    assert 1 < len(views) < 128
+    sources = [key for view in views for key in view["shard"]]
+    assert len(sources) == len(set(sources)) == len(objects)
+    assert all(
+        wire_size(view["shard"]) <= 131072 // 2 and wire_size(view["index"]) <= 131072 // 5
+        for view in views
+    )
+    first = next(view for view in views if "issue:1" in view["shard"])
+    assert "issue:1999" in first["index"]
+    assert all(
+        view["candidate_selection"]["mode"] == "related_subset_not_exhaustive" for view in views
+    )
+
+
+@pytest.mark.parametrize("reference", ["issue", "issue_url"])
+def test_case_insensitive_native_repository_ownership_is_not_skipped(decision, reference):
+    action, evidence, policy, _ = decision
+    details = {"repository": "A/B", "unit_id": "owned", "campaign_id": "campaign"}
+    details[reference] = (
+        {"number": 2} if reference == "issue" else "https://github.com/A/B/issues/2"
+    )
+    owners = {"items": [{"kind": "native-unit", "state": "draft", "details": details}]}
+    with pytest.raises(CampaignError, match="campaign owns"):
+        validate_action(action, evidence, policy, owners=owners)
+    details["repository"] = "genuinely/foreign"
+    validate_action(action, evidence, policy, owners=owners)
+
+
+@pytest.mark.parametrize(
+    "body", ["Fixes a/b#2", "Fixes A/B#2", "Fixes #2", "Fixes https://github.com/A/B/issues/2"]
+)
+def test_open_pull_reference_forms_block_issue_closure(decision, body):
+    from bmad_loop.repo_actions import referencing_pulls
+
+    action, evidence, policy, _ = decision
+    pull = {"kind": "pr", "record": {"state": "open", "body": body, "number": 9}}
+    evidence["pulls"] = referencing_pulls(
+        {"objects": {"pull:9": pull}}, evidence["source"], policy.repository
+    )
+    assert evidence["pulls"] == [pull]
+    with pytest.raises(CampaignError, match="[Pp][Rr]|[Pp]ull"):
+        validate_action(action, evidence, policy)
+    pull["record"]["body"] = "Fixes foreign/repo#2 and https://github.com/foreign/repo/issues/2"
+    evidence["pulls"] = referencing_pulls(
+        {"objects": {"pull:9": pull}}, evidence["source"], policy.repository
+    )
+    assert evidence["pulls"] == []
+    validate_action(action, evidence, policy)
+
+
+def test_independent_action_reviews_share_bounded_parallel_scheduler(
+    workflow, monkeypatch, tmp_path
+):
+    runtime, transport = workflow
+    for number in (3, 4):
+        transport.rows[number] = {
+            **transport.rows[2],
+            "id": 100 + number,
+            "number": number,
+            "html_url": f"https://github.com/a/b/issues/{number}",
+        }
+        transport.comments[number] = []
+    cap = runtime.state["capabilities"]["proposer"]
+    script = Path(cap["dependencies"][0]["path"])
+    text = script.read_text(encoding="utf-8")
+    start, end = text.index("    actions=[]"), text.index("    result=dict(actions=actions")
+    text = (
+        text[:start]
+        + "    actions=[dict(kind='label',source=key,target='',labels=['organized'],reason='Evidence-backed organization') for key in value['shard']]\n"
+        + text[end:]
+    )
+    script.write_text(text, encoding="utf-8")
+    cap["dependencies"][0]["sha256"] = file_digest(script)
+    runtime.state["capabilities"]["proposer"] = fixture_capability(
+        tmp_path, cap, runtime.policy.proposer
+    )
+    runtime.jobs.policy = replace(runtime.policy, max_sessions=2)
+    runtime.jobs.capacity = lambda *args: CapacityObservation(
+        True, slots=3, model_access=True, observed_at=time.time(), expires_at=time.time() + 60
+    )
+    mux, peaks = runtime.jobs.runner.mux, []
+    start_window = mux.new_window
+
+    def tracked(*args):
+        result = start_window(*args)
+        if any(
+            row["role"] == "reviewer" and row["state"] in {"prepared", "running"}
+            for row in runtime.state["jobs"].values()
+        ):
+            peaks.append(sum(process.poll() is None for process in mux.processes.values()))
+        return result
+
+    monkeypatch.setattr(mux, "new_window", tracked)
+    runtime.audit()
+    assert runtime.state["phase"] == "ready", runtime.state["reason"]
+    assert max(peaks) == 2
+    assert len(runtime.state["actions"]) == 4
+    assert all(row["state"] == "approved" and row["review_job"] for row in runtime.state["actions"])
+    before = len(mux.processes)
+    runtime.audit()
+    assert len(mux.processes) == before
+
+
+@pytest.fixture
+def managed_repo(workflow, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from test_campaign_message_bridge import FakeHcom, seed_room
+
+    from bmad_loop import campaign_message_bridge as bridge
+    from bmad_loop.campaign_managed_communication import ManagedCommunication
+    from bmad_loop.repo_communication import RepoCommunication
+
+    runtime, transport = workflow
+    room = tmp_path / "repo-room"
+    seed_room(room)
+    fake = FakeHcom()
+    monkeypatch.setattr(
+        bridge,
+        "get_process_host",
+        lambda: SimpleNamespace(identity=lambda pid: 42.5, liveness_of=lambda *args: "dead"),
+    )
+    monkeypatch.setenv("HCOM_DIR", str(tmp_path / "foreign-room-must-not-be-used"))
+    policy = replace(runtime.policy, communication_room=str(room))
+    runtime.policy = runtime.jobs.policy = policy
+    runtime.state.update(
+        policy=json.loads(json.dumps(asdict(policy))), policy_digest=digest(asdict(policy))
+    )
+    runtime.store.save(runtime.state, "fixture-explicit-room")
+    communication = RepoCommunication(
+        runtime.store,
+        policy,
+        factory=lambda directory: ManagedCommunication(
+            directory, executable="fake-hcom", runner=fake, clock=lambda: 100
+        ),
+    )
+    runtime.jobs.communication = communication
+    return runtime, fake, communication, room
+
+
+def test_explicit_managed_repo_endpoints_follow_actual_native_completion(managed_repo):
+    from bmad_loop.campaign_headless import read_json
+    from bmad_loop.repo_runtime import status
+
+    runtime, fake, communication, room = managed_repo
+    runtime.audit()
+    assert runtime.state["phase"] == "ready", runtime.state["reason"]
+    assert fake.count("start") == fake.count("stop") == 2
+    assert not communication.manager(runtime.state).has_open()
+    for row in runtime.state["jobs"].values():
+        envelope = read_json(Path(row["path"]))
+        assert envelope["communication_room"] == str(room)
+        assert envelope["managed_binding"] == row["endpoint"]
+        assert row["endpoint"]["target"]["launch_id"] == row["launch_id"]
+        assert row["verified_quiescent"] is True
+    document = status(runtime.state)
+    assert document["communication"]["available"]
+    assert all(row["endpoint"]["kind"] == "bridge" for row in document["jobs"].values())
+    assert all(call[1]["env"]["HCOM_DIR"] == str(room) for call in fake.calls)
+
+
+def test_prelaunch_stop_closes_exact_controller_and_resumes_without_native_attempt_charge(
+    managed_repo, monkeypatch
+):
+    runtime, fake, communication, _ = managed_repo
+    prepare = runtime.jobs.runner.prepare
+
+    def stop_after_prepare(*args, **kwargs):
+        result = prepare(*args, **kwargs)
+        runtime.store.stop(runtime.state["id"])
+        return result
+
+    monkeypatch.setattr(runtime.jobs.runner, "prepare", stop_after_prepare)
+    runtime.audit()
+    assert runtime.state["phase"] == "stopped"
+    row = next(iter(runtime.state["jobs"].values()))
+    previous = row["launch_id"]
+    assert row["state"] == "preparation_stopped" and row["attempt"] == 1
+    assert not runtime.jobs.runner.mux.processes and fake.count("stop") == 1
+    monkeypatch.setattr(runtime.jobs.runner, "prepare", prepare)
+    runtime.store.stop(runtime.state["id"], False)
+    runtime.audit()
+    assert runtime.state["phase"] == "ready", runtime.state["reason"]
+    assert row["launch_id"] != previous and row["preparations"][0]["launch_id"] == previous
+    assert row["attempt"] == 1 and len(runtime.jobs.runner.mux.processes) == 2
+    assert fake.count("start") == fake.count("stop") == 3
+    assert not communication.manager(runtime.state).has_open()
+
+
+@pytest.mark.parametrize("marker", ["launch-intent.json", "startup.json", "receipt.json"])
+def test_managed_controller_does_not_close_on_uncertain_native_presence(managed_repo, marker):
+    from bmad_loop.repo_actions import PROPOSAL_SCHEMA
+
+    runtime, _, communication, _ = managed_repo
+    identity, row = runtime.jobs._prepare(
+        runtime.state,
+        ("uncertain-control", "proposer", {"shard": {}}, "Read bounded evidence", PROPOSAL_SCHEMA),
+    )
+    runtime.jobs._materialize(runtime.state, identity, row)
+    (Path(row["path"]).parent / marker).write_text("{}", encoding="utf-8")
+    runtime.jobs._settle_controllers(runtime.state)
+    assert communication.manager(runtime.state).has_open()
+    assert row["controller_quiescent"] is False
+    assert row["state"] == "prepared"
+    # This test manufactured no process; close only its exact fake endpoint.
+    communication.manager(runtime.state).close(row["endpoint"]["target"], outcome="fixture-ended")
+
+
+def test_external_control_refuses_product_state_root_before_creating_directory(
+    workflow, monkeypatch
+):
+    runtime, _ = workflow
+    selected = runtime.store.project / "wrong-native-control"
+    monkeypatch.setenv("BMAD_LOOP_STATE_DIR", str(selected))
+    with pytest.raises(CampaignError, match="outside the product"):
+        runtime.store.control_directory(runtime.state["id"])
+    assert not selected.exists()

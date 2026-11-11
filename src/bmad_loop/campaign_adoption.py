@@ -207,21 +207,25 @@ def read_manifest(path: Path) -> AdoptionManifest:
 
 
 def load_provider(
-    name: str, *, snapshot: CampaignSnapshot | None = None
+    name: str, *, snapshot: CampaignSnapshot | None = None, store=None
 ) -> tuple[ProviderIdentity, Callable[[Path, Path], ServiceInventory]]:
     """Resolve only an explicitly selected installed extension, never a URL/argv."""
-    if name == "native":
+    if name in {"native", "campaign"}:
         if snapshot is None or not snapshot.spec.paradev.project_id:
             raise AdoptionError("native observer needs this campaign's exact Paradev project ID")
         from . import __version__
-        from .campaign_native_inventory import NativeServiceObserver
+        from .campaign_native_inventory import CampaignTransferObserver, NativeServiceObserver
 
-        provider = NativeServiceObserver(snapshot.spec.paradev.project_id)
+        provider = (
+            CampaignTransferObserver(snapshot, store=store)
+            if name == "campaign"
+            else NativeServiceObserver(snapshot.spec.paradev.project_id)
+        )
         path = Path(inspect.getfile(NativeServiceObserver))
         return (
             ProviderIdentity(
                 name,
-                "bmad_loop.campaign_native_inventory:NativeServiceObserver",
+                "bmad_loop.campaign_native_inventory:" + type(provider).__name__,
                 "bmad-loop",
                 __version__,
                 hashlib.sha256(path.read_bytes()).hexdigest(),
@@ -623,7 +627,9 @@ def propose(
     else:
         try:
             checked = manifest_from_dict({**value, "authorized_by": "proposal-check-only"})
-            qualify_pr(project, snapshot, checked, provider, gateway, resolver=resolver, now=now)
+            qualify_pr(
+                project, snapshot, checked, provider, gateway, resolver=resolver, now=explicit_now
+            )
         except AdoptionError as exc:
             problems.append(str(exc))
     return {
@@ -877,6 +883,11 @@ def prepare(runtime, snapshot, action) -> dict[str, Any]:
     state = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
     if state and state.get("manifest_digest") != value["manifest_digest"]:
         raise AdoptionError("adoption preparation action was reused for different owner intent")
+    if state:
+        saved_workspace = Path(state.get("workspace", ""))
+        if not saved_workspace.is_absolute() or not saved_workspace.resolve().is_relative_to(root):
+            raise AdoptionError("adoption preparation workspace escaped its frozen root")
+        workspace = saved_workspace.resolve()
     if not state:
         qualified = qualify_pr(
             runtime.project,
@@ -899,7 +910,9 @@ def prepare(runtime, snapshot, action) -> dict[str, Any]:
         }
         atomic_write_text(path, json.dumps(state, sort_keys=True), follow_symlinks=False)
     else:
-        qualify(runtime.project, snapshot, manifest, provider, resolver=runtime.adoption_resolver)
+        qualified = qualify(
+            runtime.project, snapshot, manifest, provider, resolver=runtime.adoption_resolver
+        )
         pr = runtime.gateway(snapshot).pull(manifest.pr_number)
         allowed_head = (state.get("result") or {}).get("head", manifest.head)
         if (
@@ -955,6 +968,44 @@ def prepare(runtime, snapshot, action) -> dict[str, Any]:
         verify.create_ref(runtime.project, preserved_ref, manifest.head)
     if verify.ref_revision(runtime.project, preserved_ref) != manifest.head:
         raise AdoptionError("adoption preservation ref changed")
+    native = {}
+    preserved_allocation = snapshot.spec.paradev.reflect and provider.name == "campaign"
+    if preserved_allocation:
+        from .campaign_paradev import ParadevWorkspaceProvider
+        from .campaign_reflection_flow import new_group_identity
+
+        release = (qualified.actor.get("details") or {}).get("release") or {}
+        if not release or manifest.workspace or manifest.workspace_id:
+            raise AdoptionError("campaign transfer requires its released allocation coordinates")
+        selected = ParadevWorkspaceProvider(
+            project_id=snapshot.spec.paradev.project_id,
+            allowed_root=root,
+            repository=runtime.project,
+            state_dir=runtime.store.directory(snapshot.id) / "reflection",
+        )
+        native = dataclasses.asdict(
+            selected.allocate_preserved(
+                unit.id,
+                manifest.branch,
+                "adopt-" + unit.id,
+                action.id,
+                expected_head=manifest.head,
+                archived_workspace_id=release["predecessor_bindings"]["native"]["workspace_id"],
+                release_id=release["id"],
+                recheck=lambda: qualify_pr(
+                    runtime.project,
+                    snapshot,
+                    manifest,
+                    provider,
+                    runtime.gateway(snapshot),
+                    resolver=runtime.adoption_resolver,
+                ),
+                group=new_group_identity(snapshot, unit),
+            )
+        )
+        workspace = Path(native["path"])
+        state.update(workspace=str(workspace), native=native)
+        atomic_write_text(path, json.dumps(state, sort_keys=True), follow_symlinks=False)
     from .campaign_workers import worktree_metadata_lock
 
     with worktree_metadata_lock(runtime.project):
@@ -985,8 +1036,7 @@ def prepare(runtime, snapshot, action) -> dict[str, Any]:
             or not verify.worktree_clean(workspace)
         ):
             raise AdoptionError("selected adopted workspace identity or clean preservation changed")
-    native = {}
-    if snapshot.spec.paradev.reflect:
+    if snapshot.spec.paradev.reflect and not preserved_allocation:
         from .campaign_paradev import ParadevWorkspaceProvider
 
         selected = ParadevWorkspaceProvider(

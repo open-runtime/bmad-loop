@@ -382,10 +382,9 @@ def test_ready_fallback_reuses_or_replans_packet_for_fresh_destination_capacity(
     assert unit.claim.launch_id == "original" and unit.claim.quiescent
     if input_limit == 100000:
         assert value["packet"] == packet and value["phase"] == "ready"
-        assert (
-            flow.resume_proposal(snapshot, unit, runtime=runtime).payload["candidate"]["model"]
-            == alternative.model
-        )
+        resume = flow.resume_proposal(snapshot, unit, runtime=runtime)
+        assert resume is not None
+        assert resume.payload["candidate"]["model"] == alternative.model
     else:
         assert value["phase"] == "audit" and "packet" not in value
         assert flow.resume_proposal(snapshot, unit, runtime=runtime) is None
@@ -528,6 +527,7 @@ def test_history_native_receipt_cannot_be_relabelled_as_contract_proof(
     }
     path.write_text(json.dumps(evidence))
     cap["semantic_qualification"]["sha256"] = file_digest(path)
+    cap["semantic_qualification"]["proofs"][0]["sha256"] = file_digest(path)
     with pytest.raises(flow.HandoffRouteWait, match="did not review this contract"):
         flow.validate_fidelity_qualification(cap, contract=contract)
 

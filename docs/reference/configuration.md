@@ -15,6 +15,16 @@ Where a key can be set in more than one place, the first of these wins:
 
 Plugin activation (`[plugins] enabled`) and plugin settings (`[plugins.<name>]`) are not listed here; see the [plugin authoring guide](../plugin-authoring-guide.md#settings) and each plugin's own guide.
 
+## Campaign continuation history
+
+Campaign `[reasoning] history_max_bytes` bounds each retained source stream to
+512 MiB by default, with a maximum of 1 GiB and a separate 64 MiB per-record
+limit. This frozen byte budget controls capture, not the destination model's
+context window. Model context/output limits and `packet_token_limit` continue
+to bound reasoning jobs and the successor packet. See the
+[campaign guide](../campaign-guide.md#ordered-continuation-summaries) for ordered
+stage pools, qualification and audit independence.
+
 ## Campaign inventory budget
 
 Campaign specifications use their own `[github]` table, separate from the project

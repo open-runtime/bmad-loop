@@ -129,7 +129,17 @@ def test_native_campaign_rechecks_actual_landing_then_completes_tracking(
                 # New accepted main commit arrives after the last pre-merge read.
                 tree = git(case.remote, "rev-parse", base + "^{tree}")
                 newer = git(
-                    case.remote, "commit-tree", tree, "-p", base, "-m", "concurrent accepted main"
+                    case.remote,
+                    "-c",
+                    "user.name=Scripted Bot",
+                    "-c",
+                    "user.email=bot@example.test",
+                    "commit-tree",
+                    tree,
+                    "-p",
+                    base,
+                    "-m",
+                    "concurrent accepted main",
                 )
                 git(case.remote, "update-ref", "refs/heads/main", newer, base)
                 base = newer
@@ -149,7 +159,19 @@ def test_native_campaign_rechecks_actual_landing_then_completes_tracking(
                 )
                 tree = git(case.remote, "write-tree")
             merged = git(
-                case.remote, "commit-tree", tree, "-p", base, "-p", head, "-m", "native merge"
+                case.remote,
+                "-c",
+                "user.name=Scripted Bot",
+                "-c",
+                "user.email=bot@example.test",
+                "commit-tree",
+                tree,
+                "-p",
+                base,
+                "-p",
+                head,
+                "-m",
+                "native merge",
             )
             git(case.remote, "update-ref", "refs/heads/main", merged, base)
             pr.update(merged=True, state="closed", merge_commit_sha=merged)

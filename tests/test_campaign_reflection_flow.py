@@ -173,7 +173,7 @@ def test_reflection_projects_enabled_tasks_through_normal_flow(flow):
     )
     result = reflect(snapshot, unit, claim, provider=provider, mux=mux, run_directories=(run_dir,))
     assert result["task"] == {"state": "confirmed", "task_id": "task-id"}
-    assert calls[0]["title"] == "hcom:pending · E:epic · I:pending · PR:pending · Story"
+    assert calls[0]["title"] == "Story"
     assert calls[0]["state"] == unit.state.value
 
 
@@ -208,16 +208,15 @@ def test_reflection_uses_shared_native_issue_for_all_navigation_and_task_links(f
     result = reflect(
         snapshot, unit, unit.claim, provider=provider, mux=mux, run_directories=(run_dir,)
     )
-    prefix = "hcom:pending · E:epic · I:#1582 · PR:pending"
-    assert workspaces[0]["title"] == prefix + " · Story"
-    assert workspaces[0]["group_title"] == prefix
-    assert workspaces[0]["group_fields"]["issues"] == ("#1582",)
-    assert tasks[0]["title"] == prefix + " · Story"
+    assert workspaces[0]["title"] == "#1582 · Story"
+    assert workspaces[0]["group_title"] == "source · Epic epic"
+    assert tasks[0]["title"] == "#1582 · Story"
     assert tasks[0]["links"] == ("https://github.com/owner/repo/issues/1582",)
     assert len(terminals) == (1 if active else 0)
     if active:
-        assert terminals[0]["navigation_prefix"] == prefix
-        assert terminals[0]["title"].startswith(prefix + " · Story")
+        assert terminals[0]["title"] == terminals[0]["navigation_prefix"]
+        assert "attempt 1" in terminals[0]["title"]
+        assert "#1582 · Story" in terminals[0]["title"]
     assert result["task"] == {"state": "confirmed", "task_id": "task-id"}
     assert unit.bindings["hierarchy_ready"] is False and "issue" not in unit.bindings
 
@@ -242,7 +241,7 @@ def test_reasoning_terminal_presentation_uses_shared_story_without_borrowing_act
         }
     }
     view = presentation(snapshot, SimpleNamespace(unit=unit.id))
-    assert view["navigation_prefix"] == "hcom:pending · E:epic · I:#529 · PR:pending"
+    assert view["navigation_prefix"] == "#529 · Story"
 
 
 def test_sibling_prompt_is_scoped_and_bounded(flow):
@@ -363,7 +362,9 @@ def test_runtime_group_refreshes_quiescent_siblings_after_actor_and_pr_discovery
     )
     snapshot.units[peer.id] = peer
     snapshot.spec = dataclasses.replace(
-        snapshot.spec, paradev=dataclasses.replace(snapshot.spec.paradev, group_by="epic")
+        snapshot.spec,
+        units=tuple(work.spec for work in snapshot.units.values()),
+        paradev=dataclasses.replace(snapshot.spec.paradev, group_by="epic"),
     )
     runtime = CampaignRuntime(
         Path(claim.workspace), CampaignStore(tmp_path / "refresh-store"), clock=lambda: 100
@@ -381,7 +382,7 @@ def test_runtime_group_refreshes_quiescent_siblings_after_actor_and_pr_discovery
         "windows": [{"state": "gone", "hook": {"hcom_name": "tina"}}],
     }
     proposed = [row for row in runtime.observe_workers(snapshot) if row.kind == "reflection"]
-    assert {row.unit for row in proposed} == {unit.id, peer.id}
+    assert {row.unit for row in proposed} == {unit.id}
     captured = []
     provider = SimpleNamespace(reflect=lambda *args, **kwargs: captured.append(kwargs) or kwargs)
     monkeypatch.setattr(campaign_paradev, "ParadevWorkspaceProvider", lambda **kwargs: provider)
@@ -403,16 +404,11 @@ def test_runtime_group_refreshes_quiescent_siblings_after_actor_and_pr_discovery
     from bmad_loop.campaign_store import add_action
 
     action = add_action(snapshot, "reflection", peer.id, {})
+    runtime.store.create(snapshot)
     result = runtime.perform(snapshot, action)
     assert isinstance(result, Observation) and result.state == "confirmed"
-    assert captured[0]["group_title"].startswith("@tina · E:epic · I:#42 · PR:#18")
-    assert captured[0]["group_fields"] == {
-        "names": ("tina",),
-        "epics": ("epic",),
-        "issues": ("#42",),
-        "prs": ("#18",),
-    }
-    assert captured[0]["title"].startswith("hcom:pending · E:epic · I:pending · PR:pending")
+    assert captured[0]["group_title"] == "source · Epic epic"
+    assert captured[0]["title"] == "Other story"
 
 
 def test_runtime_persists_hcom_cursor_with_reflection_disabled(flow, tmp_path, monkeypatch):

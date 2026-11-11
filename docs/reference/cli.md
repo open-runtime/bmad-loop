@@ -2,11 +2,29 @@
 
 Every `bmad-loop` subcommand, its options, its `--json` document, the process exit codes, and the `validate` check ids. `bmad-loop <command> --help` prints the same option list from the installed version. For where run state lives on disk, see [run state](run-state.md); for policy keys, see [configuration](configuration.md).
 
+## Repository organization
+
+```sh
+bmad-loop repo audit --policy FILE [--project PROJECT] [--json]
+bmad-loop repo reconcile ID --expected-revision REVISION [--project PROJECT] [--json]
+bmad-loop repo status ID [--project PROJECT] [--json]
+bmad-loop repo history ID [--after SEQUENCE] [--limit N] [--project PROJECT] [--json]
+bmad-loop repo stop ID [--project PROJECT] [--json]
+bmad-loop repo resume ID [--project PROJECT] [--json]
+```
+
+Audit reads remote and local repository state and runs bounded proposal/review
+sessions without GitHub writes. Reconcile applies the frozen owner policy to an
+exact audit revision, preserving branches, worktrees and original discussion.
+History is paginated; status and stop remain available while work runs. Resume
+retains attempt and write history. See [repository organization](../repository-operations.md)
+for policy, budgets, ownership and closure requirements.
+
 ## Global options
 
 - The top-level parser documents only `-h` and `--version`. A subcommand is required; a missing or unknown one exits 2.
 - **`--project PROJECT`** — every subcommand except `relay` accepts it. It names the target project root; the default is the current directory. Legacy commands apply the project's `[mux] backend` choice; a broken `policy.toml` falls back to auto-selection there. Campaign validation and observations bypass this legacy mux setup. Commands that need the policy load it themselves and fail with `error: …`, exit 1.
-- **`--json`** — accepted by `validate`, `plugins`, `probe-adapter`, `decisions`, `confirm`, `list`, `status`, `diagnose`, `cleanup`, `clean` and campaign commands except `campaign attach`. See [Machine-readable output](#machine-readable-output---json).
+- **`--json`** — accepted by `validate`, `plugins`, `probe-adapter`, `decisions`, `confirm`, `list`, `status`, `diagnose`, `cleanup`, `clean`, repository commands and campaign commands except `campaign attach`. See [Machine-readable output](#machine-readable-output---json).
 
 ### Run references
 
@@ -39,7 +57,7 @@ bmad-loop campaign validate SPEC [--json]
 bmad-loop campaign preflight SPEC [--json]
 bmad-loop campaign migration-inventory SPEC [--json]
 bmad-loop campaign migration-qualify SPEC MANIFEST [--json]
-bmad-loop campaign run SPEC [--paradev-reflect] [--paradev-project ID] [--json]
+bmad-loop campaign run SPEC [--prepare-only] [--paradev-reflect] [--paradev-project ID] [--json]
 bmad-loop campaign list [--json]
 bmad-loop campaign status ID [--json]
 bmad-loop campaign history ID [--unit UNIT] [--role ROLE] [--after SEQUENCE] [--limit N] [--json]
@@ -50,6 +68,8 @@ bmad-loop campaign steer ID [--unit UNIT] [--job JOB] --text TEXT [--request-id 
 bmad-loop campaign handoff ID --unit UNIT [--profile PROFILE] [--model MODEL] [--effort EFFORT] [--reason TEXT] [--json]
 bmad-loop campaign migrate-state ID [--json]
 bmad-loop campaign requalify ID --capabilities FILE --expected-revision REVISION --reason TEXT [--json]
+bmad-loop campaign reconfigure ID --spec FILE --expected-revision REVISION --reason TEXT [--review-policy-source COMMIT:PATH] [--preview] [--json]
+bmad-loop campaign reflect ID [--unit UNIT] [--expected-revision REVISION] [--preview] [--json]
 bmad-loop campaign resume ID [--json]
 bmad-loop campaign stop ID [--terminate-workers] [--json]
 bmad-loop campaign hold ID --unit UNIT --reason TEXT [--json]
@@ -58,6 +78,7 @@ bmad-loop campaign attach ID --unit UNIT [--role ROLE]
 bmad-loop campaign reconcile ID [--json]
 bmad-loop campaign adoption-proposal ID --unit UNIT --pr NUMBER [--observer NAME] [--json]
 bmad-loop campaign adopt ID --unit UNIT --manifest FILE [--observer NAME] [--json]
+bmad-loop campaign transfer ID --unit UNIT --successor ID --successor-unit UNIT --pr NUMBER --expected-revision REVISION --expected-successor-revision REVISION --reason TEXT [--preview] [--json]
 ```
 
 `--project PROJECT` is accepted before or after the campaign action. Validation
@@ -87,6 +108,17 @@ and immutable template. The campaign remains stopped; resume is a separate actio
 It refuses stale revisions, uncertain effects or actors, changed route contracts,
 and campaigns that already began delivery. This is not a general mid-delivery
 installation migration or permission to rewrite qualification receipts.
+
+Reconfiguration explicitly changes qualified routes, summary pools and grouping
+before unit execution. Scope, worker policy, grants, reviews and limits stay frozen; the full
+specification and current revision are required. Preview returns a proposal;
+apply returns campaign status with a new immutable configuration revision. Neither
+starts workers. Stopped reflection returns per-workspace display results and
+refreshes only existing bound resources. Its preview performs no display writes.
+The optional `--review-policy-source` explicitly adopts a committed owner decision
+for `github.require_independent_review` only, appending the exact
+decision path if absent. It cannot remove native reviews, required checks or other gates;
+the complete source and previous value are retained with the startup revision.
 Renewed semantic proof coordinates must preserve every declared current purpose
 and contract and pass full fidelity validation against the replacement route.
 
@@ -98,9 +130,23 @@ adopt queues only a fully qualified handoff with the explicitly selected install
 observer. The native observer reports unsupported admission/drain fences as
 unavailable evidence.
 
+`run --prepare-only` performs normal preflight and freezes a stopped campaign
+from its first saved state, without starting a supervisor, workspace or session.
+`transfer` is limited to stopped startup campaigns with no unit worker attempts,
+proved ended reasoning jobs, archived workspaces and exact preserved open PRs.
+Its preview identifies every unmapped unit and the permanent retirement of the
+entire predecessor. Applying it fences all predecessor admissions and binds the
+selected PR to one prepared successor. Later transfers can name only that same
+successor. Histories and unit states remain intact; no work is marked delivered.
+The bundled `campaign` observer then supports ordinary adoption with a new native
+workspace identity on the preserved branch. Neither transfer nor adoption starts
+the successor; explicit resume is separate. Older binaries refuse the retired
+predecessor's forward-only storage format. Other campaigns retain their format.
+
 JSON results contain `schema_version`, `command` and `ok`. Status and execution
 results have a `campaign` projection; list has `campaigns`; controls have `request`.
-Invalid validation/preflight is a failing verdict document. Operational errors
+Invalid validation/preflight, transfer refusals and controls refused by retirement
+are failing verdict documents. Other operational errors
 leave stdout empty and report on stderr. Status excludes private configuration
 and raw evidence; `delivered` requires confirmed merge and reconciled tracking.
 

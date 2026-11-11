@@ -294,6 +294,9 @@ class CampaignSupervisor:
         # Queued holds/stops must reach the authority before an uncertain
         # effect can authorize any retry during startup reconciliation.
         snapshot = self.store.load(campaign_id)
+        from .campaign_transfer import require_not_retired
+
+        require_not_retired(snapshot, operation="supervise or reconcile")
         if snapshot.bindings.get("hold_channels_version") != 1:
             # Migrate from committed authority before queued controls can write
             # channels. This save never recreates an already initialized root.

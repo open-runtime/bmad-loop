@@ -183,6 +183,10 @@ def test_selected_native_stories_complete_dependency_and_landing_repair_without_
                 broken_once.append(number)
             landed = git(
                 case.remote,
+                "-c",
+                "user.name=Scripted Bot",
+                "-c",
+                "user.email=bot@example.test",
                 "commit-tree",
                 tree,
                 "-p",

@@ -155,12 +155,16 @@ def apply_batch(
 
 
 def untriaged(snapshot: CampaignSnapshot) -> tuple[str, ...]:
+    from .campaign_intake_baseline import deferred_versions
+
     state = _state(snapshot)
     bound = getattr(snapshot.spec.intake, "max_triage_attempts", 2)
+    deferred = deferred_versions(snapshot)
     pending = [
         (key, row)
         for key, row in state["records"].items()
         if row["state"] == "pending"
+        and key not in deferred
         and row.get("attempts", 0) < bound
         and state["latest"].get(f"{row['observation']['kind']}:{row['observation']['object_id']}")
         == key

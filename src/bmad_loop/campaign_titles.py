@@ -1,8 +1,8 @@
 """Bounded navigation labels; never use presentation text as resource identity.
 
-Hcom identities come from hook observations bound to the current worker launch.
-Unknown actors and uncreated GitHub objects stay explicit. Group labels aggregate
-their members rather than attributing the whole group to one arbitrary worker.
+Groups, workspaces and tasks identify durable work. Sessions identify their own
+native actors and separately named controller bridges. Legacy compact navigation
+helpers remain available for old projections; they never define resource identity.
 """
 
 from __future__ import annotations
@@ -133,6 +133,27 @@ def issue_reference(unit, *, snapshot=None) -> tuple[dict, str]:
         return (bound if isinstance(bound, dict) else {}), url
     shared = snapshot.bindings.get("github_hierarchy", {}).get("story:" + unit.id)
     if not isinstance(shared, dict):
+        control = unit.bindings.get("intake_control", {})
+        records = snapshot.bindings.get("intake_inbox", {}).get("records", {})
+        observed = []
+        for version in control.get("input_versions", ()):
+            record = records.get(version, {})
+            row = record.get("observation", {})
+            number = row.get("number")
+            if (
+                record.get("control_unit") == unit.id
+                and row.get("kind") == "issue"
+                and isinstance(row.get("repository"), str)
+                and row.get("repository", "").lower() == snapshot.repository.lower()
+                and type(number) is int
+                and number > 0
+                and isinstance(row.get("url"), str)
+                and row.get("url", "").lower()
+                == f"https://github.com/{snapshot.repository}/issues/{number}".lower()
+            ):
+                observed.append(row)
+        if observed and len({row["number"] for row in observed}) == 1:
+            return observed[0], observed[0]["url"]
         return {}, ""
     number, native_id, shared_url = (
         shared.get("number"),
@@ -204,3 +225,116 @@ def group_navigation(snapshot, unit, *, projection: dict | None = None) -> dict:
         for name, items in values.items():
             fields[name].update(items)
     return {name: tuple(sorted(values)) for name, values in fields.items()}
+
+
+def initiative_identity(snapshot, unit) -> str:
+    """Use frozen source authority; never consult current project configuration."""
+    observation = snapshot.bindings.get("source_observations", {}).get(unit.id, {})
+    source = unit.bindings.get("effective_source", {})
+    values = [unit.spec.initiative, observation.get("effective_initiative", "")]
+    if source.get("kind") == "tickets" and source.get("id") == unit.spec.source:
+        values.append(source.get("initiative", ""))
+    values = {value for value in values if isinstance(value, str) and value}
+    if len(values) > 1:
+        raise ValueError("Frozen initiative identities disagree")
+    return next(iter(values), "")
+
+
+def group_key(snapshot, unit) -> tuple[str, str, str]:
+    initiative = initiative_identity(snapshot, unit)
+    mode = snapshot.spec.paradev.group_by
+    if mode == "initiative":
+        if not initiative and unit.spec.source != "campaign-intake":
+            raise ValueError("Initiative grouping requires frozen initiative identity")
+        label = initiative or "intake"
+    else:
+        label = unit.spec.epic if mode == "epic" else unit.spec.parent or unit.id
+    return unit.spec.source, initiative, label
+
+
+def group_title(snapshot, unit) -> str:
+    """Business hierarchy only; sessions and rotating PR lists are not groups."""
+    source, initiative, label = group_key(snapshot, unit)
+    prefix = initiative or source
+    if snapshot.spec.paradev.group_by == "initiative":
+        parts = [prefix]
+    elif snapshot.spec.paradev.group_by == "story":
+        parts = [prefix, "Story " + (unit.spec.parent or unit.spec.selector or label)]
+    else:
+        parts = [prefix, "Intake" if source == "campaign-intake" else "Epic " + label]
+    return folder_title(" · ".join(parts))
+
+
+def folder_title(value: str) -> str:
+    """Native folder displayName uses a separate 200 UTF-16-unit limit."""
+    value = _text(value, 200)
+    if len(value.encode("utf-16-le")) // 2 <= 200:
+        return value
+    result = ""
+    for char in value:
+        if len((result + char).encode("utf-16-le")) // 2 > 199:
+            break
+        result += char
+    return result + "…"
+
+
+def work_title(unit, *, snapshot=None) -> str:
+    """Stable work labels omit absent coordinates and all actor identities."""
+    issue, url = issue_reference(unit, snapshot=snapshot)
+    parts = list(_number(issue, url))
+    if unit.spec.selector:
+        parts.append(unit.spec.selector)
+    parts.append(unit.spec.title)
+    prs = _number(unit.bindings.get("pr"))
+    suffix = " · PR " + "/".join(prs) if prs else ""
+    return _text(" · ".join(parts), 180 - len(suffix)) + suffix
+
+
+def session_title(
+    *,
+    role="",
+    model="",
+    attempt=None,
+    native_name="",
+    bridge=None,
+    description="",
+    historical=False,
+    limit=180,
+) -> str:
+    """Native actors and controller addresses are different, generation-bound facts."""
+    parts = [str(value) for value in (role, model) if value]
+    if re.fullmatch(r"[a-z][a-z0-9_-]{2,31}", native_name):
+        parts.append("native @" + native_name)
+    if isinstance(bridge, dict) and re.fullmatch(r"[a-z][a-z0-9_-]{2,31}", bridge.get("name", "")):
+        closed = bridge.get("state") == "closed"
+        label = "closed control @" if closed else "past control @" if historical else "control @"
+        parts.append(label + bridge["name"])
+    if attempt is not None:
+        parts.append("attempt " + str(attempt))
+    if historical:
+        parts.append("history")
+    if description:
+        parts.append(description)
+    return _text(" · ".join(parts) or "Session", limit)
+
+
+def unit_session_title(unit, window, *, snapshot=None, historical=False, limit=150) -> str:
+    claim = unit.claim
+    bridge = unit.bindings.get("managed_communication", {})
+    target = bridge.get("target", {})
+    if not claim or (target.get("unit_id"), target.get("launch_id"), target.get("generation")) != (
+        unit.id,
+        claim.launch_id,
+        claim.generation,
+    ):
+        bridge = None
+    return session_title(
+        role=window.get("phase", "session"),
+        model=(window.get("native") or {}).get("definitionId", ""),
+        attempt=claim.attempt if claim else unit.attempt,
+        native_name=(window.get("hook") or {}).get("hcom_name", ""),
+        bridge=bridge,
+        description=work_title(unit, snapshot=snapshot),
+        historical=historical,
+        limit=limit,
+    )
