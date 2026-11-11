@@ -14,6 +14,7 @@ import dataclasses
 import json
 import re
 from pathlib import Path
+from typing import Any, Mapping
 
 from .adapters.profile import get_profile
 from .campaign_execution import CampaignExecution
@@ -197,7 +198,7 @@ def _preserve_spec(path: Path, spec: CampaignSpec) -> None:
 def reconfigure(
     store: CampaignStore,
     campaign_id: str,
-    proposed: CampaignSpec,
+    proposed: CampaignSpec | Mapping[str, Any],
     *,
     expected_revision: int,
     reason: str,
@@ -223,6 +224,15 @@ def reconfigure(
             or template.config_revision != snapshot.config_revision
         ):
             raise CampaignError("campaign configuration binding mismatch")
+        if not isinstance(proposed, CampaignSpec):
+            raw = dict(proposed)
+            paradev = raw.get("paradev", {})
+            if isinstance(paradev, Mapping):
+                paradev = dict(paradev)
+                # Omitted grouping is not an explicit revision; keep the campaign's.
+                paradev.setdefault("group_by", snapshot.spec.paradev.group_by)
+                raw["paradev"] = paradev
+            proposed = spec_from_dict(raw)
         policy_source = _review_policy_source(Path(snapshot.root), review_policy_source)
         proposed = _proposed(
             snapshot.spec,
