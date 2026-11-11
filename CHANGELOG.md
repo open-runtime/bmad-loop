@@ -22,6 +22,7 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Keep truncated repository audits incomplete through resume, reconciliation and public status.
 - Recognize terminated Linux zombie descendants as dead while retaining PID-reuse and unreadable-process safeguards.
 - Compare initial mirrored issues with selected committed stories before allocating additional intake work; retain new requirements and bounded fallback.
 - Release completed owned headless terminals only after exact process, receipt and native-identity verification; preserve output and unrelated views.

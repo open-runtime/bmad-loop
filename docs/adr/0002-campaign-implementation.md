@@ -78,6 +78,17 @@ go through delivered planning or implementation PRs. Defaults bound one cycle to
 100 mutations and 20 closures, checkpointing excess work. Do not infer completion
 from age, inactivity or semantic similarity.
 
+Catalog completeness is separate from action-specific ownership-observer
+coverage. A truncated frozen inventory remains incomplete across audit, resume,
+reconciliation and status, including older ledgers that incorrectly recorded
+completion. It cannot admit new reasoning or remote mutations; obtaining complete
+coverage requires a new audit with sufficient bounds. Already issued native jobs
+and uncertain GitHub mutations retain read-only receipt/readback settlement and
+owned-controller closure, including while stopped. Preserve their original
+attempts, counters, errors and immutable intents; observation never replays a
+write or makes the incomplete audit complete. Missing ownership evidence still
+constrains only actions requiring that evidence when the catalog itself is complete.
+
 New campaigns use epic grouping; legacy snapshots with omitted grouping retain
 story grouping. Initiative grouping is also supported by this extension; sprint
 grouping requires a future explicit source identity and implies no calendar or

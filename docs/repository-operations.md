@@ -13,6 +13,19 @@ inventories are partitioned into bounded jobs. An incomplete inventory or an
 object that cannot fit its declared limit remains visible and prevents claiming
 complete coverage.
 
+Status exposes `inventory_coverage`, including catalog limits and separate
+ownership-observer completeness. A truncated catalog remains held and cannot
+be reconciled, including when an older ledger recorded it as complete. Resume
+retains its frozen inventory; start a new audit with sufficient limits to obtain
+complete coverage. Unavailable ownership evidence independently constrains
+the actions that require it, without preventing safe organization of a complete
+catalog.
+The hold blocks new reasoning and remote mutations. Already issued jobs and
+uncertain GitHub writes remain observable: their exact receipts and readback
+can settle, including after stop, without replaying writes or granting complete
+coverage. Uncertain outcomes and observation errors remain visible with their
+original attempts, counters and frozen evidence.
+
 Every source appears in a recorded shard. Related destinations are selected
 deterministically from the full inventory using references, milestones and title
 overlap, within a separate prompt budget. Candidate selection and omission

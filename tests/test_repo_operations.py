@@ -15,7 +15,7 @@ from test_campaign_headless import ChildMux, fixture_capability
 
 from bmad_loop import cli
 from bmad_loop.campaign_capacity import CapacityObservation
-from bmad_loop.campaign_github import ApiResponse, GithubGateway, UncertainMutation
+from bmad_loop.campaign_github import ApiResponse, GithubError, GithubGateway, UncertainMutation
 from bmad_loop.campaign_headless import HeadlessRunner, file_digest
 from bmad_loop.campaign_jobs import digest
 from bmad_loop.campaign_model import CampaignError, RoleCandidate
@@ -883,6 +883,348 @@ def test_partial_audit_with_approved_subset_cannot_reconcile(workflow):
     with pytest.raises(CampaignError, match="Incomplete audit"):
         runtime.reconcile()
     assert not any(method != "GET" for method, _, _ in transport.requests)
+
+
+@pytest.mark.parametrize("objects", [0, 1])
+def test_truncated_inventory_never_finishes_or_launches_reasoning(workflow, objects):
+    from bmad_loop.repo_runtime import status
+
+    runtime, transport = workflow
+    runtime.inventory.policy = replace(
+        runtime.policy, metadata_bytes=1 if objects == 0 else 64 * 1024 * 1024, max_objects=1
+    )
+    runtime.audit()
+    frozen = copy.deepcopy(runtime.state["inventory"])
+    catalog = runtime.store.read(frozen)
+    assert len(catalog["objects"]) == objects and catalog["complete"] is False
+    assert "catalog_bound" in catalog["unavailable"]
+    assert runtime.state["phase"] == "held"
+    assert runtime.state["audit_complete"] is False
+    assert runtime.state["jobs"] == {}
+    for operation in (runtime.audit, runtime.reconcile):
+        operation()
+        document = status(runtime.state)
+        assert document["phase"] == "held"
+        assert document["audit_complete"] is False
+        assert document["inventory_coverage"]["complete"] is False
+        assert document["inventory_coverage"]["objects"] == objects
+        assert "catalog_bound" in document["inventory_coverage"]["unavailable"]
+        assert "new audit" in document["reason"]
+        assert runtime.state["inventory"] == frozen
+    assert not runtime.state["jobs"]
+    assert not any(method != "GET" for method, _, _ in transport.requests)
+
+
+@pytest.mark.parametrize("phase", ["ready", "complete"])
+@pytest.mark.parametrize("objects", [0, 1])
+def test_legacy_truncated_inventory_is_rechecked_by_status_and_reconcile(
+    workflow, phase, objects, capsys
+):
+    runtime, transport = workflow
+    runtime.inventory.policy = replace(
+        runtime.policy, metadata_bytes=1 if objects == 0 else 64 * 1024 * 1024, max_objects=1
+    )
+    catalog = runtime.inventory.collect()
+    assert len(catalog["objects"]) == objects and catalog["complete"] is False
+    runtime.state.update(
+        inventory=runtime.store.artifact(runtime.state["id"], "inventory", catalog),
+        audit_complete=True,
+        phase=phase,
+    )
+    runtime.store.save(runtime.state, "legacy-completion-fixture")
+    before = copy.deepcopy(runtime.store.load(runtime.state["id"]))
+    code = cli.main(
+        [
+            "repo",
+            "status",
+            runtime.state["id"],
+            "--project",
+            str(runtime.store.project),
+            "--json",
+        ]
+    )
+    document = json.loads(capsys.readouterr().out)
+    assert code == 1 and document["phase"] == "held"
+    assert document["audit_complete"] is False
+    assert document["inventory_coverage"]["complete"] is False
+    assert "catalog_bound" in document["reason"]
+    assert runtime.store.load(runtime.state["id"]) == before  # Status is observation only.
+    runtime.reconcile()
+    assert runtime.state["phase"] == "held" and runtime.state["audit_complete"] is False
+    assert runtime.state["inventory"] == before["inventory"]
+    assert not any(method != "GET" for method, _, _ in transport.requests)
+
+
+def legacy_incomplete_inventory(runtime):
+    # Keep producer-created intents/receipts, reproducing a legacy checkpoint
+    # that claimed coverage over a truncated catalog. Never edit an artifact.
+    catalog = runtime.store.read(runtime.state["inventory"])
+    catalog.update(complete=False, unavailable=["catalog_bound"])
+    runtime.state.update(
+        inventory=runtime.store.artifact(runtime.state["id"], "inventory", catalog),
+        audit_complete=True,
+    )
+    runtime.store.save(runtime.state, "legacy-truncated-checkpoint-fixture")
+    return copy.deepcopy(runtime.state["inventory"])
+
+
+@pytest.mark.parametrize("outcome", ["confirmed", "absent", "error"])
+@pytest.mark.parametrize("stopped", [False, True])
+def test_incomplete_catalog_observes_issued_write_without_replaying_or_continuing(
+    workflow, monkeypatch, outcome, stopped
+):
+    from bmad_loop.repo_runtime import status
+
+    runtime, transport = approved(workflow)
+    transport.lose_ack = True
+    runtime.reconcile()
+    row = runtime.state["actions"][0]
+    assert [step["state"] for step in row["steps"]] == ["sent_unknown", "prepared"]
+    frozen = legacy_incomplete_inventory(runtime)
+    counts = (runtime.state["mutations"], runtime.state["closures"])
+    submitted = copy.deepcopy(row["steps"][0])
+    prepared = copy.deepcopy(row["steps"][1])
+    requests = len(transport.requests)
+    if outcome == "absent":
+        transport.comments[1].clear()
+    elif outcome == "error":
+        original = transport.request
+
+        def failing(method, path, payload=None):
+            if method == "GET" and urlsplit(path).path.endswith("/comments"):
+                raise GithubError("readback unavailable")
+            return original(method, path, payload)
+
+        monkeypatch.setattr(transport, "request", failing)
+    if stopped:
+        runtime.store.stop(runtime.state["id"])
+    runtime.reconcile()
+    document = status(runtime.state)
+    assert document["phase"] in {"held", "stopped", "observation_wait"}
+    assert document["audit_complete"] is False
+    assert document["inventory_coverage"]["complete"] is False
+    assert runtime.state["inventory"] == frozen
+    assert (runtime.state["mutations"], runtime.state["closures"]) == counts
+    assert row["steps"][1] == prepared
+    assert all(method == "GET" for method, _, _ in transport.requests[requests:])
+    if outcome == "confirmed":
+        assert row["steps"][0]["state"] == "confirmed"
+        assert row["steps"][0]["observation"]["body"] == submitted["payload"]["body"]
+    else:
+        assert row["steps"][0] == submitted
+        assert row["state"] == "uncertain"
+        assert ("no replay" if outcome == "absent" else "readback unavailable") in document[
+            "reason"
+        ]
+    runtime.reconcile()
+    assert runtime.state["audit_complete"] is False and runtime.state["phase"] != "complete"
+    assert all(method == "GET" for method, _, _ in transport.requests[requests:])
+    assert (runtime.state["mutations"], runtime.state["closures"]) == counts
+
+
+@pytest.mark.parametrize("stopped", [False, True])
+def test_incomplete_catalog_settles_existing_managed_job_without_new_admission(
+    managed_repo, monkeypatch, stopped
+):
+    runtime, fake, communication, _ = managed_repo
+    runner = runtime.jobs.runner
+    launch, observe = runner.launch, runner.observe
+
+    def uncertain_launch(*args, **kwargs):
+        launch(*args, **kwargs)
+        return {"state": "unknown"}
+
+    monkeypatch.setattr(runner, "launch", uncertain_launch)
+    monkeypatch.setattr(runner, "observe", lambda path: {"state": "unknown"})
+    runtime.audit()
+    row = next(iter(runtime.state["jobs"].values()))
+    assert row["state"] == "unknown" and communication.manager(runtime.state).has_open()
+    for process in runner.mux.processes.values():
+        process.wait(timeout=10)
+    launch_id, attempts = row["launch_id"], row["attempt"]
+    frozen = legacy_incomplete_inventory(runtime)
+    if stopped:
+        runtime.store.stop(runtime.state["id"])
+    # An uncertain observation remains visible and does not close its actor.
+    runtime.audit()
+    assert "outcome uncertain" in runtime.state["reason"]
+    assert "catalog_bound" in runtime.state["reason"]
+    assert communication.manager(runtime.state).has_open()
+    assert runtime.state["audit_complete"] is False
+    monkeypatch.setattr(runner, "observe", observe)
+
+    def forbidden_launch(*args, **kwargs):
+        pytest.fail("Incomplete catalog launched a new native job")
+
+    monkeypatch.setattr(runner, "launch", forbidden_launch)
+    runtime.audit()
+    assert row["state"] == "completed" and row["verified_quiescent"] is True
+    assert row["launch_id"] == launch_id and row["attempt"] == attempts
+    assert len(runner.mux.processes) == 1 and fake.count("start") == fake.count("stop") == 1
+    assert not communication.manager(runtime.state).has_open()
+    assert not runtime.state["actions"]
+    assert runtime.state["audit_complete"] is False
+    assert runtime.state["phase"] == ("stopped" if stopped else "held")
+    assert runtime.state["inventory"] == frozen
+
+
+@pytest.mark.parametrize("damage", ["missing", "corrupt", "malformed"])
+def test_unavailable_inventory_keeps_issued_write_readback(workflow, damage, monkeypatch, capsys):
+    from bmad_loop import repo_cli
+    from bmad_loop.repo_runtime import status
+
+    runtime, transport = approved(workflow)
+    transport.lose_ack = True
+    runtime.reconcile()
+    row = runtime.state["actions"][0]
+    prepared = copy.deepcopy(row["steps"][1])
+    frozen = copy.deepcopy(runtime.state["inventory"])
+    path = Path(frozen["path"])
+    if damage == "missing":
+        path.unlink()
+    else:
+        path.write_text("{" if damage == "malformed" else "{}", encoding="utf-8")
+    runtime.store.stop(runtime.state["id"])
+    before = len(transport.requests)
+    # Exercise both settlement and the CLI's second evidence read for reporting.
+    monkeypatch.setattr(
+        repo_cli,
+        "RepoRuntime",
+        lambda store, state: RepoRuntime(
+            store, state, gateway=runtime.gateway, inventory=runtime.inventory, jobs=runtime.jobs
+        ),
+    )
+    assert (
+        cli.main(
+            [
+                "repo",
+                "reconcile",
+                runtime.state["id"],
+                "--project",
+                str(runtime.store.project),
+                "--expected-revision",
+                str(runtime.state["revision"]),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    cli_document = json.loads(capsys.readouterr().out)
+    runtime.state = runtime.store.load(runtime.state["id"])
+    row = runtime.state["actions"][0]
+    document = status(runtime.state)
+    assert document["phase"] == "stopped" and document["audit_complete"] is False
+    assert document["inventory_coverage"]["complete"] is None
+    assert "Audit" in document["reason"] and "evidence" in document["reason"]
+    assert cli_document["phase"] == "stopped" and cli_document["audit_complete"] is False
+    assert cli_document["inventory_coverage"]["complete"] is None
+    assert "evidence" in cli_document["reason"]
+    assert row["steps"][0]["state"] == "confirmed" and row["steps"][1] == prepared
+    assert all(method == "GET" for method, _, _ in transport.requests[before:])
+    assert runtime.state["inventory"] == frozen and runtime.state["mutations"] == 1
+
+
+def test_incomplete_catalog_holds_next_independent_label_after_issued_readback(workflow, tmp_path):
+    runtime, transport = workflow
+    cap = runtime.state["capabilities"]["proposer"]
+    script = Path(cap["dependencies"][0]["path"])
+    text = script.read_text(encoding="utf-8")
+    start, end = text.index("    actions=[]"), text.index("    result=dict(actions=actions")
+    script.write_text(
+        text[:start]
+        + "    actions=[dict(kind='label',source=key,target='',labels=['organized'],reason='Organize this issue') for key in value['shard']]\n"
+        + text[end:],
+        encoding="utf-8",
+    )
+    cap["dependencies"][0]["sha256"] = file_digest(script)
+    runtime.state["capabilities"]["proposer"] = fixture_capability(
+        tmp_path, cap, runtime.policy.proposer
+    )
+    runtime.audit()
+    assert len(runtime.state["actions"]) == 2
+    assert all(row["state"] == "approved" for row in runtime.state["actions"])
+    transport.lose_ack = True
+    runtime.reconcile()
+    first, second = runtime.state["actions"]
+    assert first["steps"][0]["state"] == "sent_unknown"
+    pending = copy.deepcopy(second["steps"])
+    frozen = legacy_incomplete_inventory(runtime)
+    count = len(transport.requests)
+    runtime.reconcile()
+    assert first["steps"][0]["state"] == "confirmed"
+    assert second["steps"] == pending and second["state"] == "held"
+    assert runtime.state["mutations"] == 1 and runtime.state["closures"] == 0
+    assert all(method == "GET" for method, _, _ in transport.requests[count:])
+    assert runtime.state["audit_complete"] is False and runtime.state["phase"] == "held"
+    assert runtime.state["inventory"] == frozen
+
+
+def test_incomplete_ownership_does_not_hide_complete_catalog_or_block_safe_assignment(
+    workflow, monkeypatch
+):
+    from bmad_loop.repo_runtime import status
+
+    runtime, transport = workflow
+    transport.milestones[3] = {
+        "id": 303,
+        "number": 3,
+        "title": "Existing milestone",
+        "state": "open",
+        "updated_at": "2026-11-01T00:00:00Z",
+        "html_url": "https://github.com/a/b/milestone/3",
+        "open_issues": 0,
+        "closed_issues": 0,
+    }
+    monkeypatch.setattr(
+        runtime.inventory,
+        "owners",
+        lambda: {"complete": False, "unavailable": ["external-service-unavailable"]},
+    )
+    runtime.audit()
+    assert runtime.state["phase"] == "ready"
+    document = status(runtime.state)
+    assert document["audit_complete"] is True
+    assert document["inventory_coverage"]["complete"] is True
+    assert document["inventory_coverage"]["ownership_complete"] is False
+    runtime.reconcile()
+    assert runtime.state["phase"] == "complete"
+    assert transport.rows[2]["milestone"]["number"] == 3
+
+
+def test_cli_resume_stop_projects_legacy_complete_inventory(workflow, monkeypatch, capsys):
+    runtime, _ = workflow
+    catalog = runtime.inventory.collect()
+    runtime.state.update(
+        inventory=runtime.store.artifact(runtime.state["id"], "inventory", catalog),
+        audit_complete=True,
+        phase="ready",
+    )
+    runtime.store.save(runtime.state, "legacy-complete-fixture")
+    original = RepoRuntime.audit
+
+    def stop_before_audit(current):
+        current.store.stop(current.state["id"])
+        return original(current)
+
+    monkeypatch.setattr(RepoRuntime, "audit", stop_before_audit)
+    assert (
+        cli.main(
+            [
+                "repo",
+                "resume",
+                runtime.state["id"],
+                "--project",
+                str(runtime.store.project),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    document = json.loads(capsys.readouterr().out)
+    assert document["phase"] == "stopped" and document["reason"] == ""
+    assert document["inventory_coverage"]["complete"] is True
+    assert document["audit_complete"] is True
+    assert not runtime.store.load(runtime.state["id"])["jobs"]
 
 
 @pytest.mark.skipif(
