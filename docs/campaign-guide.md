@@ -902,18 +902,28 @@ bmad-loop campaign provenance --expected-commit FULL_MERGED_SHA --json
 
 A pinned Git installation records its commit. An editable installation also
 requires a clean matching checkout. A wheel installed from an ordinary directory
-does not prove its build commit through its version number. Install the exact
-merged fork commit with the optional transport extra before activation:
+does not prove its build commit through its version number. A Git commit pin
+alone does not freeze dependency resolution. From a clean checkout of the exact
+merged commit, export its locked runtime constraints and use the tested Python
+interpreter when installing the optional transport extra:
 
 ```bash
 BMAD_RELEASE_ROOT="$HOME/.local/share/uv/bmad-loop-releases/FULL_MERGED_SHA"
+BMAD_RELEASE_PYTHON="/absolute/path/to/tested/python"
+mkdir -p "$BMAD_RELEASE_ROOT"
+uv export --frozen --all-extras --no-dev --no-emit-project --no-hashes \
+  --output-file "$BMAD_RELEASE_ROOT/constraints.txt"
 env UV_TOOL_DIR="$BMAD_RELEASE_ROOT/tools" UV_TOOL_BIN_DIR="$BMAD_RELEASE_ROOT/bin" \
-  uv tool install "bmad-loop[tui,paradev,non-linux] @ git+https://github.com/open-runtime/bmad-loop.git@FULL_MERGED_SHA"
+  uv tool install --python "$BMAD_RELEASE_PYTHON" --constraints "$BMAD_RELEASE_ROOT/constraints.txt" \
+  "bmad-loop[tui,paradev,non-linux] @ git+https://github.com/open-runtime/bmad-loop.git@FULL_MERGED_SHA"
 "$BMAD_RELEASE_ROOT/bin/bmad-loop" campaign provenance --expected-commit FULL_MERGED_SHA --json
 ```
 
 Use a new permanent release directory; do not replace an environment used by
-older live or paused workers. On macOS, `non-linux` supplies psutil for authenticated
+older live or paused workers. Retain the exported constraints with installation
+evidence. A dependency update is a separate candidate requiring affected checks;
+do not silently resolve newer native extensions during activation.
+On macOS, `non-linux` supplies psutil for authenticated
 process identities. Qualify installed native paths before switching the future
 global entry. The default uv registry can still describe the preserved old tool;
 inspect or upgrade the new release with its explicit `UV_TOOL_DIR` and

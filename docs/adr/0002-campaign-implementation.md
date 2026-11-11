@@ -327,7 +327,10 @@ in ADR 0003. No hosted Linux/Windows qualification is inferred from these checks
 Installation and target-project delivery remain distinct obligations. The exact
 merged installation must retain its final interpreter/dependency paths, earn any
 changed native grants and pass provenance, process-identity and generic onboarding
-checks. Preserve old live/paused environments. The REM pilot requires maintained
+checks. Install with runtime constraints exported from that commit's frozen lock
+and the tested interpreter; a Git source pin alone permits dependency drift.
+Retain the export with installation evidence, and qualify dependency updates as
+separate candidates. Preserve old live/paused environments. The REM pilot requires maintained
 source configuration, actual full-graph dispatch validation, current ownership,
 selected acceptance and CI, native/independent reviews, merge, landing and tracking.
 Ticket-local dependency lists alone are insufficient: source import must include
