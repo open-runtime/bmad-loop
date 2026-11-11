@@ -93,6 +93,14 @@ class HeadlessAdapter(CodingCLIAdapter):
         """Keep native authority records outside the engine's writable checkout."""
         self.native_job_root = Path(directory)
 
+    def live_history_binding(self, handle: SessionHandle):
+        """Controller-owned request identity; this is not a completion receipt."""
+        path = self.requests[handle.task_id]
+        return {
+            "headless_request": str(path),
+            "headless_request_sha256": file_digest(path),
+        }
+
     def start_session(self, spec: SessionSpec) -> SessionHandle:
         from ..campaign_hold import admission, held
         from .multiplexer import MultiplexerError

@@ -799,9 +799,11 @@ class HeadlessRunner:
             "presentation_status": self._presentation_status(directory),
         }
 
-    def refresh_presentation(self, request_path: Path, navigation_prefix: str = "") -> dict | None:
+    def refresh_presentation(
+        self, request_path: Path, navigation_prefix: str = "", *, historical: bool = False
+    ) -> dict | None:
         """Refresh display-only links without changing frozen input or borrowing actor names."""
-        from .campaign_titles import navigation_title
+        from .campaign_titles import session_title
 
         envelope = read_json(request_path)
         if not envelope.get("presentation"):
@@ -810,19 +812,29 @@ class HeadlessRunner:
         window = read_json(directory / "window.json")
         if window.get("launch_id") != envelope["launch_id"]:
             raise CampaignError("Headless title target differs from owned launch")
-        prefix = navigation_prefix or navigation_title(
-            epics=("unbound",), issues=("none",), prs=("none",)
-        )
+        prefix = navigation_prefix or "Portfolio"
         request = envelope["request"]
-        detail = " · ".join(
-            str(value) for value in (request["id"], request["role"], envelope["selection"]["model"])
+        bridge = envelope.get("managed_binding")
+        prefix = session_title(
+            role=request["role"],
+            model=envelope["selection"]["model"],
+            bridge=bridge,
+            historical=historical,
+            description=prefix,
+            limit=150,
         )
-        title = prefix + " · " + " ".join(detail.split())[: max(0, 177 - len(prefix))]
+        title = prefix + " · " + request["id"][: max(0, 177 - len(prefix))]
         status = {
             "state": "confirmed",
             "title": title,
             "requested_title": title,
             "terminal_id": window["native_id"],
+            "identity": {
+                "launch_id": envelope["launch_id"],
+                "generation": envelope["generation"],
+                "controller_bridge": bridge,
+                "historical": historical,
+            },
         }
         try:
             displayed = getattr(self.mux, "set_display_title")(

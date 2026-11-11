@@ -213,9 +213,10 @@ class CampaignDatabase:
             if connection.execute("PRAGMA user_version").fetchone()[0] < minimum_schema:
                 raise CampaignError("campaign marker requires a newer database schema")
             row = connection.execute(
-                "WITH projection(value) AS (SELECT json_remove(payload, "
+                "WITH projection(value) AS (SELECT json_set(json_remove(payload, "
                 "'$.bindings','$.outbox','$.events','$.config_snapshot',"
-                "'$.processed_commands','$.jobs') FROM authority WHERE id=1) "
+                "'$.processed_commands','$.jobs'), '$.bindings', json_object("
+                "'github_hierarchy', coalesce(json_extract(payload, '$.bindings.github_hierarchy'), json('{}')))) FROM authority WHERE id=1) "
                 "SELECT length(CAST(value AS BLOB)), "
                 "CASE WHEN length(CAST(value AS BLOB))<=? THEN value END FROM projection",
                 (max_bytes,),

@@ -176,6 +176,7 @@ def inspect(
     from .campaign_headless import load_capabilities
     from .campaign_route_readiness import inspect as inspect_route
     from .campaign_route_readiness import permissions_for
+    from .campaign_summary_routes import candidates as summary_candidates
 
     routes = {}
     manifest_problem = ""
@@ -192,7 +193,7 @@ def inspect(
         if role in {"planning", "planning_review"} and not spec.planning.enabled:
             continue
         choices = []
-        for candidate in spec.candidates(role):
+        for candidate in summary_candidates(spec, role):
             profile_name = (
                 candidate.profile
                 or pol.adapter.resolved("review" if role == "publication_review" else "triage").name
@@ -264,7 +265,7 @@ def inspect(
             for role, mode in sorted(modes):
                 qualified = []
                 reasons = []
-                for candidate in spec.candidates(role):
+                for candidate in summary_candidates(spec, role):
                     try:
                         cap = capability_for(
                             routes,
@@ -293,6 +294,41 @@ def inspect(
                 if not qualified:
                     problem("planning", f"{role}: no qualified {mode} route for reasoning/handoff")
             capabilities["planning"]["observations"]["reasoning"] = observations
+            if spec.reasoning.summary_routes:
+                from .campaign_summary_routes import independent_families, qualified_candidates
+
+                stages, stage_options = {}, {}
+                for stage, _ in spec.reasoning.summary_routes:
+                    options, reasons = qualified_candidates(spec, routes, stage)
+                    ready, eligible = [], []
+                    for candidate in options:
+                        readiness = inspect_route(
+                            get_profile(candidate.profile, project), candidate, routes, "reasoning"
+                        )
+                        reason = (
+                            readiness["reason"]
+                            if not readiness["ready"]
+                            else route_unavailable(capacity_observer(candidate, project))
+                        )
+                        if reason:
+                            reasons.append(str(reason))
+                        else:
+                            ready.append(dataclasses.asdict(candidate))
+                            eligible.append(candidate)
+                    stage_options[stage] = eligible
+                    stages[stage] = {"qualified": ready, "problems": reasons}
+                    if not ready:
+                        problem("planning", f"summary {stage}: no eligible qualified stage route")
+                capabilities["planning"]["observations"]["summary_routes"] = stages
+                independent = independent_families(stage_options)
+                capabilities["planning"]["observations"]["summary_audit_families"] = list(
+                    independent
+                )
+                if not independent:
+                    problem(
+                        "planning",
+                        "summary stages cannot reserve an independent qualified audit family",
+                    )
         except (CampaignError, OSError, ValueError) as exc:
             problem("planning", str(exc))
     if spec.planning.enabled or spec.intake.allow_new_units:

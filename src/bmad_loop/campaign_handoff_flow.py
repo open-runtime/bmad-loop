@@ -477,6 +477,7 @@ def _requires_replan(row):
 def _obsolete_summaries(runtime, snapshot, value):
     from .campaign_summary import (
         EXTRACT_PROMPT_VERSION,
+        FINAL_PROMPT_VERSION,
         REDUCE_PROMPT_VERSION,
         summary_contract_current,
     )
@@ -496,6 +497,7 @@ def _obsolete_summaries(runtime, snapshot, value):
             if value.get("summary_contracts", {}).get(key) not in {
                 EXTRACT_PROMPT_VERSION,
                 REDUCE_PROMPT_VERSION,
+                FINAL_PROMPT_VERSION,
             }:
                 return True
         elif not summary_contract_current(row["request"]):
@@ -535,6 +537,11 @@ def _remember_failures(runtime, snapshot, value):
 
 
 def _prepare_with_failures(snapshot, request, value):
+    family = request.coordinates.get("audit_family")
+    if family:
+        if value.get("audit_family", family) != family:
+            raise CampaignError("Summary job changed the reserved independent audit family")
+        value["audit_family"] = family
     row = prepare(snapshot, request)
     failures = max(
         (value.get("failure_ledger", {}).get(key, 0) for key in _failure_keys(row["request"])),
@@ -864,6 +871,7 @@ def _capture(runtime, snapshot, unit, value):
                                 binding,
                                 root / "managed-history",
                                 session_id=row.get("session_id") or binding.get("session_id") or "",
+                                max_bytes=snapshot.spec.reasoning.history_max_bytes,
                             )
                         )
                     )
@@ -894,7 +902,13 @@ def _capture(runtime, snapshot, unit, value):
             try:
                 sources.append(
                     dataclasses.asdict(
-                        snapshot_history(Path(path), harness, identity, root / "history")
+                        snapshot_history(
+                            Path(path),
+                            harness,
+                            identity,
+                            root / "history",
+                            max_bytes=snapshot.spec.reasoning.history_max_bytes,
+                        )
                     )
                 )
             except (CampaignError, OSError, ValueError) as exc:
@@ -1015,20 +1029,35 @@ def _summary_route(
     min_payload=0,
     purpose="",
     contract="",
+    stage="",
 ):
     from .campaign_headless import provider_family
+    from .campaign_summary_routes import candidates, enabled, reserve_auditor, stage_for
 
     allowed, failures = [], []
-    purpose = purpose or ("handoff_audit" if role == "handoff_audit" else "handoff_map")
+    purpose = purpose or (
+        ("handoff_final_audit" if enabled(snapshot.spec) else "handoff_audit")
+        if role == "handoff_audit"
+        else "handoff_map"
+    )
+    stage = (stage or stage_for(purpose, contract)) if enabled(snapshot.spec) else ""
+    authors = _summary_authors(runtime, snapshot, value) if stage else set()
+    reserved = (value or {}).get("audit_family", "")
     excluded = {
         route
         for route, until in (value or {}).get("route_cooldowns", {}).items()
         if until > runtime.clock()
     }
-    for candidate in snapshot.spec.candidates(role):
+    for candidate in candidates(snapshot.spec, role, stage):
         if (
             candidate.profile + ":" + candidate.model in excluded
             or provider_family(candidate.model) in excluded_families
+            or (
+                stage
+                and role == "handoff_audit"
+                and reserved
+                and provider_family(candidate.model) != reserved
+            )
         ):
             continue
         try:
@@ -1036,6 +1065,13 @@ def _summary_route(
             validate_fidelity_qualification(
                 cap, candidate=candidate, purpose=purpose, contract=contract
             )
+            if stage and role == "summarization":
+                reserve_auditor(
+                    runtime,
+                    snapshot,
+                    authors | {provider_family(candidate.model)},
+                    reserved=reserved,
+                )
             if min_payload and _budget(candidate, cap).payload_tokens < min_payload:
                 continue
         except CampaignError as exc:
@@ -1043,7 +1079,16 @@ def _summary_route(
             continue
         allowed.append(candidate)
     selected = (
-        runtime._role(snapshot, role, allowed_candidates=tuple(allowed))
+        runtime._role(
+            snapshot,
+            role,
+            allowed_candidates=tuple(allowed),
+            **(
+                {"summary_stage": stage, "permissions": "reasoning", "require_headless": True}
+                if stage
+                else {}
+            ),
+        )
         if allowed and hasattr(runtime, "_role")
         else allowed[0] if allowed else None
     )
@@ -1054,6 +1099,42 @@ def _summary_route(
             + (": " + "; ".join(dict.fromkeys(failures)) if failures else "")
         )
     return selected, _cap(snapshot, selected, "reasoning")
+
+
+def _summary_authors(runtime, snapshot, value):
+    from .campaign_headless import provider_family
+
+    result = set()
+    for field in ("all_jobs", "constraint_jobs", "recovery_jobs"):
+        for identifier in (value or {}).get(field, ()):
+            row = _job(runtime, snapshot, identifier)
+            if row.get("state") != "applied":
+                continue
+            family = (row.get("receipt") or {}).get("provider_family")
+            if not family:
+                selection = row.get("selection") or {}
+                family = provider_family(selection.get("model", ""))
+            if not family:
+                raise HandoffRouteWait("Applied summary author family is unknown")
+            result.add(family)
+    return result
+
+
+def _stage_coordinates(runtime, snapshot, value, candidate, stage):
+    from .campaign_headless import provider_family
+    from .campaign_summary_routes import STAGES, enabled, reserve_auditor
+
+    if not enabled(snapshot.spec):
+        return {}
+    reserved = (value or {}).get("audit_family", "")
+    if STAGES[stage][0] == "summarization":
+        reserved = reserve_auditor(
+            runtime,
+            snapshot,
+            _summary_authors(runtime, snapshot, value) | {provider_family(candidate.model)},
+            reserved=reserved,
+        )
+    return {"summary_stage": stage, "audit_family": reserved}
 
 
 def _budget(candidate, cap):
@@ -1091,7 +1172,6 @@ def _maps(runtime, snapshot, unit, value):
         summary_schema,
     )
 
-    candidate, cap = _summary_route(runtime, snapshot, "summarization", value)
     histories = tuple(HistorySnapshot(**row) for row in value["capture"]["sources"])
     events = merge_lineage_events(histories)
     completed = tuple(
@@ -1118,6 +1198,13 @@ def _maps(runtime, snapshot, unit, value):
     )
     known = {job.id for job, _ in completed}
     completed = (*completed, *((job, result) for job, result in warmed if job.id not in known))
+    value = {
+        **value,
+        "all_jobs": list(
+            dict.fromkeys([*value.get("all_jobs", []), *(job.id for job, _ in completed)])
+        ),
+    }
+    candidate, cap = _summary_route(runtime, snapshot, "summarization", value)
     planned = plan_remaining_maps(
         events, completed, _budget(candidate, cap), _root(runtime, snapshot, value) / "maps"
     )
@@ -1131,6 +1218,7 @@ def _maps(runtime, snapshot, unit, value):
         )
         coordinates = {
             **_coordinates(snapshot, unit, value),
+            **_stage_coordinates(runtime, snapshot, value, candidate, "leaf"),
             "summary_spec": dataclasses.asdict(spec),
             "history_snapshots": value["capture"]["sources"],
         }
@@ -1172,11 +1260,13 @@ def _maps(runtime, snapshot, unit, value):
 
 def _reduce(runtime, snapshot, unit, value):
     from .campaign_summary import (
+        FINAL_PROMPT_VERSION,
         SummaryJobSpec,
         plan_reduction,
         summary_prompt,
         summary_schema,
     )
+    from .campaign_summary_routes import enabled
 
     if any(_job(runtime, snapshot, key)["state"] != "applied" for key in value["jobs"]):
         raise CampaignError("History compaction requires a complete applied frontier")
@@ -1203,7 +1293,19 @@ def _reduce(runtime, snapshot, unit, value):
     if any(child.get("structural_coverage") is not True for _, child in children):
         raise CampaignError("History compaction requires complete structural coverage")
     frontier = {"bytes": sum(len(encoded(child)) for _, child in children), "nodes": len(children)}
-    if len(children) <= 1 or (not value.get("reduction_level", 0) and frontier["bytes"] <= ceiling):
+    staged = enabled(snapshot.spec)
+    if (
+        staged
+        and all(
+            _job(runtime, snapshot, key)["request"]["coordinates"].get("summary_stage") == "final"
+            for key in value["jobs"]
+        )
+        and len(children) == 1
+    ):
+        return None
+    if not staged and (
+        len(children) <= 1 or (not value.get("reduction_level", 0) and frontier["bytes"] <= ceiling)
+    ):
         return None
     previous = value.get("reduction_frontier")
     limited = (
@@ -1216,6 +1318,8 @@ def _reduce(runtime, snapshot, unit, value):
         )
     )
     if limited:
+        if staged:
+            raise HandoffRouteWait("Final summary synthesis remains incomplete: " + limited)
         return {
             "history_compaction": {
                 "status": "compaction-limited",
@@ -1226,9 +1330,24 @@ def _reduce(runtime, snapshot, unit, value):
                 "retained_jobs": list(value["jobs"]),
             }
         }
-    candidate, cap = _summary_route(
-        runtime, snapshot, "summarization", value, purpose="handoff_reduce", contract=""
-    )
+    stage = "intermediate"
+    if staged:
+        candidate, cap = _summary_route(
+            runtime, snapshot, "summarization", value, purpose="handoff_final", stage="final"
+        )
+        final_plan = plan_reduction(
+            children,
+            _budget(candidate, cap),
+            _root(runtime, snapshot, value) / "reductions",
+            artifact_bytes=0,
+            project_native_events=True,
+        )
+        if len(final_plan) == 1:
+            stage = "final"
+    if stage != "final":
+        candidate, cap = _summary_route(
+            runtime, snapshot, "summarization", value, purpose="handoff_reduce", contract=""
+        )
     budget = _budget(candidate, cap)
     # Stored native/structural evidence is independent of the initial view.
     # Complete artifacts remain indexed; assembly budgets selected context only
@@ -1246,10 +1365,13 @@ def _reduce(runtime, snapshot, unit, value):
             planned_spec,
             id=digest(
                 [value["id"], planned_spec.id, value.get("plan_epoch", 0), snapshot.config_revision]
+                + ([stage] if staged else [])
             ),
+            **({"prompt_version": FINAL_PROMPT_VERSION} if stage == "final" else {}),
         )
         coordinates = {
             **_coordinates(snapshot, unit, value),
+            **_stage_coordinates(runtime, snapshot, value, candidate, stage),
             "summary_spec": dataclasses.asdict(spec),
             "history_snapshots": value["capture"]["sources"],
             "reduction_failure_keys": _reduction_failure_keys(runtime, snapshot, spec),
@@ -1303,6 +1425,7 @@ def _reduction_failure_keys(runtime, snapshot, spec):
 def _summary_replan(runtime, snapshot, unit, value):
     """Retry the current reduction frontier, never discard it to re-extract maps."""
     from .campaign_summary import (
+        FINAL_PROMPT_VERSION,
         REDUCE_PROMPT_VERSION,
         SummaryJobSpec,
         load_input,
@@ -1325,6 +1448,7 @@ def _summary_replan(runtime, snapshot, unit, value):
         if claim and not claim.get("quiescent"):
             raise CampaignError("Cannot replace a reducer with unknown native quiescence")
         old = SummaryJobSpec(**row["request"]["coordinates"]["summary_spec"])
+        stage = row["request"]["coordinates"].get("summary_stage", "")
         split = (
             row["state"] == "failed"
             and claim.get("quiescent") is True
@@ -1352,17 +1476,19 @@ def _summary_replan(runtime, snapshot, unit, value):
                 "summarization",
                 value,
                 min_payload=planned.input_tokens,
-                purpose="handoff_reduce",
+                purpose="handoff_final" if stage == "final" else "handoff_reduce",
+                stage=stage,
             )
             spec = dataclasses.replace(
                 planned,
                 id=digest([value["id"], planned.id, value["plan_epoch"], snapshot.config_revision]),
                 route=_budget(candidate, cap).route,
                 output_tokens=min(planned.output_tokens, cap["output_tokens"]),
-                prompt_version=REDUCE_PROMPT_VERSION,
+                prompt_version=FINAL_PROMPT_VERSION if stage == "final" else REDUCE_PROMPT_VERSION,
             )
             coordinates = {
                 **_coordinates(snapshot, unit, value),
+                **_stage_coordinates(runtime, snapshot, value, candidate, stage or "intermediate"),
                 "summary_spec": dataclasses.asdict(spec),
                 "history_snapshots": value["capture"]["sources"],
                 "reduction_failure_keys": _reduction_failure_keys(runtime, snapshot, spec),
@@ -1424,8 +1550,9 @@ def validate_fidelity_qualification(cap, *, candidate=None, purpose="", contract
 
 
 def _audit_plan(runtime, snapshot, unit, value):
-    from .campaign_fidelity import HISTORY_AUDIT_PROMPT_VERSION
+    from .campaign_fidelity import FINAL_AUDIT_PROMPT_VERSION, HISTORY_AUDIT_PROMPT_VERSION
     from .campaign_summary import SummaryJobSpec, load_input
+    from .campaign_summary_routes import enabled
 
     reduced = _reduce(runtime, snapshot, unit, value)
     if reduced is not None and "requests" in reduced:
@@ -1468,6 +1595,11 @@ def _audit_plan(runtime, snapshot, unit, value):
             "current_state": value["capture"]["current"],
             "exclusion_evidence": [],
         }
+        if enabled(snapshot.spec):
+            content_base["final_frontier"] = [
+                {"job_id": identifier, "summary": _applied(_job(runtime, snapshot, identifier))}
+                for identifier in value["jobs"]
+            ]
         for batch in batches(
             spans,
             content=content_base,
@@ -1480,13 +1612,22 @@ def _audit_plan(runtime, snapshot, unit, value):
             path = blob(_root(runtime, snapshot, value) / "audits", data)
             coordinates = {
                 **_coordinates(snapshot, unit, value),
+                **_stage_coordinates(runtime, snapshot, value, candidate, "audit"),
                 "owner_ids": owner_ids,
                 "owner_spans": batch,
                 "obligation_ids": [row["id"] for row in obligations],
                 "history_snapshots": value["capture"]["sources"],
-                "audit_prompt_version": HISTORY_AUDIT_PROMPT_VERSION,
+                "audit_prompt_version": (
+                    FINAL_AUDIT_PROMPT_VERSION
+                    if enabled(snapshot.spec)
+                    else HISTORY_AUDIT_PROMPT_VERSION
+                ),
+                **({"final_frontier": list(value["jobs"])} if enabled(snapshot.spec) else {}),
             }
-            prompt = PROMPT + json.dumps(
+            prompt = PROMPT
+            if enabled(snapshot.spec):
+                prompt += " Independently compare the final_frontier synthesis against this exact leaf history, leaf summary and canonical obligations. Report any dropped, contradicted, invented or hidden material obligation in ambiguities; correct leaf extraction alone cannot approve an incorrect final synthesis."
+            prompt += json.dumps(
                 {
                     "handoff_id": value["id"],
                     "capture_digest": coordinates["capture_digest"],
@@ -1654,6 +1795,18 @@ def _contract_job(
     path = blob(_root(runtime, snapshot, value) / "contract-inputs", data)
     coordinates = {
         **_coordinates(snapshot, unit, value),
+        **_stage_coordinates(
+            runtime,
+            snapshot,
+            value,
+            candidate,
+            {
+                "constraint-reduce-v1": "constraint",
+                "constraint-audit-v1": "constraint_audit",
+                "recovery-extract-v1": "recovery",
+                "recovery-audit-v1": "recovery_audit",
+            }[contract],
+        ),
         "contract": contract,
         "handoff_job_field": field,
     }

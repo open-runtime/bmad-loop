@@ -111,6 +111,13 @@ permissions and context limits require actual native and semantic qualification;
 the catalog alone is not proof. AGY requires a supported capacity observation or
 explicit capacity command; unknown capacity uses an eligible fallback.
 
+Freeze `reasoning.history_max_bytes` independently from model context limits:
+512 MiB per source by default, at most 1 GiB, with a separate 64 MiB record
+ceiling. Stream raw sealing and normalized event writes rather than retaining
+multiple full-stream buffers. A large scripted corpus proves chunking/reuse
+mechanics only; actual native fidelity remains bound to its earned corpus and
+route. Oversized or inaccessible ranges are explicit coverage debt.
+
 Managed headless warmup seals complete stream frames bound to the exact launch,
 generation and native process. Immutable prefix capture is separate from terminal
 export and cannot claim quiescence. Keep stable event IDs, tolerate appended bytes
@@ -950,9 +957,11 @@ corrupt optional artifacts, stale extraction contracts, unavailable bindings and
 route changes. Exhausted maps advance optional pages without becoming semantic
 coverage; mandatory final extraction still includes their failed source ranges.
 Background jobs remain optional, resource-bound and lower priority than required
-reasoning work. Only trusted hook-bound native prefixes qualify for live warmup;
-active managed-headless streams retain their quiescent-export boundary. No
-native-store import writer or universal live-history capability is claimed.
+reasoning work. That qualification initially covered trusted hook-bound native
+prefixes only. The portable operations extension adds separately validated
+immutable managed-headless prefixes; final capture and writable continuation
+still require quiescence. No native-store import writer or universal live-history
+capability is claimed.
 
 The frozen scripted load qualification on `3efacd77` delivered 48 stories across
 24 active epics, reached eight verification slots, eight review slots and four

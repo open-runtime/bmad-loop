@@ -22,19 +22,44 @@ class Host:
         self.no_create = False
         self.rewrite_branch = False
         self.tasks = []
+        self.folder_settings = []
+        self.folder_writes = []
+        self.lose_folder_reply = False
         self.statuses = [
             {"id": "todo", "type": "unstarted"},
             {"id": "doing", "type": "started"},
             {"id": "done", "type": "completed"},
         ]
 
-    def rpc(self, procedure, payload=None):
+    def rpc(self, procedure, payload=None, mutate=False):
         if procedure == "project.list":
             return copy.deepcopy(self.projects)
         if procedure == "workspace.list":
             return copy.deepcopy(self.workspaces)
         if procedure == "terminal.daemon.listSessions":
             return []
+        if procedure == "tagFolders.list":
+            assert not mutate
+            return copy.deepcopy(self.folder_settings)
+        if procedure == "tagFolders.upsert":
+            assert mutate and set(payload) == {"scope", "tag", "displayName"}
+            assert 1 <= len(payload["displayName"].encode("utf-16-le")) // 2 <= 200
+            self.folder_writes.append(copy.deepcopy(payload))
+            row = next(
+                (
+                    row
+                    for row in self.folder_settings
+                    if (row["scope"], row["tag"]) == (payload["scope"], payload["tag"])
+                ),
+                None,
+            )
+            if row is None:
+                row = {"color": None, "tabOrder": None}
+                self.folder_settings.append(row)
+            row.update(payload)
+            if self.lose_folder_reply:
+                raise TimeoutError
+            return {"tagSettings": copy.deepcopy(self.folder_settings)}
         raise AssertionError(procedure)
 
     def cli(self, args):
@@ -229,7 +254,7 @@ def test_reflection_retains_operator_tags_and_reports_precedence(provider):
         binding, campaign_id="campaign", epic="epic", phase="running", attempt=1, held=True
     )
     assert data["held"]
-    assert data["folder_selection"] == "operator-tag-precedence"
+    assert data["folder_selection"] == "operator-tags-present"
     assert "aaa-owner" in host.workspaces[0]["tags"]
     assert data["group"] == "story"
 
@@ -248,7 +273,8 @@ def test_native_tag_normalization_keeps_mixed_case_group_identity(provider):
     host.cli = normalized
     data = p.reflect(binding, campaign_id="Campaign", epic="Epic CART", phase="running", attempt=1)
     assert data["group"] == "Epic CART"
-    assert data["folder"] == "bmad-campaign-epic cart"
+    assert data["folder"].startswith("bmad-")
+    assert data["group_display"]["observed"] == "Epic CART"
     assert data["folder_selection"] == "confirmed"
     before = len(host.calls)
     assert (
@@ -290,8 +316,9 @@ def test_navigation_titles_refresh_without_changing_allocation_or_operator_tags(
         group_fields={"names": ("tina",), "epics": ("epic",), "issues": ("#42",), "prs": ("#18",)},
     )
     assert host.workspaces[0]["name"] == title
-    assert updated["folder"].startswith("@tina · e:epic · i:#42 · pr:#18")
-    assert initial["folder"] not in host.workspaces[0]["tags"]
+    assert updated["folder"] == initial["folder"]
+    assert updated["group_display"]["observed"] == title
+    assert initial["folder"] in host.workspaces[0]["tags"]
     assert "factory-desk-side-tasks" in host.workspaces[0]["tags"]
     assert (
         p.allocate(
@@ -321,8 +348,8 @@ def test_native_tag_budget_preserves_navigation_and_full_titles(provider, epic):
         group_fields=fields,
     )
     assert len(data["folder"].encode("utf-16-le")) // 2 <= 64
-    assert data["folder"].startswith("hcom:?")
-    assert all(label in data["folder"] for label in (" · e:", " · i:", " · pr:"))
+    assert data["folder"].startswith("bmad-")
+    assert data["group_display"]["observed"] == navigation_title(**fields)
     assert data["group_title"] == navigation_title(**fields)
     assert host.workspaces[0]["name"] == full
     assert set(host.workspaces[0]["tags"].split(",")) == {"owner-folder", data["folder"]}
@@ -363,8 +390,7 @@ def test_compact_projection_lost_ack_reconciles_same_workspace_without_second_wr
         attempt=0,
         group_fields={"epics": ("epic",)},
     )
-    with pytest.raises(TimeoutError):
-        p.reflect(binding, **kwargs)
+    assert p.reflect(binding, **kwargs)["state"] == "confirmed"
     written = host.workspaces[0]["tags"]
     calls = len(host.calls)
     host.cli = original

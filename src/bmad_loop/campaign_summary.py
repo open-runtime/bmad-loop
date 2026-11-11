@@ -21,6 +21,7 @@ from .platform_util import atomic_write_text, is_link_like
 TokenCounter = Callable[[str], int]
 EXTRACT_PROMPT_VERSION = "history-extract-v3"
 REDUCE_PROMPT_VERSION = "history-reduce-v5"
+FINAL_PROMPT_VERSION = "history-final-v1"
 
 
 class SummaryResultRejected(CampaignError):
@@ -35,6 +36,8 @@ def summary_contract_current(request) -> bool:
         return True  # Non-summary/legacy generic jobs have their own contracts.
     spec = coordinates["summary_spec"]
     expected = EXTRACT_PROMPT_VERSION if purpose == "handoff_map" else REDUCE_PROMPT_VERSION
+    if coordinates.get("summary_stage") == "final":
+        expected = FINAL_PROMPT_VERSION
     return isinstance(spec, dict) and spec.get("prompt_version") == expected
 
 
@@ -961,6 +964,14 @@ def summary_schema_template() -> dict[str, Any]:
 def summary_prompt(job: SummaryJobSpec) -> str:
     return (
         (
+            "Produce the final successor synthesis from the entire supplied summary frontier. "
+            "Reconcile chronology, supersession and contradictions across children; keep every "
+            "unresolved owner obligation and distinguish established facts from uncertainty. "
+            "This is the final synthesis, not another independent leaf extraction. "
+            if job.prompt_version == FINAL_PROMPT_VERSION
+            else ""
+        )
+        + (
             "Build a compact working brief and retrieval index for the supplied retained history. "
             "The complete child summaries and exact source records remain available. "
             if job.artifact_bytes

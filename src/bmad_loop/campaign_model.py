@@ -118,7 +118,7 @@ class GitHubSpec:
 class ParadevSpec:
     reflect: bool = False
     project_id: str = ""
-    group_by: str = "story"
+    group_by: str = "epic"
     tasks: bool = False
     worktree_root: str = ""
     retention: int = 20
@@ -181,6 +181,8 @@ class ReasoningSpec:
     max_turns: int = 4
     timeout_s: int = 1800
     packet_token_limit: int = 160000
+    history_max_bytes: int = 512 * 1024 * 1024
+    summary_routes: tuple[tuple[str, str], ...] = ()
     purposes: tuple[str, ...] = (
         "routing",
         "triage",
@@ -415,6 +417,10 @@ def _construct(cls: Any, value: Any, name: str) -> Any:
             out[key] = _strings(item, f"{name}.{key}")
         elif key in {"inventory_metadata_bytes", "inventory_pr_detail_bytes"}:
             _positive(item, f"{name}.{key}")
+        elif key == "history_max_bytes":
+            _positive(item, f"{name}.{key}")
+            if item > 1024 * 1024 * 1024:
+                raise CampaignError("reasoning.history_max_bytes cannot exceed 1 GiB")
         elif key == "candidate_check_app_id":
             if type(item) is not int or item < 0:
                 raise CampaignError("github.candidate_check_app_id must be a nonnegative integer")
@@ -461,6 +467,15 @@ def _construct(cls: Any, value: Any, name: str) -> Any:
             if not isinstance(item, (list, tuple)):
                 raise CampaignError(f"{name}.{key} must be an array")
             out[key] = tuple(_positive(n, f"{name}.{key}") for n in item)
+        elif key == "summary_routes":
+            if not isinstance(item, dict):
+                raise CampaignError("reasoning.summary_routes must map stages to pool names")
+            if any(
+                not isinstance(stage, str) or not isinstance(pool, str) or not pool.strip()
+                for stage, pool in item.items()
+            ):
+                raise CampaignError("reasoning.summary_routes must map stages to pool names")
+            out[key] = tuple(item.items())
         elif key == "skills":
             skills = _table(item, f"{name}.skills") if isinstance(item, dict) else dict(item)
             if not all(isinstance(k, str) and isinstance(v, str) and v for k, v in skills.items()):
@@ -795,8 +810,24 @@ def spec_from_dict(value: Mapping[str, Any]) -> CampaignSpec:
         raise CampaignError(
             "github.merge_method must be merge: campaigns preserve all checkpoint commits and agent history; squash and rebase are prohibited"
         )
-    if spec.paradev.group_by not in {"story", "epic"}:
-        raise CampaignError("paradev.group_by must be story or epic")
+    if spec.paradev.group_by not in {"story", "epic", "initiative"}:
+        raise CampaignError("paradev.group_by must be story, epic or initiative")
+    summary_routes = dict(spec.reasoning.summary_routes)
+    if summary_routes:
+        stages = {
+            "leaf",
+            "intermediate",
+            "final",
+            "constraint",
+            "recovery",
+            "audit",
+            "constraint_audit",
+            "recovery_audit",
+        }
+        if set(summary_routes) != stages:
+            raise CampaignError("reasoning.summary_routes must name all eight summary stages")
+        if set(summary_routes.values()) - set(dict(spec.role_pools)):
+            raise CampaignError("reasoning.summary_routes references an unknown pool")
     if spec.communication.mode not in {"off", "observe", "managed"}:
         raise CampaignError("communication mode requires off, observe or managed")
     if spec.communication.mode == "managed" and (
@@ -849,6 +880,7 @@ def spec_to_dict(spec: CampaignSpec) -> dict[str, Any]:
     }
     raw["roles"] = {name: asdict(role) for name, role in spec.roles}
     raw["planning"]["skills"] = dict(spec.planning.skills)
+    raw["reasoning"]["summary_routes"] = dict(spec.reasoning.summary_routes)
     raw["ownership"] = dict(spec.ownership)
     return raw
 
@@ -876,7 +908,11 @@ def snapshot_from_dict(value: Mapping[str, Any]) -> CampaignSnapshot:
     if raw.get("schema_version") != SCHEMA_VERSION or type(raw.get("schema_version")) is not int:
         raise CampaignError("unsupported campaign snapshot schema")
     _fields(raw, set(CampaignSnapshot.__dataclass_fields__), "snapshot")
-    raw["spec"] = spec_from_dict(_table(raw["spec"], "snapshot.spec"))
+    stored_spec = dict(_table(raw["spec"], "snapshot.spec"))
+    stored_paradev = dict(_table(stored_spec.get("paradev", {}), "snapshot.spec.paradev"))
+    stored_paradev.setdefault("group_by", "story")
+    stored_spec["paradev"] = stored_paradev
+    raw["spec"] = spec_from_dict(stored_spec)
     units: dict[str, CampaignUnit] = {}
     for key, item in _table(raw.get("units", {}), "snapshot.units").items():
         unit = dict(item)

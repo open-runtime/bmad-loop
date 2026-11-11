@@ -8,6 +8,7 @@ from test_campaign_reasoning_jobs import case
 
 from bmad_loop.campaign_headless import read_json
 from bmad_loop.campaign_paradev import WorkspaceBinding
+from bmad_loop.campaign_titles import work_title
 
 
 def test_registered_terminal_runs_owned_child_with_external_no_tools_state(prepared, tmp_path):
@@ -49,9 +50,7 @@ def test_registered_terminal_runs_owned_child_with_external_no_tools_state(prepa
     assert envelope["presentation"] == view
     assert envelope["workspace"] == str(path.parent)
     assert envelope["permissions"] == "no-tools" and envelope["grants"] == {}
-    assert titles == [
-        ("1", f"hcom:pending · E:unbound · I:none · PR:none · {request.id} · summary · gpt-test")
-    ]
+    assert titles == [("1", f"summary · gpt-test · Portfolio · {request.id}")]
     assert result["receipt"]["presentation_status"]["state"] == "confirmed"
 
 
@@ -100,7 +99,7 @@ def test_reasoning_waits_for_workspace_then_freezes_its_native_binding(tmp_path,
     expected = {
         "workspace": str(workspace),
         "workspace_id": "owned-workspace",
-        "navigation_prefix": f"hcom:pending · E:{unit.spec.epic} · I:pending · PR:pending",
+        "navigation_prefix": work_title(unit, snapshot=snapshot),
     }
     assert job["claim"]["presentation"] == expected
     unit.bindings["native"]["workspace_id"] = "later-workspace"
@@ -133,7 +132,8 @@ def test_reasoning_navigation_uses_own_unknown_actor_and_updates_parent_pr(tmp_p
     unit.bindings["issue"] = {"number": 42}
     unit.bindings["pr"] = {"number": 18}
     view = presentation(snapshot, request)
-    assert view["navigation_prefix"] == f"hcom:pending · E:{unit.spec.epic} · I:#42 · PR:#18"
+    assert view["navigation_prefix"] == work_title(unit, snapshot=snapshot)
+    assert "tina" not in view["navigation_prefix"]
     runner, _, standalone, candidate, capability = prepared
     runner.mux.set_display_title = lambda terminal, title, **kwargs: title
     path = runner.prepare(
@@ -147,9 +147,10 @@ def test_reasoning_navigation_uses_own_unknown_actor_and_updates_parent_pr(tmp_p
     )
     runner.launch(path)
     before = path.read_bytes()
-    prefix = view["navigation_prefix"].replace("PR:#18", "PR:#19")
+    prefix = view["navigation_prefix"].replace("PR #18", "PR #19")
     status = runner.refresh_presentation(path, prefix)
-    assert status["title"].startswith(prefix + " · ")
+    assert prefix in status["title"]
+    assert status["identity"]["launch_id"] == "title-refresh"
     assert path.read_bytes() == before
 
 

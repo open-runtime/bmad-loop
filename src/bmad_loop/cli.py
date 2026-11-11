@@ -11559,6 +11559,9 @@ def main(argv: list[str] | None = None) -> int:
     from . import campaign_cli
 
     campaign_cli.register(sub)
+    from . import repo_cli
+
+    repo_cli.register(sub)
 
     init_p = add(
         "init", cmd_init, "install hooks + skills + policy template into the target project"
@@ -12139,7 +12142,7 @@ def main(argv: list[str] | None = None) -> int:
         # Install the policy [mux] backend choice before dispatch: several
         # handlers (probe/diagnose/attach/stop/cleanup/tui) reach the mux
         # without ever loading policy, so this is the one reliable seam.
-        if args.command == "campaign":
+        if args.command in {"campaign", "repo"}:
             return args.func(args)
         _configure_mux(_project(args))
         if args.ctl_launch and args.func in (cmd_resume, cmd_resolve):

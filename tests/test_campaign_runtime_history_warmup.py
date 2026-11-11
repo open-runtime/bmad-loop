@@ -39,14 +39,48 @@ class ObservedReasoning(ScriptedReasoning):
             assert unit.claim and not unit.claim.quiescent
             assert not unit.evidence.get("handoff")
             pid, identity = runs.read_named_pid_identity(Path(unit.claim.run_dir) / "engine.pid")
-            assert runs.probe_liveness(pid, identity) == "alive"
+            assert pid is not None and runs.probe_liveness(pid, identity) == "alive"
         self.launches.append(copy.deepcopy(request))
+        if request["purpose"] == "handoff_reduce":
+            from bmad_loop.campaign_summary import SummaryJobSpec, load_input
+
+            envelope = read_json(path)
+            spec = SummaryJobSpec(**coordinates["summary_spec"])
+            source = load_input(spec)
+            result = {
+                "schema_version": 1,
+                "job_id": request["id"],
+                "input_sha256": spec.input_sha256,
+                "covered_ids": list(spec.primary_ids),
+                "gaps": [],
+                "facts": [
+                    fact for child in source["children"] for fact in child["summary"]["facts"]
+                ],
+            }
+            return {
+                "state": "finished",
+                "receipt": {
+                    "job_id": request["id"],
+                    "request_digest": envelope["request_digest"],
+                    "launch_id": envelope["launch_id"],
+                    "generation": envelope["generation"],
+                    "quiescent": True,
+                    "outcome": "completed",
+                    "input_complete": True,
+                    "usage": {},
+                    "result": result,
+                    "observed_model": envelope["selection"]["model"],
+                    "provider_family": "openai",
+                },
+            }
         return super()._launch(path)
 
 
-@pytest.mark.parametrize("initial_profile", ["codex", "claude"])
+@pytest.mark.parametrize(
+    "initial_profile,managed", [("codex", False), ("claude", False), ("codex", True)]
+)
 def test_live_prefix_maps_are_reused_after_append_and_quota_handoff(
-    campaign, production_case, tmp_path, monkeypatch, initial_profile
+    campaign, prepared, production_case, tmp_path, monkeypatch, initial_profile, managed
 ):
     from bmad_loop import campaign_history_warmup as warmup
 
@@ -75,6 +109,19 @@ def test_live_prefix_maps_are_reused_after_append_and_quota_handoff(
             purposes=("handoff_map", "handoff_reduce", "handoff_audit"),
         ),
     )
+    if managed:
+        from bmad_loop.campaign_summary_routes import STAGES
+
+        spec = dataclasses.replace(
+            spec,
+            reasoning=dataclasses.replace(
+                spec.reasoning,
+                summary_routes=tuple(
+                    (stage, "auditors" if role == "handoff_audit" else "map")
+                    for stage, (role, _, _) in STAGES.items()
+                ),
+            ),
+        )
     _, snapshot = create(case.repo, spec)
     dependent = snapshot.units["source:project:dependent"]
     dependent.spec = dataclasses.replace(dependent.spec, after=(UNIT,))
@@ -179,6 +226,10 @@ def execution(request, session):
         '    observe_adapter(adapter,directory=envelope.directory,run_dir=run_dir,claim=WorkerClaim(**request["claim"]),campaign_id=envelope.campaign_id,environment=request.get("reflection_environment",{}))\n'
         '    return {role:adapter for role in ("dev","review","retro","triage")}',
     )
+    if managed:
+        from campaign_managed_warmup_fixture import install
+
+        body = install(body, tmp_path, prepared, PREFIX, TAIL)
     script.write_text(body)
 
     prefix_jobs = set()
@@ -215,6 +266,23 @@ def execution(request, session):
             not invalid_launchers
         ), "Qualification fixture changed during execution: " + json.dumps(invalid_launchers)
         unit = current.units[UNIT]
+        if managed:
+            failures = [
+                row.get("error")
+                for row in unit.evidence.get("worker_history", [])
+                if row.get("error")
+            ]
+            assert not failures, json.dumps(
+                {
+                    "failures": failures,
+                    "handoff": unit.evidence.get("handoff"),
+                    "state": unit.state.value,
+                    "hold": dataclasses.asdict(unit.hold) if unit.hold else None,
+                    "warmup": unit.evidence.get("history_warmup"),
+                    "history": unit.evidence.get("worker_history"),
+                },
+                indent=2,
+            )
         if not prefix_jobs:
             applied = [
                 row
@@ -224,12 +292,10 @@ def execution(request, session):
             if applied:
                 assert unit.claim and not unit.claim.quiescent
                 assert not unit.evidence.get("handoff")
-                assert (
-                    runs.probe_liveness(
-                        *runs.read_named_pid_identity(Path(unit.claim.run_dir) / "engine.pid")
-                    )
-                    == "alive"
+                pid, identity = runs.read_named_pid_identity(
+                    Path(unit.claim.run_dir) / "engine.pid"
                 )
+                assert pid is not None and runs.probe_liveness(pid, identity) == "alive"
                 prefix_jobs = {row["id"] for row in applied}
                 original_launch, original_pr = unit.claim.launch_id, unit.bindings["pr"]
                 (tmp_path / "parallel-markers" / "append-history").touch()
@@ -272,21 +338,36 @@ def execution(request, session):
     assert prefix_jobs <= {row["id"] for row in warm_requests}
     assert all(sum(row["id"] == job for row in reasoner.launches) == 1 for job in prefix_jobs)
     audits = [row for row in reasoner.launches if row["purpose"] == "handoff_audit"]
-    captured = next(
-        source
-        for source in handoff["capture"]["sources"]
-        if source["session_id"] == "warmup-native"
-    )
-    original = Path(handoff["predecessor"]["run_dir"]) / "live-history.jsonl"
-    assert Path(captured["raw_path"]).read_bytes() == original.read_bytes()
-    assert captured["captured_bytes"] == original.stat().st_size
-    assert set(captured["owner_event_ids"]) <= {
-        identity for row in audits for identity in row["coordinates"]["owner_ids"]
-    }
-    audited_text = "\n".join(
-        span["text"] for row in audits for span in row["coordinates"]["owner_spans"]
-    )
-    assert PREFIX in audited_text and TAIL in audited_text
+    if managed:
+        from bmad_loop.campaign_transcripts import HistorySnapshot, load_events
+
+        captured = next(
+            source
+            for source in handoff["capture"]["sources"]
+            if source["harness"] == "managed-headless"
+        )
+        texts = "\n".join(event.record.text for event in load_events(HistorySnapshot(**captured)))
+        assert PREFIX in texts and TAIL in texts
+        assert not captured["owner_event_ids"]
+        assert any(row["coordinates"].get("summary_stage") == "final" for row in reasoner.launches)
+        assert handoff["audit_family"] == "anthropic"
+        assert any(row["coordinates"].get("history_warmup") for row in reasoner.launches)
+    else:
+        captured = next(
+            source
+            for source in handoff["capture"]["sources"]
+            if source["session_id"] == "warmup-native"
+        )
+        original = Path(handoff["predecessor"]["run_dir"]) / "live-history.jsonl"
+        assert Path(captured["raw_path"]).read_bytes() == original.read_bytes()
+        assert captured["captured_bytes"] == original.stat().st_size
+        assert set(captured["owner_event_ids"]) <= {
+            identity for row in audits for identity in row["coordinates"]["owner_ids"]
+        }
+        audited_text = "\n".join(
+            span["text"] for row in audits for span in row["coordinates"]["owner_spans"]
+        )
+        assert PREFIX in audited_text and TAIL in audited_text
     events = [json.loads(line) for line in case.events.read_text().splitlines()]
     own = [row["event"] for row in events if row["unit"] == UNIT]
     assert own.index("history-ready") < own.index("history-appended") < own.index("quota")

@@ -2,6 +2,24 @@
 
 Every `bmad-loop` subcommand, its options, its `--json` document, the process exit codes, and the `validate` check ids. `bmad-loop <command> --help` prints the same option list from the installed version. For where run state lives on disk, see [run state](run-state.md); for policy keys, see [configuration](configuration.md).
 
+## Repository organization
+
+```sh
+bmad-loop repo audit --policy FILE [--project PROJECT] [--json]
+bmad-loop repo reconcile ID --expected-revision REVISION [--project PROJECT] [--json]
+bmad-loop repo status ID [--project PROJECT] [--json]
+bmad-loop repo history ID [--after SEQUENCE] [--limit N] [--project PROJECT] [--json]
+bmad-loop repo stop ID [--project PROJECT] [--json]
+bmad-loop repo resume ID [--project PROJECT] [--json]
+```
+
+Audit reads remote and local repository state and runs bounded proposal/review
+sessions without GitHub writes. Reconcile applies the frozen owner policy to an
+exact audit revision, preserving branches, worktrees and original discussion.
+History is paginated; status and stop remain available while work runs. Resume
+retains attempt and write history. See [repository organization](../repository-operations.md)
+for policy, budgets, ownership and closure requirements.
+
 ## Global options
 
 - The top-level parser documents only `-h` and `--version`. A subcommand is required; a missing or unknown one exits 2.
@@ -50,6 +68,8 @@ bmad-loop campaign steer ID [--unit UNIT] [--job JOB] --text TEXT [--request-id 
 bmad-loop campaign handoff ID --unit UNIT [--profile PROFILE] [--model MODEL] [--effort EFFORT] [--reason TEXT] [--json]
 bmad-loop campaign migrate-state ID [--json]
 bmad-loop campaign requalify ID --capabilities FILE --expected-revision REVISION --reason TEXT [--json]
+bmad-loop campaign reconfigure ID --spec FILE --expected-revision REVISION --reason TEXT [--preview] [--json]
+bmad-loop campaign reflect ID [--unit UNIT] [--expected-revision REVISION] [--preview] [--json]
 bmad-loop campaign resume ID [--json]
 bmad-loop campaign stop ID [--terminate-workers] [--json]
 bmad-loop campaign hold ID --unit UNIT --reason TEXT [--json]
@@ -87,6 +107,13 @@ and immutable template. The campaign remains stopped; resume is a separate actio
 It refuses stale revisions, uncertain effects or actors, changed route contracts,
 and campaigns that already began delivery. This is not a general mid-delivery
 installation migration or permission to rewrite qualification receipts.
+
+Reconfiguration explicitly changes qualified routes, summary pools and grouping
+before unit execution. Scope, policy, grants and limits stay frozen; the full
+specification and current revision are required. Preview returns a proposal;
+apply returns campaign status with a new immutable configuration revision. Neither
+starts workers. Stopped reflection returns per-workspace display results and
+refreshes only existing bound resources. Its preview performs no display writes.
 Renewed semantic proof coordinates must preserve every declared current purpose
 and contract and pass full fidelity validation against the replacement route.
 

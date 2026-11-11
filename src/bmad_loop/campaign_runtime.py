@@ -103,16 +103,22 @@ def create(project: Path, spec: CampaignSpec) -> tuple[CampaignStore, CampaignSn
         raise CampaignError("ambient transport override conflicts with native reflection")
     pol = dataclasses.replace(pol, mux=dataclasses.replace(pol.mux, backend=resolved_backend))
     profiles = runsetup.resolve_profiles(pol, project)
-    for role in set(dict(spec.roles)) | {
-        "planning",
-        "planning_review",
-        "triage",
-        "escalation",
-        "decision_review",
-        "conflict_repair",
-        "publication_review",
-    }:
-        for candidate in spec.candidates(role):
+    from .campaign_summary_routes import candidates as summary_candidates
+
+    for role in (
+        set(dict(spec.roles))
+        | {
+            "planning",
+            "planning_review",
+            "triage",
+            "escalation",
+            "decision_review",
+            "conflict_repair",
+            "publication_review",
+        }
+        | ({"summarization", "handoff_audit"} if spec.reasoning.summary_routes else set())
+    ):
+        for candidate in summary_candidates(spec, role):
             if candidate.profile:
                 profiles["campaign:" + candidate.profile] = get_profile(candidate.profile, project)
     from .cli import _launch_plugin_grants
@@ -346,10 +352,12 @@ class CampaignRuntime:
         allowed_candidates: tuple[RoleCandidate, ...] | None = None,
         permissions: str | None = None,
         require_headless: bool = False,
+        summary_stage: str = "",
     ) -> RoleCandidate | None:
         from .campaign_route_readiness import permissions_for
+        from .campaign_summary_routes import selection_spec as summary_selection
 
-        selection_spec = snapshot.spec
+        selection_spec = summary_selection(snapshot.spec, role, summary_stage)
         if role == "execution" and role not in dict(selection_spec.roles):
             selection_spec = resolve_roles(selection_spec, self.template(snapshot).policy)
         rows = snapshot.bindings.get("capacity", {})
@@ -496,14 +504,18 @@ class CampaignRuntime:
             selection_spec,
             role,
             capacities,
-            selections={
-                tuple(key.split("\0")): count
-                for key, count in snapshot.bindings.get("role_selections", {}).items()
-            },
+            selections=(
+                {}
+                if summary_stage
+                else {
+                    tuple(key.split("\0")): count
+                    for key, count in snapshot.bindings.get("role_selections", {}).items()
+                }
+            ),
             spent_usd=snapshot.bindings.get("role_spend", {}).get(role, 0),
             allowed_candidates=launchable,
         )
-        if selected is not None:
+        if selected is not None and not summary_stage:
             from .campaign_reasoning_results import preferred_candidate
 
             eligible = tuple(
@@ -2097,7 +2109,7 @@ class CampaignRuntime:
 
     @staticmethod
     def _reflection_fingerprint(unit, snapshot=None) -> str:
-        from .campaign_titles import group_navigation, unit_navigation
+        from .campaign_titles import group_key, group_title, unit_navigation, work_title
 
         return hashlib.sha256(
             json.dumps(
@@ -2107,8 +2119,9 @@ class CampaignRuntime:
                     "claim": dataclasses.asdict(unit.claim) if unit.claim else None,
                     "pr": unit.bindings.get("pr"),
                     "navigation": unit_navigation(unit, snapshot=snapshot),
-                    "group_navigation": group_navigation(snapshot, unit) if snapshot else None,
-                    "title": unit.spec.title,
+                    "group": group_key(snapshot, unit) if snapshot else None,
+                    "group_title": group_title(snapshot, unit) if snapshot else None,
+                    "title": work_title(unit, snapshot=snapshot),
                 },
                 sort_keys=True,
             ).encode()
@@ -2154,11 +2167,31 @@ class CampaignRuntime:
             state_dir=self.store.directory(snapshot.id) / "reflection",
         )
         mux = self._native_mux(snapshot)
-        result = reflect(snapshot, unit, unit.claim, provider=provider, mux=mux)
-        bridge = self._lifecycle_bridge(snapshot, mux=mux, provider=provider)
+        display_only = action.payload.get("display_only", False)
+        if display_only and action.payload.get("config_revision") != snapshot.config_revision:
+            raise CampaignError("Display reflection configuration changed")
+        result = reflect(
+            snapshot,
+            unit,
+            unit.claim,
+            provider=provider,
+            mux=mux,
+            display_only=display_only,
+            effect_id=action.id,
+        )
+        bridge = (
+            None if display_only else self._lifecycle_bridge(snapshot, mux=mux, provider=provider)
+        )
         try:
-            result["lifecycle"] = bridge.observe(
-                snapshot, unit, observer=self._hcom_observer(snapshot), projection=result["stage"]
+            result["lifecycle"] = (
+                {"state": "display-only"}
+                if bridge is None
+                else bridge.observe(
+                    snapshot,
+                    unit,
+                    observer=self._hcom_observer(snapshot),
+                    projection=result["stage"],
+                )
             )
         except Exception as exc:
             result["lifecycle"] = {
@@ -2406,6 +2439,7 @@ class CampaignRuntime:
 
     def _perform_capacity(self, snapshot, action) -> Observation:
         from .campaign_route_readiness import permissions_for
+        from .campaign_summary_routes import candidates as summary_candidates
 
         observed_at = self.clock()
         observations = []
@@ -2422,8 +2456,9 @@ class CampaignRuntime:
                 "conflict_repair",
                 "publication_review",
             }
+            | ({"summarization", "handoff_audit"} if spec.reasoning.summary_routes else set())
         ):
-            for candidate in spec.candidates(role):
+            for candidate in summary_candidates(spec, role):
                 identity = (candidate.profile, candidate.model)
                 readiness = {
                     "role": role,
@@ -2552,8 +2587,8 @@ class CampaignRuntime:
         base = verify.rev_parse_revision(self.project, observation_ref)
         if snapshot.spec.paradev.reflect:
             from .campaign_paradev import ParadevWorkspaceProvider
-            from .campaign_reflection_flow import group_identity
-            from .campaign_titles import navigation_title
+            from .campaign_reflection_flow import new_group_identity
+            from .campaign_titles import work_title
 
             provider = ParadevWorkspaceProvider(
                 project_id=snapshot.spec.paradev.project_id,
@@ -2566,9 +2601,9 @@ class CampaignRuntime:
                 branch,
                 unit.spec.title,
                 action_id=action.id,
-                display_name=navigation_title(epics=(unit.spec.epic,), description=unit.spec.title),
+                display_name=work_title(unit, snapshot=snapshot),
                 target=snapshot.spec.target,
-                group=group_identity(unit.spec, snapshot.spec.paradev.group_by),
+                group=new_group_identity(snapshot, unit),
             )
             workspace = Path(binding.path)
             native = dataclasses.asdict(binding)

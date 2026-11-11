@@ -11,10 +11,13 @@ from .campaign_jobs import digest
 from .campaign_model import CampaignError
 
 HISTORY_AUDIT_PROMPT_VERSION = "history-audit-v3"
+FINAL_AUDIT_PROMPT_VERSION = "history-final-audit-v1"
 
 PURPOSES = {
     "handoff_map",
     "handoff_reduce",
+    "handoff_final",
+    "handoff_final_audit",
     "handoff_audit",
     "constraint_reduce",
     "constraint_audit",
@@ -51,6 +54,7 @@ def semantic_contract(purpose, audit_schema, contract=""):
     """
     from .campaign_summary import (
         EXTRACT_PROMPT_VERSION,
+        FINAL_PROMPT_VERSION,
         REDUCE_PROMPT_VERSION,
         summary_schema,
         summary_schema_template,
@@ -70,7 +74,13 @@ def semantic_contract(purpose, audit_schema, contract=""):
         from .campaign_handoff_recovery import AUDIT_SCHEMA, SCHEMA
 
         return {**result, "contract": contract, "schemas_digest": digest([SCHEMA, AUDIT_SCHEMA])}
-    if contract or purpose not in {"handoff_map", "handoff_reduce", "handoff_audit"}:
+    if contract or purpose not in {
+        "handoff_map",
+        "handoff_reduce",
+        "handoff_final",
+        "handoff_final_audit",
+        "handoff_audit",
+    }:
         raise CampaignError("Unknown semantic fidelity purpose/contract combination")
     result.update(
         reader_versions=dict(READER_VERSIONS), summary_schema_digest=digest(summary_schema())
@@ -78,11 +88,13 @@ def semantic_contract(purpose, audit_schema, contract=""):
     result["prompt_version"] = {
         "handoff_map": EXTRACT_PROMPT_VERSION,
         "handoff_reduce": REDUCE_PROMPT_VERSION,
+        "handoff_final": FINAL_PROMPT_VERSION,
         "handoff_audit": HISTORY_AUDIT_PROMPT_VERSION,
+        "handoff_final_audit": FINAL_AUDIT_PROMPT_VERSION,
     }[purpose]
-    if purpose in {"handoff_map", "handoff_reduce"}:
+    if purpose in {"handoff_map", "handoff_reduce", "handoff_final"}:
         result["summary_job_schema_digest"] = digest(summary_schema_template())
-    if purpose == "handoff_audit":
+    if purpose in {"handoff_audit", "handoff_final_audit"}:
         result["audit_schema_digest"] = digest(audit_schema)
     return result
 
@@ -105,8 +117,10 @@ def contract_header(purpose, audit_schema, contract=""):
         expected.update(
             {key: actual_contract[key] for key in ("reader_versions", "summary_schema_digest")}
         )
-        if purpose in {"handoff_map", "handoff_reduce"}:
+        if purpose in {"handoff_map", "handoff_reduce", "handoff_final"}:
             expected["summary_job_schema_digest"] = actual_contract["summary_job_schema_digest"]
+        if purpose == "handoff_final_audit":
+            expected["audit_schema_digest"] = actual_contract["audit_schema_digest"]
         if purpose == "handoff_audit":
             expected.update(
                 audit_schema_digest=actual_contract["audit_schema_digest"],

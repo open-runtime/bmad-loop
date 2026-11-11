@@ -80,6 +80,11 @@ membership tags. Only recorded BMAD-owned tags may change during regrouping.
 Session identity never becomes workspace identity. No cleanup of the existing
 pilot is authorized merely by its stale pending labels.
 
+Phase and actor identity belong to each terminal/session view. Preserve existing
+tab/pane layout and operator tab labels; a shared tab cannot represent a single
+actor when it contains multiple sessions. Historical phase views reattach exact
+retained terminals and never create a substitute live session.
+
 ### Accepted completion extension — 2026-11-08
 
 Reconcile every earlier requirement against its ordinary CLI/runtime path, tests,

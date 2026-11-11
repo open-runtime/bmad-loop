@@ -48,6 +48,7 @@ def register(subparsers: Any) -> None:
         ("steer", "queue advisory instructions for the next safe stage boundary"),
         ("handoff", "queue continuation through approved harness candidates"),
         ("migrate-state", "migrate quiescent campaign storage with a preserved backup"),
+        ("reconfigure", "change qualified startup routes and grouping while retaining history"),
         (
             "requalify",
             "renew installed route proofs for a stopped campaign before its first unit worker",
@@ -58,6 +59,7 @@ def register(subparsers: Any) -> None:
         ("authorize-scope", "authorize exact acceptance reductions in a delivered revised plan"),
         ("attach", "attach the existing owned unit terminal"),
         ("reconcile", "refresh an existing campaign without starting workers"),
+        ("reflect", "refresh existing native display labels in a stopped campaign"),
         ("adoption-proposal", "inspect exact existing PR and service handoff coordinates"),
         ("adopt", "queue an owner-authorized, independently fenced existing PR handoff"),
         ("provenance", "verify the currently loaded installation and exact fork commit"),
@@ -140,6 +142,10 @@ def register(subparsers: Any) -> None:
             child.add_argument("--text", required=True)
             child.add_argument("--job", default="")
             child.add_argument("--request-id", default="")
+        if command == "reflect":
+            child.add_argument("--unit", default="", metavar="UNIT")
+            child.add_argument("--preview", action="store_true")
+            child.add_argument("--expected-revision", type=int)
         if command == "authorize-scope":
             child.add_argument("--expected-revision", required=True, type=int)
             child.add_argument("--reason", required=True)
@@ -147,6 +153,11 @@ def register(subparsers: Any) -> None:
             child.add_argument("--capabilities", required=True, metavar="FILE")
             child.add_argument("--expected-revision", required=True, type=int)
             child.add_argument("--reason", required=True)
+        if command == "reconfigure":
+            child.add_argument("--spec", required=True, metavar="FILE")
+            child.add_argument("--expected-revision", required=True, type=int)
+            child.add_argument("--reason", required=True)
+            child.add_argument("--preview", action="store_true")
         if command == "stop":
             child.add_argument(
                 "--terminate-workers",
@@ -775,6 +786,17 @@ def dispatch(args: argparse.Namespace) -> int:
         )
     campaign_id = args.campaign_id
     snapshot = store.load(campaign_id)
+    if command == "reflect":
+        from .campaign_reflect import refresh
+
+        report = refresh(
+            store,
+            campaign_id,
+            unit_id=args.unit,
+            preview=args.preview,
+            expected_revision=args.expected_revision,
+        )
+        return _emit(args, _result(command, **report))
     if command == "status":
         return _emit(args, _result(command, campaign=status_document(snapshot)))
     if command == "endpoints":
@@ -844,6 +866,20 @@ def dispatch(args: argparse.Namespace) -> int:
     if command == "migrate-state":
         migrated = store.migrate_state(campaign_id)
         return _emit(args, _result(command, campaign=status_document(migrated)))
+    if command == "reconfigure":
+        from .campaign_reconfiguration import reconfigure
+
+        result = reconfigure(
+            store,
+            campaign_id,
+            parse_spec(Path(args.spec).expanduser()),
+            expected_revision=args.expected_revision,
+            reason=args.reason,
+            preview=args.preview,
+        )
+        if isinstance(result, dict):
+            return _emit(args, _result(command, proposal=result))
+        return _emit(args, _result(command, campaign=status_document(result)))
     if command == "requalify":
         from .campaign_requalification import requalify
 

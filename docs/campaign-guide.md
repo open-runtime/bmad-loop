@@ -532,6 +532,71 @@ Legacy live policy reload cannot replace that snapshot. Internal child rollback
 hands recovery to the campaign before destructive resets or ledger restoration;
 checkpoint ancestry and pending pushes must reconcile before another attempt.
 
+### Ordered continuation summaries
+
+An optional `reasoning.summary_routes` table assigns a named pool to each of
+eight stages. All eight entries are required when the table is present. Pools
+are tried in their configured order after exact semantic/native qualification,
+launcher readiness, fresh capacity and resource checks. Unqualified candidates
+remain visible exclusions; declaring a model never grants launch permission.
+Without this table, existing summarization role behavior is preserved.
+
+```toml
+[reasoning.summary_routes]
+leaf = "history_leaf"
+intermediate = "history_synthesis"
+final = "history_synthesis"
+constraint = "history_synthesis"
+recovery = "history_synthesis"
+audit = "history_synthesis"
+constraint_audit = "history_synthesis"
+recovery_audit = "history_synthesis"
+
+[role_pools.history_leaf]
+candidates = [
+  { profile = "antigravity", model = "gemini-3.8-flash-high", effort = "high" },
+  { profile = "grok", model = "grok-4.7", effort = "xhigh" },
+  { profile = "muse", model = "muse-wonder-full-1.0", effort = "xhigh" },
+  { profile = "claude", model = "claude-sonnet-5-5", effort = "high" },
+  { profile = "codex", model = "gpt-6.1-terra", effort = "high" },
+]
+
+[role_pools.history_synthesis]
+candidates = [
+  { profile = "antigravity", model = "gemini-4-argon-high", effort = "high" },
+  { profile = "grok", model = "grok-4.7", effort = "xhigh" },
+  { profile = "muse", model = "muse-wonder-full-1.0", effort = "xhigh" },
+  { profile = "claude", model = "claude-opus-5-5", effort = "max" },
+  { profile = "codex", model = "gpt-6.1-sol", effort = "ultra" },
+]
+```
+
+These preferences require local qualification for the exact route, effort,
+permissions and purpose. Use a supported capacity observer or an explicit
+`capacity_command` for AGY; unknown allowance selects an eligible fallback.
+Existing role and shared-session limits also constrain these jobs.
+
+A higher-order final synthesis runs even when only one leaf summary remains.
+Before extraction begins, the coordinator reserves an independent qualified
+audit family without consuming a live session slot. That family cannot author
+the summary it audits. All contributing families remain recorded across retries;
+lost independence produces a visible wait, never a lower-quality implicit route.
+
+`reasoning.history_max_bytes` bounds each captured source stream (512 MiB by
+default, at most 1 GiB). It is frozen independently of per-model input and output
+limits. Large history is sealed and parsed incrementally, then partitioned into
+bounded summary jobs; a single native record remains limited to 64 MiB. Oversized
+sources produce explicit coverage failures. These are byte limits, not token
+counts or a claim that one model can ingest the entire conversation.
+
+Managed headless sessions can expose immutable prefixes of complete stream
+frames while still live. Optional warmup summarizes those prefixes within the
+same resource budgets; final capture verifies every reused prefix against the
+terminal stream. Interrupted or incomplete frames do not become history facts.
+Native owner records retain their provenance, and controller prompts cannot
+become owner decisions. Final continuation still requires predecessor quiescence,
+current obligations, independent audits and the same owned worktree/branch/PR.
+
 ## Paradev reflection and hcom
 
 Install the optional `paradev` extra and enable `[paradev] reflect = true` with a
@@ -545,32 +610,35 @@ location. It must resolve outside every editing worktree; invalid or relative
 paths are refused. Keep the selected state location stable while sessions are live
 and preserve it when reconciling a retained terminal.
 
-Story or epic grouping can place multiple unit workspaces under one group.
+Epic grouping is the default for new campaigns, with the initiative included in
+the folder name. Story and initiative grouping are also available. Old persisted
+specifications retain their original grouping, including the historical story
+default when the field was omitted.
 Phase tabs attach actual worker PTYs and retain unit/attempt identities. Missing
 panes, unavailable host observations and pending native registration do not
 permit a replacement launch. Managed presentation preserves operator layout and
 user-owned workspace content.
 
-Managed workspace, task and terminal titles start with the observed hcom name,
-epic, issue and PR: `@tina · E:epic · I:#42 · PR:#18 · description`. Missing
-bindings display `pending`; no name is inferred from a model or another worker.
+Workspace titles describe durable work: issue number, story identifier, description
+and the actual PR when one exists. Tasks retain the requirement and its links.
+Neither workspaces nor folders claim an hcom identity. Session views show the
+actual actor, role, model and attempt; managed check-in addresses are explicitly
+identified as controller bridges. Unknown actor and nonexistent PR fields are
+omitted from work labels rather than displayed as `pending` or `?`.
 Confirmed campaign story issues appear before hierarchy setup finishes, even
 when their per-unit issue binding is still pending. This changes navigation only;
 the remaining hierarchy and admission checks still apply.
-Groups aggregate their members' actors/issues/PRs, with counts when the bounded
-label omits additional members. Stable workspace and group identities survive
-renaming. Actor changes and discovered GitHub links refresh the labels, including
-quiescent group members; native tasks also receive the linked PR URL.
+Groups use native folder display names independently of their stable membership
+tags. Actor changes do not rename the story workspace. Discovered GitHub links
+refresh work labels and native task links, including quiescent group members.
 
-Campaign-created tabs inherit terminal titles. Existing manually titled tabs
-retain their operator label and can mask a terminal's automatic tab title.
-Operator terminal text follows the managed navigation prefix. Native tags are
-lowercased and limited to 64 UTF-16 units, including their ownership marker.
-Group labels shorten field values to fit, using `?` for unknown bindings and an
-ellipsis for shortened values; full titles retain longer labels. Existing
-operator tags are preserved, and a full 32-tag set reports a projection wait.
-Earlier-sorting operator tags can still determine the sidebar folder,
-which reflection reports as `operator-tag-precedence`.
+Phase tabs describe their purpose; existing manually titled views retain their
+operator labels. Native tags are limited to 64 UTF-16 units while folder display
+names have their own larger limit. Existing operator tags and folder ordering
+are preserved; a full 32-tag set reports a projection wait. Operator folder
+precedence can still determine placement and is reported explicitly. The native
+folder API lacks conditional updates, so a concurrent manual rename cannot be
+made atomic with a managed refresh.
 Managed titles follow the native host's normalization of replacement characters
 and Braille spinner glyphs; other Unicode text is retained.
 
@@ -646,6 +714,8 @@ bmad-loop campaign history CAMPAIGN_ID --unit QUALIFIED_UNIT --role review --aft
 bmad-loop campaign handoff CAMPAIGN_ID --unit QUALIFIED_UNIT --profile codex --reason "capacity wait" --json
 bmad-loop campaign migrate-state CAMPAIGN_ID --json
 bmad-loop campaign requalify CAMPAIGN_ID --capabilities /path/to/earned-capabilities.json --expected-revision REVISION --reason "Renew installed routes before first worker" --json
+bmad-loop campaign reconfigure CAMPAIGN_ID --spec campaign.toml --expected-revision REVISION --reason "Update qualified startup routes and grouping" --preview --json
+bmad-loop campaign reflect CAMPAIGN_ID --preview --json
 bmad-loop campaign hold CAMPAIGN_ID --unit QUALIFIED_UNIT --reason "Inspect this change" --json
 bmad-loop campaign release CAMPAIGN_ID --unit QUALIFIED_UNIT --json
 bmad-loop campaign stop CAMPAIGN_ID --json
@@ -668,6 +738,20 @@ with the same contracts and the current campaign revision. It preserves prior
 proofs and configuration templates, leaves the campaign stopped, and does not
 reload project policy. Campaigns with launched workers or PR publication history
 require their original qualified installation; this command refuses those cases.
+
+`reconfigure` explicitly changes qualified route pools, summary-stage mappings or
+grouping at the same stopped startup boundary. It preserves source scope,
+acceptance, policy, grants and resource limits. Supply the updated full campaign
+specification and exact current revision; `--preview` validates and shows the
+change without publishing a revision. Applying without `--preview` writes an
+immutable configuration revision while preserving prior specifications, templates,
+capabilities, attempts and workspace identities. It does not resume the campaign.
+
+`reflect` refreshes existing bound workspace, task and session views while stopped.
+It launches no workers, creates no workspaces and leaves unbound tasks explicit.
+Preview reads the exact proposed display changes. An ordinary refresh preserves
+membership; a separately recorded configuration regroup replaces only the old
+BMAD-owned membership tag. Manual labels and unrelated tags remain intact.
 
 An allocated draft can also renew after `reconcile` settles its workspace
 preparation under the upgraded installation. Its recorded bootstrap commit must

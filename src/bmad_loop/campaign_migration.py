@@ -165,11 +165,15 @@ def _native_items(
             raise MigrationError("native worker claim belongs to another unit")
         details = {
             "campaign_id": snapshot.id,
+            "repository": snapshot.repository,
             "unit_id": unit.id,
             "hold": asdict(unit.hold) if unit.hold else None,
             "claim": asdict(unit.claim) if unit.claim else None,
             "workspace": unit.bindings.get("workspace"),
             "pr": unit.bindings.get("pr"),
+            "issue": unit.bindings.get("issue"),
+            "issue_url": unit.bindings.get("issue_url"),
+            "shared_issue": snapshot.bindings.get("github_hierarchy", {}).get("story:" + unit.id),
             "admissions_open": snapshot.phase == "active",
         }
         items.append(

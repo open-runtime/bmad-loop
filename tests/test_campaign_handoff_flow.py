@@ -96,7 +96,13 @@ def campaign(prepared, project, tmp_path):
                     "route_bindings_digest": digest(route_bindings),
                     "semantic_contract_digests": {
                         purpose: digest(semantic_contract(purpose, flow.AUDIT_SCHEMA))
-                        for purpose in ("handoff_map", "handoff_reduce", "handoff_audit")
+                        for purpose in (
+                            "handoff_map",
+                            "handoff_reduce",
+                            "handoff_final",
+                            "handoff_final_audit",
+                            "handoff_audit",
+                        )
                     },
                     "contract_schema_digests": {
                         "constraints-v1": digest([REDUCTION_SCHEMA, CONSTRAINT_AUDIT_SCHEMA]),
@@ -346,6 +352,7 @@ def test_quota_handoff_preserves_work_and_continues_same_stage(campaign):
     step(runtime, snapshot, unit, "handoff-release")
     assert unit.state == UnitState.READY and unit.hold is None
     proposed = flow.resume_proposal(snapshot, unit)
+    assert proposed is not None
     assert proposed.payload["candidate"]["profile"] == "claude"
     request = {**proposed.payload, "role": "execution"}
     flow.decorate_launch(snapshot, unit, request)
@@ -521,6 +528,7 @@ def test_native_review_uses_explicit_review_pool_and_preserves_dev_candidate(cam
     step(runtime, snapshot, unit, "handoff-assemble")
     step(runtime, snapshot, unit, "handoff-release")
     proposal = flow.resume_proposal(snapshot, unit)
+    assert proposal is not None
     assert proposal.payload["candidate"] == original
     assert proposal.payload["review_candidate"]["profile"] == "claude"
     assert proposal.payload["kind"] == "execution" and proposal.payload["role"] == "execution"

@@ -221,6 +221,12 @@ def from_teamrouter(
 def observe(
     candidate: RoleCandidate, project: Path, *, now: float | None = None
 ) -> CapacityObservation:
+    if not candidate.capacity_command and candidate.profile == "antigravity":
+        return CapacityObservation(
+            False,
+            known=False,
+            reason="AGY capacity requires a supported explicit native capacity command",
+        )
     if not candidate.capacity_command and candidate.profile in {"grok", "muse"}:
         from .campaign_native_capacity import observe as observe_native
 
