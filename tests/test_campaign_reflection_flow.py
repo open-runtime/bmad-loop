@@ -362,7 +362,9 @@ def test_runtime_group_refreshes_quiescent_siblings_after_actor_and_pr_discovery
     )
     snapshot.units[peer.id] = peer
     snapshot.spec = dataclasses.replace(
-        snapshot.spec, paradev=dataclasses.replace(snapshot.spec.paradev, group_by="epic")
+        snapshot.spec,
+        units=tuple(work.spec for work in snapshot.units.values()),
+        paradev=dataclasses.replace(snapshot.spec.paradev, group_by="epic"),
     )
     runtime = CampaignRuntime(
         Path(claim.workspace), CampaignStore(tmp_path / "refresh-store"), clock=lambda: 100
@@ -402,6 +404,7 @@ def test_runtime_group_refreshes_quiescent_siblings_after_actor_and_pr_discovery
     from bmad_loop.campaign_store import add_action
 
     action = add_action(snapshot, "reflection", peer.id, {})
+    runtime.store.create(snapshot)
     result = runtime.perform(snapshot, action)
     assert isinstance(result, Observation) and result.state == "confirmed"
     assert captured[0]["group_title"] == "source · Epic epic"

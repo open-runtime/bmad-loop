@@ -307,6 +307,7 @@ def test_missing_push_journal_reenters_only_original_immutable_action(case):
     from bmad_loop.campaign_supervisor import Observation
 
     case.pusher.observations = lambda: ()
+    case.runtime.store = SimpleNamespace(load=lambda identity: case.snapshot)
     calls = []
     case.runtime._perform_push = lambda snapshot, action: calls.append(action) or Observation(
         "unknown", reason="still observing"
