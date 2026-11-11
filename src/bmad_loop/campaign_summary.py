@@ -20,8 +20,8 @@ from .platform_util import atomic_write_text, is_link_like
 
 TokenCounter = Callable[[str], int]
 EXTRACT_PROMPT_VERSION = "history-extract-v3"
-REDUCE_PROMPT_VERSION = "history-reduce-v5"
-FINAL_PROMPT_VERSION = "history-final-v1"
+REDUCE_PROMPT_VERSION = "history-reduce-v6"
+FINAL_PROMPT_VERSION = "history-final-v2"
 
 
 class SummaryResultRejected(CampaignError):
@@ -962,6 +962,38 @@ def summary_schema_template() -> dict[str, Any]:
 
 
 def summary_prompt(job: SummaryJobSpec) -> str:
+    synthesis = job.purpose == "handoff-reduce"
+    synthesis_guidance = (
+        "Preserve each obligation's action, scope, condition and timing. "
+        "Do not turn delivery postconditions into prerequisites for editing, continuation or merge. "
+        "Do not invent owner approval requirements or review waivers. "
+        "Pending review or verification describes unfinished work, not an instruction to leave it undone. "
+        "Treat suggestions and added barriers as proposals, not mandatory owner instructions. "
+        "Child summaries and quote previews are fallible paraphrases, not new authority. "
+        "An exact quote ID locates source evidence; it does not endorse every child inference. "
+        "Use exact source text when supplied. If it is not supplied, attribute the child claim "
+        "and retain uncertainty; retrieve retained originals before acting on a disputed requirement. "
+        "Keep contradictions visible rather than choosing an unsupported resolution. "
+        "Describe a missing worktree or PR identity as a historical omission unless current "
+        "supplied evidence also lacks it. If the canonical packet supplies it, use that current identity "
+        "without inventing an owner-input prerequisite. Do not infer canonical values that are absent "
+        "from this request. "
+        if synthesis
+        else ""
+    )
+    retrieval_guidance = (
+        "Index only detail categories actually present in the retained sources. "
+        "Name the retained child job IDs and cite the relevant native events for each indexed detail. "
+        "Do not claim commands, absolute roots, hashes, grants, lifecycle receipts or debug chronology "
+        "exist merely because this prompt lists them. Qualify absent details as unavailable; "
+        "do not fabricate an index entry or completion. Existing indexed details remain required "
+        "retrieval context before revisiting that work; they are not discarded or resolved. "
+        if synthesis
+        else "Represent earlier commands, repeated absolute roots, hashes, grants, lifecycle receipts "
+        "and debug chronology through a concise index fact naming the retained child job IDs "
+        "and citing the relevant native events. These indexed details remain required "
+        "retrieval context before revisiting that work; they are not discarded or resolved. "
+    )
     return (
         (
             "Produce the final successor synthesis from the entire supplied summary frontier. "
@@ -990,6 +1022,7 @@ def summary_prompt(job: SummaryJobSpec) -> str:
         "Return coverage of every primary fragment (or child job for reduction); report "
         "missing input or ambiguity in gaps. No tools or external writes. Return only "
         "the schema-conforming JSON result. "
+        + synthesis_guidance
         + (
             f"Reduce this history into a compact successor brief. The native output allowance is "
             f"{job.output_tokens} tokens, including any reasoning counted by the provider; "
@@ -1001,12 +1034,9 @@ def summary_prompt(job: SummaryJobSpec) -> str:
             "Consolidate facts across kinds when their intent remains clear. Preserve every distinct "
             "current owner obligation, correction, unresolved conflict and required next action; "
             "use exact quote IDs for owner obligations, without copying their full source text. "
-            "Keep active files, branch and PR coordinates needed for the next action. Represent "
-            "earlier commands, repeated absolute roots, hashes, grants, lifecycle receipts and "
-            "debug chronology through a concise index fact naming the retained child job IDs "
-            "and citing the relevant native events. These indexed details remain required "
-            "retrieval context before revisiting that work; they are not discarded or resolved. "
-            "Retain unresolved uncertainty as a clearly qualified fact. Missing full hashes, "
+            "Keep active files, branch and PR coordinates needed for the next action. "
+            + retrieval_guidance
+            + "Retain unresolved uncertainty as a clearly qualified fact. Missing full hashes, "
             "unverified historical warnings, absent later instructions and intermediate receipts "
             "are known limitations, not missing supplied input. Use gaps only for missing "
             "primary coverage or an ambiguity that prevents faithful continuation and cannot "

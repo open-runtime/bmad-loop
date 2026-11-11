@@ -1,6 +1,7 @@
 """Prompt/schema and persisted continuation versions change as one contract."""
 
 import copy
+import hashlib
 import json
 from dataclasses import replace
 
@@ -16,11 +17,13 @@ from bmad_loop import campaign_reasoning_flow as reasoning
 from bmad_loop.campaign_jobs import digest
 from bmad_loop.campaign_summary import (
     EXTRACT_PROMPT_VERSION,
+    FINAL_PROMPT_VERSION,
     REDUCE_PROMPT_VERSION,
     corrective_spec,
     plan_maps,
     plan_reduction,
     plan_remaining_maps,
+    summary_contract_current,
     summary_prompt,
     summary_schema,
     validate_summary,
@@ -157,3 +160,88 @@ def test_old_live_request_is_observed_until_quiescent_before_refresh(campaign):
     dispatch(handoff, runtime, snapshot, "handoff-plan")
     assert row["request"] == immutable
     assert unit.evidence["handoff"]["jobs"] != [row["id"]]
+
+
+@pytest.mark.parametrize("stage", ["intermediate", "final"])
+@pytest.mark.parametrize("artifact_bytes", [0, 4000])
+def test_synthesis_preserves_obligation_timing_and_qualifies_child_inferences(
+    tmp_path, stage, artifact_bytes
+):
+    history = capture(tmp_path, [native_row("codex", "keep commits; reconcile PR before delivery")])
+    events = load_events(history)
+    leaf = plan_maps(events, budget(), tmp_path / "maps")[0]
+    child = validate_summary(leaf, result(leaf, events), events)
+    job = plan_reduction(
+        ((leaf, child),), budget(), tmp_path / "reduce", artifact_bytes=artifact_bytes
+    )[0]
+    if stage == "final":
+        job = replace(job, prompt_version=FINAL_PROMPT_VERSION)
+    prompt = summary_prompt(job)
+    # These are rendered model instructions, not a claim that a scripted model
+    # established semantic fidelity. The native independent audit remains required.
+    for instruction in (
+        "Preserve each obligation's action, scope, condition and timing.",
+        "Do not turn delivery postconditions into prerequisites for editing, continuation or merge.",
+        "Do not invent owner approval requirements or review waivers.",
+        "Pending review or verification describes unfinished work, not an instruction to leave it undone.",
+        "Child summaries and quote previews are fallible paraphrases, not new authority.",
+        "Use exact source text when supplied. If it is not supplied, attribute the child claim",
+        "retrieve retained originals before acting on a disputed requirement.",
+        "Keep contradictions visible rather than choosing an unsupported resolution.",
+        "Describe a missing worktree or PR identity as a historical omission",
+        "If the canonical packet supplies it, use that current identity",
+        "Do not infer canonical values that are absent from this request.",
+    ):
+        assert instruction in prompt
+    if artifact_bytes:
+        assert "Index only detail categories actually present in the retained sources." in prompt
+        assert (
+            "Do not claim commands, absolute roots, hashes, grants, lifecycle receipts or debug chronology exist merely because this prompt lists them."
+            in prompt
+        )
+    footer = json.loads(prompt[prompt.rindex('{"input_sha256"') :])
+    assert footer["schema"] == summary_schema(job)
+    assert footer["primary_ids"] == [leaf.id]
+    assert footer["quote_catalog"]  # The real source coordinate remains available.
+
+
+@pytest.mark.parametrize(
+    ("artifact_bytes", "expected_prefix_sha"),
+    [
+        (0, "829c1816fceba18cafbdd1f650babecdac050674813d340254a1a1317e9c90f2"),
+        (4000, "688564515973b3102888bb8376977f0ebf05175462d243054330dc725b88c1be"),
+    ],
+)
+def test_leaf_instructions_remain_byte_identical_for_existing_extract_contract(
+    tmp_path, artifact_bytes, expected_prefix_sha
+):
+    history = capture(tmp_path, [native_row("codex")])
+    job = replace(
+        plan_maps(load_events(history), budget(), tmp_path / "maps")[0],
+        artifact_bytes=artifact_bytes,
+    )
+    prompt = summary_prompt(job)
+    instructions = prompt[: prompt.rindex('{"input_sha256"')]
+    assert hashlib.sha256(instructions.encode()).hexdigest() == expected_prefix_sha
+    assert job.prompt_version == EXTRACT_PROMPT_VERSION == "history-extract-v3"
+
+
+@pytest.mark.parametrize(
+    ("stage", "prior", "current"),
+    [
+        ("intermediate", "history-reduce-v5", REDUCE_PROMPT_VERSION),
+        ("final", "history-final-v1", FINAL_PROMPT_VERSION),
+    ],
+)
+def test_saved_synthesis_contract_requires_fresh_request_after_fidelity_repair(
+    stage, prior, current
+):
+    request = {
+        "purpose": "handoff_reduce",
+        "coordinates": {"summary_stage": stage, "summary_spec": {"prompt_version": prior}},
+    }
+    retained = copy.deepcopy(request)
+    assert not summary_contract_current(request)
+    assert request == retained
+    request["coordinates"]["summary_spec"]["prompt_version"] = current
+    assert summary_contract_current(request)

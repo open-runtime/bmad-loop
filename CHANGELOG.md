@@ -7,6 +7,10 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserve source-supported action timing and authority in intermediate and final handoff summaries.
+
 ## [0.16.0] — 2026-11-11
 
 ### Added

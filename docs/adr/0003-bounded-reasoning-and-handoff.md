@@ -503,6 +503,14 @@ available independently of every lossy summary or native import.
    semantic child identities. Retry dependencies remain separate provenance.
    Final summaries omitted while fitting initial or audited context stay retrievable;
    bounded omission indexes distinguish omitted finals from intermediate nodes.
+   Intermediate and final producers preserve source-supported action timing and
+   authority: completion postconditions cannot become action prerequisites,
+   pending work cannot become an instruction to leave it unfinished, and absent
+   approval cannot create a new approval requirement. Preserve prohibitions
+   without inventing exceptions. Child interpretations remain fallible even with
+   valid citations; consolidation cannot promote them into owner instructions.
+   Retrieval claims identify actual retained artifacts and do not claim exact
+   source text was supplied when only a reference or paraphrase was available.
 6. Assemble a concise working brief, the exact active obligations and latest owner
    direction, current repository/PR state and a bounded detailed-history packet.
    Size it to the destination's effective context after instructions, tools,
@@ -511,6 +519,16 @@ available independently of every lossy summary or native import.
 7. Audit extraction coverage and critical obligations against exact sources.
    Structural checks prove references and inclusion, not semantic completeness.
    Preserve missing/ambiguous information visibly and offer source retrieval.
+
+Independent audits compare final and leaf interpretations against exact owner
+spans and canonical obligations. An unsupported inference in a structurally valid
+leaf must not acquire authority by surviving reduction. Audit ambiguities refuse
+writable continuation; they do not grant approval or silently rewrite the source.
+Historical omissions and current bindings are separate evidence: absence of a PR
+number in old history does not erase a current canonical PR identity. A native
+result can complete successfully while failing semantic qualification. Preserve
+that result and its findings, and require matching evidence for any changed
+producer prompt contract before admitting the revised route.
 
 For T unique tokens, payload window W and overlap O, the window count is one for
 T <= W; otherwise it is `1 + ceil((T - W) / (W - O))`, with `0 <= O < W`.
@@ -859,9 +877,9 @@ unchanged parent hash and fact identity. Partial views remain distinct from
 complete summaries; hashed omission indexes retain every omitted fact and node.
 If history contains facts but no useful whole fact fits, continuation requires
 visible context recovery. Final exact packet bounds and launch-time provenance
-and canonical-obligation checks remain mandatory. Versioned prompt templates and
-schema definitions remain unchanged; fresh requests bind the selected artifact
-mode and limits. Fresh native reduction and independent qualification still
+and canonical-obligation checks remain mandatory. Artifact mode and limits bind
+each fresh request independently of its versioned prompt and schema contracts.
+Fresh native reduction and independent qualification still
 precede use of a new route.
 
 New durable packets also bind the complete mandatory context independently of
@@ -873,10 +891,12 @@ the controller never manufactures a binding from their mutable contents. Live
 successors continue under their existing claim and enter a fresh fenced handoff
 only after normal observation establishes their interruption and quiescence.
 Extraction and reduction prompts embed their exact job-bound native schema,
-including eligible citations and quote IDs. The corrected `history-extract-v3`
-and `history-reduce-v5` contracts require fresh extraction and reducer semantic
-qualification. Earlier receipts remain historical evidence, not grants for the
-new prompts; unchanged audit and finite-contract proofs retain their own validity.
+including eligible citations and quote IDs. Leaf instructions retain the
+`history-extract-v3` contract. The revised `history-reduce-v6` and
+`history-final-v2` contracts require fresh intermediate and final semantic
+qualification. Earlier synthesis receipts remain historical evidence, not grants
+for the new prompts; unchanged extraction, audit and finite-contract proofs
+retain their own validity.
 This applies to queued jobs, applied summaries and already assembled packets.
 Keep old requests and results immutable, observe any live or uncertain claim to
 quiescence, then use the existing safe refresh path before releasing a successor.

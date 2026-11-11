@@ -354,8 +354,46 @@ def test_map_proof_ignores_unused_audit_schema_and_reducer_prompt(proof, monkeyp
     manifest = path.read_bytes()
     monkeypatch.setattr(flow, "AUDIT_SCHEMA", {"changed-unused": True})
     monkeypatch.setattr(summary, "REDUCE_PROMPT_VERSION", "changed-unused-prompt")
+    monkeypatch.setattr(summary, "FINAL_PROMPT_VERSION", "changed-unused-final-prompt")
     flow.validate_fidelity_qualification(cap, purpose="handoff_map")
     assert path.read_bytes() == manifest
+
+
+@pytest.mark.parametrize(
+    ("purpose", "prior_version"),
+    [("handoff_reduce", "history-reduce-v5"), ("handoff_final", "history-final-v1")],
+)
+def test_prior_synthesis_native_proof_cannot_qualify_repaired_prompt(proof, purpose, prior_version):
+    from pathlib import Path
+
+    cap, path = proof
+    evidence = read_json(path)
+    contract, header = contract_header(purpose, flow.AUDIT_SCHEMA)
+    evidence.update(header)
+    evidence["route_bindings"] = [route_binding(cap, purpose)]
+    receipt_path = Path(evidence["independent_review"]["native_receipt_path"])
+    receipt = read_json(receipt_path)
+    receipt["result"].update(
+        route_bindings_digest=digest(evidence["route_bindings"]),
+        semantic_contract_digests={purpose: digest(contract)},
+    )
+
+    def save():
+        write_json(receipt_path, receipt)
+        evidence["independent_review"]["sha256"] = file_digest(receipt_path)
+        write_json(path, evidence)
+        cap["semantic_qualification"]["proofs"][0]["sha256"] = file_digest(path)
+
+    save()
+    flow.validate_fidelity_qualification(cap, purpose=purpose)
+    receipt["result"]["semantic_contract_digests"][purpose] = digest(
+        {**contract, "prompt_version": prior_version}
+    )
+    save()
+    retained = (path.read_bytes(), receipt_path.read_bytes())
+    with pytest.raises(flow.HandoffRouteWait, match="semantic contract"):
+        flow.validate_fidelity_qualification(cap, purpose=purpose)
+    assert retained == (path.read_bytes(), receipt_path.read_bytes())
 
 
 @pytest.mark.parametrize("change", ["additionalProperties", "required"])

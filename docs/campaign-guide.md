@@ -594,6 +594,18 @@ audit family without consuming a live session slot. That family cannot author
 the summary it audits. All contributing families remain recorded across retries;
 lost independence produces a visible wait, never a lower-quality implicit route.
 
+Intermediate and final summaries must preserve the source's action order and
+authority. A completion condition is not a prerequisite for starting that action;
+pending review remains work to perform, not an instruction to leave it undone.
+Summaries cannot invent owner-approval requirements or exceptions to prohibitions.
+Child summaries can contain unsupported inferences despite valid citations, so
+independent audits compare the final synthesis with exact owner history and
+canonical obligations. Unresolved audit findings block writable continuation.
+Historical uncertainty remains separate from current worktree and PR bindings;
+retained indexes identify the actual source artifacts available for retrieval.
+Passing structural checks or a native transport probe does not establish semantic
+fidelity or authorize continuation.
+
 `reasoning.history_max_bytes` bounds each captured source stream (512 MiB by
 default, at most 1 GiB). It is frozen independently of per-model input and output
 limits. Large history is sealed and parsed incrementally, then partitioned into
