@@ -233,7 +233,7 @@ def _result(command: str, *, ok: bool = True, **fields: Any) -> dict[str, Any]:
     return {"schema_version": SCHEMA_VERSION, "command": f"campaign.{command}", "ok": ok, **fields}
 
 
-def _job_document(row, *, details=False):
+def _job_document(row, *, details=False, launch_wait=None):
     from .sanitize import scrub_json
 
     result = {
@@ -274,6 +274,7 @@ def _job_document(row, *, details=False):
         or claim.get("presentation_status"),
     }
     result["communication"] = claim.get("managed_communication")
+    result["launch_wait"] = launch_wait
     if details:
         receipt = row.get("receipt") or {}
         result["receipt"] = {
@@ -364,6 +365,32 @@ def _checkpoint_document(snapshot, unit, now: float) -> dict[str, Any]:
     return value
 
 
+def _registration_wait(snapshot, claim):
+    """Project the last acknowledged pre-dispatch wait, not a live session."""
+    if not claim or claim.get("status") != "prepared":
+        return None
+    reasons = {
+        "before_worker_request": "Managed bridge registration busy before worker dispatch",
+        "before_native_request": "Managed bridge registration busy before native reasoning dispatch",
+    }
+    for action in snapshot.outbox:
+        proof = action.receipt.get("registration_wait")
+        if (
+            action.id == claim.get("launch_id")
+            and action.state == "sent_unknown"
+            and isinstance(proof, dict)
+            and isinstance(proof.get("phase"), str)
+            and action.error == reasons.get(proof["phase"])
+        ):
+            return {
+                "launch_id": action.id,
+                "phase": proof["phase"],
+                "reason": "managed-registration-busy",
+                "retry_at": action.next_retry_at,
+            }
+    return None
+
+
 def status_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
     from .campaign_action_history import counts as action_counts
 
@@ -433,6 +460,7 @@ def status_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
                 "resolution_attempts": unit.resolution_attempts,
                 "hold": hold,
                 "claim": claim,
+                "launch_wait": _registration_wait(snapshot, claim),
                 "retry_at": unit.retry_at,
                 "acceptance": scrub_json(
                     {
@@ -618,7 +646,10 @@ def status_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
             ),
         },
         "units": units,
-        "jobs": [_job_document(row) for row in list(snapshot.jobs.values())[:100]],
+        "jobs": [
+            _job_document(row, launch_wait=_registration_wait(snapshot, row.get("claim")))
+            for row in list(snapshot.jobs.values())[:100]
+        ],
         "jobs_truncated": len(snapshot.jobs) > 100,
         "reasoning": {
             "enabled": snapshot.spec.reasoning.enabled,
@@ -972,7 +1003,14 @@ def dispatch(args: argparse.Namespace) -> int:
             args,
             _result(
                 command,
-                jobs=[_job_document(row, details=args.details) for row in rows],
+                jobs=[
+                    _job_document(
+                        row,
+                        details=args.details,
+                        launch_wait=_registration_wait(snapshot, row.get("claim")),
+                    )
+                    for row in rows
+                ],
                 next_after=rows[-1]["id"] if rows else args.after,
                 has_more=len(rows) == args.limit,
             ),

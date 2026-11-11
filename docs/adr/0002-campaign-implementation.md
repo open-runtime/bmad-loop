@@ -1824,6 +1824,20 @@ it at the next eligible stage boundary and records application only after owned
 stage completion. Unit mail targets coding stages; explicit job mail targets that
 reasoning job. A queued message cannot grant scope, bypass a hold or reopen work.
 
+Managed actor registration contention is retryable only at the evidenced boundary
+before a worker request exists. The controller seals campaign, unit, launch,
+generation, attempt, configuration revision and payload digest, reports a
+pre-worker wait, and reuses the existing actor and launch reservation. Reconciliation
+checks current ownership and controls before retrying. The proof is consumed before
+request preparation can dispatch; request, startup, receipt or launch-intent evidence
+preserves the existing unknown-launch containment. A failed proof write supplies no
+retry authority. Scripted regressions hold the real registration lock, exercise
+supervisor harvest/reconciliation, and cover lost replies, concurrent controls and
+uncertain dispatch without provider calls.
+Native reasoning jobs use the same typed wait without failing their attempt. Their
+existing immutable request/launch-intent journal supplies dispatch containment; a
+busy bridge never resets that journal or replaces the job claim.
+
 The endpoint ledger, bounded shared-room poller and durable message ledger survive
 coordinator restart. They preserve uncertain replies, detect database replacement,
 close only owned bridge registrations and return explicit closed-target receipts

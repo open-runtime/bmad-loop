@@ -1928,6 +1928,14 @@ class CampaignRuntime:
             refused = self._launch_preparation_refusal(snapshot, action)
             if refused is not None:
                 return refused
+            waiting = self._launch_registration_wait(snapshot, action)
+            if waiting is not None:
+                if waiting.state != "waiting":
+                    return waiting
+                guarded = self._registration_retry_guard(snapshot, action)
+                if guarded is not None:
+                    return guarded
+                return self._perform_launch(snapshot, action)
             claim = snapshot.units[action.unit].claim
             if claim is None:
                 return Observation("unknown", reason="launch ownership missing")
@@ -3485,8 +3493,84 @@ class CampaignRuntime:
             return Observation("unknown", reason="preparation refusal binding mismatch")
         return Observation("confirmed", {"not_launched": True, "preparation_refused": value})
 
+    def _registration_retry_guard(self, snapshot, action) -> Observation | None:
+        current = self.store.load(snapshot.id)
+        claim = snapshot.units[action.unit].claim
+        unit = current.units[action.unit]
+        if (
+            current.config_revision != snapshot.config_revision
+            or not claim
+            or not unit.claim
+            or dataclasses.asdict(unit.claim) != dataclasses.asdict(claim)
+        ):
+            return Observation("unknown", reason="registration wait ownership changed")
+        if current.phase != "active" or unit.hold:
+            return Observation("confirmed", {"not_launched": True})
+        return None
+
+    def _launch_registration_wait(self, snapshot, action, *, error=None) -> Observation | None:
+        """Retry only an explicit pre-request bridge wait, never a possible dispatch."""
+        from .campaign_headless import read_json
+        from .platform_util import is_link_like
+
+        directory = self.store.directory(snapshot.id) / "workers" / action.id
+        path = directory / "registration-wait.json"
+        consumed = directory / "registration-wait-consumed.json"
+        if error is None and (not path.exists() and not is_link_like(path)):
+            return None
+        if consumed.exists() or is_link_like(consumed):
+            if error is not None:
+                raise error
+            return None
+        if any(
+            (directory / name).exists() or is_link_like(directory / name)
+            for name in ("request.json", "startup.json", "receipt.json", "launch-intent.json")
+        ):
+            if error is not None:
+                raise error
+            # Normal startup reconciliation remains authoritative after dispatch.
+            return None
+        claim = snapshot.units[action.unit].claim
+        if (
+            is_link_like(directory)
+            or not claim
+            or claim.launch_id != action.id
+            or claim.generation != action.generation
+            or claim.quiescent
+        ):
+            return Observation(
+                "unknown", reason="registration wait conflicts with launch ownership"
+            )
+        expected = {
+            "schema_version": 1,
+            "campaign_id": snapshot.id,
+            "unit_id": action.unit,
+            "launch_id": action.id,
+            "generation": action.generation,
+            "attempt": claim.attempt,
+            "config_revision": snapshot.config_revision,
+            "payload_digest": hashlib.sha256(
+                json.dumps(action.payload, sort_keys=True).encode("utf-8")
+            ).hexdigest(),
+            "phase": "before_worker_request",
+            "reason": "managed-registration-busy",
+        }
+        if error is not None and not (path.exists() or is_link_like(path)):
+            directory.mkdir(parents=True, exist_ok=True)
+            atomic_write_text(path, json.dumps(expected, sort_keys=True), follow_symlinks=False)
+        value = read_json(path, limit=65536)
+        if value != expected or any(type(value.get(k)) is not type(v) for k, v in expected.items()):
+            return Observation("unknown", reason="registration wait binding mismatch")
+        return Observation(
+            "waiting",
+            {"registration_wait": value},
+            "Managed bridge registration busy before worker dispatch",
+            self.clock() + 1,
+        )
+
     def _perform_launch(self, snapshot, action) -> Observation:
         from . import campaign_hold
+        from .campaign_communication_runtime import RegistrationBusy
         from .campaign_execution import CampaignExecutionError
         from .platform_util import is_link_like
 
@@ -3495,6 +3579,10 @@ class CampaignRuntime:
             return prior
         try:
             prepared = self._prepare_launch(snapshot, action)
+        except RegistrationBusy as exc:
+            waiting = self._launch_registration_wait(snapshot, action, error=exc)
+            assert waiting is not None
+            return waiting
         except (CampaignError, CampaignExecutionError) as exc:
             # This helper cannot spawn. Once a request exists, however, absence
             # of startup is not proof of absence: preserve uncertain launches.
@@ -3536,8 +3624,22 @@ class CampaignRuntime:
         if isinstance(prepared, Observation):
             return prepared
         envelope, request, launch_env = prepared
+        waiting = self._launch_registration_wait(snapshot, action)
+        if waiting is not None:
+            if waiting.state != "waiting":
+                return waiting
+            # Seal consumption before request preparation can enter dispatch.
+            atomic_write_text(
+                envelope.directory / "registration-wait-consumed.json",
+                json.dumps(waiting.data["registration_wait"], sort_keys=True),
+                follow_symlinks=False,
+            )
         path = prepare_launch(envelope, request)
         unit = snapshot.units[action.unit]
+        if waiting is not None:
+            guarded = self._registration_retry_guard(snapshot, action)
+            if guarded is not None:
+                return guarded
         if campaign_hold.active(
             campaign_hold.channel(self.store.directory(snapshot.id), unit.id),
             campaign=snapshot.id,

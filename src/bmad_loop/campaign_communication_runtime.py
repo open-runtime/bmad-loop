@@ -1,7 +1,14 @@
 """Bind public controller mailboxes to immutable native launch generations."""
 
-from .campaign_managed_communication import ManagedCommunication
+import errno
+
+from .campaign_managed_communication import ManagedCommunication, _key
 from .campaign_model import CampaignError
+from .platform_util import LockUnavailableError
+
+
+class RegistrationBusy(CampaignError):
+    """This exact bridge is busy before the caller's worker request is sealed."""
 
 
 def manager(runtime, snapshot):
@@ -29,19 +36,28 @@ def prepare(runtime, snapshot, *, unit=None, job=None):
         "launch_id": claim["launch_id"],
         "generation": claim["generation"],
     }
-    endpoint = manager(runtime, snapshot).prepare(
-        snapshot,
-        target,
-        {
-            "role": role,
-            "selection": {
-                key: selection[key] for key in ("profile", "model", "effort") if key in selection
+    control = manager(runtime, snapshot)
+    try:
+        endpoint = control.prepare(
+            snapshot,
+            target,
+            {
+                "role": role,
+                "selection": {
+                    key: selection[key]
+                    for key in ("profile", "model", "effort")
+                    if key in selection
+                },
+                "stage": "prepared",
+                "status_source": "controller",
+                "steering": "next-safe-stage-boundary",
             },
-            "stage": "prepared",
-            "status_source": "controller",
-            "steering": "next-safe-stage-boundary",
-        },
-    )
+        )
+    except LockUnavailableError as exc:
+        expected = control.directory / "actors" / _key(target) / ".registration.lock"
+        if exc.errno not in (errno.EAGAIN, errno.EACCES) or exc.filename != str(expected):
+            raise
+        raise RegistrationBusy("Managed bridge registration is busy: " + str(expected)) from exc
     # Registration, cursors and facts evolve. The sealed native request carries
     # only the identity; retrying prepare must reproduce identical bytes.
     return {key: endpoint[key] for key in ("kind", "name", "room", "target")}

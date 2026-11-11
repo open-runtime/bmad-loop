@@ -699,6 +699,17 @@ Acceptance, inclusion in a completed stage and compliance are distinct: an
 for pending, applied or closed receipts. Oversized messages are rejected; mail
 that cannot fit a reasoning request remains queued.
 
+A busy managed-registration lock before any worker request is sealed produces a
+visible `launch_wait` in campaign status and an `effect-wait` history event.
+The controller retries the same launch, attempt and actor after contention clears;
+a bridge address alone does not mean a coding session is running. The retry requires
+an exact durable pre-request proof and fresh ownership, stop and hold checks.
+Before request preparation, the controller consumes that proof. Existing requests,
+launch intents or consumed proofs retain ordinary uncertain-launch reconciliation;
+absence of a startup file never authorizes another dispatch.
+Reasoning jobs expose the same wait without consuming a failed attempt and retain
+their existing native request/launch-intent recovery boundary.
+
 Closed endpoints never restart a writer. Lost acknowledgements, unknown owners
 and a replaced room database remain explicit errors. Completion/drain waits for
 owned bridge closure. Managed communication uses the installed hcom service and

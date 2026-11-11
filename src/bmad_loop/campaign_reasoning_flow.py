@@ -428,6 +428,7 @@ def _confirmed_preparation_failure(snapshot, row):
 
 
 def perform(runtime, snapshot, action, *, reconcile: bool = False) -> Observation:
+    from .campaign_communication_runtime import RegistrationBusy
     from .campaign_headless import capability_for, readonly_grants
 
     row = _effect_row(runtime, snapshot, action)
@@ -528,6 +529,28 @@ def perform(runtime, snapshot, action, *, reconcile: bool = False) -> Observatio
                     presentation=view,
                     **({"managed_binding": managed_binding} if managed_binding else {}),
                     **({"steering": mail} if mail else {}),
+                )
+            except RegistrationBusy as exc:
+                if any(
+                    (path.parent / name).exists() or is_link_like(path.parent / name)
+                    for name in (
+                        "request.json",
+                        "launch-intent.json",
+                        "startup.json",
+                        "receipt.json",
+                    )
+                ):
+                    return Observation("unknown", reason=str(exc), retry_at=runtime.clock() + 5)
+                deferred = _launch_guard(runtime, snapshot, row, action, path)
+                if deferred is not None:
+                    return deferred
+                # The native runner already journals dispatch; retrying this
+                # exact pre-request job needs no second launch authority.
+                return Observation(
+                    "waiting",
+                    {"registration_wait": {"phase": "before_native_request"}},
+                    "Managed bridge registration busy before native reasoning dispatch",
+                    runtime.clock() + 1,
                 )
             except (CampaignError, OSError, ValueError) as exc:
                 # No launch has been attempted; this is a typed preparation
