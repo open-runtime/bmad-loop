@@ -355,6 +355,10 @@ class ParadevWorkspaceProvider:
             raise ReflectionError(
                 "Workspace create remains uncertain or has conflicting matches; no replacement launched"
             )
+        if intent.get("mode") == "preserved" and matches[0].get("id") == intent.get(
+            "archived_workspace_id"
+        ):
+            raise ReflectionError("Preserved allocation unexpectedly restored archived UUID")
         binding = self._verify(matches[0], intent)
         if pinned and asdict(binding) != pinned:
             raise ReflectionError("Pinned workspace UUID has a different Git/worktree identity")
@@ -392,6 +396,128 @@ class ParadevWorkspaceProvider:
                     "Temporary create marker removal unconfirmed"
                     + (": " + failure if failure else "")
                 )
+        return binding
+
+    def allocate_preserved(
+        self,
+        unit_id: str,
+        branch: str,
+        name: str,
+        action_id: str,
+        *,
+        expected_head: str,
+        archived_workspace_id: str,
+        release_id: str,
+        recheck: Callable[[], object],
+        group: str = "",
+        display_name: str = "",
+    ) -> WorkspaceBinding:
+        """Allocate a new UUID on one explicitly released, retained branch.
+
+        The caller revalidates the permanent campaign fence and fresh scoped
+        actors immediately before admission. An uncertain create only reconciles
+        its original action tag; neither absence nor an archived UUID is retry
+        permission. This never restores or modifies the archived allocation.
+        """
+        from .platform_util import is_link_like
+
+        if (
+            not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", expected_head)
+            or not re.fullmatch(r"[0-9a-f]{64}", release_id)
+            or not archived_workspace_id
+        ):
+            raise ReflectionError(
+                "Preserved allocation requires exact release/head/archive identity"
+            )
+        self.preflight()
+        path = self._path(action_id)
+        coordinates = {
+            "schema_version": 1,
+            "mode": "preserved",
+            "unit_id": unit_id,
+            "branch": branch,
+            "name": name,
+            "action_id": action_id,
+            "project_id": self.project_id,
+            "group": group or unit_id,
+            "expected_head": expected_head,
+            "release_id": release_id,
+            "archived_workspace_id": archived_workspace_id,
+        }
+        existing = False
+        with file_lock(self.root / "allocation.lock"):
+            if is_link_like(path):
+                raise ReflectionError("Preserved allocation intent is redirected")
+            existing = path.exists()
+            if existing:
+                intent = read_private_json(path)
+                if any(intent.get(key) != value for key, value in coordinates.items()):
+                    raise ReflectionError("Preserved allocation action coordinates changed")
+            else:
+                recheck()
+                rows = self._rows("workspace.list")
+                if any(
+                    row.get("projectId") == self.project_id
+                    and row.get("branch") == branch
+                    and not row.get("archivedAt")
+                    for row in rows
+                ):
+                    raise ReflectionError("Preserved branch has an active native allocation")
+                env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+                head = git_bytes(
+                    self.repository,
+                    "rev-parse",
+                    "--verify",
+                    "refs/heads/" + branch,
+                    timeout_s=10,
+                    env=env,
+                )
+                worktrees = git_bytes(
+                    self.repository, "worktree", "list", "--porcelain", timeout_s=10, env=env
+                )
+                if (
+                    head.returncode
+                    or os.fsdecode(head.stdout).strip() != expected_head
+                    or worktrees.returncode
+                    or "branch refs/heads/" + branch in os.fsdecode(worktrees.stdout).splitlines()
+                ):
+                    raise ReflectionError("Preserved local branch moved or is checked out")
+                intent = {
+                    **coordinates,
+                    "state": "sent_unknown",
+                    "display_name": display_name or name,
+                    "tag": "zz-bmad-action-" + hashlib.sha256(action_id.encode()).hexdigest()[:24],
+                }
+                private_json(path, intent)
+        if not existing:
+            try:
+                self.host.cli(
+                    [
+                        "workspaces",
+                        "create",
+                        "--local",
+                        "--project",
+                        self.project_id,
+                        "--checkout",
+                        "worktree",
+                        "--name",
+                        intent["display_name"],
+                        "--branch",
+                        branch,
+                        "--base-branch",
+                        expected_head,
+                        "--skip-branch-prefix",
+                        "--tag",
+                        intent["tag"],
+                    ]
+                )
+            except Exception as exc:
+                raise ReflectionError(
+                    f"Preserved workspace creation outcome unknown ({type(exc).__name__}); reconcile action {action_id}"
+                ) from None
+        binding = self.reconcile(action_id)
+        if binding.workspace_id == archived_workspace_id:
+            raise ReflectionError("Preserved allocation unexpectedly restored archived UUID")
         return binding
 
     def _folder_settings(self) -> list[dict]:

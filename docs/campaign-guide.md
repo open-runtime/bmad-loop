@@ -31,6 +31,11 @@ model-route capacity, merge rules and optional reflection capabilities. Its
 planning, execution, publication and reflection verdicts are separate. A failed
 capability keeps the project from activating.
 
+Use `campaign run campaign.toml --prepare-only` to create a stopped campaign after
+normal preflight. Its first saved state already has admissions closed, and no
+supervisor, workspace or coding session starts. This prepares a named successor
+for ownership transfer without racing a subsequent stop command.
+
 For configured sources, preflight and creation fetch an isolated observation of
 the current target and compare selected native source, configuration and scheduler
 metadata. Changed, deleted or unmerged planning files require updating the project
@@ -879,6 +884,30 @@ verification and review. Provider names select installed
 or fabricate service responses. Existing registered Paradev workspaces can be
 linked through exact project, UUID and Git identity without rearranging their
 operator layout.
+
+For an archived BMAD startup campaign that never launched a unit worker, the
+built-in transfer path can establish this ownership release. First prepare a
+stopped successor, then inspect the exact retirement:
+
+```bash
+bmad-loop campaign transfer OLD_ID --unit OLD_UNIT --successor NEW_ID --successor-unit NEW_UNIT --pr 42 --expected-revision OLD_REVISION --expected-successor-revision NEW_REVISION --reason "Continue the preserved startup work" --preview --json
+```
+
+Apply the same command without `--preview` after reviewing its scope. It permanently
+retires the entire predecessor's admissions, including unmapped intake units;
+unit states, source specifications, PR history and unresolved work remain intact.
+Only further explicit transfers to the same successor are allowed. This operation
+requires confirmed native archival, exact preserved branch/head/source, complete
+reasoning-process quiescence and no overlapping active owner. It never stops
+another campaign or deletes a branch, worktree or session. Attempted unit workers
+and missing preservation proof require another qualified recovery route.
+
+Use `adoption-proposal NEW_ID --unit NEW_UNIT --pr 42 --observer campaign` and the
+ordinary reviewed adoption manifest next. This observer reads the committed
+retirement directly, rather than trusting a supplied fence or old PID. Adoption
+allocates a new owned native workspace on the existing branch with recoverable
+allocation identity. The archived UUID stays historical. Both transfer and adoption
+leave the successor stopped; resume it explicitly after its normal readiness gates.
 
 A handoff provider is an installed callable
 `(project: Path, common_dir: Path) -> ServiceInventory`. Explicit observer

@@ -80,7 +80,9 @@ def store_for(project: Path) -> CampaignStore:
     return CampaignStore(runs.state_root() / "campaigns" / key)
 
 
-def create(project: Path, spec: CampaignSpec) -> tuple[CampaignStore, CampaignSnapshot]:
+def create(
+    project: Path, spec: CampaignSpec, *, prepare_only: bool = False
+) -> tuple[CampaignStore, CampaignSnapshot]:
     project = project.resolve()
     store = store_for(project)
     common = common_directory(project)
@@ -145,6 +147,7 @@ def create(project: Path, spec: CampaignSpec) -> tuple[CampaignStore, CampaignSn
         root=str(project),
         remote_url=remote_url,
         config_snapshot={"policy": pol.to_dict(), "configuration_revision": 1},
+        phase="stopped" if prepare_only else "active",
     )
     snapshot.bindings["source_observations"] = graph.observations
     if spec.reasoning.enabled or spec.reasoning.capabilities:
@@ -210,6 +213,8 @@ def create(project: Path, spec: CampaignSpec) -> tuple[CampaignStore, CampaignSn
         spec, units=tuple(unit.spec for unit in snapshot.units.values())
     )
     add_event(snapshot, "campaign-created", selected_units=len(snapshot.units))
+    if prepare_only:
+        add_event(snapshot, "campaign-prepared", admissions_open=False)
     snapshot = store.create(snapshot)
     try:
         path, digest = template.save()
@@ -660,6 +665,10 @@ class CampaignRuntime:
 
     @capability_admission
     def proposals(self, snapshot: CampaignSnapshot) -> tuple[Proposal, ...]:
+        from .campaign_transfer import retired
+
+        if retired(snapshot):
+            return ()
         if self._units_settled(snapshot) and self.completion_ready(snapshot):
             # Let already-issued observations/metadata drain. Re-admitting a
             # periodic observation here can permanently outrun terminality on a
@@ -1341,6 +1350,10 @@ class CampaignRuntime:
 
     @capability_admission
     def observe_workers(self, snapshot: CampaignSnapshot) -> tuple[Proposal, ...]:
+        from .campaign_transfer import retired
+
+        if retired(snapshot):
+            return ()
         from .campaign_handoff_flow import proposals as handoff_proposals
         from .campaign_history_warmup import proposals as warmup_proposals
         from .campaign_reasoning_flow import proposals as reasoning_proposals
@@ -1449,6 +1462,9 @@ class CampaignRuntime:
         return tuple(proposals)
 
     def control(self, snapshot: CampaignSnapshot, command: dict[str, Any]) -> None:
+        from .campaign_transfer import require_not_retired
+
+        require_not_retired(snapshot, operation="campaign control")
         kind, key = command["kind"], command.get("unit", "")
         if kind == "authorize-scope":
             from .campaign_scope_authority import apply
@@ -1737,6 +1753,12 @@ class CampaignRuntime:
     def perform(self, snapshot: CampaignSnapshot, action) -> Observation:
         if action.generation != snapshot.generation:
             return Observation("rejected", reason="stale effect generation")
+        from .campaign_transfer import retired
+
+        if retired(self.store.load(snapshot.id)):
+            return Observation(
+                "rejected", reason="Campaign ownership was transferred; effects are fenced"
+            )
         if action.kind == "history-warmup":
             from .campaign_history_warmup import perform
 
@@ -1787,6 +1809,12 @@ class CampaignRuntime:
         return handler(snapshot, action)
 
     def reconcile_action(self, snapshot: CampaignSnapshot, action) -> Observation:
+        from .campaign_transfer import retired
+
+        if retired(self.store.load(snapshot.id)):
+            return Observation(
+                "rejected", reason="Campaign ownership was transferred; effects are fenced"
+            )
         if action.kind == "history-warmup":
             from .campaign_history_warmup import perform
 

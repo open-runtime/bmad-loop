@@ -57,7 +57,7 @@ bmad-loop campaign validate SPEC [--json]
 bmad-loop campaign preflight SPEC [--json]
 bmad-loop campaign migration-inventory SPEC [--json]
 bmad-loop campaign migration-qualify SPEC MANIFEST [--json]
-bmad-loop campaign run SPEC [--paradev-reflect] [--paradev-project ID] [--json]
+bmad-loop campaign run SPEC [--prepare-only] [--paradev-reflect] [--paradev-project ID] [--json]
 bmad-loop campaign list [--json]
 bmad-loop campaign status ID [--json]
 bmad-loop campaign history ID [--unit UNIT] [--role ROLE] [--after SEQUENCE] [--limit N] [--json]
@@ -78,6 +78,7 @@ bmad-loop campaign attach ID --unit UNIT [--role ROLE]
 bmad-loop campaign reconcile ID [--json]
 bmad-loop campaign adoption-proposal ID --unit UNIT --pr NUMBER [--observer NAME] [--json]
 bmad-loop campaign adopt ID --unit UNIT --manifest FILE [--observer NAME] [--json]
+bmad-loop campaign transfer ID --unit UNIT --successor ID --successor-unit UNIT --pr NUMBER --expected-revision REVISION --expected-successor-revision REVISION --reason TEXT [--preview] [--json]
 ```
 
 `--project PROJECT` is accepted before or after the campaign action. Validation
@@ -129,9 +130,23 @@ adopt queues only a fully qualified handoff with the explicitly selected install
 observer. The native observer reports unsupported admission/drain fences as
 unavailable evidence.
 
+`run --prepare-only` performs normal preflight and freezes a stopped campaign
+from its first saved state, without starting a supervisor, workspace or session.
+`transfer` is limited to stopped startup campaigns with no unit worker attempts,
+proved ended reasoning jobs, archived workspaces and exact preserved open PRs.
+Its preview identifies every unmapped unit and the permanent retirement of the
+entire predecessor. Applying it fences all predecessor admissions and binds the
+selected PR to one prepared successor. Later transfers can name only that same
+successor. Histories and unit states remain intact; no work is marked delivered.
+The bundled `campaign` observer then supports ordinary adoption with a new native
+workspace identity on the preserved branch. Neither transfer nor adoption starts
+the successor; explicit resume is separate. Older binaries refuse the retired
+predecessor's forward-only storage format. Other campaigns retain their format.
+
 JSON results contain `schema_version`, `command` and `ok`. Status and execution
 results have a `campaign` projection; list has `campaigns`; controls have `request`.
-Invalid validation/preflight is a failing verdict document. Operational errors
+Invalid validation/preflight, transfer refusals and controls refused by retirement
+are failing verdict documents. Other operational errors
 leave stdout empty and report on stderr. Status excludes private configuration
 and raw evidence; `delivered` requires confirmed merge and reconciled tracking.
 

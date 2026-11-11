@@ -1055,6 +1055,10 @@ def child_main(request_path: Path) -> int:
 
         try:
             latest = CampaignStore(state_root).load(envelope.campaign_id)
+            from .campaign_transfer import retired
+
+            if retired(latest):
+                return True
             if latest.bindings.get("terminate_requested"):
                 from .adapters.multiplexer import MultiplexerError
 
@@ -1077,6 +1081,13 @@ def child_main(request_path: Path) -> int:
     result: dict[str, Any]
     monitor = None
     try:
+        if state_root is not None:
+            from .campaign_store import CampaignStore
+            from .campaign_transfer import require_not_retired
+
+            require_not_retired(
+                CampaignStore(state_root).load(envelope.campaign_id), operation="execute a worker"
+            )
         if request.get("checkpoint_interval_s") and (
             request["kind"] == "execution"
             or (request["kind"] == "stage" and not request.get("read_only"))

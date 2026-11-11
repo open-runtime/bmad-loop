@@ -27,6 +27,12 @@ replaces the accepted contract, actual repository state or publication receipts.
 This decision extends the original campaign work; it does not defer its unresolved
 correctness, GitHub, Paradev or activation requirements.
 
+Session handoff preserves context within existing authority; it never transfers
+a repository branch between campaign owners. An archived BMAD-owned branch uses
+the [explicit predecessor release and successor adoption contract](0002-campaign-implementation.md#transfer-of-an-archived-bmad-owned-branch).
+Retain old optional-job attempts, receipts and histories without applying their
+results to the successor or treating a summary as proof that ownership ended.
+
 The initial extension landed in PR 18 alongside the original audit repairs. Follow
 the [G0–G8 traceability matrix](0002-campaign-implementation.md#implementation-goals-and-traceability)
 and keep implementation, normal-runtime coverage, native qualification and

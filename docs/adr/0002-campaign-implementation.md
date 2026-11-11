@@ -100,6 +100,115 @@ that exact decision source if absent, and archive the old/new value and source.
 All unit/attempt, hold, check, native-review and budget protections still apply.
 Ordinary route/group changes cannot change this policy or remove configured roles.
 
+#### Transfer of an archived BMAD-owned branch
+
+The supported operation provides startup-only transfer from an archived,
+stopped native BMAD campaign to a named successor. No unit writer may have
+attempted work; ended optional reasoning retains its independently validated
+request, receipt, grant and process history. It does not generalize factory migration or
+treat archived terminals, old PIDs, titles, disabled automations or a remote PR as
+an ownership release. Ordinary native observation never grants release authority;
+the bundled campaign observer reads the immutable predecessor retirement and
+combines it with fresh scoped native observations. Keep the operation separate from harness continuation and from the
+existing `release` command, which removes an operator hold.
+
+Sandbox qualification exercises ordinary preparation, archived native observations,
+SQLite transaction faults, older-reader refusal, named-successor adoption and
+ordinary scripted delivery. Native and GitHub services and coding sessions are
+scripted; these checks do not claim an operational campaign transfer. Each live
+operation must earn its own fresh preview, release and adoption evidence.
+
+Create the successor through an ordinary non-launching preparation path: parse,
+qualify and freeze its specification, then persist it stopped and unallocated.
+Do not create an active campaign and race a stop request. Transfer preview reads
+current authority and returns exact proposed coordinates without saving state,
+registering workspaces, submitting effects or calling a model. Applying the
+explicit transfer does not resume either campaign.
+
+The release record binds one predecessor campaign/unit and one successor
+campaign/unit, repository/common directory, selected source identities, preserved
+branch/head, positive PR number/node ID, target/base, native archive identity and
+preservation evidence. Preserve the original unit bindings, attempt counts,
+configuration, failed jobs, histories and source preimages. A preservation PR may
+have been created after the predecessor stopped: qualify its actual repository,
+branch and head rather than inventing a prior PR binding. PR-less transfer is
+outside this narrow contract. Neither transferred nor unfinished work becomes
+delivered or canceled merely to suppress its old writer.
+
+Fresh release qualification requires a stopped predecessor with no unit writer
+attempts, complete hot and cold job ownership, and no unresolved mutating effect.
+The first release permanently retires the whole predecessor, including unmapped
+work listed explicitly in preview; additional mappings can name only the same
+successor. Issued uncertainty follows its existing observation/reconciliation path; it is
+never relabeled never-issued. Pending reads retain their identities and history.
+Existing dirty or unpublished work must be preserved before release. An absent
+archived checkout needs its retained preservation evidence and current immutable
+branch identity; absence alone never proves a clean retirement. Inspect exact
+native project/workspace/terminal identities and other campaign claims covering
+the selected branch, checkout or ownership scope. Unrelated live REM sessions do
+not require a global drain, and no transfer command stops or moves them.
+
+The predecessor is the single release authority. Collect bounded observations
+before the write transaction, then recheck revisions and local bindings under the
+existing repository coordinator lock and store CAS. Commit an immutable release
+record, whole-campaign admission retirement and event naming the sole successor.
+A lost reply is resolved by reading that same record; repeating the operation cannot choose another recipient. A
+crash before successor adoption leaves the predecessor released, never silently
+reopened. Ordinary resume, operator-hold release and configuration changes cannot
+remove this exclusion. Current unit/session admission and mutating-effect guards
+must refuse the retired predecessor globally; ordinary saves cannot change its
+unit, configuration, job or effect authority. Read-only observations and retained
+history remain available.
+
+Storage compatibility is conditional, not a migration of every campaign. Keep
+ordinary creation and untouched stores at SQLite schema 3. A predecessor earning
+release authority commits its record, event and `PRAGMA user_version=4` in the
+same transaction, then publishes the schema-4 SQLite marker. Existing readers
+reject database version 4 even if a crash leaves marker 3. Updated readers accept
+that recoverable pair and complete marker publication; later commits and marker
+updates never downgrade version 4. Marker-only fencing is insufficient because
+inventory and history also open the database directly. All store, inventory,
+event, job and action-history paths must understand the conditional format.
+Legacy JSON authority uses the existing supported quiescent migration before
+transfer, rather than adding a release field that an old reader would ignore.
+
+A bundled campaign observer converts only these persisted releases and fresh
+scoped observations into the existing authenticated `ServiceInventory` contract.
+Its actor identifies the named successor unit and reports admissions closed,
+zero active scoped workers, preserved source/branch identity and released
+ownership only when proved. Fence and binding revisions derive from the immutable
+release, not unrelated event clocks. Existing adoption still checks current
+GitHub repository/PR/head/base, source authority, native ownership and preserved
+ancestry before each mutation or actor admission. It retains all acceptance,
+review, quota and publication gates. Caller-authored JSON cannot supply proof.
+
+When the old native workspace is archived, adoption allocates a new registered
+checkout on the preserved branch through the normal durable allocation action.
+The stock local workspace command supports an existing branch; use the exact
+branch without a namespace rewrite or an agent-launch flag. Reuse the allocation
+intent marker and exact UUID readback for lost acknowledgements. Confirm native
+project, checkout path, common directory, branch and head before source setup.
+Keep the predecessor UUID/path as historical coordinates; do not revive or rebind
+them. A current conflicting checkout or ambiguous allocation remains a visible
+refusal. Continue through the existing adopted-PR preparation and delivery flow.
+
+| Boundary            | Required zero-token acceptance                                                                                                                                                 |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Normal transfer     | Real fixture Git history and ordinary prepare/stop/release/adopt flow deliver through the same preservation PR without duplicate intake or implementation.                     |
+| Release authority   | Wrong repository/source/PR/head/revision, another recipient, dirty preservation and scoped live/unknown ownership refuse; unrelated live peers remain eligible.                |
+| Permanent exclusion | Predecessor resume, hold release, reconfigure and queued writer/publication effects cannot reclaim a released unit; failed attempts and original bindings remain unchanged.    |
+| Compatibility/crash | Old readers reject only upgraded campaigns; transaction rollback, database-4/marker-3 interruption, marker repair and subsequent saves preserve the release without downgrade. |
+| Native allocation   | Existing-branch creation and lost acknowledgements reconcile one new workspace UUID, preserve old history and never reuse or close another actor's session.                    |
+| Adoption freshness  | Moving source, PR, ref or ownership evidence invalidates the observation before mutation; provider output alone cannot waive ordinary adoption checks.                         |
+
+Use guard-removal ablations for every refusal. The planned core is a cohesive
+transfer module plus conditional store compatibility; shared runtime/CLI wiring
+owns permanent admission/effect exclusion and non-launching creation. Adoption
+and Paradev collaborators own the verified observer and allocation integration.
+Scripted qualification, installed-provider qualification and actual REM transfer
+are separate results; this contract authorizes implementation, not a claim that
+the preserved pilot has already transferred.
+
 ### Accepted completion extension — 2026-11-08
 
 Reconcile every earlier requirement against its ordinary CLI/runtime path, tests,

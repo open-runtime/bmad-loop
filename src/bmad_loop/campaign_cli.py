@@ -62,6 +62,10 @@ def register(subparsers: Any) -> None:
         ("reflect", "refresh existing native display labels in a stopped campaign"),
         ("adoption-proposal", "inspect exact existing PR and service handoff coordinates"),
         ("adopt", "queue an owner-authorized, independently fenced existing PR handoff"),
+        (
+            "transfer",
+            "retire a stopped startup campaign and transfer a preserved PR to a prepared successor",
+        ),
         ("provenance", "verify the currently loaded installation and exact fork commit"),
     ):
         child = commands.add_parser(command, help=help_text)
@@ -135,6 +139,15 @@ def register(subparsers: Any) -> None:
             child.add_argument("--manifest", required=True, metavar="FILE")
         if command == "adoption-proposal":
             child.add_argument("--pr", required=True, type=int, metavar="NUMBER")
+        if command == "transfer":
+            child.add_argument("--unit", required=True)
+            child.add_argument("--successor", required=True)
+            child.add_argument("--successor-unit", required=True)
+            child.add_argument("--pr", required=True, type=int)
+            child.add_argument("--expected-revision", required=True, type=int)
+            child.add_argument("--expected-successor-revision", required=True, type=int)
+            child.add_argument("--reason", required=True)
+            child.add_argument("--preview", action="store_true")
         if command == "hold":
             child.add_argument("--reason", required=True)
         if command == "steer":
@@ -209,6 +222,11 @@ def register(subparsers: Any) -> None:
         if command == "run":
             child.add_argument("--paradev-reflect", action="store_true", default=None)
             child.add_argument("--paradev-project", metavar="PROJECT_ID")
+            child.add_argument(
+                "--prepare-only",
+                action="store_true",
+                help="persist a stopped campaign without allocating workspaces or launching sessions",
+            )
 
 
 def _result(command: str, *, ok: bool = True, **fields: Any) -> dict[str, Any]:
@@ -507,6 +525,17 @@ def status_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
         "repository": snapshot.repository,
         "target": snapshot.spec.target,
         "phase": snapshot.phase,
+        **(
+            {
+                "ownership_retirement": {
+                    "state": "retired",
+                    "successor": snapshot.bindings["ownership_retirement"]["successor"],
+                    "released_units": sorted(snapshot.bindings.get("ownership_transfers", {})),
+                }
+            }
+            if snapshot.bindings.get("ownership_retirement")
+            else {}
+        ),
         "revision": snapshot.revision,
         "generation": snapshot.generation,
         "graph_revision": snapshot.graph_revision,
@@ -780,6 +809,9 @@ def dispatch(args: argparse.Namespace) -> int:
             spec.github.allow_publication_wait and observed.get("can_start") is True
         ):
             return _emit(args, {**observed, "command": "campaign.run"})
+        if args.prepare_only:
+            store, snapshot = campaign_runtime.create(project, spec, prepare_only=True)
+            return _emit(args, _result(command, campaign=status_document(snapshot)))
         store, snapshot = campaign_runtime.create(project, spec)
         runtime = _runtime(campaign_runtime, project, store)
         supervisor = CampaignSupervisor(store, runtime)
@@ -793,6 +825,31 @@ def dispatch(args: argparse.Namespace) -> int:
         )
     campaign_id = args.campaign_id
     snapshot = store.load(campaign_id)
+    from .campaign_transfer import require_not_retired
+
+    if command not in {"status", "history", "jobs", "messages", "endpoints", "transfer"}:
+        try:
+            require_not_retired(snapshot, operation=command)
+        except CampaignError as exc:
+            return _emit(args, _result(command, ok=False, problems=[str(exc)]))
+    if command == "transfer":
+        from .campaign_transfer import TransferRequest, preview, release
+
+        request = TransferRequest(
+            predecessor=campaign_id,
+            unit=args.unit,
+            successor=args.successor,
+            successor_unit=args.successor_unit,
+            pr_number=args.pr,
+            expected_revision=args.expected_revision,
+            expected_successor_revision=args.expected_successor_revision,
+            reason=args.reason,
+        )
+        try:
+            report = (preview if args.preview else release)(store, request, project=project)
+        except (CampaignError, OSError, ValueError) as exc:
+            return _emit(args, _result(command, ok=False, problems=[str(exc)]))
+        return _emit(args, _result(command, **report))
     if command == "reflect":
         from .campaign_reflect import refresh
 

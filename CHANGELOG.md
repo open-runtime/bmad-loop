@@ -9,6 +9,7 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- Prepare stopped successors and transfer exact preserved startup PRs from permanently retired campaigns without reopening archived sessions.
 - Audit and reconcile existing repository work with bounded parallel reasoning, independent review and preserved history.
 - Configure ordered summary routes per stage, mandatory final synthesis and independent audit-family reservation.
 - Capture immutable managed-session history prefixes for incremental continuation summaries.

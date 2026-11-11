@@ -125,12 +125,19 @@ def writer_available(
 def admit(
     snapshot: CampaignSnapshot, *, now: float = 0, blocked: Mapping[str, str] | None = None
 ) -> Admission:
+    from .campaign_transfer import retired
+
     waits: dict[str, str] = {}
-    if snapshot.phase != "active":
+    transferred = retired(snapshot)
+    if snapshot.phase != "active" or transferred:
         return Admission(
             (),
             {
-                key: f"campaign {snapshot.phase}"
+                key: (
+                    "campaign ownership transferred"
+                    if transferred
+                    else f"campaign {snapshot.phase}"
+                )
                 for key, unit in snapshot.units.items()
                 if unit.state == UnitState.READY
             },

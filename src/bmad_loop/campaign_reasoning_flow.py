@@ -22,6 +22,10 @@ WORKSPACE_WAIT = "Waiting for an owned Paradev workspace; unit allocation will r
 
 def admission_reason(snapshot, unit_id):
     """Controls prevent new reasoning sessions, never observation of existing ones."""
+    from .campaign_transfer import retired
+
+    if retired(snapshot):
+        return "campaign ownership was transferred"
     if snapshot.phase != "active":
         return "campaign is not active"
     unit = snapshot.units.get(unit_id)
