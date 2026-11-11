@@ -88,6 +88,46 @@ GitHub mapping; introduce no calendar, dates, velocity or sprint-capacity model.
 
 ## Reasoning responsibilities
 
+### Accepted stage routing and incremental history extension
+
+The portable operations follow-up adds a frozen `reasoning.summary_routes`
+mapping for leaf, intermediate, final, constraint, recovery and their audit
+stages. Absent mapping preserves legacy behavior. Each mapped stage references
+an existing named pool, selected in configured order after exact qualification,
+launcher readiness, capacity freshness and resource admission. Role budgets
+still apply. A fallback does not reset lifetime attempts or weaken acceptance.
+
+| Stage                                                              | Ordered model preference                                                                        |
+| ------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------- |
+| Leaf extraction                                                    | Gemini Flash high; Grok 4.7 xhigh; Muse Wonder Full xhigh; Claude Sonnet high; Codex Terra high |
+| Intermediate/final, constraint reduction, missing-history recovery | Gemini Argon high; Grok 4.7 xhigh; Muse Wonder Full xhigh; Claude Opus max; Codex Sol ultra     |
+
+The owner's ordering explicitly places Terra below Sol. Require higher-order
+final synthesis even when one leaf fits. Reserve an independent audit family
+before admitting summary work, without occupying a live session slot. Retain
+all contributing families through retries and merges of summary trees; unavailable
+independence causes a visible wait, not relabeling. Model identifiers, effort,
+permissions and context limits require actual native and semantic qualification;
+the catalog alone is not proof. AGY requires a supported capacity observation or
+explicit capacity command; unknown capacity uses an eligible fallback.
+
+Managed headless warmup seals complete stream frames bound to the exact launch,
+generation and native process. Immutable prefix capture is separate from terminal
+export and cannot claim quiescence. Keep stable event IDs, tolerate appended bytes
+and partial final frames, and reject rewrites/truncation or changed process/file
+identity. Terminal capture reconciles every reused prefix against final bytes.
+Owner messages retain their provenance; injected controller prompts do not become
+owner instructions. Captured native input/output is not necessarily hidden native
+history. Final handoff still requires fenced predecessor writers and complete
+required obligations, with retained raw evidence and summary-tree retrieval.
+
+Folders/workspaces/tasks represent work; phase tabs and sessions represent its
+execution. Only sessions carry actual native hcom actor identities. Managed
+check-in addresses are controller bridges and explicitly report that distinction.
+Historical actors and closed endpoints remain separate from successor sessions.
+
+### Existing reasoning responsibilities
+
 | Purpose                           | Model proposal                                                                               | Deterministic application boundary                                                                                       |
 | --------------------------------- | -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
 | Model and effort routing          | Rank qualified candidates for task difficulty, context size, urgency and observed outcomes   | Enforce current eligibility, role requirements, supported effort, budgets and review independence                        |

@@ -31,6 +31,12 @@ The accepted [bounded reasoning and handoff extension](0003-bounded-reasoning-an
 adds semantic routing, graph/priority review and portable cross-harness continuity.
 It preserves this record's delivery contract and does not replace outstanding repairs.
 
+The accepted [portable operations extension](0002-campaign-implementation.md#portable-operations-extension--accepted-2026-11-11)
+adds entity-correct reflection, stage-specific handoff routing, incremental history
+and repository organization. Its startup migration preserves prior frozen
+configuration and existing workspaces. Implementation and activation of this
+extension are separate from the historical release evidence below.
+
 ### Implementation and delivery milestones
 
 The initial campaign and reasoning/handoff implementation has been merged and

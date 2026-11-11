@@ -39,6 +39,47 @@ validate unchanged retained semantic evidence without repeating its inference.
 Installed startup readiness does not establish actual parallel target delivery,
 identity reflection, outside-peer communication or live-worker drain/resume.
 
+### Portable operations extension — accepted 2026-11-11
+
+The next follow-up implements the following additional goals. Earlier release
+qualification does not establish these new behaviors. Preserve the existing REM
+pilot and its three clean workspaces; it remains stopped until affected startup
+and route qualifications pass. Its selected work is issues #1582 and #529.
+
+| Goal                         | Contract and completion evidence                                                                                                                                                                                                                                            |
+| ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| P1 — Entity reflection       | Initiative-prefixed epic folders, stable story/worktree labels, phase tabs, actual session actors and explicitly labeled controller endpoints. Stopped reflection creates no workers or workspaces; preserve manual overrides and unrelated tags.                           |
+| P2 — Portable continuation   | Stage-specific ordered summary pools, stronger final synthesis, independent audit-family reservation, exact qualified fallbacks and incremental managed-history capture. Normal-runtime interruption recovery retains the same worktree/PR and every unresolved obligation. |
+| P3 — Repository organization | Separate audit/reconcile authority; complete issue/PR/milestone/ref/worktree inventory; automatic evidence-backed links, allowed labels, consolidation and duplicate/superseded closures. No branch, worktree or history deletion.                                          |
+| P4 — Startup configuration   | Explicit revision-checked route/grouping changes before unit work; immutable prior specifications, templates and capabilities; retain ended optional jobs and confirmed allocation/tracking history. Preview and apply never resume the campaign.                           |
+| P5 — Deployment and delivery | Deploy reviewed TeamRouter quota repair through maintained native setup, merge and install the reviewed BMAD follow-up, renew affected route proofs, migrate the stopped pilot, and deliver both selected REM stories through review, merge and tracking reconciliation.    |
+
+Native subagents implement reflection, handoff/history and repository audit in
+parallel; the primary owns shared configuration, integration, documentation and
+publication. Regressions remain zero-token. Bounded native qualification is a
+separate operation, with exact route/effort/permission and semantic evidence.
+Record implementation, normal-runtime tests, native proof and target delivery
+separately. Missing capacity or proof must remain visible rather than silently
+changing the requested configuration or claiming the whole extension complete.
+
+Repository audit is read-only remotely and may persist local evidence. Reconcile
+uses a frozen standing Organize-and-close policy, fresh object/ownership checks,
+independent semantic review and durable uncertain-write reconciliation. Preserve
+original issue text and review history. Consolidation must account for every
+requirement; PR closure must account for unique contributions and prove writer
+release. Milestone closure needs complete membership. Scope/source/code changes
+go through delivered planning or implementation PRs. Defaults bound one cycle to
+100 mutations and 20 closures, checkpointing excess work. Do not infer completion
+from age, inactivity or semantic similarity.
+
+New campaigns use epic grouping; legacy snapshots with omitted grouping retain
+story grouping. Initiative grouping is also supported by this extension; sprint
+grouping requires a future explicit source identity and implies no calendar or
+capacity policy. Folder display names use native settings separately from stable
+membership tags. Only recorded BMAD-owned tags may change during regrouping.
+Session identity never becomes workspace identity. No cleanup of the existing
+pilot is authorized merely by its stale pending labels.
+
 ### Accepted completion extension — 2026-11-08
 
 Reconcile every earlier requirement against its ordinary CLI/runtime path, tests,
