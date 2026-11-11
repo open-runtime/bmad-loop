@@ -46,11 +46,11 @@ def test_startup_recovers_complete_discovery_before_allocating_or_planning(
             self.lock = threading.RLock()
             self.errors = []
 
-        def rpc(self, procedure, payload=None):
+        def rpc(self, procedure, payload=None, mutate=False):
             with self.lock:
                 if procedure == "terminal.list":
                     return {"sessions": []}
-                return super().rpc(procedure, payload)
+                return super().rpc(procedure, payload, mutate=mutate)
 
         def cli(self, args):
             # The base host fixture is serial. A service must assign unique
