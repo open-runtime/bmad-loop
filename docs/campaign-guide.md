@@ -646,7 +646,11 @@ text as explicitly attributed historical
 summary claims, with source references. Exact owner instructions, canonical
 acceptance and captured current controller holds are retained independently of
 that selection. A historical rule to honor holds does not establish that a hold
-is currently active. The controller rechecks current controls before continuation;
+is currently active. The final audit requires faithful selection of historical
+unfinished work, but does not require invented child facts to duplicate
+controller-only holds or canonical state already supplied as mandatory context.
+Selected claims that contradict, clear or weaken that state still require repair.
+The controller rechecks current controls before continuation;
 publication and external operator holds still have their own admission checks.
 
 Unselected facts remain in the retrievable source tree with distinct budget

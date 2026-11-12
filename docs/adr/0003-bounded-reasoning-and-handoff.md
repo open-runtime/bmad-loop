@@ -594,7 +594,7 @@ and must not leave a stale stop after release. Recheck controls at continuation
 launch; existing external hold-channel and publication admission checks retain
 their independent authority.
 
-Final-audit-v4 checks source attribution, coverage, ordering, required/excluded
+Final-audit-v5 checks source attribution, coverage, ordering, required/excluded
 classification and material omissions
 against complete leaf evidence, owner spans and current canonical state. Selecting
 an old claim cannot prove completion or invent a current hold. The final-only
@@ -604,6 +604,15 @@ findings; a repair verdict requires concrete findings. Either artifact findings
 or source ambiguities block continuation. The auditor assesses the submitted
 frontier as it stands: resolving a claim's meaning in constraint prose does not
 change the retained selection, clear a false instruction or repair an omission.
+
+Required selection covers material historical work from the leaf source. Current
+controller controls and canonical obligations remain mandatory outside the child
+fact catalog. An audit must not demand a fabricated historical fact merely to
+duplicate a controller-only hold already supplied in that context. This boundary
+addresses a native audit that rejected such a hold's absence from required IDs;
+the failed audit remains failed. Selected claims that contradict, clear or weaken
+the mandatory controls or obligations still require repair. No control is removed
+or released by this distinction.
 
 This distinction addresses a native audit that recognized an unsupported
 standing-hold claim but returned no ambiguity after resolving its meaning. That
@@ -615,7 +624,7 @@ prove current final-v6 behavior.
 A rejected selection
 can use the existing bounded correction path and exact rejected-audit inputs;
 every corrected selection still requires fresh independent audits. Preserve old
-final-v3, final-v4 and final-v5 artifacts and final-audit-v3 receipts as history,
+final-v3, final-v4 and final-v5 artifacts and final-audit-v3/v4 receipts as history,
 require new current-stage qualification, and leave
 leaf/intermediate and legacy history-audit qualification contracts unchanged.
 The captured audit context binds the active stage's prompt version and schema;

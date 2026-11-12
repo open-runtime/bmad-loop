@@ -131,7 +131,7 @@ def test_final_assessment_is_separate_from_resolvable_source_authority():
     assert obligations.validate(result, coordinates, events)["ambiguities"] == []
     with pytest.raises(CampaignError, match="Obsolete final audit"):
         obligations.final_assessment(result, coordinates, current=True)
-    coordinates["audit_prompt_version"] = "history-final-audit-v4"
+    coordinates["audit_prompt_version"] = "history-final-audit-v5"
     result.update(
         final_verdict="repair_required", final_findings=["Selected claim invents a hold."]
     )
@@ -166,7 +166,7 @@ def test_final_assessment_is_separate_from_resolvable_source_authority():
 )
 def test_final_assessment_refuses_missing_or_contradictory_artifact_verdict(mutation):
     events, coordinates, result = case()
-    coordinates.update(final_frontier=["final"], audit_prompt_version="history-final-audit-v4")
+    coordinates.update(final_frontier=["final"], audit_prompt_version="history-final-audit-v5")
     result.update(final_verdict="passed", final_findings=[])
     if mutation == "no-verdict":
         del result["final_verdict"]
@@ -198,3 +198,19 @@ def test_current_final_assessment_requires_frontier_binding():
     _, coordinates, result = case()
     with pytest.raises(CampaignError, match="lacks its frontier"):
         obligations.final_assessment(result, coordinates, current=True)
+
+
+@pytest.mark.parametrize("verdict,findings", [("passed", []), ("repair_required", ["Bad claim"])])
+def test_retained_v4_artifact_verdict_is_readable_but_not_current(verdict, findings):
+    events, coordinates, result = case()
+    coordinates.update(final_frontier=["final"], audit_prompt_version="history-final-audit-v4")
+    result.update(final_verdict=verdict, final_findings=findings)
+    retained_schema = obligations.bound_schema(coordinates)
+    assert {"final_verdict", "final_findings"} <= set(retained_schema["required"])
+    normalized = obligations.validate(result, coordinates, events)
+    assert obligations.final_assessment(normalized, coordinates) == findings
+    with pytest.raises(CampaignError, match="Obsolete final audit"):
+        obligations.final_assessment(normalized, coordinates, current=True)
+    coordinates["audit_prompt_version"] = "history-final-audit-v5"
+    assert obligations.bound_schema(coordinates) == retained_schema
+    assert obligations.final_assessment(normalized, coordinates, current=True) == findings

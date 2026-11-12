@@ -313,7 +313,8 @@ def test_editing_audit_schema_manifest_cannot_relabel_independent_native_receipt
     assert receipt_path.read_bytes() == native_bytes
 
 
-def test_final_audit_binds_final_prompt_not_history_audit(proof):
+@pytest.mark.parametrize("prior_version", [HISTORY_AUDIT_PROMPT_VERSION, "history-final-audit-v4"])
+def test_final_audit_binds_final_prompt_not_history_audit(proof, prior_version):
     from pathlib import Path
 
     _, expected = contract_header("handoff_final_audit", flow.AUDIT_SCHEMA)
@@ -324,21 +325,28 @@ def test_final_audit_binds_final_prompt_not_history_audit(proof):
     evidence = read_json(path)
     bindings = [route_binding(cap, "handoff_final_audit")]
     evidence.update(expected)
-    evidence.update(
-        route_bindings=bindings,
-        audit_prompt_version=HISTORY_AUDIT_PROMPT_VERSION,
-    )
+    evidence.update(route_bindings=bindings)
     receipt_path = Path(evidence["independent_review"]["native_receipt_path"])
     receipt = read_json(receipt_path)
     receipt["result"].update(
         route_bindings_digest=digest(bindings),
-        audit_prompt_version=HISTORY_AUDIT_PROMPT_VERSION,
+        audit_prompt_version=FINAL_AUDIT_PROMPT_VERSION,
         semantic_contract_digests={
             "handoff_final_audit": digest(
                 semantic_contract("handoff_final_audit", flow.AUDIT_SCHEMA)
             )
         },
     )
+    write_json(receipt_path, receipt)
+    evidence["independent_review"]["sha256"] = file_digest(receipt_path)
+    write_json(path, evidence)
+    cap["semantic_qualification"]["proofs"][0]["sha256"] = file_digest(path)
+    flow.validate_fidelity_qualification(cap, purpose="handoff_final_audit")
+
+    # Relabel both the native declaration and outer manifest to the prior
+    # contract. Their hashes still match, but they cannot grant the current one.
+    evidence["audit_prompt_version"] = prior_version
+    receipt["result"]["audit_prompt_version"] = prior_version
     write_json(receipt_path, receipt)
     evidence["independent_review"]["sha256"] = file_digest(receipt_path)
     write_json(path, evidence)
@@ -359,7 +367,9 @@ def test_map_proof_ignores_unused_audit_schema_and_reducer_prompt(proof, monkeyp
     assert path.read_bytes() == manifest
 
 
-def test_final_artifact_assessment_schema_changes_only_final_audit_contract(monkeypatch):
+@pytest.mark.parametrize("change", ["schema", "control-boundary-prompt"])
+def test_final_artifact_assessment_schema_changes_only_final_audit_contract(monkeypatch, change):
+    from bmad_loop import campaign_fidelity as fidelity
     from bmad_loop import campaign_handoff_obligations as obligations
 
     purposes = [
@@ -378,7 +388,12 @@ def test_final_artifact_assessment_schema_changes_only_final_audit_contract(monk
         obligations.final_schema_template()
     )
     assert before[("handoff_audit", "")]["audit_schema_digest"] == digest(obligations.AUDIT_SCHEMA)
-    monkeypatch.setattr(obligations, "final_schema_template", lambda: {"changed-final-only": True})
+    if change == "schema":
+        monkeypatch.setattr(
+            obligations, "final_schema_template", lambda: {"changed-final-only": True}
+        )
+    else:
+        monkeypatch.setattr(fidelity, "FINAL_AUDIT_PROMPT_VERSION", "history-final-audit-v4")
     after = {key: semantic_contract(key[0], flow.AUDIT_SCHEMA, key[1]) for key in purposes}
     assert [key for key in purposes if before[key] != after[key]] == [("handoff_final_audit", "")]
 

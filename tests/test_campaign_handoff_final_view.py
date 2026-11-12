@@ -26,6 +26,7 @@ def closed_packet(
     required_indices=(),
     excluded_indices=(),
     version="history-final-v4",
+    current_state=None,
 ):
     history = capture(tmp_path, [native_row("codex")])
     events = load_events(history)
@@ -99,7 +100,7 @@ def closed_packet(
     packet = context.assemble_packet(
         (history,),
         ({"id": "canonical", "criterion": "Preserve existing commits."},),
-        {"pr": 17, "hold": None},
+        {"pr": 17, "hold": None} if current_state is None else current_state,
         (final,),
         dataclasses.replace(budget(), context_tokens=80000),
         tmp_path / "packet",
@@ -140,6 +141,42 @@ def test_selected_historical_instruction_cannot_replace_mandatory_current_author
     assert payload["history_view"][0]["text"].startswith("Historical summary claim from child ")
     owners = json.loads(Path(payload["owner_index"]["path"]).read_text())
     assert owners[0]["quote"] == "keep all commits"
+
+
+def test_v6_required_history_does_not_need_to_duplicate_mandatory_controller_hold(tmp_path):
+    from bmad_loop.campaign_transcripts import digest
+
+    state = {
+        "active_hold": {"id": "controller-only-hold", "reason": "Wait for explicit resolution"}
+    }
+    current = {
+        "controller_controls": {
+            "observed_revision": 7,
+            "state": state,
+            "state_digest": digest(state),
+        }
+    }
+    payload, final, child = closed_packet(
+        tmp_path,
+        version="history-final-v6",
+        include_owner=False,
+        historical_text="Implementation has a pending review.",
+        required_indices=(0,),
+        current_state=current,
+    )
+    assert "controller-only-hold" not in json.dumps(child)
+    assert "controller-only-hold" not in json.dumps(final)
+    context.bind_authority_evidence(payload, tmp_path / "packet", [])
+    mandatory = context.mandatory_context_digest(payload)
+    context.fit_audited_history(payload, tmp_path / "packet", ceiling=20000)
+    assert payload["current_state"] == current
+    assert payload["history_view"][0]["required_context"] is True
+    assert "pending review" in payload["history_view"][0]["text"]
+    context.validate_authority_evidence(payload, mandatory)
+    context.validate_history_view(payload)
+    payload["current_state"]["controller_controls"]["state"]["active_hold"] = None
+    with pytest.raises(CampaignError, match="mandatory context differs"):
+        context.validate_authority_evidence(payload, mandatory)
 
 
 @pytest.mark.parametrize(
