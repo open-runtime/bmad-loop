@@ -533,6 +533,25 @@ result can complete successfully while failing semantic qualification. Preserve
 that result and its findings, and require matching evidence for any changed
 producer prompt contract before admitting the revised route.
 
+A completed final audit can reject a structurally valid synthesis. Retain its
+validated findings and stop admitting audits of that unchanged final; observe
+already launched siblings to quiescence. The staged handoff may request at most
+two corrective final syntheses for the same predecessor launch. Persist that
+budget independently of refresh, route selection, configuration and restart.
+Ordinary native failure budgets still apply.
+
+Each correction is a new immutable job with the same authenticated source,
+the rejected final, the audit findings and canonical obligations. Findings are
+context, not owner authority. Do not classify free-form ambiguity text as approval
+or assume a correction can resolve missing owner evidence. Recheck source hashes,
+current context, ownership and quiescence before replacing the active frontier.
+Retain all prior results, contributors and audit history. Any corrected final
+requires a fresh independent audit against the complete source frontier before
+packet assembly or writable continuation. Unresolved ambiguity, exhausted repair
+budget, corrupt source, uncertain writers or unavailable qualified capacity
+remains visible; none authorizes a successor. This repair path leaves producer
+and audit prompt contracts unchanged and requires its own runtime qualification.
+
 For T unique tokens, payload window W and overlap O, the window count is one for
 T <= W; otherwise it is `1 + ceil((T - W) / (W - O))`, with `0 <= O < W`.
 At T=20,000,000, W=1,000,000 and O=500,000, there are 39 jobs and 39,000,000

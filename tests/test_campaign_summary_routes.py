@@ -94,12 +94,30 @@ def test_single_leaf_requires_final_synthesis_before_owner_audit(campaign, damag
                 for span in coord["owner_spans"]
             ],
         }
-        row.update(
-            state="validated",
-            validation="valid",
-            result=result,
-            receipt={"result": result, "provider_family": "anthropic"},
+        from bmad_loop.campaign_jobs import accept_receipt
+
+        row["claim"] = {
+            "launch_id": "final-audit-native",
+            "generation": snapshot.generation,
+            "quiescent": False,
+        }
+        accept_receipt(
+            snapshot,
+            row["id"],
+            {
+                "job_id": row["id"],
+                "launch_id": row["claim"]["launch_id"],
+                "generation": snapshot.generation,
+                "request_digest": row["request_digest"],
+                "outcome": "completed",
+                "quiescent": True,
+                "processes_quiescent": True,
+                "input_complete": True,
+                "result": result,
+                "provider_family": "anthropic",
+            },
         )
+        assert row["state"] == "validated"
         with pytest.raises(CampaignError, match="Final synthesis omitted"):
             flow.apply_audit(runtime, snapshot, row)
         assert value["phase"] == "audit"

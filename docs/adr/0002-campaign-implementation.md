@@ -68,6 +68,15 @@ Record implementation, normal-runtime tests, native proof and target delivery
 separately. Missing capacity or proof must remain visible rather than silently
 changing the requested configuration or claiming the whole extension complete.
 
+Portable continuation includes bounded recovery from a final summary rejected
+by its independent audit. Preserve the rejection, request a new synthesis from
+the same source and findings, and require another independent audit. Two repair
+attempts per predecessor launch survive refresh and restart; they do not reset
+native retry debt or grant authority to resolve an owner decision. See
+[the handoff synthesis contract](0003-bounded-reasoning-and-handoff.md) for source,
+quiescence and evidence requirements. Qualify the normal rejection, correction,
+audit and packet path separately from a model's successful process exit.
+
 Repository audit is read-only remotely and may persist local evidence. Reconcile
 uses a frozen standing Organize-and-close policy, fresh object/ownership checks,
 independent semantic review and durable uncertain-write reconciliation. Preserve

@@ -434,6 +434,11 @@ def status_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
         "session_id",
     }
     for key, unit in snapshot.units.items():
+        handoff = unit.evidence.get("handoff", {})
+        final_repairs = unit.evidence.get("handoff_final_repairs", {}).get(
+            handoff.get("predecessor", {}).get("launch_id", ""), []
+        )
+        pending_repair = handoff.get("final_repair_pending", {})
         claim = dataclasses.asdict(unit.claim) if unit.claim else None
         hold = (
             {
@@ -479,17 +484,34 @@ def status_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
                 or (discovery_wait if unit.state in {"pending", "ready"} else ""),
                 "handoff": scrub_json(
                     {
-                        name: unit.evidence.get("handoff", {}).get(name)
-                        for name in (
-                            "id",
-                            "phase",
-                            "role",
-                            "route_role",
-                            "native_role",
-                            "reason",
-                            "retry_at",
-                        )
-                        if name in unit.evidence.get("handoff", {})
+                        **{
+                            name: handoff[name]
+                            for name in (
+                                "id",
+                                "phase",
+                                "role",
+                                "route_role",
+                                "native_role",
+                                "reason",
+                                "retry_at",
+                            )
+                            if name in handoff
+                        },
+                        **(
+                            {
+                                "final_repair": {
+                                    "attempts": len(final_repairs),
+                                    "max_attempts": 2,
+                                    "pending": bool(pending_repair),
+                                    "audit_jobs": [
+                                        finding["audit_job"]
+                                        for finding in pending_repair.get("findings", [])
+                                    ],
+                                }
+                            }
+                            if final_repairs or pending_repair
+                            else {}
+                        ),
                     }
                 ),
                 "links": {

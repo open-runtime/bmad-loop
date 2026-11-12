@@ -606,6 +606,16 @@ retained indexes identify the actual source artifacts available for retrieval.
 Passing structural checks or a native transport probe does not establish semantic
 fidelity or authorize continuation.
 
+When a completed independent audit rejects a final summary, staged handoff can
+request up to two corrected syntheses from the same source and recorded findings.
+It retains rejected outputs and waits for any existing auditors to stop before
+replacing the active summary. Every correction needs a fresh independent audit.
+The limit follows the predecessor launch across restart, refresh and route
+changes. Audit findings cannot supply owner approval or missing source evidence;
+an unresolved result still blocks writable continuation.
+`campaign status --json` reports pending repair, the attempts used and the audit
+job IDs without exposing private source text or findings.
+
 Reducers receive exact authenticated owner spans referenced by their children,
 not only quote IDs or paraphrase previews. The coordinator verifies provenance,
 offsets and hashes, deduplicates the spans, and includes their inline bytes before
