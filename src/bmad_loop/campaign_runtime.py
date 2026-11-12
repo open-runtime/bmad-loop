@@ -16,6 +16,7 @@ import threading
 import time
 import uuid
 from collections import Counter
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -370,6 +371,7 @@ class CampaignRuntime:
             (row["profile"], row["model"]): CapacityObservation(**row["capacity"])
             for row in rows.get("observations", [])
         }
+        from .campaign_capacity import unavailable_reason
         from .campaign_scheduler import route_unavailable
 
         for identity, observation in capacities.items():
@@ -389,9 +391,12 @@ class CampaignRuntime:
                 ),
             )
             reason = route_unavailable(stamped, now=self.clock())
-            fault = snapshot.bindings.get("capacity_faults", {}).get("\0".join(identity), {})
-            if fault and (stamped.observed_at or 0) <= fault["observed_at"]:
-                reason = fault["reason"]
+            reason = (
+                unavailable_reason(
+                    snapshot, *identity, observed_at=stamped.observed_at or 0, now=self.clock()
+                )
+                or reason
+            )
             capacities[identity] = (
                 dataclasses.replace(stamped, available=False, reason=reason) if reason else stamped
             )
@@ -3646,7 +3651,33 @@ class CampaignRuntime:
             unit=unit.id,
         ):
             return Observation("confirmed", {"not_launched": True})
-        process = spawn(path, env=launch_env)
+        from .campaign_capacity import selected_fault
+        from .campaign_workers import LaunchAdmissionHeld
+        from .platform_util import file_lock
+
+        @contextmanager
+        def admission():
+            # The owned reservation is the dispatch boundary. Serialize only
+            # that boundary with persisted quota, never slow OS process startup.
+            with file_lock(self.store.root / ".state.lock"):
+                latest = self.store.load(snapshot.id)
+                reason = ""
+                for key in ("candidate", "review_candidate"):
+                    selected = request.get(key) or {}
+                    reason = selected_fault(
+                        latest,
+                        selected.get("profile", ""),
+                        selected.get("model", ""),
+                        now=self.clock(),
+                    )
+                    if reason:
+                        break
+                yield reason
+
+        try:
+            process = spawn(path, env=launch_env, admission=admission)
+        except LaunchAdmissionHeld as exc:
+            return Observation("confirmed", {"not_launched": True, "quota_wait": str(exc)})
         return Observation(
             "confirmed",
             {
@@ -5689,7 +5720,15 @@ class CampaignRuntime:
                         reason=refusal["reason"],
                     )
                     return
-                add_event(snapshot, "operator-held-launch-suppressed", unit=unit.id)
+                if data.get("quota_wait"):
+                    add_event(
+                        snapshot,
+                        "quota-held-launch-suppressed",
+                        unit=unit.id,
+                        reason=data["quota_wait"],
+                    )
+                else:
+                    add_event(snapshot, "operator-held-launch-suppressed", unit=unit.id)
                 return
             if data.get("not_launched") and data.get("remote_feedback_changed"):
                 unit.claim.quiescent = True

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from typing import Any
 
 from .campaign_headless import provider_family
@@ -25,6 +26,13 @@ _ERRORS = {
     "context_length_exceeded": "limit",
     "max_tokens": "limit",
 }
+
+AGY_QUOTA_SOURCE = "agy-native-individual-quota-v1"
+AGY_QUOTA_MAX_RESET_S = 7 * 24 * 60 * 60
+_AGY_QUOTA_RESET = re.compile(
+    r"Individual quota reached\. Please upgrade your subscription to increase your limits\. "
+    r"Resets in (0|[1-9][0-9]{0,2})h(0|[1-5]?[0-9])m(0|[1-5]?[0-9])s\."
+)
 
 
 def _grok_messages(frames, *, partial=False):
@@ -146,8 +154,22 @@ def _agy_envelopes(frames, *, partial=False):
             raise CampaignError("AGY native usage has an invalid counter")
         totals[target] = value
     error = terminal.get("error")
-    # A native free-text error is retained but never guessed into a quota code.
-    # Only a machine-classified error object may select automatic quota recovery.
+    quota = {}
+    # This exact native ERROR grammar is distinct from response/tool prose.
+    # Keep duration relative here: replaying a stream must not extend its reset.
+    if (
+        not partial
+        and initialized
+        and model
+        and status == "ERROR"
+        and terminal.get("finished_reason") == "error"
+        and isinstance(error, str)
+        and (match := _AGY_QUOTA_RESET.fullmatch(error))
+    ):
+        hours, minutes, seconds = map(int, match.groups())
+        reset_s = hours * 3600 + minutes * 60 + seconds
+        if 0 < reset_s <= AGY_QUOTA_MAX_RESET_S:
+            quota = {"quota_source": AGY_QUOTA_SOURCE, "quota_retry_after_s": reset_s}
     return [
         {"type": "system", "model": model, "session_id": session},
         {
@@ -159,9 +181,12 @@ def _agy_envelopes(frames, *, partial=False):
             "usage": totals,
             "num_turns": turns,
             "is_error": status != "SUCCESS",
-            "error": error if isinstance(error, dict) else {},
+            "error": (
+                {"code": "quota_exceeded"} if quota else error if isinstance(error, dict) else {}
+            ),
             "native_error": error if isinstance(error, str) else "",
             "native_canceled": status in {"CANCELED", "INTERRUPTED"},
+            **quota,
         },
     ]
 
@@ -246,7 +271,7 @@ def parse_output(
     served_model_aliases: tuple[str, ...] = (),
     partial: bool = False,
 ) -> dict[str, Any]:
-    """Decode native stream frames; never classify prose as provider failure."""
+    """Decode native failure envelopes; never classify model prose as failure."""
     try:
         whole = json.loads(text)
         frames = whole if isinstance(whole, list) else [whole]
@@ -303,6 +328,7 @@ def parse_output(
     outcome, reason, truncated = "completed", "", False
     failure_kind = ""
     limit_kind = ""
+    quota: dict[str, Any] = {}
     native_terminal_completed = False
     turns = 0
     for frame in frames:
@@ -424,6 +450,11 @@ def parse_output(
             outcome, reason = "canceled", "Native run was canceled or interrupted"
         elif protocol == "agy-json" and frame.get("is_error") and frame.get("native_error"):
             reason = "AGY native failure: " + frame["native_error"][:512]
+            if frame.get("quota_source") == AGY_QUOTA_SOURCE:
+                quota = {
+                    "quota_source": AGY_QUOTA_SOURCE,
+                    "quota_retry_after_s": frame["quota_retry_after_s"],
+                }
         if (
             frame.get("finish_reason") in {"length", "max_tokens"}
             or frame.get("stop_reason") == "max_tokens"
@@ -482,7 +513,7 @@ def parse_output(
     observed = models[0] if models else ""
     if (
         not partial
-        and (outcome == "completed" or failure_kind == "schema")
+        and (outcome == "completed" or failure_kind == "schema" or quota)
         and (not observed or observed not in {selected_model, *served_model_aliases})
     ):
         raise CampaignError("Native primary model is missing or differs from selected route")
@@ -494,6 +525,7 @@ def parse_output(
     if not partial and failure_kind == "schema" and not session_id:
         raise CampaignError("Native schema rejection lacks session identity")
     return {
+        **(quota if not partial and outcome == "quota" else {}),
         **({"native_confinement": native_confinement} if native_confinement is not None else {}),
         **({"native_review": native_review} if native_review is not None else {}),
         **(

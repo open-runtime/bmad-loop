@@ -269,6 +269,8 @@ class HeadlessAdapter(CodingCLIAdapter):
                 model=receipt["observed_model"],
                 cli=self.profile.name,
             )
+        from ..campaign_interruptions import quota_retry_evidence
+
         return SessionResult(
             (
                 "completed"
@@ -307,6 +309,7 @@ class HeadlessAdapter(CodingCLIAdapter):
                 "outcome": outcome,
                 "quiescent": True,
                 "input_delivery": receipt.get("input_delivery", {}),
+                **quota_retry_evidence(receipt),
             },
         )
 

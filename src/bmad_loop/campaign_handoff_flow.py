@@ -381,7 +381,7 @@ def intercept_terminal(runtime, snapshot, unit, receipt) -> bool:
         and unit.claim
         and unit.claim.quiescent
     ):
-        from .campaign_capacity import record_unavailable
+        from .campaign_capacity import quota_retry_at, record_unavailable
 
         launch = next((row for row in snapshot.outbox if row.id == unit.claim.launch_id), None)
         native_role = receipt["interruption"].get("role")
@@ -395,12 +395,23 @@ def intercept_terminal(runtime, snapshot, unit, receipt) -> bool:
             native = receipt["sessions"][-1]
             candidate = {"profile": native.get("adapter"), "model": native.get("model")}
         if candidate.get("profile") and candidate.get("model"):
+            interruption = receipt["interruption"]
+            deadline = quota_retry_at(interruption)
+            observations = unit.evidence.setdefault("quota_fault_observations", {})
+            identity = digest([candidate["profile"], candidate["model"], interruption])
+            recorded = observations.get(unit.claim.launch_id)
+            if recorded is not None and recorded["identity"] != identity:
+                raise CampaignError("Owned quota interruption changed after observation")
+            if recorded is None:
+                recorded = {"identity": identity, "observed_at": runtime.clock()}
+                observations[unit.claim.launch_id] = recorded
             record_unavailable(
                 snapshot,
                 candidate["profile"],
                 candidate["model"],
-                now=runtime.clock(),
+                now=recorded["observed_at"],
                 reason="native quota interruption",
+                quota_retry_at=deadline,
             )
     value = unit.evidence.get("handoff")
     if value and unit.claim and unit.claim.launch_id != value["predecessor"]["launch_id"]:

@@ -272,6 +272,19 @@ self-updates. They verify zero model turns and tokens, plus unchanged native
 executable and global settings. Native authentication and manager initialization
 may still occur.
 
+A native AGY individual-quota error takes precedence over positive weekly
+allowance metadata. BMAD recognizes the supported terminal error format and
+records its reset deadline in the worker receipt and campaign capacity state.
+That route waits until the reset and a new positive observation after it; restart
+or another general allowance query does not clear the wait. Eligible qualified
+fallbacks can continue within the frozen pool. Other native quota failures without
+a reset retain their newer-observation recovery behavior. Assistant or tool prose
+cannot establish a native quota failure or reset deadline.
+`campaign status --json` exposes retained native fault times and reset deadlines
+under `resources.provider_faults`, alongside provider observations. Fault records
+remain visible after recovery; their presence alone does not mean a route is
+still blocked.
+
 The built-in native observers support the shipped `grok` and `muse` launcher
 names without profile environment or argument overrides. Qualified headless
 workers use their capability recipe, so a custom profile launcher or environment

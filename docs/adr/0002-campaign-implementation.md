@@ -863,6 +863,15 @@ quota waits are resumable resource conditions, not product failures. Unknown
 usage stays unknown. Bound repair/review/rebase attempts and surface exhaustion;
 do not restart counters by creating another worker or PR.
 
+Preserve an authenticated native quota reset through the worker receipt,
+interruption and durable capacity fault. A newer general allowance observation
+cannot authorize that route before its reset, including after coordinator restart
+or while a reasoning launch is already prepared. Require fresh capacity after
+the reset; keep eligible alternatives and unrelated units admissible. Without a
+native reset, retain the existing newer-observation recovery behavior. Native
+AGY error decoding and timestamp anchoring follow ADR 0003; model prose cannot
+supply quota evidence.
+
 Reasoning jobs consume the same global session budget as unit workers. Persist
 their claims before computing ordinary-worker proposals and recheck capacity
 when preparing every never-sent launch. A last-slot race defers the action
