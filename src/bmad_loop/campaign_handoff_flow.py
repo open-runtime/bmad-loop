@@ -49,6 +49,7 @@ EXPECTED_PHASE = {
     "handoff-replan": "summarize",
     "handoff-audit-plan": "summarize",
     "handoff-audit-replan": "audit",
+    "handoff-final-repair": "audit",
     "handoff-assemble": "audit",
     "handoff-release": "assemble",
     "handoff-constraint-audit": "constraint_reduce",
@@ -710,6 +711,14 @@ def proposals(runtime, snapshot):
             if not live_jobs and not _pending(snapshot, unit, "handoff-refresh"):
                 result.append(Proposal("handoff-refresh", unit.id, {"handoff_id": value["id"]}))
             continue
+        if phase == "audit" and value.get("final_repair_pending"):
+            # Observe issued siblings to quiescence; never ask the same audit
+            # again whether its unchanged rejected final should now pass.
+            if not live_jobs and not _pending(snapshot, unit, "handoff-final-repair"):
+                result.append(
+                    Proposal("handoff-final-repair", unit.id, {"handoff_id": value["id"]})
+                )
+            continue
         if not live_jobs:
             exhausted = [
                 key
@@ -1340,10 +1349,12 @@ def _reduce(runtime, snapshot, unit, value):
     from .campaign_summary import (
         FINAL_PROMPT_VERSION,
         SummaryJobSpec,
+        owner_quote_references,
         plan_reduction,
         summary_prompt,
         summary_schema,
     )
+    from .campaign_summary_quotes import resolve_owner_quotes
     from .campaign_summary_routes import enabled
 
     if any(_job(runtime, snapshot, key)["state"] != "applied" for key in value["jobs"]):
@@ -1408,6 +1419,12 @@ def _reduce(runtime, snapshot, unit, value):
                 "retained_jobs": list(value["jobs"]),
             }
         }
+    # Resolve once for this frontier, before either the final-fit decision or
+    # intermediate partitioning. Every candidate group pays for its exact spans.
+    owner_quotes = resolve_owner_quotes(
+        tuple(HistorySnapshot(**row) for row in value["capture"]["sources"]),
+        owner_quote_references([result for _, result in children]),
+    )
     stage = "intermediate"
     if staged:
         candidate, cap = _summary_route(
@@ -1419,6 +1436,7 @@ def _reduce(runtime, snapshot, unit, value):
             _root(runtime, snapshot, value) / "reductions",
             artifact_bytes=0,
             project_native_events=True,
+            owner_quotes=owner_quotes,
         )
         if len(final_plan) == 1:
             stage = "final"
@@ -1436,6 +1454,7 @@ def _reduce(runtime, snapshot, unit, value):
         _root(runtime, snapshot, value) / "reductions",
         artifact_bytes=artifact_limit,
         project_native_events=True,
+        owner_quotes=owner_quotes,
     )
     jobs = []
     for planned_spec in planned:
@@ -1553,7 +1572,8 @@ def _summary_replan(runtime, snapshot, unit, value):
                 snapshot,
                 "summarization",
                 value,
-                min_payload=planned.input_tokens,
+                min_payload=planned.input_tokens
+                + sum(source["tokens"] for source in row["request"]["inputs"][1:]),
                 purpose="handoff_final" if stage == "final" else "handoff_reduce",
                 stage=stage,
             )
@@ -1578,6 +1598,11 @@ def _summary_replan(runtime, snapshot, unit, value):
                 "summary_spec": dataclasses.asdict(spec),
                 "history_snapshots": value["capture"]["sources"],
                 "reduction_failure_keys": _reduction_failure_keys(runtime, snapshot, spec),
+                **(
+                    {"final_repair": row["request"]["coordinates"]["final_repair"]}
+                    if "final_repair" in row["request"]["coordinates"]
+                    else {}
+                ),
             }
             requests.append(
                 dataclasses.asdict(
@@ -1593,6 +1618,7 @@ def _summary_replan(runtime, snapshot, unit, value):
                                 "sha256": spec.input_sha256,
                                 "tokens": spec.input_tokens,
                             },
+                            *tuple(row["request"]["inputs"][1:]),
                         ),
                         summary_prompt(spec),
                         summary_schema(spec),
@@ -1612,6 +1638,14 @@ def _summary_replan(runtime, snapshot, unit, value):
                     )
                 )
             )
+            from .campaign_headless import render_input
+
+            try:
+                render_input(request_from_dict(requests[-1]), cap)
+            except CampaignError as exc:
+                raise HandoffRouteWait(
+                    "Complete replanned summary evidence cannot fit: " + str(exc)
+                ) from exc
     return {
         "requests": requests,
         "reuse_jobs": reuse,
@@ -1843,10 +1877,6 @@ def apply_audit(runtime, snapshot, row):
             or set(result[key]) != set(expected)
         ):
             raise CampaignError("Handoff audit omitted or invented required coverage")
-    if result.get("ambiguities"):
-        raise CampaignError(
-            "Handoff still has unresolved current constraints: " + "; ".join(result["ambiguities"])
-        )
     events = {
         event.id: event
         for source in coordinates["history_snapshots"]
@@ -1859,11 +1889,271 @@ def apply_audit(runtime, snapshot, row):
         raise CampaignError(
             "Missing native history must be recovered before automatic writer continuation"
         )
+    if result.get("ambiguities"):
+        _record_final_rejection(runtime, snapshot, unit, value, row, result)
+        raise CampaignError(
+            "Handoff still has unresolved current constraints: " + "; ".join(result["ambiguities"])
+        )
     data = encoded({**result, "authority": "context-only", "validated": True})
     path = blob(_root(runtime, snapshot, value) / "audited-constraints", data)
     row["applied_result"] = {
         "artifact_path": str(path),
         "artifact_sha256": hashlib.sha256(data).hexdigest(),
+    }
+
+
+def _repair_sources(value):
+    """A bounded rewrite cannot repair missing/corrupt original evidence."""
+    from .campaign_transcripts import stream_hash
+
+    if value["capture"].get("gaps"):
+        raise CampaignError("Missing original history cannot be repaired by summary synthesis")
+    histories = tuple(HistorySnapshot(**raw) for raw in value["capture"]["sources"])
+    for history in histories:
+        if stream_hash(Path(history.raw_path)) != history.raw_sha256:
+            raise CampaignError("Final repair original native history changed")
+        load_events(history)
+    return histories
+
+
+def _record_final_rejection(runtime, snapshot, unit, value, row, normalized):
+    """Preserve a validated ambiguity; this never classifies it as resolvable."""
+    from .campaign_summary_routes import enabled
+
+    coordinates = row["request"]["coordinates"]
+    frontier = value.get("jobs", [])
+    if not enabled(snapshot.spec) or not coordinates.get("final_frontier"):
+        return  # Legacy audit behavior remains unchanged.
+    if (
+        value.get("phase") != "audit"
+        or coordinates["final_frontier"] != frontier
+        or len(frontier) != 1
+        or row["id"] not in value.get("audits", [])
+        or coordinates.get("plan_epoch", 0) != value.get("plan_epoch", 0)
+        or value["capture"].get("audit_context") != _audit_context(snapshot, unit)
+    ):
+        raise CampaignError("Rejected final audit no longer binds the current frontier")
+    final = _job(runtime, snapshot, frontier[0])
+    if (
+        final["state"] != "applied"
+        or final["request"]["coordinates"].get("summary_stage") != "final"
+    ):
+        raise CampaignError("Final repair requires an applied final synthesis")
+    claim, receipt = row.get("claim") or {}, row.get("receipt") or {}
+    expected = {
+        "job_id": row["id"],
+        "launch_id": claim.get("launch_id"),
+        "generation": claim.get("generation"),
+        "request_digest": row["request_digest"],
+        "outcome": "completed",
+        "quiescent": True,
+        "input_complete": True,
+        "processes_quiescent": True,
+    }
+    if (
+        not claim.get("launch_id")
+        or claim.get("quiescent") is not True
+        or any(receipt.get(key) != val for key, val in expected.items())
+        or receipt.get("result") != row["result"]
+        or not unit.claim
+        or not unit.claim.quiescent
+    ):
+        raise CampaignError("Final repair requires exact quiescent native audit and predecessor")
+    # This immutable finding is context only. Full archive authentication runs
+    # in the repair effect, outside the coordinator's result-application path.
+    data = encoded(
+        {
+            "request": row["request"],
+            "receipt": receipt,
+            "result": row["result"],
+            "normalized": normalized,
+            "authority": "context-only; unresolved, not permission",
+        }
+    )
+    path = blob(_root(runtime, snapshot, value) / "final-rejections", data)
+    record = {
+        "audit_job": row["id"],
+        "artifact_path": str(path),
+        "artifact_sha256": hashlib.sha256(data).hexdigest(),
+        "request_digest": row["request_digest"],
+        "receipt_digest": digest(receipt),
+    }
+    pending = value.setdefault(
+        "final_repair_pending",
+        {
+            "frontier": list(frontier),
+            "capture_digest": value["capture"]["capture_digest"],
+            "findings": [],
+        },
+    )
+    if (
+        pending["frontier"] != frontier
+        or pending["capture_digest"] != value["capture"]["capture_digest"]
+    ):
+        raise CampaignError("Final rejection belongs to a different repair frontier")
+    prior = next((item for item in pending["findings"] if item["audit_job"] == row["id"]), None)
+    if prior is not None and prior != record:
+        raise CampaignError("Final audit already has different immutable rejection evidence")
+    if prior is None:
+        pending["findings"].append(record)
+        add_event(
+            snapshot,
+            "handoff-final-rejected",
+            unit=unit.id,
+            handoff_id=value["id"],
+            final_job=frontier[0],
+            audit_job=row["id"],
+            evidence=record,
+        )
+
+
+def _final_repair(runtime, snapshot, unit, value):
+    """Create a contextual correction, with a lifetime cap and fresh audit debt."""
+    from .campaign_headless import render_input
+    from .campaign_summary import (
+        SummaryJobSpec,
+        corrective_spec,
+        load_input,
+        owner_quote_references,
+        summary_prompt,
+        summary_schema,
+    )
+    from .campaign_summary_quotes import resolve_owner_quotes
+
+    pending = value.get("final_repair_pending")
+    if (
+        not pending
+        or pending["frontier"] != value["jobs"]
+        or pending["capture_digest"] != value["capture"]["capture_digest"]
+    ):
+        raise CampaignError("Final repair lost its exact rejected frontier")
+    if any(
+        row.get("claim") and not row["claim"].get("quiescent")
+        for row in snapshot.jobs.values()
+        if row["request"].get("coordinates", {}).get("handoff_id") == value["id"]
+    ):
+        raise CampaignError("Final repair awaits all prior audit and summary actors")
+    histories = _repair_sources(value)
+    lifetime_key = value["predecessor"]["launch_id"]
+    history = unit.evidence.get("handoff_final_repairs", {}).get(lifetime_key, [])
+    if len(history) >= 2:
+        return {"final_repair_exhausted": True, "final_repair_pending_digest": digest(pending)}
+    previous = _job(runtime, snapshot, pending["frontier"][0])
+    if (
+        previous["state"] != "applied"
+        or previous["request"]["coordinates"].get("summary_stage") != "final"
+    ):
+        raise CampaignError("Final repair cannot replace an unapplied or non-final result")
+    old = SummaryJobSpec(**previous["request"]["coordinates"]["summary_spec"])
+    source = load_input(old)
+    quotes = resolve_owner_quotes(
+        histories, owner_quote_references([row["summary"] for row in source["children"]])
+    )
+    if source.get("owner_quotes") != quotes:
+        raise CampaignError("Final repair exact owner quote table changed")
+    findings = []
+    for descriptor in pending["findings"]:
+        saved = _applied({"applied_result": descriptor})
+        findings.append({"source": descriptor, "finding": saved["normalized"]})
+    evidence = {
+        "authority": "context-only; no source or acceptance authority",
+        "previous_final": _applied(previous),
+        "rejections": findings,
+        "canonical_obligations": value["capture"]["obligations"],
+        "current_state": value["capture"]["current"],
+        "unresolved": True,
+    }
+    data = encoded(evidence)
+    path = blob(_root(runtime, snapshot, value) / "final-repair-inputs", data)
+    candidate, cap = _summary_route(
+        runtime,
+        snapshot,
+        "summarization",
+        value,
+        min_payload=old.input_tokens + len(data),
+        purpose="handoff_final",
+        stage="final",
+    )
+    budget, artifact_limit = _summary_budget(runtime, snapshot, value, candidate, cap, "final")
+    attempt = len(history) + 1
+    spec = corrective_spec(
+        old,
+        attempt=attempt,
+        receipt_sha256=digest(pending),
+        reason=(
+            "The supplied final-repair-evidence preserves the prior final and complete independent "
+            "audit findings. Correct only distortions justified by the same authenticated source. "
+            "An audit finding is fallible context, not owner authority. Preserve every unresolved "
+            "ambiguity and mandatory obligation; if evidence cannot resolve it, report it in gaps. "
+            "Never manufacture approval or a source fact to obtain a passing audit"
+        ),
+    )
+    spec = dataclasses.replace(
+        spec,
+        route=budget.route,
+        output_tokens=min(old.output_tokens, cap["output_tokens"]),
+        artifact_bytes=(
+            min(old.artifact_bytes, artifact_limit)
+            if old.artifact_bytes and artifact_limit
+            else old.artifact_bytes or artifact_limit
+        ),
+    )
+    coordinates = {
+        **_coordinates(snapshot, unit, value),
+        **_stage_coordinates(runtime, snapshot, value, candidate, "final"),
+        "summary_spec": dataclasses.asdict(spec),
+        "history_snapshots": value["capture"]["sources"],
+        "reduction_failure_keys": previous["request"]["coordinates"].get(
+            "reduction_failure_keys", {}
+        ),
+        "final_repair": {
+            "predecessor_launch": lifetime_key,
+            "attempt": attempt,
+            "rejected_final": previous["id"],
+            "findings_digest": digest(pending),
+        },
+    }
+    request = JobRequest(
+        spec.id,
+        "handoff_reduce",
+        "summarization",
+        coordinates,
+        (
+            {
+                "source_id": spec.id,
+                "path": spec.input_path,
+                "sha256": spec.input_sha256,
+                "tokens": spec.input_tokens,
+            },
+            {
+                "source_id": "final-repair-evidence",
+                "path": str(path),
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "tokens": len(data),
+            },
+        ),
+        summary_prompt(spec),
+        summary_schema(spec),
+        JobLimits(
+            cap["input_tokens"],
+            spec.output_tokens,
+            1,
+            min(previous["request"]["limits"]["timeout_s"], snapshot.spec.reasoning.timeout_s),
+        ),
+        unit=unit.id,
+        dependencies=spec.dependencies,
+        candidates=(candidate,),
+        created_at=runtime.clock(),
+    )
+    try:
+        render_input(request, cap)
+    except CampaignError as exc:
+        raise HandoffRouteWait("Complete final repair evidence cannot fit: " + str(exc)) from exc
+    return {
+        "final_repair": dataclasses.asdict(request),
+        "final_repair_pending_digest": digest(pending),
+        "final_repair_lifetime_key": lifetime_key,
+        "final_repair_attempt": attempt,
     }
 
 
@@ -2505,6 +2795,8 @@ def _perform(runtime, snapshot, action, *, reconcile=False):
         ):
             return Observation("unknown", reason="Prior reasoning attempts still draining")
         data = _capture(runtime, snapshot, unit, value)
+    elif action.kind == "handoff-final-repair":
+        data = _final_repair(runtime, snapshot, unit, value)
     elif action.kind == "handoff-failed":
         data = {"exhausted_jobs": action.payload["jobs"]}
     elif action.kind in {"handoff-replan", "handoff-audit-replan", "handoff-contract-replan"}:
@@ -2647,6 +2939,10 @@ def apply(runtime, snapshot, action, observation):
             and value["phase"] not in {"drain", "capture"}
             and _obsolete_summaries(runtime, snapshot, value)
         )
+        or (
+            data.get("final_repair_pending_digest") is not None
+            and data["final_repair_pending_digest"] != digest(value.get("final_repair_pending"))
+        )
         or data.get("retry_from_epoch", value.get("plan_epoch", 0)) != value.get("plan_epoch", 0)
         or data.get("effect_phase", value["phase"]) != value["phase"]
         or data.get("effect_context", _audit_context(snapshot, unit))
@@ -2687,7 +2983,60 @@ def apply(runtime, snapshot, action, observation):
         add_event(snapshot, "handoff-capacity-wait", unit=unit.id, reason=data["wait_reason"])
         return
     value.pop("retry_at", None)
-    if data.get("exhausted_jobs"):
+    if data.get("final_repair_exhausted"):
+        value["phase"] = "failed"
+        unit.hold.reason = (
+            "Final synthesis remains unresolved after two lifetime semantic corrections"
+        )
+    elif data.get("final_repair"):
+        if unit.claim and not unit.claim.quiescent or _debt(snapshot, unit):
+            raise CampaignError("Cannot apply final repair while original writes are uncertain")
+        if any(
+            row.get("claim") and not row["claim"].get("quiescent")
+            for row in snapshot.jobs.values()
+            if row["request"].get("coordinates", {}).get("handoff_id") == value["id"]
+        ):
+            raise CampaignError("Cannot replace a final while an audit or summary actor is live")
+        ledger = unit.evidence.setdefault("handoff_final_repairs", {}).setdefault(
+            data["final_repair_lifetime_key"], []
+        )
+        if data["final_repair_attempt"] != len(ledger) + 1 or len(ledger) >= 2:
+            raise CampaignError("Final repair lifetime budget changed")
+        request = request_from_dict(data["final_repair"])
+        _prepare_with_failures(snapshot, request, value)
+        ledger.append(
+            {
+                "attempt": data["final_repair_attempt"],
+                "job_id": request.id,
+                "capture_digest": value["capture"]["capture_digest"],
+                "findings": value["final_repair_pending"],
+                "config_revision": snapshot.config_revision,
+            }
+        )
+        value.setdefault("audit_history", []).append(
+            {"frontier": list(value["jobs"]), "audits": list(value["audits"])}
+        )
+        for key in value["audits"]:
+            row = snapshot.jobs.get(key)
+            if row is not None and row["state"] not in {"applied", "failed"}:
+                row["state"] = "canceled"
+        value["jobs"], value["audits"], value["phase"] = [request.id], [], "summarize"
+        value["all_jobs"] = list(dict.fromkeys([*value.get("all_jobs", []), request.id]))
+        value["summary_contracts"] = {
+            request.id: request.coordinates["summary_spec"]["prompt_version"]
+        }
+        value.pop("final_repair_pending", None)
+        value.pop("packet", None)
+        unit.bindings.pop("handoff_ready", None)
+        add_event(
+            snapshot,
+            "handoff-final-repair-planned",
+            unit=unit.id,
+            job_id=request.id,
+            attempt=data["final_repair_attempt"],
+            predecessor=data["final_repair_lifetime_key"],
+        )
+    elif data.get("exhausted_jobs"):
         value["phase"] = "failed"
         value["exhausted_jobs"] = data["exhausted_jobs"]
         unit.hold.reason = (
@@ -2775,6 +3124,10 @@ def apply(runtime, snapshot, action, observation):
                 unit.bindings.pop("handoff_ready", None)
     elif action.kind in {"handoff-capture", "handoff-refresh"}:
         if action.kind == "handoff-refresh":
+            if value.get("final_repair_pending"):
+                value.setdefault("invalidated_final_rejections", []).append(
+                    value.pop("final_repair_pending")
+                )
             value["plan_epoch"] = value.get("plan_epoch", 0) + 1
             for key in [
                 *value["audits"],
@@ -3091,7 +3444,11 @@ def job_launch_allowed(snapshot, row):
         return True
     unit = snapshot.units.get(row["request"]["unit"])
     value = unit.evidence.get("handoff", {}) if unit else {}
-    if value.get("id") != coordinates["handoff_id"] or _requires_replan(row):
+    if (
+        value.get("id") != coordinates["handoff_id"]
+        or _requires_replan(row)
+        or value.get("final_repair_pending")
+    ):
         return False
     if value.get("capture", {}).get("audit_context") != _audit_context(snapshot, unit):
         return False

@@ -594,6 +594,37 @@ audit family without consuming a live session slot. That family cannot author
 the summary it audits. All contributing families remain recorded across retries;
 lost independence produces a visible wait, never a lower-quality implicit route.
 
+Intermediate and final summaries must preserve the source's action order and
+authority. A completion condition is not a prerequisite for starting that action;
+pending review remains work to perform, not an instruction to leave it undone.
+Summaries cannot invent owner-approval requirements or exceptions to prohibitions.
+Child summaries can contain unsupported inferences despite valid citations, so
+independent audits compare the final synthesis with exact owner history and
+canonical obligations. Unresolved audit findings block writable continuation.
+Historical uncertainty remains separate from current worktree and PR bindings;
+retained indexes identify the actual source artifacts available for retrieval.
+Passing structural checks or a native transport probe does not establish semantic
+fidelity or authorize continuation.
+
+When a completed independent audit rejects a final summary, staged handoff can
+request up to two corrected syntheses from the same source and recorded findings.
+It retains rejected outputs and waits for any existing auditors to stop before
+replacing the active summary. Every correction needs a fresh independent audit.
+The limit follows the predecessor launch across restart, refresh and route
+changes. Audit findings cannot supply owner approval or missing source evidence;
+an unresolved result still blocks writable continuation.
+`campaign status --json` reports pending repair, the attempts used and the audit
+job IDs without exposing private source text or findings.
+
+Reducers receive exact authenticated owner spans referenced by their children,
+not only quote IDs or paraphrase previews. The coordinator verifies provenance,
+offsets and hashes, deduplicates the spans, and includes their inline bytes before
+budgeting and partitioning. Missing or inconsistent source evidence stops
+preparation; exact quotes grant no additional authority. Leaf extraction and its
+result schema remain unchanged. Intermediate `history-reduce-v7` and final
+`history-final-v3` require fresh purpose-bound semantic proof; earlier receipts
+remain historical evidence under their original contracts.
+
 `reasoning.history_max_bytes` bounds each captured source stream (512 MiB by
 default, at most 1 GiB). It is frozen independently of per-model input and output
 limits. Large history is sealed and parsed incrementally, then partitioned into

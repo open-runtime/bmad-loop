@@ -273,6 +273,39 @@ def test_status_and_list_are_observer_projections_without_private_config(runtime
     assert calls == []
 
 
+@pytest.mark.parametrize("pending, attempts", [(True, 0), (False, 2)])
+def test_status_exposes_current_final_repair_without_private_findings(
+    runtime, capsys, pending, attempts
+):
+    store, snapshot, calls = runtime
+    unit = snapshot.units["s:e:u"]
+    unit.evidence["handoff"] = {
+        "id": "handoff-current",
+        "phase": "audit" if pending else "failed",
+        "predecessor": {"launch_id": "current-launch"},
+    }
+    unit.evidence["handoff_final_repairs"] = {
+        "older-launch": [{"private": "private-old-finding"}],
+        "current-launch": [{"private": "private-repair-finding"}] * attempts,
+    }
+    if pending:
+        unit.evidence["handoff"]["final_repair_pending"] = {
+            "findings": [{"audit_job": "audit-rejected", "artifact_path": "private-findings"}]
+        }
+    snapshot = store.save(snapshot, snapshot.revision)
+    assert cli.main(["campaign", "status", snapshot.id, "--json"]) == 0
+    raw = capsys.readouterr().out
+    repair = json.loads(raw)["campaign"]["units"][0]["handoff"]["final_repair"]
+    assert repair == {
+        "attempts": attempts,
+        "max_attempts": 2,
+        "pending": pending,
+        "audit_jobs": ["audit-rejected"] if pending else [],
+    }
+    assert "private" not in raw and "older-launch" not in raw
+    assert calls == [] and store.load(snapshot.id).revision == snapshot.revision
+
+
 def test_history_reads_saved_events_without_starting_runtime(runtime, capsys):
     from bmad_loop.campaign_store import add_event
 

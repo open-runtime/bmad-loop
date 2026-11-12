@@ -63,6 +63,11 @@ def _launch_guard(runtime, snapshot, row, action, path):
         if current(latest, request)
         else "reasoning request is no longer current"
     )
+    if not reason and request.coordinates.get("handoff_id"):
+        from .campaign_handoff_flow import job_launch_allowed
+
+        if not job_launch_allowed(latest, current_row):
+            reason = "handoff no longer admits this reasoning frontier"
     if not reason and request.coordinates.get("history_warmup"):
         from .campaign_history_warmup import launch_allowed
 

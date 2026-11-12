@@ -7,6 +7,12 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserve source-supported action timing and authority in intermediate and final handoff summaries.
+- Supply authenticated owner quote spans inline before sizing and partitioning handoff reductions.
+- Correct rejected final handoff summaries within a durable two-attempt budget and require fresh independent audits.
+
 ## [0.16.0] — 2026-11-11
 
 ### Added

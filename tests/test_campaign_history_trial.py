@@ -333,7 +333,7 @@ def test_historical_schema_failure_reparse_is_bound_and_never_successful(tmp_pat
 def test_legacy_reducer_has_one_presentation_revision_without_resetting_attempts(
     tmp_path, prepared, revision_passes
 ):
-    from test_campaign_handoff_context import budget, result
+    from test_campaign_handoff_context import budget, quotes, result
 
     from bmad_loop.campaign_history_trial import _one, trial_request
     from bmad_loop.campaign_summary import plan_maps, plan_reduction, validate_summary
@@ -344,7 +344,12 @@ def test_legacy_reducer_has_one_presentation_revision_without_resetting_attempts
     events = load_events(snapshot)
     mapped = plan_maps(events, budget(), tmp_path / "map-inputs")[0]
     child = validate_summary(mapped, result(mapped, events), events)
-    job = plan_reduction(((mapped, child),), budget(), tmp_path / "reduce-inputs")[0]
+    job = plan_reduction(
+        ((mapped, child),),
+        budget(),
+        tmp_path / "reduce-inputs",
+        owner_quotes=quotes(snapshot, child),
+    )[0]
     script = tmp_path / "reducer-native.py"
     script.write_text("""import json,sys
 source=next(json.loads(line) for line in sys.stdin.read().splitlines() if line.startswith('{"source_id":'))
@@ -433,7 +438,9 @@ def test_new_trial_retains_old_maps_without_reusing_obsolete_prompt_coverage(
     with monkeypatch.context() as prior:
         prior.setattr(summary, "EXTRACT_PROMPT_VERSION", "history-extract-v2")
         prior.setattr(trial, "EXTRACT_PROMPT_VERSION", "history-extract-v2")
-        defaults = list(summary.SummaryJobSpec.__init__.__defaults__)
+        existing_defaults = summary.SummaryJobSpec.__init__.__defaults__
+        assert existing_defaults is not None
+        defaults = list(existing_defaults)
         defaults[2] = "history-extract-v2"
         prior.setattr(summary.SummaryJobSpec.__init__, "__defaults__", tuple(defaults))
         assert run_trial(snapshots, capability, first, runner=runner, timeout_s=20)["ok"]
@@ -475,12 +482,12 @@ def test_fresh_trial_projects_whole_children_before_production_admission(tmp_pat
         "reserved_tokens": 65536,
         "qualification": {"sha256": "proof"},
     }
-    jobs = _plan_reducers(children, cap, tmp_path / "v2", "adaptive-render-v2")
+    jobs = _plan_reducers(children, cap, tmp_path / "v2", "adaptive-render-v2", ())
     assert len(jobs) == 2
     assert {key for job in jobs for key in job.primary_ids} == {job.id for job, _ in children}
     assert all(job.input_tokens <= 33447 for job in jobs)
     assert all(load_input(job)["citation_presentation"] == "native-events-v1" for job in jobs)
-    legacy = _plan_reducers(children, cap, tmp_path / "v1", "adaptive-render-v1")
+    legacy = _plan_reducers(children, cap, tmp_path / "v1", "adaptive-render-v1", ())
     assert len(legacy) == 1 and "citation_presentation" not in load_input(legacy[0])
 
 

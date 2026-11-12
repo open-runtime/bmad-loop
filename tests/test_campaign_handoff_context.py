@@ -17,6 +17,7 @@ from bmad_loop.campaign_summary import (
     ContextBudget,
     SummaryCache,
     load_input,
+    owner_quote_references,
     plan_maps,
     plan_reduction,
     plan_remaining_maps,
@@ -24,6 +25,7 @@ from bmad_loop.campaign_summary import (
     validate_summary,
     window_count,
 )
+from bmad_loop.campaign_summary_quotes import resolve_owner_quotes
 from bmad_loop.campaign_transcripts import (
     encoded,
     load_events,
@@ -113,6 +115,10 @@ def result(job, events):
             }
         ],
     }
+
+
+def quotes(snapshot, *summaries):
+    return resolve_owner_quotes((snapshot,), owner_quote_references(list(summaries)))
 
 
 def test_native_output_measurement_overrides_conservative_bytes_only_with_receipt(tmp_path):
@@ -341,7 +347,12 @@ def test_reducers_retain_child_dependencies_and_citations(tmp_path):
     events = load_events(snapshot)
     maps = plan_maps(events, budget(), tmp_path / "jobs")
     children = tuple((job, validate_summary(job, result(job, events), events)) for job in maps)
-    reducers = plan_reduction(children, budget(), tmp_path / "reducers")
+    reducers = plan_reduction(
+        children,
+        budget(),
+        tmp_path / "reducers",
+        owner_quotes=quotes(snapshot, *(value for _, value in children)),
+    )
     assert set(dep for job in reducers for dep in job.dependencies) == {job.id for job in maps}
     for job in reducers:
         assert job.purpose == "handoff-reduce"
@@ -357,7 +368,11 @@ def test_reduction_native_reasoning_budget_is_separate_from_artifact_bytes(tmp_p
     validated = validate_summary(child, result(child, events), events)
     native_budget = replace(budget(), context_tokens=100000, output_tokens=16384)
     reducer = plan_reduction(
-        ((child, validated),), native_budget, tmp_path / "reducers", artifact_bytes=4164
+        ((child, validated),),
+        native_budget,
+        tmp_path / "reducers",
+        artifact_bytes=4164,
+        owner_quotes=quotes(snapshot, validated),
     )[0]
     prompt = summary_prompt(reducer)
     assert "16384 tokens, including any reasoning" in prompt
@@ -383,7 +398,9 @@ def test_reducer_presentation_keeps_native_sources_without_competing_fact_ids(tm
     events = load_events(snapshot)
     job = plan_maps(events, budget(), tmp_path / "maps")[0]
     child = validate_summary(job, result(job, events), events)
-    original = plan_reduction(((job, child),), budget(), tmp_path / "reducers")[0]
+    original = plan_reduction(
+        ((job, child),), budget(), tmp_path / "reducers", owner_quotes=quotes(snapshot, child)
+    )[0]
     original_bytes = Path(original.input_path).read_bytes()
     projected = project_reduction_input(original, tmp_path / "projected")
     payload = load_input(projected)
@@ -485,7 +502,9 @@ def test_packet_retains_complete_summary_tree_but_inlines_only_final_nodes(tmp_p
     events = load_events(snapshot)
     child = plan_maps(events, budget(), tmp_path / "maps")[0]
     detail = validate_summary(child, result(child, events), events)
-    reducer = plan_reduction(((child, detail),), budget(), tmp_path / "reduce")[0]
+    reducer = plan_reduction(
+        ((child, detail),), budget(), tmp_path / "reduce", owner_quotes=quotes(snapshot, detail)
+    )[0]
     final_result = result(reducer, events)
     final_summary = validate_summary(reducer, final_result, events)
     packet = assemble_packet(

@@ -20,8 +20,8 @@ from .platform_util import atomic_write_text, is_link_like
 
 TokenCounter = Callable[[str], int]
 EXTRACT_PROMPT_VERSION = "history-extract-v3"
-REDUCE_PROMPT_VERSION = "history-reduce-v5"
-FINAL_PROMPT_VERSION = "history-final-v1"
+REDUCE_PROMPT_VERSION = "history-reduce-v7"
+FINAL_PROMPT_VERSION = "history-final-v3"
 
 
 class SummaryResultRejected(CampaignError):
@@ -342,17 +342,65 @@ def quote_catalog(job: SummaryJobSpec) -> dict[str, dict[str, Any]]:
                     "preview": text[:80],
                 }
             offset += len(line)
-    for child in payload.get("children", []):
-        for fact in child["summary"].get("facts", []):
-            proof = fact.get("source_quote_ref")
-            if isinstance(proof, dict) and proof.get("id"):
-                value = {**proof, "preview": fact.get("text", "")[:80]}
-                if proof["id"] in result and any(
-                    result[proof["id"]].get(key) != proof.get(key)
-                    for key in ("event_id", "start", "end", "sha256")
-                ):
-                    raise CampaignError("summary quote identity is ambiguous")
-                result[proof["id"]] = value
+    if "children" in payload:
+        for identity, quote in _reduction_quotes(
+            [child["summary"] for child in payload["children"]], payload.get("owner_quotes")
+        ).items():
+            result[identity] = {
+                **{key: value for key, value in quote.items() if key != "text"},
+                "preview": quote["text"][:80],
+            }
+    return result
+
+
+def owner_quote_references(summaries: list[dict[str, Any]]) -> tuple[dict[str, Any], ...]:
+    """Collect existing validated quote coordinates without accepting paraphrase as source."""
+    result = []
+    for summary in summaries:
+        for fact in summary["facts"]:
+            reference = fact.get("source_quote_ref")
+            if reference is None:
+                if fact.get("source_quote_id") or fact.get("kind") == "owner_request":
+                    raise CampaignError("reducer child lacks its validated owner quote reference")
+                continue
+            if (
+                not isinstance(reference, dict)
+                or set(reference) != {"id", "event_id", "start", "end", "sha256"}
+                or not isinstance(reference["id"], str)
+                or not reference["id"]
+                or reference["event_id"] not in fact["citations"]
+                or fact.get("source_quote_id") not in (None, "", reference["id"])
+            ):
+                raise CampaignError("reducer child has an invalid owner quote reference")
+            result.append(reference)
+    return tuple(result)
+
+
+def _reduction_quotes(
+    summaries: list[dict[str, Any]], table: dict[str, dict[str, Any]] | None
+) -> dict[str, dict[str, Any]]:
+    """Select the exact authenticated spans needed by a whole-child candidate group."""
+    if table is not None and not isinstance(table, dict):
+        raise CampaignError("reducer owner quote table is malformed")
+    result = {}
+    for reference in owner_quote_references(summaries):
+        quote = (table or {}).get(reference["id"])
+        if not isinstance(quote, dict) or set(quote) != {*reference, "text"}:
+            raise CampaignError("reducer input lacks its authenticated owner quote text")
+        text = quote["text"]
+        start, end = reference["start"], reference["end"]
+        if (
+            any(quote[key] != value for key, value in reference.items())
+            or type(start) is not int
+            or type(end) is not int
+            or not isinstance(text, str)
+            or not 0 <= start < end
+            or not 0 < len(text) == end - start <= 512
+            or reference["id"] != digest([reference["event_id"], start, end])
+            or hashlib.sha256(text.encode()).hexdigest() != reference["sha256"]
+        ):
+            raise CampaignError("reducer owner quote differs from its authenticated reference")
+        result[reference["id"]] = dict(quote)
     return result
 
 
@@ -575,6 +623,7 @@ def plan_reduction(
     count: TokenCounter = byte_token_bound,
     artifact_bytes: int = 0,
     project_native_events: bool = False,
+    owner_quotes: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[SummaryJobSpec, ...]:
     """Partition whole children using exactly the representation the model receives."""
     jobs, batch = [], []
@@ -585,6 +634,7 @@ def plan_reduction(
         payload = {
             "schema_version": 1,
             "children": [{"job_id": job.id, "summary": result} for job, result in items],
+            "owner_quotes": _reduction_quotes([result for _, result in items], owner_quotes),
         }
         data = encoded(payload)
         sha256 = hashlib.sha256(data).hexdigest()
@@ -752,6 +802,9 @@ def _native_reduction_payload(job: SummaryJobSpec, payload: dict[str, Any]) -> d
         "schema_version": 1,
         "citation_presentation": "native-events-v1",
         "source_input": {"path": job.input_path, "sha256": job.input_sha256, "job_id": job.id},
+        "owner_quotes": _reduction_quotes(
+            [child["summary"] for child in payload["children"]], payload.get("owner_quotes")
+        ),
         "children": [
             {
                 "job_id": child["job_id"],
@@ -776,6 +829,9 @@ def project_reduction_input(
     if job.purpose != "handoff-reduce":
         raise CampaignError("Citation presentation applies only to reducer inputs")
     if payload.get("citation_presentation") == "native-events-v1":
+        _reduction_quotes(
+            [child["summary"] for child in payload["children"]], payload.get("owner_quotes")
+        )
         return job
     value = _native_reduction_payload(job, payload)
     content = encoded(value)
@@ -853,7 +909,13 @@ def split_reduction_input(job: SummaryJobSpec, artifact_root: Path) -> tuple[Sum
     result = []
     middle = len(children) // 2
     for group in (children[:middle], children[middle:]):
-        value = {**payload, "children": group}
+        value = {
+            **payload,
+            "children": group,
+            "owner_quotes": _reduction_quotes(
+                [child["summary"] for child in group], payload.get("owner_quotes")
+            ),
+        }
         content = encoded(value)
         path = blob(artifact_root, content)
         identifiers = tuple(child["job_id"] for child in group)
@@ -962,6 +1024,40 @@ def summary_schema_template() -> dict[str, Any]:
 
 
 def summary_prompt(job: SummaryJobSpec) -> str:
+    synthesis = job.purpose == "handoff-reduce"
+    synthesis_guidance = (
+        "Preserve each obligation's action, scope, condition and timing. "
+        "Do not turn delivery postconditions into prerequisites for editing, continuation or merge. "
+        "Do not invent owner approval requirements or review waivers. "
+        "Pending review or verification describes unfinished work, not an instruction to leave it undone. "
+        "Treat suggestions and added barriers as proposals, not mandatory owner instructions. "
+        "Child summaries are fallible paraphrases, not new authority. "
+        "The owner_quotes table supplies authenticated exact source spans; quote catalog previews "
+        "are only short excerpts of those spans. Read the full table text for the cited obligation. "
+        "An exact quote ID locates source evidence; it does not endorse every child inference. "
+        "Use exact source text when supplied. If it is not supplied, attribute the child claim "
+        "and retain uncertainty; retrieve retained originals before acting on a disputed requirement. "
+        "Keep contradictions visible rather than choosing an unsupported resolution. "
+        "Describe a missing worktree or PR identity as a historical omission unless current "
+        "supplied evidence also lacks it. If the canonical packet supplies it, use that current identity "
+        "without inventing an owner-input prerequisite. Do not infer canonical values that are absent "
+        "from this request. "
+        if synthesis
+        else ""
+    )
+    retrieval_guidance = (
+        "Index only detail categories actually present in the retained sources. "
+        "Name the retained child job IDs and cite the relevant native events for each indexed detail. "
+        "Do not claim commands, absolute roots, hashes, grants, lifecycle receipts or debug chronology "
+        "exist merely because this prompt lists them. Qualify absent details as unavailable; "
+        "do not fabricate an index entry or completion. Existing indexed details remain required "
+        "retrieval context before revisiting that work; they are not discarded or resolved. "
+        if synthesis
+        else "Represent earlier commands, repeated absolute roots, hashes, grants, lifecycle receipts "
+        "and debug chronology through a concise index fact naming the retained child job IDs "
+        "and citing the relevant native events. These indexed details remain required "
+        "retrieval context before revisiting that work; they are not discarded or resolved. "
+    )
     return (
         (
             "Produce the final successor synthesis from the entire supplied summary frontier. "
@@ -990,6 +1086,7 @@ def summary_prompt(job: SummaryJobSpec) -> str:
         "Return coverage of every primary fragment (or child job for reduction); report "
         "missing input or ambiguity in gaps. No tools or external writes. Return only "
         "the schema-conforming JSON result. "
+        + synthesis_guidance
         + (
             f"Reduce this history into a compact successor brief. The native output allowance is "
             f"{job.output_tokens} tokens, including any reasoning counted by the provider; "
@@ -1001,12 +1098,9 @@ def summary_prompt(job: SummaryJobSpec) -> str:
             "Consolidate facts across kinds when their intent remains clear. Preserve every distinct "
             "current owner obligation, correction, unresolved conflict and required next action; "
             "use exact quote IDs for owner obligations, without copying their full source text. "
-            "Keep active files, branch and PR coordinates needed for the next action. Represent "
-            "earlier commands, repeated absolute roots, hashes, grants, lifecycle receipts and "
-            "debug chronology through a concise index fact naming the retained child job IDs "
-            "and citing the relevant native events. These indexed details remain required "
-            "retrieval context before revisiting that work; they are not discarded or resolved. "
-            "Retain unresolved uncertainty as a clearly qualified fact. Missing full hashes, "
+            "Keep active files, branch and PR coordinates needed for the next action. "
+            + retrieval_guidance
+            + "Retain unresolved uncertainty as a clearly qualified fact. Missing full hashes, "
             "unverified historical warnings, absent later instructions and intermediate receipts "
             "are known limitations, not missing supplied input. Use gaps only for missing "
             "primary coverage or an ambiguity that prevents faithful continuation and cannot "

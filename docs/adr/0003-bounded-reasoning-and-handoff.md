@@ -499,10 +499,21 @@ available independently of every lossy summary or native import.
 5. Reduce by workstream and chronology. Each reducer receives relevant source
    references and ledger entries as well as child summaries. Retain a summary tree
    for targeted retrieval; do not discard intermediate artifacts after reduction.
+   Resolve referenced owner quotes against authenticated captured events and supply
+   their exact text inline, deduplicated by span identity. Include those bytes before
+   budgeting and partitioning; a hash or paraphrase is not the original instruction.
    Packet indexes retain every validated summary node, its immutable input and
    semantic child identities. Retry dependencies remain separate provenance.
    Final summaries omitted while fitting initial or audited context stay retrievable;
    bounded omission indexes distinguish omitted finals from intermediate nodes.
+   Intermediate and final producers preserve source-supported action timing and
+   authority: completion postconditions cannot become action prerequisites,
+   pending work cannot become an instruction to leave it unfinished, and absent
+   approval cannot create a new approval requirement. Preserve prohibitions
+   without inventing exceptions. Child interpretations remain fallible even with
+   valid citations; consolidation cannot promote them into owner instructions.
+   Retrieval claims identify actual retained artifacts and do not claim exact
+   source text was supplied when only a reference or paraphrase was available.
 6. Assemble a concise working brief, the exact active obligations and latest owner
    direction, current repository/PR state and a bounded detailed-history packet.
    Size it to the destination's effective context after instructions, tools,
@@ -511,6 +522,35 @@ available independently of every lossy summary or native import.
 7. Audit extraction coverage and critical obligations against exact sources.
    Structural checks prove references and inclusion, not semantic completeness.
    Preserve missing/ambiguous information visibly and offer source retrieval.
+
+Independent audits compare final and leaf interpretations against exact owner
+spans and canonical obligations. An unsupported inference in a structurally valid
+leaf must not acquire authority by surviving reduction. Audit ambiguities refuse
+writable continuation; they do not grant approval or silently rewrite the source.
+Historical omissions and current bindings are separate evidence: absence of a PR
+number in old history does not erase a current canonical PR identity. A native
+result can complete successfully while failing semantic qualification. Preserve
+that result and its findings, and require matching evidence for any changed
+producer prompt contract before admitting the revised route.
+
+A completed final audit can reject a structurally valid synthesis. Retain its
+validated findings and stop admitting audits of that unchanged final; observe
+already launched siblings to quiescence. The staged handoff may request at most
+two corrective final syntheses for the same predecessor launch. Persist that
+budget independently of refresh, route selection, configuration and restart.
+Ordinary native failure budgets still apply.
+
+Each correction is a new immutable job with the same authenticated source,
+the rejected final, the audit findings and canonical obligations. Findings are
+context, not owner authority. Do not classify free-form ambiguity text as approval
+or assume a correction can resolve missing owner evidence. Recheck source hashes,
+current context, ownership and quiescence before replacing the active frontier.
+Retain all prior results, contributors and audit history. Any corrected final
+requires a fresh independent audit against the complete source frontier before
+packet assembly or writable continuation. Unresolved ambiguity, exhausted repair
+budget, corrupt source, uncertain writers or unavailable qualified capacity
+remains visible; none authorizes a successor. This repair path leaves producer
+and audit prompt contracts unchanged and requires its own runtime qualification.
 
 For T unique tokens, payload window W and overlap O, the window count is one for
 T <= W; otherwise it is `1 + ceil((T - W) / (W - O))`, with `0 <= O < W`.
@@ -859,9 +899,9 @@ unchanged parent hash and fact identity. Partial views remain distinct from
 complete summaries; hashed omission indexes retain every omitted fact and node.
 If history contains facts but no useful whole fact fits, continuation requires
 visible context recovery. Final exact packet bounds and launch-time provenance
-and canonical-obligation checks remain mandatory. Versioned prompt templates and
-schema definitions remain unchanged; fresh requests bind the selected artifact
-mode and limits. Fresh native reduction and independent qualification still
+and canonical-obligation checks remain mandatory. Artifact mode and limits bind
+each fresh request independently of its versioned prompt and schema contracts.
+Fresh native reduction and independent qualification still
 precede use of a new route.
 
 New durable packets also bind the complete mandatory context independently of
@@ -873,10 +913,12 @@ the controller never manufactures a binding from their mutable contents. Live
 successors continue under their existing claim and enter a fresh fenced handoff
 only after normal observation establishes their interruption and quiescence.
 Extraction and reduction prompts embed their exact job-bound native schema,
-including eligible citations and quote IDs. The corrected `history-extract-v3`
-and `history-reduce-v5` contracts require fresh extraction and reducer semantic
-qualification. Earlier receipts remain historical evidence, not grants for the
-new prompts; unchanged audit and finite-contract proofs retain their own validity.
+including eligible citations and quote IDs. Leaf instructions retain the
+`history-extract-v3` contract and leaf result schema. The revised `history-reduce-v7` and
+`history-final-v3` contracts require fresh intermediate and final semantic
+qualification. Earlier synthesis receipts remain historical evidence, not grants
+for the new prompts; unchanged extraction, audit and finite-contract proofs
+retain their own validity.
 This applies to queued jobs, applied summaries and already assembled packets.
 Keep old requests and results immutable, observe any live or uncertain claim to
 quiescence, then use the existing safe refresh path before releasing a successor.
@@ -1297,10 +1339,16 @@ strings. A model-result rejection permits two immutable corrective attempts and
 retains the rejected receipts. Source corruption or uncertain native lifecycle is
 not a semantic retry.
 
-Reducer presentation exposes native citations and exact owner-quote references,
-with child identities retained for coverage. Internal fact IDs remain in the
-hash-bound original artifact rather than competing with eligible citations in
-the model input. Existing frozen trial requests remain immutable. The operator
+Reducer presentation exposes native citations, exact owner-quote references and
+their authenticated source text, with child identities retained for coverage.
+Quote resolution verifies owner provenance, event identity, offsets and content
+hash before including each referenced span. Repeated references share one inline
+span; missing or inconsistent source evidence refuses preparation. Exact text
+remains context, not a new approval or authority grant.
+
+Internal fact IDs remain in the hash-bound original artifact rather than competing
+with eligible citations in the model input. Existing frozen trial requests remain
+immutable. The operator
 trial can reconcile an exhausted legacy reducer through one recorded presentation
 revision, retaining all three prior attempts and allowing one additional native
 attempt. This does not reset campaign lifetime retry counters or reinterpret an

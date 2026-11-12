@@ -35,6 +35,7 @@ from .campaign_summary import (
     SummaryResultRejected,
     corrective_spec,
     measured_output_tokens,
+    owner_quote_references,
     plan_reduction,
     plan_remaining_maps,
     project_reduction_input,
@@ -44,6 +45,7 @@ from .campaign_summary import (
     summary_schema,
     validate_summary,
 )
+from .campaign_summary_quotes import resolve_owner_quotes
 from .campaign_transcripts import HistorySnapshot, blob, encoded, merge_lineage_events
 from .platform_util import file_lock, is_link_like
 
@@ -501,8 +503,11 @@ def _draining(directory):
     return True
 
 
-def _plan_reducers(current, capability, directory, planning):
+def _plan_reducers(current, capability, directory, planning, snapshots):
     """New trials use production context accounting and project before admission."""
+    owner_quotes = resolve_owner_quotes(
+        snapshots, owner_quote_references([result for _, result in current])
+    )
     if planning == "adaptive-render-v2":
         from .campaign_handoff_flow import _budget
 
@@ -510,8 +515,11 @@ def _plan_reducers(current, capability, directory, planning):
             capability["profile"], capability["model"], capability["efforts"][0]
         )
         budget = _budget(candidate, capability)
-        return plan_reduction(tuple(current), budget, directory, project_native_events=True)
-    # Already-frozen trial identities retain their original deterministic plan.
+        return plan_reduction(
+            tuple(current), budget, directory, project_native_events=True, owner_quotes=owner_quotes
+        )
+    # Retain the frozen budget/planning mode. The current input contract still
+    # creates new reducer identities; it never rewrites an earlier request.
     output = capability["output_tokens"]
     payload = max(1024, capability["input_tokens"] * 3 // 4 - 8192)
     budget = ContextBudget(
@@ -522,7 +530,7 @@ def _plan_reducers(current, capability, directory, planning):
         working_tokens=0,
         qualified=True,
     )
-    return plan_reduction(tuple(current), budget, directory)
+    return plan_reduction(tuple(current), budget, directory, owner_quotes=owner_quotes)
 
 
 def run_trial(
@@ -783,7 +791,9 @@ def run_trial(
                     layer=layer,
                 )
                 break
-            next_jobs = _plan_reducers(current, reducer_capability, directory / "inputs", planning)
+            next_jobs = _plan_reducers(
+                current, reducer_capability, directory / "inputs", planning, snapshots
+            )
             next_jobs = _fit_maps(
                 next_jobs, reducer_capability, snapshots, timeout_s, directory / "inputs"
             )
