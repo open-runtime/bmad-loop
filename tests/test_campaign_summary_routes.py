@@ -49,14 +49,16 @@ def test_single_leaf_requires_final_synthesis_before_owner_audit(campaign, damag
     assert final["id"] != leaf["id"] and value["phase"] == "summarize"
     assert final["request"]["coordinates"]["summary_stage"] == "final"
     assert final["request"]["coordinates"]["summary_spec"]["prompt_version"] == FINAL_PROMPT_VERSION
-    assert "Rank" in final["request"]["prompt"]
+    assert "ranked_fact_ids" in final["request"]["prompt"]
     spec = SummaryJobSpec(**final["request"]["coordinates"]["summary_spec"])
     result = {
-        "schema_version": 3,
+        "schema_version": 4,
         "job_id": final["id"],
         "input_sha256": spec.input_sha256,
         "covered_ids": [leaf["id"]],
         "ranked_fact_ids": list(load_input(spec)["fact_catalog"]),
+        "required_fact_ids": [],
+        "excluded_fact_ids": [],
     }
     final.update(
         state="validated",
@@ -285,11 +287,13 @@ def _fill_summary(runtime, snapshot, row, *, near_limit=False):
     )
     if spec.prompt_version == FINAL_PROMPT_VERSION:
         result = {
-            "schema_version": 3,
+            "schema_version": 4,
             "job_id": spec.id,
             "input_sha256": spec.input_sha256,
             "covered_ids": list(spec.primary_ids),
             "ranked_fact_ids": list(source["fact_catalog"]),
+            "required_fact_ids": [],
+            "excluded_fact_ids": [],
         }
         row["result"] = row["receipt"]["result"] = result
         # The model ranks every fact; production Python packs the bounded view.

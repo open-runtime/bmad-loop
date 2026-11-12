@@ -535,27 +535,45 @@ producer prompt contract before admitting the revised route.
 
 ### Closed final selection and controller authority
 
-The final-v5 contract replaces generated final prose with a complete ranking of
-controller-issued fact IDs. Its response has only a schema version, job ID, input
-hash, complete child coverage and every ranked fact ID exactly once. It cannot supply new
-titles, constraints, actions, approvals or hold state. Each catalog ID binds the
-child job, the complete immutable child result hash and the source fact identity.
-The controller renders selected text verbatim as an attributed historical summary
+The final-v6 contract replaces generated final prose with a complete ranking of
+controller-issued fact IDs and disjoint required/excluded reference sets. Its
+response has only a schema version, job ID, input hash, complete child coverage,
+every ranked fact ID exactly once, required IDs and excluded IDs. It cannot supply
+new titles, constraints, actions, approvals or hold state. Each catalog ID binds the
+child job, complete immutable child result hash and source fact identity. The
+controller renders selected text verbatim as an attributed historical summary
 claim, preserving citations and exact quote references. A cited child claim can
-still be mistaken; attribution does not establish its truth or authority.
+still be mistaken; attribution does not establish truth or authority.
+
+The model identifies all material unfinished work, pending reviews, failures and
+unresolved contradictions as required context. Python packs all required whole
+facts first in rank order, then optional ranked facts within the remaining exact
+serialized artifact budget. A required fact that cannot fit causes visible refusal;
+it is never skipped to make room for cheaper context. Every required fact also
+survives successor-packet fitting and launch validation. Capacity failure at this
+second boundary cannot silently discard an already audited obligation.
+
+Excluded references identify misleading historical inferences or redundant
+paraphrases whose useful content is faithfully represented elsewhere. Exclusions
+never appear as instructions and remain distinguished from budget omissions in
+the retained catalog. They cannot waive work, certify completion or establish
+current clearance. A related action or shared source citation cannot replace an
+explicit pending review. The independent full-source audit must reject unsupported
+exclusions and material obligations not marked or retained as required.
 
 All authenticated owner spans and canonical acceptance obligations remain
-mandatory independently of the selection. Preserve the complete source and
-summary indexes, omitted fact IDs and inherited gaps. Python scans the ranking
-and includes each whole attributed fact only when its exact serialized size fits
-the artifact budget. Retain the complete ranking, selected IDs and explicit budget
-omissions; never clip text, alter source claims or treat an omission as completed
-work. Count provenance, measurement and omission metadata in the same budget.
-An envelope that cannot fit must fail visibly rather than enlarging the budget.
-The model does not estimate Python's serialized byte overhead. Structural packing
-does not establish fidelity: independent full-source review must still reject
-omission of material unfinished work. The complete final catalog also remains
-subject to its existing input budget.
+mandatory independently of selection. Preserve complete source and summary indexes,
+required/excluded sets, omitted IDs and inherited gaps. Count provenance,
+measurement and omission metadata in the same budget; never clip source text or
+enlarge the budget. Preflight reserves the worst no-fact classification envelope;
+actual required-fact size is checked after the response. The model does not
+estimate Python serialization overhead. Packing is not semantic fidelity.
+
+Required/excluded selection can repair a bounded presentation when faithful
+alternatives already exist in the source catalog. It cannot reconstruct a missing
+fact or correct a claim for which every available representation is wrong. Such
+cases remain explicit semantic failures; source reconstruction is not implied by
+the bounded final-selection repair path.
 
 Current local controls come from the campaign controller, with a captured revision
 and state digest. Keep active, prior and pending holds separate from historical
@@ -564,12 +582,13 @@ and must not leave a stale stop after release. Recheck controls at continuation
 launch; existing external hold-channel and publication admission checks retain
 their independent authority.
 
-Final-audit-v2 checks source attribution, coverage, ordering and material omissions
+Final-audit-v3 checks source attribution, coverage, ordering, required/excluded
+classification and material omissions
 against complete leaf evidence, owner spans and current canonical state. Selecting
 an old claim cannot prove completion or invent a current hold. A rejected selection
 can use the existing bounded correction path and exact rejected-audit inputs;
 every corrected selection still requires fresh independent audits. Preserve old
-final-v3 and final-v4 artifacts as history, require new current-stage qualification, and leave
+final-v3, final-v4 and final-v5 artifacts as history, require new current-stage qualification, and leave
 leaf/intermediate and legacy history-audit qualification contracts unchanged.
 
 A completed final audit can reject a structurally valid synthesis. Retain its

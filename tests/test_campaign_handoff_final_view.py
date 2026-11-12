@@ -23,6 +23,8 @@ def closed_packet(
     historical_text=None,
     historical_facts=None,
     selection_order=None,
+    required_indices=(),
+    excluded_indices=(),
     version="history-final-v4",
 ):
     history = capture(tmp_path, [native_row("codex")])
@@ -56,12 +58,18 @@ def closed_packet(
     path = blob(tmp_path / "final-input", encoded(projected))
     field = "selected_fact_ids" if version == "history-final-v4" else "ranked_fact_ids"
     selection = {
-        "schema_version": 2 if version == "history-final-v4" else 3,
+        "schema_version": {"history-final-v4": 2, "history-final-v5": 3, "history-final-v6": 4}[
+            version
+        ],
         "job_id": "closed-final",
         "input_sha256": path.stem,
         "covered_ids": [child_spec.id],
         field: list(projected["fact_catalog"]),
     }
+    if version == "history-final-v6":
+        ids = selection[field]
+        selection["required_fact_ids"] = [ids[i] for i in required_indices]
+        selection["excluded_fact_ids"] = [ids[i] for i in excluded_indices]
     if selection_order is not None:
         selected = selection[field]
         selection[field] = [selected[index] for index in selection_order]
@@ -104,7 +112,7 @@ def closed_packet(
     return payload, final, child
 
 
-@pytest.mark.parametrize("version", ["history-final-v4", "history-final-v5"])
+@pytest.mark.parametrize("version", ["history-final-v4", "history-final-v5", "history-final-v6"])
 def test_bounded_closed_history_retains_exact_attribution_and_owner_provenance(tmp_path, version):
     payload, final, _ = closed_packet(tmp_path, version=version)
     context.fit_audited_history(payload, tmp_path / "packet", ceiling=20000)
@@ -137,7 +145,7 @@ def test_selected_historical_instruction_cannot_replace_mandatory_current_author
 @pytest.mark.parametrize(
     "fault", ["missing-attribution", "missing-contract", "wrong-contract", "bare-instruction"]
 )
-@pytest.mark.parametrize("version", ["history-final-v4", "history-final-v5"])
+@pytest.mark.parametrize("version", ["history-final-v4", "history-final-v5", "history-final-v6"])
 def test_closed_parent_artifact_cannot_silently_downgrade_to_legacy_context(
     tmp_path, fault, version
 ):
@@ -166,7 +174,7 @@ def test_v4_bounded_view_cannot_drop_retained_attribution_or_source_fields(tmp_p
         context.validate_history_view(payload)
 
 
-@pytest.mark.parametrize("version", ["history-final-v4", "history-final-v5"])
+@pytest.mark.parametrize("version", ["history-final-v4", "history-final-v5", "history-final-v6"])
 def test_closed_attribution_and_unicode_are_charged_to_exact_packet_boundary(tmp_path, version):
     payload, _, _ = closed_packet(
         tmp_path,
@@ -185,7 +193,7 @@ def test_closed_attribution_and_unicode_are_charged_to_exact_packet_boundary(tmp
         context.fit_audited_history(copy.deepcopy(payload), tmp_path / "packet", ceiling=exact - 1)
 
 
-@pytest.mark.parametrize("version", ["history-final-v4", "history-final-v5"])
+@pytest.mark.parametrize("version", ["history-final-v4", "history-final-v5", "history-final-v6"])
 def test_closed_selected_order_survives_kind_priority_and_bounded_omission(tmp_path, version):
     payload, final, _ = closed_packet(
         tmp_path,
@@ -249,3 +257,90 @@ def test_legacy_initial_history_keeps_reverse_order_within_kind(tmp_path):
     assert [row["fact_id"] for row in payload["history_view"]] == [
         fact["id"] for fact in reversed(full["facts"])
     ]
+
+
+def test_required_review_survives_second_context_packing_and_excluded_advice_stays_out(tmp_path):
+    payload, final, _ = closed_packet(
+        tmp_path,
+        historical_facts=[
+            ("next_action", "Do not merge, even though no active hold is established."),
+            ("nuance", "Old background detail. " * 40),
+            ("verification_claim", "Claim 1 is unverified; its review remains pending."),
+        ],
+        version="history-final-v6",
+        required_indices=(2,),
+        excluded_indices=(0,),
+    )
+    complete = copy.deepcopy(payload)
+    context.fit_audited_history(complete, tmp_path / "packet", ceiling=30000)
+    assert len(complete["history_view"]) == 2
+    required = complete["history_view"][0]
+    assert required["required_context"] is True
+    assert "review remains pending" in required["text"]
+    assert all("Do not merge" not in row["text"] for row in complete["history_view"])
+    assert final["omitted_facts"] == [
+        {"catalog_id": final["excluded_fact_ids"][0], "reason": "model-excluded-context"}
+    ]
+    only_required = copy.deepcopy(complete)
+    only_required["history_view"] = [required]
+    only_required["omitted_history_fact_index"]["count"] = 1
+    ceiling = len(encoded(only_required))
+    bounded = copy.deepcopy(payload)
+    context.fit_audited_history(bounded, tmp_path / "packet", ceiling=ceiling)
+    assert bounded["history_view"] == [required]
+    assert len(encoded(bounded)) == ceiling
+    with pytest.raises(context.HistoryContextRecoveryNeeded, match="Required historical context"):
+        context.fit_audited_history(
+            copy.deepcopy(payload), tmp_path / "packet", ceiling=ceiling - 1
+        )
+
+
+def test_launch_validation_refuses_missing_required_fact_even_with_consistent_omission_index(
+    tmp_path,
+):
+    payload, _, _ = closed_packet(
+        tmp_path,
+        historical_facts=[("progress", "Review is still pending."), ("nuance", "Background.")],
+        version="history-final-v6",
+        required_indices=(0,),
+    )
+    context.fit_audited_history(payload, tmp_path / "packet", ceiling=30000)
+    payload["history_view"] = [
+        row for row in payload["history_view"] if not row["required_context"]
+    ]
+    # Keep the independent omission index internally consistent: only the
+    # required-context invariant should reject this otherwise useful packet.
+    facts = context._history_facts(payload)
+    omitted = context._fact_omissions(facts, payload["history_view"])
+    path = blob(tmp_path / "omitted", encoded(omitted))
+    payload["omitted_history_fact_index"] = {
+        "path": str(path),
+        "sha256": path.stem,
+        "count": len(omitted["omitted"]),
+    }
+    with pytest.raises(
+        context.HistoryContextRecoveryNeeded, match="Required historical context is missing"
+    ):
+        context.validate_history_view(payload)
+
+
+def test_optional_fact_fitting_does_not_hide_oversized_required_context(tmp_path):
+    payload, _, _ = closed_packet(
+        tmp_path,
+        historical_facts=[
+            ("verification_claim", "Unfinished review detail. " * 80),
+            ("nuance", "Small optional background."),
+        ],
+        version="history-final-v6",
+        required_indices=(0,),
+    )
+    full = copy.deepcopy(payload)
+    context.fit_audited_history(full, tmp_path / "packet", ceiling=30000)
+    assert len(full["history_view"]) == 2
+    full["history_view"] = [row for row in full["history_view"] if not row["required_context"]]
+    full["omitted_history_fact_index"]["count"] = 1
+    # The base envelope and one useful optional fact fit. Required context alone
+    # must cause refusal, independent of the general nonempty-history check.
+    ceiling = len(encoded(full))
+    with pytest.raises(context.HistoryContextRecoveryNeeded, match="Required historical context"):
+        context.fit_audited_history(payload, tmp_path / "packet", ceiling=ceiling)

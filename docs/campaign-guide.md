@@ -607,15 +607,22 @@ Passing structural checks or a native transport probe does not establish semanti
 fidelity or authorize continuation.
 
 The final model ranks every bound source fact ID instead of writing new
-instructions or estimating serialized sizes. Python fits whole facts to the exact
-artifact budget and renders their text as explicitly attributed historical
+instructions or estimating serialized sizes. It marks required facts and excluded
+historical claims as disjoint sets of known references. Python retains all required
+whole facts first, then fits optional history to the exact artifact budget, rendering
+text as explicitly attributed historical
 summary claims, with source references. Exact owner instructions, canonical
 acceptance and captured current controller holds are retained independently of
 that selection. A historical rule to honor holds does not establish that a hold
 is currently active. The controller rechecks current controls before continuation;
 publication and external operator holds still have their own admission checks.
-Unselected facts remain in the retrievable source tree with explicit budget
-omissions, and inherited gaps remain visible. The complete ranking is retained.
+
+Unselected facts remain in the retrievable source tree with distinct budget
+omissions or contextual exclusions, and inherited gaps remain visible. Excluding
+a misleading recommendation never waives its underlying work or establishes
+approval. The complete ranking is retained. If required facts cannot fit either
+the artifact or the successor packet, continuation is refused; no required fact
+is silently omitted.
 Expanded attributed text and its metadata must fit the same packet budget as other
 history; an ID-only response cannot bypass context limits. A structurally valid
 packing still requires independent full-source review for material unfinished work.
@@ -626,7 +633,9 @@ It retains rejected outputs and waits for any existing auditors to stop before
 replacing the active summary. Every correction needs a fresh independent audit.
 The limit follows the predecessor launch across restart, refresh and route
 changes. Audit findings cannot supply owner approval or missing source evidence;
-an unresolved result still blocks writable continuation.
+an unresolved result still blocks writable continuation. A missing or wrong-only
+source fact cannot be repaired by choosing different references; it remains a
+visible fidelity failure rather than an invented correction.
 `campaign status --json` reports pending repair, the attempts used and the audit
 job IDs without exposing private source text or findings.
 
@@ -1299,10 +1308,17 @@ Output token limits use verified native telemetry when available, including the
 provider's reported reasoning contribution. Unknown usage retains a conservative
 UTF-8 byte bound. Model-supplied usage fields do not establish that measurement.
 
+Managed AGY reasoning and writing recipes force the native update-disable setting
+to literal `true` in each child environment, preserving the executable bound by
+qualification. The shipped interactive profile supplies the same setting. Shared
+shell settings remain unchanged; an intentional CLI upgrade still requires fresh
+qualification for the changed binary and recipe.
+
 Campaign reducers retain complete validated artifacts separately from the bounded
 initial context. Native input, output, turn and time limits still apply. Packet
 assembly budgets the exact remaining bytes after mandatory state and independently
-audited constraints; it selects whole facts without clipping their text. Explicit
+audited constraints; it preserves every required historical fact before selecting
+optional whole facts, without clipping their text. Explicit
 artifact limits on older jobs remain enforced, and a later packet policy cannot
 turn an earlier rejected result into a successful receipt. Retry cooldowns are
 persisted per failed attempt, so polling and restart do not continually postpone

@@ -1,8 +1,11 @@
 """AGY native envelopes and hook recipes, exclusively scripted/zero-token."""
 
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
+from types import MappingProxyType
 
 import pytest
 from test_campaign_headless import prepared as prepared
@@ -12,6 +15,55 @@ from bmad_loop.campaign_headless import file_digest, read_json, validate_capabil
 from bmad_loop.campaign_headless_protocol import parse_output
 from bmad_loop.campaign_model import CampaignError, RoleCandidate
 from bmad_loop.campaign_qualification import _no_tools, qualify
+
+
+@pytest.mark.parametrize("inherited", [None, "1", "false", "true"])
+def test_agy_child_environment_forces_literal_true_without_mutating_source(inherited):
+    source = {"HOME": "/existing-account", "HCOM_DIR": "/owned-room"}
+    if inherited is not None:
+        source["AGY_CLI_DISABLE_AUTO_UPDATE"] = inherited
+    before = dict(source)
+    result = launcher.child_environment(MappingProxyType(source))
+    assert result == {**before, "AGY_CLI_DISABLE_AUTO_UPDATE": "true"}
+    assert source == before
+
+
+def test_no_tools_main_passes_forced_update_setting_to_native(tmp_path, monkeypatch):
+    native, source, schema = (tmp_path / name for name in ("native", "input", "schema"))
+    native.write_text("not executed")
+    source.write_text("fixed input")
+    schema.write_text(json.dumps({"type": "object"}))
+    monkeypatch.setenv("AGY_CLI_DISABLE_AUTO_UPDATE", "1")
+    monkeypatch.setenv("HCOM_DIR", str(tmp_path / "owned-room"))
+    before = dict(os.environ)
+    calls = []
+
+    def native_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        assert kwargs["env"] == {**before, "AGY_CLI_DISABLE_AUTO_UPDATE": "true"}
+        assert json.loads(kwargs["input"])["message"]["content"] == "fixed input"
+        return subprocess.CompletedProcess(argv, 17)
+
+    monkeypatch.setattr(launcher.subprocess, "run", native_run)
+    result = launcher.main(
+        [
+            "--native",
+            str(native),
+            "--input",
+            str(source),
+            "--schema",
+            str(schema),
+            "--model",
+            "gemini-test",
+            "--effort",
+            "high",
+            "--max-invocations",
+            "1",
+        ]
+    )
+    assert result == 17 and len(calls) == 1
+    assert calls[0][0][0] == str(native)
+    assert dict(os.environ) == before
 
 
 def frames(**changes):

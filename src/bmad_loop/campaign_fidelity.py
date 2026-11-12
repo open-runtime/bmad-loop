@@ -11,7 +11,7 @@ from .campaign_jobs import digest
 from .campaign_model import CampaignError
 
 HISTORY_AUDIT_PROMPT_VERSION = "history-audit-v3"
-FINAL_AUDIT_PROMPT_VERSION = "history-final-audit-v2"
+FINAL_AUDIT_PROMPT_VERSION = "history-final-audit-v3"
 
 PURPOSES = {
     "handoff_map",

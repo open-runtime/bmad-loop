@@ -85,9 +85,11 @@ def finish(runtime, snapshot, row, result, family, *, harvest=False, output_toke
 def final_result(row, *, reverse=False):
     spec = SummaryJobSpec(**row["request"]["coordinates"]["summary_spec"])
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "job_id": row["id"],
         "input_sha256": spec.input_sha256,
+        "required_fact_ids": list(load_input(spec)["fact_catalog"]),
+        "excluded_fact_ids": [],
         "covered_ids": list(spec.primary_ids),
         "ranked_fact_ids": (
             list(load_input(spec)["fact_catalog"])[::-1]
@@ -183,11 +185,15 @@ def test_failed_final_repairs_through_receipt_apply_reaudit_and_packet(audited_f
     for identity in value["audits"]:
         fresh = snapshot.jobs[identity]
         assert fresh["request"]["coordinates"]["final_frontier"] == [repair["id"]]
+        assert "required_fact_ids" in fresh["request"]["prompt"]
+        assert "excluded_fact_ids" in fresh["request"]["prompt"]
         finish(runtime, snapshot, fresh, audit_result(fresh, False), "anthropic")
         assert fresh["state"] == "applied"
     step(runtime, snapshot, unit, "handoff-assemble")
     step(runtime, snapshot, unit, "handoff-release")
     assert value["phase"] == "ready" and flow.resume_proposal(snapshot, unit, runtime) is not None
+    packet = json.loads(Path(value["packet"]["path"]).read_text())
+    assert packet["history_view"] and all(row["required_context"] for row in packet["history_view"])
     assert len(unit.evidence["handoff_final_repairs"][unit.claim.launch_id]) == 1
     assert original["request"] == old_request and original["receipt"] == old_receipt
 

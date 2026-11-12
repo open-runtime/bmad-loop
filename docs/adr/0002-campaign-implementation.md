@@ -14,9 +14,12 @@ The accepted [reasoning-job and handoff contract](0003-bounded-reasoning-and-han
 extends this work without weakening its acceptance or publication gates.
 
 Final handoff views use the ADR 0003 closed selection contract: the model orders
-all immutable source references, and Python packs whole attributed historical
-claims within the exact serialized budget. Retain the complete ranking and budget
-omissions; independent source review still rejects omitted material unfinished work.
+all immutable source references and marks required or excluded context. Python
+packs every required whole attributed fact before optional history, refusing an
+insufficient budget at both final-artifact and successor-packet fitting. Retain the
+complete ranking and distinguish budget omissions from contextual exclusions;
+independent source review still rejects omitted material unfinished work or
+unsupported exclusion. Selection cannot repair missing or wrong-only source facts.
 Exact owner requirements and controller-observed holds remain separate mandatory
 context. Changed controls invalidate continuation before writer admission; each
 new final-selection or final-audit contract requires its own native qualification.

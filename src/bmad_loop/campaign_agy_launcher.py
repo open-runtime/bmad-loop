@@ -9,13 +9,24 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shlex
 import subprocess
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 from .campaign_model import CampaignError
 from .platform_util import file_lock, is_link_like
+
+
+def child_environment(source: Mapping[str, str]) -> dict[str, str]:
+    """Keep the pinned native image stable without changing the caller's env.
+
+    AGY compares this provider-owned setting to the literal ``true``; ``1``
+    does not disable its background updater, including in headless sessions.
+    """
+    return {**source, "AGY_CLI_DISABLE_AUTO_UPDATE": "true"}
 
 
 def launcher_text():
@@ -203,7 +214,11 @@ def main(argv=None):
     # Exactly one input turn. Native init/result envelopes remain unmodified.
     message = {"event": "user", "message": {"content": args.input.read_text(encoding="utf-8")}}
     return subprocess.run(
-        native, cwd=directory, input=json.dumps(message) + "\n", text=True
+        native,
+        cwd=directory,
+        input=json.dumps(message) + "\n",
+        text=True,
+        env=child_environment(os.environ),
     ).returncode
 
 

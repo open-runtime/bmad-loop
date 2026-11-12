@@ -10,11 +10,13 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import shlex
 import subprocess
 import sys
 from pathlib import Path
 
+from .campaign_agy_launcher import child_environment
 from .campaign_agy_launcher import hook_result as bounded_hook
 from .campaign_jobs import digest
 from .campaign_model import CampaignError
@@ -321,7 +323,11 @@ def main(argv=None):
         native.extend(["--effort", args.effort])
     message = {"event": "user", "message": {"content": args.input.read_text(encoding="utf-8")}}
     return subprocess.run(
-        native, cwd=directory, input=json.dumps(message) + "\n", text=True
+        native,
+        cwd=directory,
+        input=json.dumps(message) + "\n",
+        text=True,
+        env=child_environment(os.environ),
     ).returncode
 
 
