@@ -886,7 +886,23 @@ development counters without replaying completed development. Accepted-review an
 stopped-native reservations remain fenced; they are not ordinary-review permits.
 
 A native quota receipt invalidates older positive capacity observations for its
-actual development or review route. Before replacing a writer, the coordinator
+actual development or review route. AGY's exact native terminal `ERROR` envelope
+can also carry an individual-quota reset as a bounded duration. Recognize only
+the supported native error format, never assistant output or tool text. The
+worker anchors that duration once to its immutable receipt completion time and
+preserves the resulting `quota_retry_at` through session and execution receipts.
+Replaying history must not extend that deadline.
+
+Retain the deadline in durable profile/model capacity faults. Neither a newer
+positive weekly-allowance observation nor a later fault without a deadline can
+erase it. Admission resumes only after the deadline and a fresh positive
+observation strictly after that deadline. Recheck newly recorded faults before
+launching an already prepared reasoning job. Faults without a native reset retain
+the existing newer-observation recovery path, including TeamRouter account
+rerouting. These waits preserve attempt history and do not reserve unused worker
+slots or prevent eligible alternatives from running.
+
+Before replacing a writer, the coordinator
 can choose another currently eligible, qualified member of the frozen role pool.
 An explicit operator-selected route remains explicit. Rerouting reuses an audited
 packet when its bytes fit the new destination; a smaller destination returns to

@@ -16,9 +16,9 @@ import subprocess
 import sys
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from . import bmadconfig, childrun, runs, runsetup, verify
 from .adapters.base import SessionSpec
@@ -223,15 +223,26 @@ def prepare_launch(execution: CampaignExecution, request: dict[str, Any]) -> Pat
     return target
 
 
-def spawn(request_path: Path, *, env: dict[str, str] | None = None) -> subprocess.Popen[Any]:
+class LaunchAdmissionHeld(CampaignError):
+    """Admission refused before this interpreter reserved or spawned a worker."""
+
+
+def spawn(
+    request_path: Path,
+    *,
+    env: dict[str, str] | None = None,
+    admission: Callable[[], AbstractContextManager[str]] | None = None,
+) -> subprocess.Popen[Any]:
     directory = request_path.parent.resolve()
     # An existing startup/receipt, including a dead child, is reconciled by the
     # coordinator.  This API never guesses whether retrying the spawn is safe.
-    with _OWNED_LAUNCHES_LOCK:
+    with admission() if admission is not None else nullcontext("") as refusal, _OWNED_LAUNCHES_LOCK:
         if directory in _OWNED_LAUNCHES:
             raise CampaignError("launch already has an owned process or uncertain spawn")
         if (directory / "startup.json").exists() or (directory / "receipt.json").exists():
             raise CampaignError("launch already has a startup binding or receipt")
+        if refusal:
+            raise LaunchAdmissionHeld(refusal)
         request = json.loads(request_path.read_text(encoding="utf-8"))
         owned = _OwnedLaunch(tuple(request[k] for k in _LAUNCH_KEYS), os.getpid())
         _OWNED_LAUNCHES[directory] = owned

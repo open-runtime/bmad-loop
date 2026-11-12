@@ -13,20 +13,90 @@ import time
 from pathlib import Path
 from typing import Any, TypeGuard
 
-from .campaign_model import RoleCandidate
+from .campaign_model import CampaignError, RoleCandidate
 from .campaign_scheduler import CapacityObservation
 from .childrun import run_argv
 
 
-def record_unavailable(snapshot, profile: str, model: str, *, now: float, reason: str) -> None:
-    """Invalidate an older positive observation after an owned native quota failure."""
+def quota_retry_at(value: dict[str, Any]) -> float | None:
+    """Read a native reset deadline, never a model-written retry recommendation."""
+    if "quota_retry_at" not in value and "quota_source" not in value:
+        return None
+    deadline = value.get("quota_retry_at")
+    if (
+        (value.get("outcome") != "quota" and value.get("kind") != "quota")
+        or value.get("quota_source") != "agy-native-individual-quota-v1"
+        or not _finite_number(deadline)
+        or deadline <= 0
+    ):
+        raise CampaignError("Native quota reset evidence is invalid")
+    return deadline
+
+
+def record_unavailable(
+    snapshot,
+    profile: str,
+    model: str,
+    *,
+    now: float,
+    reason: str,
+    quota_retry_at: float | None = None,
+) -> None:
+    """Merge native denials without letting newer weekly telemetry erase a reset."""
+    if not _finite_number(now) or (
+        quota_retry_at is not None and (not _finite_number(quota_retry_at) or quota_retry_at <= 0)
+    ):
+        raise CampaignError("Native quota fault timestamp is invalid")
     if not profile or not model:
         return
-    snapshot.bindings.setdefault("capacity_faults", {})[profile + "\0" + model] = {
-        "observed_at": now,
-        "reason": reason,
+    faults = snapshot.bindings.setdefault("capacity_faults", {})
+    key = profile + "\0" + model
+    previous = faults.get(key, {})
+    prior_at = previous.get("observed_at", now)
+    prior_reset = previous.get("quota_retry_at")
+    if not _finite_number(prior_at) or (
+        prior_reset is not None and (not _finite_number(prior_reset) or prior_reset <= 0)
+    ):
+        raise CampaignError("Retained native quota fault is invalid")
+    fault = {
+        "observed_at": max(now, prior_at),
+        "reason": reason if now >= prior_at else previous["reason"],
     }
+    deadlines = [value for value in (prior_reset, quota_retry_at) if value is not None]
+    if deadlines:
+        fault["quota_retry_at"] = max(deadlines)
+        fault["quota_source"] = "agy-native-individual-quota-v1"
+    faults[key] = fault
     snapshot.bindings.setdefault("capacity", {})["observed_at"] = 0
+
+
+def unavailable_reason(
+    snapshot, profile: str, model: str, *, observed_at: float, now: float
+) -> str:
+    """A native reset requires a new positive observation strictly after reset."""
+    fault = snapshot.bindings.get("capacity_faults", {}).get(profile + "\0" + model, {})
+    if not fault:
+        return ""
+    deadline = fault.get("quota_retry_at")
+    if deadline is not None:
+        deadline = quota_retry_at({"outcome": "quota", **fault})
+        assert deadline is not None
+        if now < deadline or observed_at <= deadline:
+            return "native quota reset requires fresh capacity after " + str(deadline)
+    return fault["reason"] if observed_at <= fault["observed_at"] else ""
+
+
+def selected_fault(snapshot, profile: str, model: str, *, now: float) -> str:
+    """Recheck a persisted native denial at an already prepared launch boundary."""
+    batch = snapshot.bindings.get("capacity", {})
+    observed_at = 0
+    for row in batch.get("observations", []):
+        if (row["profile"], row["model"]) == (profile, model):
+            observed_at = row["capacity"].get("observed_at")
+            if observed_at is None:
+                observed_at = batch.get("observed_at", 0)
+            break
+    return unavailable_reason(snapshot, profile, model, observed_at=observed_at, now=now)
 
 
 def _finite_number(value: Any) -> TypeGuard[int | float]:

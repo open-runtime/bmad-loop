@@ -563,6 +563,34 @@ def test_projection_preserves_actual_hold_and_delivery_distinctions(runtime):
     assert view["units"][0]["state"] != "delivered"
 
 
+def test_projection_shows_native_reset_beside_positive_provider_metadata(runtime):
+    from bmad_loop.campaign_capacity import record_unavailable
+
+    _, snapshot, _ = runtime
+    observation = {
+        "profile": "antigravity",
+        "model": "flash",
+        "capacity": {"available": True, "observed_at": 150},
+    }
+    snapshot.bindings["capacity"] = {"observations": [observation]}
+    record_unavailable(
+        snapshot, "antigravity", "flash", now=100, reason="native quota", quota_retry_at=200
+    )
+    snapshot.bindings["capacity_faults"]["antigravity\0flash"]["private_payload"] = "hidden"
+    view = status_document(snapshot)["resources"]
+    assert view["provider_routes"] == [observation]
+    assert view["provider_faults"] == [
+        {
+            "profile": "antigravity",
+            "model": "flash",
+            "observed_at": 100,
+            "reason": "<redacted:str>",
+            "quota_retry_at": 200,
+            "quota_source": "agy-native-individual-quota-v1",
+        }
+    ]
+
+
 def test_projection_explains_discovery_wait_and_clears_it_when_complete(runtime, capsys):
     from bmad_loop.campaign_cli import _emit
 

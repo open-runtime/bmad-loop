@@ -63,6 +63,13 @@ def _launch_guard(runtime, snapshot, row, action, path):
         if current(latest, request)
         else "reasoning request is no longer current"
     )
+    if not reason:
+        from .campaign_capacity import selected_fault
+
+        selection = current_row.get("selection", {})
+        reason = selected_fault(
+            latest, selection.get("profile", ""), selection.get("model", ""), now=runtime.clock()
+        )
     if not reason and request.coordinates.get("handoff_id"):
         from .campaign_handoff_flow import job_launch_allowed
 
@@ -722,6 +729,9 @@ def apply(runtime, snapshot, action, observation) -> None:
         row["failure_attempts"] = snapshot.spec.reasoning.max_attempts
     elif data.get("state") == "finished":
         first_receipt = row.get("receipt") is None
+        from .campaign_capacity import quota_retry_at, record_unavailable
+
+        deadline = quota_retry_at(data["receipt"])
         accept_receipt(snapshot, row["id"], data["receipt"], now=runtime.clock())
         if first_receipt:
             usage = data["receipt"].get("usage") or {}
@@ -746,9 +756,8 @@ def apply(runtime, snapshot, action, observation) -> None:
         if row["state"] == "failed":
             row["failure_attempts"] = row.get("failure_attempts", 0) + 1
             row["retry_at"] = runtime.clock() + 15
-        elif row["state"] == "capacity_wait":
+        elif row["state"] == "capacity_wait" and first_receipt:
             row["retry_at"] = runtime.clock() + 30
-            from .campaign_capacity import record_unavailable
 
             selected = row.get("selection", {})
             record_unavailable(
@@ -757,6 +766,7 @@ def apply(runtime, snapshot, action, observation) -> None:
                 selected.get("model", ""),
                 now=runtime.clock(),
                 reason="native quota exhausted; waiting for newer provider capacity",
+                quota_retry_at=deadline,
             )
     else:
         row["state"] = "running"

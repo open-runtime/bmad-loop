@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import math
 import os
 import subprocess
 import time
@@ -20,7 +21,7 @@ from .campaign_headless import (
     validate_probe_capability,
     write_json,
 )
-from .campaign_headless_protocol import parse_output
+from .campaign_headless_protocol import AGY_QUOTA_MAX_RESET_S, AGY_QUOTA_SOURCE, parse_output
 from .campaign_jobs import JobLimits, digest, request_from_dict
 from .campaign_model import CampaignError, CommunicationSpec, RoleCandidate
 from .childrun import kill_tree
@@ -57,6 +58,32 @@ def _wire_output_limit(
         # tokens. Neither transport overhead nor tool text buys tokens.
         wire_limit = input_bytes * 6 + limits.output_tokens * 512 + 32 * 65536 * 12 + 65536
     return wire_limit
+
+
+def _stamp_quota_reset(receipt):
+    """Anchor native relative evidence once, at the immutable receipt timestamp."""
+    if "quota_retry_after_s" not in receipt and "quota_source" not in receipt:
+        return
+    if receipt["outcome"] != "quota":
+        for key in ("quota_source", "quota_retry_after_s", "quota_retry_at"):
+            receipt.pop(key, None)
+        return
+    duration = receipt.get("quota_retry_after_s")
+    finished = receipt.get("finished_at")
+    if (
+        receipt.get("quota_source") != AGY_QUOTA_SOURCE
+        or type(duration) is not int
+        or not 0 < duration <= AGY_QUOTA_MAX_RESET_S
+        or type(finished) not in (int, float)
+        or not math.isfinite(finished)
+        or finished <= 0
+        or not math.isfinite(finished + duration)
+    ):
+        receipt.update(outcome="failed", reason="Native quota reset evidence is invalid")
+        for key in ("quota_source", "quota_retry_after_s", "quota_retry_at"):
+            receipt.pop(key, None)
+        return
+    receipt["quota_retry_at"] = finished + duration
 
 
 def child_main(path: Path) -> int:
@@ -390,6 +417,7 @@ def child_main(path: Path) -> int:
             host.liveness_of(pid, stamp) == "dead" for pid, stamp in known.items()
         )
         receipt["finished_at"] = time.time()
+        _stamp_quota_reset(receipt)
         write_json(directory / "receipt.json", receipt)
     return 0 if receipt["outcome"] == "completed" else 1
 

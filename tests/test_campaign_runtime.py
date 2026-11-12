@@ -891,8 +891,8 @@ def test_lost_child_launch_ack_adopts_existing_process_without_relaunch(
     original = campaign_runtime.spawn
     lost = []
 
-    def spawn_with_lost_ack(request_path, *, env=None):
-        process = original(request_path, env=env)
+    def spawn_with_lost_ack(request_path, *, env=None, admission=None):
+        process = original(request_path, env=env, admission=admission)
         request = json.loads(request_path.read_text())
         if request["kind"] == "execution" and not lost:
             lost.append(request["launch_id"])

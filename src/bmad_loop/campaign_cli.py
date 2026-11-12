@@ -650,6 +650,22 @@ def status_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
             "provider_routes": scrub_json(
                 snapshot.bindings.get("capacity", {}).get("observations", [])
             ),
+            "provider_faults": scrub_json(
+                [
+                    {
+                        "profile": identity.split("\0", 1)[0],
+                        "model": identity.split("\0", 1)[1],
+                        **{
+                            key: fault[key]
+                            for key in ("observed_at", "reason", "quota_retry_at", "quota_source")
+                            if key in fault
+                        },
+                    }
+                    for identity, fault in sorted(
+                        snapshot.bindings.get("capacity_faults", {}).items()
+                    )
+                ]
+            ),
             "verify_slots": snapshot.spec.resources.verify_slots,
             "active_queue_views": sum(
                 bool(unit.claim and not unit.claim.quiescent and unit.claim.role == "queue_verify")
