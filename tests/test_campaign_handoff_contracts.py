@@ -228,9 +228,25 @@ def test_missing_history_attempts_readonly_recovery_before_escalation(campaign, 
             decisions=dataclasses.replace(snapshot.spec.decisions, sources=("CURRENT.md",)),
         )
     if large:
+        from bmad_loop.campaign_transcripts import digest, encoded
+
+        # Preserve the original constrained history budget while reserving the
+        # newly mandatory exact controller state; no authority bytes may vanish.
+        controls = flow._controller_controls(snapshot, unit)
+        packet_limit = 10000 + len(
+            encoded(
+                {
+                    "controller_controls": {
+                        "observed_revision": snapshot.revision,
+                        "state": controls,
+                        "state_digest": digest(controls),
+                    }
+                }
+            )
+        )
         snapshot.spec = dataclasses.replace(
             snapshot.spec,
-            reasoning=dataclasses.replace(snapshot.spec.reasoning, packet_token_limit=10000),
+            reasoning=dataclasses.replace(snapshot.spec.reasoning, packet_token_limit=packet_limit),
         )
     Path(receipt["sessions"][0]["transcript_path"]).unlink()
     flow.intercept_terminal(runtime, snapshot, unit, receipt)
@@ -312,7 +328,8 @@ def test_missing_history_attempts_readonly_recovery_before_escalation(campaign, 
         index = json.loads(Path(packet["recovered_constraints_index"]["path"]).read_text())
         assert index[0]["source_quote"] == policy.read_text()
         assert packet["resolved_constraints"][0]["authority"] == "context-only"
-        assert len(Path(value["packet"]["path"]).read_bytes()) <= 10000
+        assert len(Path(value["packet"]["path"]).read_bytes()) <= packet_limit
+        assert packet["current_state"]["controller_controls"]["state"] == controls
     else:
         assert packet["recovered_constraints"]
     assert unit.hold is None and value["phase"] == "ready"

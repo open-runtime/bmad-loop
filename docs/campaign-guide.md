@@ -588,7 +588,7 @@ permissions and purpose. Use a supported capacity observer or an explicit
 `capacity_command` for AGY; unknown allowance selects an eligible fallback.
 Existing role and shared-session limits also constrain these jobs.
 
-A higher-order final synthesis runs even when only one leaf summary remains.
+A higher-order final selection runs even when only one leaf summary remains.
 Before extraction begins, the coordinator reserves an independent qualified
 audit family without consuming a live session slot. That family cannot author
 the summary it audits. All contributing families remain recorded across retries;
@@ -606,8 +606,19 @@ retained indexes identify the actual source artifacts available for retrieval.
 Passing structural checks or a native transport probe does not establish semantic
 fidelity or authorize continuation.
 
+The final model selects and orders bound source fact IDs instead of writing new
+instructions. Python renders the selected text as explicitly attributed historical
+summary claims, with source references. Exact owner instructions, canonical
+acceptance and captured current controller holds are retained independently of
+that selection. A historical rule to honor holds does not establish that a hold
+is currently active. The controller rechecks current controls before continuation;
+publication and external operator holds still have their own admission checks.
+Unselected facts remain in the retrievable source tree, and inherited gaps remain
+visible. Expanded attributed text must fit the same packet budget as other
+history; an ID-only response cannot bypass context limits.
+
 When a completed independent audit rejects a final summary, staged handoff can
-request up to two corrected syntheses from the same source and recorded findings.
+request up to two corrected selections from the same source and recorded findings.
 It retains rejected outputs and waits for any existing auditors to stop before
 replacing the active summary. Every correction needs a fresh independent audit.
 The limit follows the predecessor launch across restart, refresh and route

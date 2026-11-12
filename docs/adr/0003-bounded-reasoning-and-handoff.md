@@ -120,7 +120,7 @@ still apply. A fallback does not reset lifetime attempts or weaken acceptance.
 | Intermediate/final, constraint reduction, missing-history recovery | Gemini Argon high; Grok 4.7 xhigh; Muse Wonder Full xhigh; Claude Opus max; Codex Sol ultra     |
 
 The owner's ordering explicitly places Terra below Sol. Require higher-order
-final synthesis even when one leaf fits. Reserve an independent audit family
+final selection even when one leaf fits. Reserve an independent audit family
 before admitting summary work, without occupying a live session slot. Retain
 all contributing families through retries and merges of summary trees; unavailable
 independence causes a visible wait, not relabeling. Model identifiers, effort,
@@ -532,6 +532,38 @@ number in old history does not erase a current canonical PR identity. A native
 result can complete successfully while failing semantic qualification. Preserve
 that result and its findings, and require matching evidence for any changed
 producer prompt contract before admitting the revised route.
+
+### Closed final selection and controller authority
+
+The final-v4 contract replaces generated final prose with an ordered selection of
+controller-issued fact IDs. Its response has only a schema version, job ID, input
+hash, complete child coverage and unique selected fact IDs. It cannot supply new
+titles, constraints, actions, approvals or hold state. Each catalog ID binds the
+child job, the complete immutable child result hash and the source fact identity.
+The controller renders selected text verbatim as an attributed historical summary
+claim, preserving citations and exact quote references. A cited child claim can
+still be mistaken; attribution does not establish its truth or authority.
+
+All authenticated owner spans and canonical acceptance obligations remain
+mandatory independently of the selection. Preserve the complete source and
+summary indexes, omitted fact IDs and inherited gaps. Measure the expanded,
+attributed artifact and complete final catalog against their existing budgets;
+small model output containing only IDs does not imply a small successor packet.
+
+Current local controls come from the campaign controller, with a captured revision
+and state digest. Keep active, prior and pending holds separate from historical
+conditional rules. The owned handoff coordination hold is not an owner instruction
+and must not leave a stale stop after release. Recheck controls at continuation
+launch; existing external hold-channel and publication admission checks retain
+their independent authority.
+
+Final-audit-v2 checks source attribution, coverage, ordering and material omissions
+against complete leaf evidence, owner spans and current canonical state. Selecting
+an old claim cannot prove completion or invent a current hold. A rejected selection
+can use the existing bounded correction path and exact rejected-audit inputs;
+every corrected selection still requires fresh independent audits. Preserve old
+final-v3 artifacts as history, require new current-stage qualification, and leave
+leaf/intermediate and legacy history-audit qualification contracts unchanged.
 
 A completed final audit can reject a structurally valid synthesis. Retain its
 validated findings and stop admitting audits of that unchanged final; observe

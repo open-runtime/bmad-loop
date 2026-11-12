@@ -11,7 +11,7 @@ from .campaign_jobs import digest
 from .campaign_model import CampaignError
 
 HISTORY_AUDIT_PROMPT_VERSION = "history-audit-v3"
-FINAL_AUDIT_PROMPT_VERSION = "history-final-audit-v1"
+FINAL_AUDIT_PROMPT_VERSION = "history-final-audit-v2"
 
 PURPOSES = {
     "handoff_map",
@@ -59,6 +59,7 @@ def semantic_contract(purpose, audit_schema, contract=""):
         summary_schema,
         summary_schema_template,
     )
+    from .campaign_summary_final import schema_template as final_schema_template
     from .campaign_transcripts import READER_VERSIONS
 
     result = {"schema_version": 1, "purpose": purpose}
@@ -85,6 +86,8 @@ def semantic_contract(purpose, audit_schema, contract=""):
     result.update(
         reader_versions=dict(READER_VERSIONS), summary_schema_digest=digest(summary_schema())
     )
+    if purpose in {"handoff_final", "handoff_final_audit"}:
+        result["summary_schema_digest"] = digest(final_schema_template())
     result["prompt_version"] = {
         "handoff_map": EXTRACT_PROMPT_VERSION,
         "handoff_reduce": REDUCE_PROMPT_VERSION,
@@ -93,7 +96,9 @@ def semantic_contract(purpose, audit_schema, contract=""):
         "handoff_final_audit": FINAL_AUDIT_PROMPT_VERSION,
     }[purpose]
     if purpose in {"handoff_map", "handoff_reduce", "handoff_final"}:
-        result["summary_job_schema_digest"] = digest(summary_schema_template())
+        result["summary_job_schema_digest"] = digest(
+            final_schema_template() if purpose == "handoff_final" else summary_schema_template()
+        )
     if purpose in {"handoff_audit", "handoff_final_audit"}:
         result["audit_schema_digest"] = digest(audit_schema)
     return result

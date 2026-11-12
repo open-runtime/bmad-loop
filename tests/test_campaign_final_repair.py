@@ -16,11 +16,11 @@ from bmad_loop import campaign_handoff_flow as flow
 from bmad_loop import campaign_reasoning_flow as reasoning
 from bmad_loop.campaign_jobs import accept_receipt, prepare, request_from_dict
 from bmad_loop.campaign_model import CampaignError, OutboxAction
-from bmad_loop.campaign_summary import SummaryJobSpec, quote_catalog
+from bmad_loop.campaign_summary import SummaryJobSpec, load_input, quote_catalog
 from bmad_loop.campaign_supervisor import Observation
 
 
-def finish(runtime, snapshot, row, result, family, *, harvest=False):
+def finish(runtime, snapshot, row, result, family, *, harvest=False, output_tokens=None):
     row["attempt"] += 1
     row["claim"] = {
         "launch_id": "native-" + row["id"],
@@ -44,6 +44,8 @@ def finish(runtime, snapshot, row, result, family, *, harvest=False):
         "usage": {},
         "turns": 1,
     }
+    if output_tokens is not None:
+        receipt.update(usage_known=True, usage={"output_tokens": output_tokens})
     accept_receipt(snapshot, row["id"], receipt, now=runtime.clock())
     assert row["state"] == "validated", row.get("reason")
     apply = OutboxAction(
@@ -82,26 +84,12 @@ def finish(runtime, snapshot, row, result, family, *, harvest=False):
 
 def final_result(row, *, missing=False):
     spec = SummaryJobSpec(**row["request"]["coordinates"]["summary_spec"])
-    catalog = quote_catalog(spec)
-    identity, quote = next(iter(catalog.items()))
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "job_id": row["id"],
         "input_sha256": spec.input_sha256,
         "covered_ids": list(spec.primary_ids),
-        "gaps": [],
-        "facts": (
-            []
-            if missing
-            else [
-                {
-                    "kind": "owner_request",
-                    "text": "Keep history and all acceptance criteria.",
-                    "source_quote_id": identity,
-                    "citations": [quote["event_id"]],
-                }
-            ]
-        ),
+        "selected_fact_ids": [] if missing else list(load_input(spec)["fact_catalog"]),
     }
 
 
@@ -141,9 +129,14 @@ def audited_final(campaign, request):
     value = unit.evidence["handoff"]
     final = snapshot.jobs[value["jobs"][0]]
     for attempt in range(getattr(request, "param", 0)):
-        invalid = final_result(final)
-        invalid["facts"][0]["text"] = "x" * (final["request"]["limits"]["output_tokens"] + 1)
-        finish(runtime, snapshot, final, invalid, "openai")
+        finish(
+            runtime,
+            snapshot,
+            final,
+            final_result(final),
+            "openai",
+            output_tokens=final["request"]["limits"]["output_tokens"] + 1,
+        )
         assert final["state"] == "failed" and final["failure_attempts"] == attempt + 1
     finish(runtime, snapshot, final, final_result(final, missing=True), "openai")
     assert final["state"] == "applied"
@@ -229,7 +222,24 @@ def test_two_repairs_exhaust_without_reset_after_persistence_and_config_refresh(
             # A changed configuration may require a fresh exact extraction;
             # already applied cold records are reused without reinsertion.
             assert row is snapshot.jobs[key]
-            finish(runtime, snapshot, row, final_result(row), "openai")
+            spec = SummaryJobSpec(**row["request"]["coordinates"]["summary_spec"])
+            identity, quote = next(iter(quote_catalog(spec).items()))
+            result = {
+                "schema_version": 1,
+                "job_id": row["id"],
+                "input_sha256": spec.input_sha256,
+                "covered_ids": list(spec.primary_ids),
+                "gaps": [],
+                "facts": [
+                    {
+                        "kind": "owner_request",
+                        "text": "Keep history and all acceptance criteria.",
+                        "source_quote_id": identity,
+                        "citations": [quote["event_id"]],
+                    }
+                ],
+            }
+            finish(runtime, snapshot, row, result, "openai")
             assert row["state"] == "applied"
     step(runtime, snapshot, unit, "handoff-audit-plan")
     final = snapshot.jobs[value["jobs"][0]]
@@ -669,17 +679,9 @@ def test_nonowner_caution_is_inlined_for_repair_then_fresh_audit_and_release(cam
         assert row["state"] == "applied"
     step(runtime, snapshot, unit, "handoff-audit-plan")
     original = snapshot.jobs[value["jobs"][0]]
-    finish(
-        runtime,
-        snapshot,
-        original,
-        contextual_result(
-            original,
-            "Do not start the successor absent instruction; reconcile partial before any effect.",
-        ),
-        "openai",
-    )
-    assert original["state"] == "applied"  # Structural context labels are not semantic approval.
+    # A final can still omit useful context, but cannot invent a new hold.
+    finish(runtime, snapshot, original, final_result(original, missing=True), "openai")
+    assert original["state"] == "applied"  # Selection needs an independent semantic audit.
     old_input = load_input(SummaryJobSpec(**original["request"]["coordinates"]["summary_spec"]))
     assert exact_context not in json.dumps(old_input)
     step(runtime, snapshot, unit, "handoff-audit-plan")
@@ -689,7 +691,7 @@ def test_nonowner_caution_is_inlined_for_repair_then_fresh_audit_and_release(cam
         result = audit_result(audit)
         assert result["covered_owner_ids"] == result["covered_span_ids"] == []
         result["ambiguities"] = [
-            "The final turns an old agent proposal into a current continuation hold."
+            "The final omitted the historical caution needed to interpret the partial receipt."
         ]
         finish(runtime, snapshot, audit, result, "anthropic")
         assert audit["state"] == "failed"
@@ -731,12 +733,14 @@ def test_nonowner_caution_is_inlined_for_repair_then_fresh_audit_and_release(cam
     assert evidence["audited_input_shared_fields"]["final_frontier"] == [
         {"job_id": original["id"], "summary_evidence_field": "previous_final"}
     ]
-    corrected = contextual_result(
-        repair,
-        "The predecessor's agent proposed rereading its partial receipt. This historical proposal establishes no current owner hold.",
-    )
+    corrected = final_result(repair)
     finish(runtime, snapshot, repair, corrected, "openai")
     assert repair["state"] == "applied"
+    restored_summary = flow._applied(repair)
+    assert (
+        restored_summary["facts"][0]["selected_from"]["presentation"] == "historical-summary-claim"
+    )
+    assert json.dumps(historical_proposal) in restored_summary["facts"][0]["text"]
     step(runtime, snapshot, unit, "handoff-audit-plan")
     assert set(value["audits"]).isdisjoint(old_audits)
     for key in value["audits"]:

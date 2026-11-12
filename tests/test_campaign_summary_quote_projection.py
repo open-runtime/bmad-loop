@@ -17,13 +17,13 @@ from bmad_loop.campaign_history_trial import _plan_reducers, trial_request
 from bmad_loop.campaign_jobs import request_from_dict
 from bmad_loop.campaign_model import CampaignError, ReasoningSpec, RoleCandidate
 from bmad_loop.campaign_summary import (
-    FINAL_PROMPT_VERSION,
     REDUCE_PROMPT_VERSION,
     corrective_spec,
     load_input,
     owner_quote_references,
     plan_maps,
     plan_reduction,
+    project_final_input,
     project_reduction_input,
     quote_catalog,
     split_reduction_input,
@@ -98,7 +98,7 @@ def test_synthesis_receives_full_exact_quotes_once_without_changing_leaf_results
         children, budget(), tmp_path / "reduce", owner_quotes=table, project_native_events=projected
     )[0]
     if stage == "final":
-        job = replace(job, prompt_version=FINAL_PROMPT_VERSION)
+        job = project_final_input(job, tmp_path / "final")
     payload = load_input(job)
     assert payload["owner_quotes"] == table and len(table) == 2
     assert len(owner_quote_references([r for _, r in children])) == 3

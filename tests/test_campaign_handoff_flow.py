@@ -143,9 +143,14 @@ def campaign(prepared, project, tmp_path):
             "path": str(qualification_path),
             "sha256": file_digest(qualification_path),
         }
-        # Final-synthesis auditing earns a different prompt header. Keep its
-        # receipt/proof separate so the legacy history audit remains qualified.
-        final_bindings = [route_binding(value, "handoff_final_audit", candidate)]
+        # Closed final selection has a separate schema from legacy history.
+        # Each synthetic receipt declares precisely the contracts it exercises.
+        from bmad_loop.campaign_summary_final import schema_template as final_schema_template
+
+        final_bindings = [
+            route_binding(value, purpose, candidate)
+            for purpose in ("handoff_final", "handoff_final_audit")
+        ]
         final_native = read_json(native_path)
         final_native["result"].update(
             audit_prompt_version=FINAL_AUDIT_PROMPT_VERSION,
@@ -155,6 +160,8 @@ def campaign(prepared, project, tmp_path):
         write_json(final_native_path, final_native)
         final_proof = copy.deepcopy(qualification)
         final_proof.update(
+            summary_schema_digest=digest(final_schema_template()),
+            summary_job_schema_digest=digest(final_schema_template()),
             route_bindings=final_bindings,
             audit_prompt_version=FINAL_AUDIT_PROMPT_VERSION,
             independent_review={
