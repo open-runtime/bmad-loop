@@ -185,6 +185,9 @@ def _validate_capability(
     from .campaign_native_limits import validate as validate_native_limits
 
     validate_native_limits(raw, verify_files=verify_files)
+    from .campaign_prelaunch_failure import validate as validate_prelaunch_failure
+
+    validate_prelaunch_failure(raw, verify_files=verify_files)
     aliases = raw.get("served_model_aliases", [])
     if (
         not isinstance(aliases, list)
