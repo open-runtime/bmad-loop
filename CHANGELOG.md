@@ -10,6 +10,7 @@ breaking changes may land in a minor release.
 ### Fixed
 
 - Preserve authenticated prelaunch sign-in failures through opt-in TeamRouter receipts without trusting stderr or changing retry authority.
+- Observe prelaunch confirmation after producer exit so a verified handshake is not lost between poll and process death.
 - Audit controller-only holds as mandatory current state without requiring fabricated historical facts.
 - Reject defective final handoff artifacts independently of resolved owner intent, preserving bounded repair and fresh audit requirements.
 - Preserve native AGY quota reset deadlines through interruption, restart and prepared-launch admission while allowing eligible fallbacks.

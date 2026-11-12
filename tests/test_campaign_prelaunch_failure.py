@@ -230,6 +230,28 @@ def test_handshake_races_or_mutation_remain_generic(channel, phase):
     assert finish(item)["outcome"] == "failed"
 
 
+def test_finish_observes_confirmation_written_before_producer_exit(channel):
+    """Producer commits confirmed.json then exits; finish must not require another live poll."""
+    item, _, host = channel
+    begin(item, host)
+    accepted = item.accepted
+    assert accepted is not None
+    failure._publish(
+        item.directory / "confirmed.json",
+        {
+            "schema_version": 1,
+            "context_sha256": item.context_sha,
+            "refusal_sha256": accepted["refusal_sha256"],
+            "ack_sha256": accepted["ack_sha256"],
+            "producer_pid": 101,
+        },
+    )
+    assert item.confirmed is None
+    result = finish(item)
+    assert result["outcome"] == "authentication"
+    assert item.confirmed is not None
+
+
 def test_lost_or_unreadable_live_identity_never_acknowledged(channel, monkeypatch):
     item, _, host = channel
     monkeypatch.setattr(

@@ -315,13 +315,16 @@ def child_main(path: Path) -> int:
             known[process.pid] = stamp
             while True:
                 record_tree()
+                # Observe exit before polling so a producer that writes
+                # confirmed.json then exits is still observed on this pass.
+                exited = process.poll() is not None
                 if prelaunch is not None:
                     prelaunch.poll(process.pid, stamp, host, known, record_tree)
                 if stream is not None:
                     stream.read(stream_source)
                     if stream.limit_kind:
                         reason, limit_kind = "limit", stream.limit_kind
-                if process.poll() is not None:
+                if exited:
                     break
                 if reason:
                     pass

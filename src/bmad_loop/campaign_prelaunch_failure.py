@@ -458,37 +458,53 @@ class Channel:
             }
         if refusal_sha != self.accepted["refusal_sha256"]:
             raise _error("refusal changed after ACK")
-        if (self.directory / "confirmed.json").exists():
-            confirmed, confirmed_sha = _read(self.directory / "confirmed.json")
-            expected = {
-                "schema_version": 1,
-                "context_sha256": self.context_sha,
-                "refusal_sha256": refusal_sha,
-                "ack_sha256": self.accepted["ack_sha256"],
-                "producer_pid": refusal["producer_pid"],
-            }
-            ack, ack_sha = _read(self.directory / "ack.json")
-            if (
-                confirmed != expected
-                or any(type(confirmed[key]) is not type(value) for key, value in expected.items())
-                or ack != self.accepted["ack"]
-                or ack_sha != self.accepted["ack_sha256"]
-            ):
-                raise _error("producer confirmation does not bind the ACK")
-            self._deadline(refusal)
-            self.confirmed = {
-                "value": confirmed,
-                "sha256": confirmed_sha,
-                "observed_at": self.clock(),
-            }
+        self._observe_confirmed(refusal, refusal_sha)
+
+    def _observe_confirmed(self, refusal, refusal_sha):
+        """Bind confirmed.json once; safe after the producer has already exited."""
+        accepted = self.accepted
+        if self.confirmed or accepted is None or not (self.directory / "confirmed.json").exists():
+            return
+        confirmed, confirmed_sha = _read(self.directory / "confirmed.json")
+        expected = {
+            "schema_version": 1,
+            "context_sha256": self.context_sha,
+            "refusal_sha256": refusal_sha,
+            "ack_sha256": accepted["ack_sha256"],
+            "producer_pid": refusal["producer_pid"],
+        }
+        ack, ack_sha = _read(self.directory / "ack.json")
+        if (
+            confirmed != expected
+            or any(type(confirmed[key]) is not type(value) for key, value in expected.items())
+            or ack != accepted["ack"]
+            or ack_sha != accepted["ack_sha256"]
+        ):
+            raise _error("producer confirmation does not bind the ACK")
+        self._deadline(refusal)
+        self.confirmed = {
+            "value": confirmed,
+            "sha256": confirmed_sha,
+            "observed_at": self.clock(),
+        }
 
     def finish(self, receipt, *, returncode, stdout_bytes, ordinary_terminal):
         """Classification never supplies completion, usage or missing lifecycle proof."""
         if self.fault:
             receipt["prelaunch_failure_error"] = self.fault
-        if not self.confirmed or not self.accepted or self.fault:
+        if not self.accepted or self.fault:
             return
         try:
+            # Producer writes confirmed.json then exits. A wait-loop gap can leave
+            # self.confirmed unset even when the transcript is already on disk.
+            if not self.confirmed:
+                self._current_context()
+                refusal, refusal_sha = _read(self.directory / "refusal.json")
+                if refusal_sha != self.accepted["refusal_sha256"]:
+                    raise _error("refusal changed after ACK")
+                self._observe_confirmed(refusal, refusal_sha)
+            if not self.confirmed:
+                return
             self._current_context()
             for name, expected in (
                 ("refusal", self.accepted["refusal_sha256"]),
@@ -507,7 +523,7 @@ class Channel:
                 and receipt.get("outcome") == "failed"
             ):
                 raise _error("terminal evidence cannot admit prelaunch authentication")
-        except (OSError, ValueError, TypeError, CampaignError) as exc:
+        except (OSError, ValueError, TypeError, KeyError, CampaignError) as exc:
             receipt["prelaunch_failure_error"] = f"{type(exc).__name__}: {exc}"
             return
         receipt.update(
