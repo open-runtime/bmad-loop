@@ -432,6 +432,36 @@ def test_observation_faults_are_unknown_without_followup(tmp_path, monkeypatch, 
     assert len(calls) == (2 if change == "aggregate" else 1)
 
 
+def test_symlink_path_entry_pins_followed_target(tmp_path, monkeypatch):
+    target, _ = fixture(tmp_path, monkeypatch)
+    link = tmp_path / "bin" / "agy"
+    link.parent.mkdir()
+    try:
+        link.symlink_to(target)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable on this host: {exc}")
+    monkeypatch.setattr(native.shutil, "which", lambda *a, **k: str(link))
+    monkeypatch.setattr(native, "TIMEOUT_S", 60.0)
+    result = campaign_capacity.observe(CANDIDATE, tmp_path, now=NOW)
+    assert result.known and result.available, result.reason
+    assert agy._image_pin(link) == agy._image_pin(target)
+
+
+def test_account_home_without_HOME_uses_path_home(tmp_path, monkeypatch):
+    binary, _ = fixture(tmp_path, monkeypatch)
+    account = tmp_path / "account"
+    monkeypatch.delenv("HOME", raising=False)
+    monkeypatch.setenv("USERPROFILE", str(account))
+    monkeypatch.setattr(Path, "home", lambda: account)
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key != "HOME" and not key.startswith(("GH_", "GITHUB_"))
+    }
+    raw = agy.read_agy(str(binary), env, time.monotonic() + 60.0)
+    assert "usage" in raw and "models" in raw
+
+
 def test_custom_capacity_command_keeps_precedence(tmp_path, monkeypatch):
     candidate = dataclasses.replace(CANDIDATE, capacity_command=("custom-status",))
     monkeypatch.setattr(

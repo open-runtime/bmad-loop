@@ -208,7 +208,9 @@ def _settings_pin(path: Path) -> tuple[str | None, dict]:
 
 
 def _image_pin(binary: Path) -> tuple:
-    if is_link_like(binary) or not binary.is_file():
+    # PATH entries are often symlinks (Homebrew, version managers). Pin the
+    # followed target inode so drift detection still sees image replacement.
+    if not binary.is_file():
         raise ProbeError("native AGY executable must be a regular native file")
     info = binary.stat()
     return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
@@ -223,7 +225,11 @@ def read_agy(binary: str, env: Mapping[str, str], deadline: float) -> dict:
         for key in env
     ):
         raise ProbeError("native AGY environment overrides require a custom capacity command")
-    home = Path(env.get("HOME", ""))
+    # Windows often has USERPROFILE without HOME; Path.home() honors that.
+    try:
+        home = Path(env.get("HOME") or str(Path.home()))
+    except RuntimeError as exc:
+        raise ProbeError("native AGY account HOME is unavailable") from exc
     if not home.is_absolute():
         raise ProbeError("native AGY account HOME is unavailable")
     settings = home / ".gemini/antigravity-cli/settings.json"

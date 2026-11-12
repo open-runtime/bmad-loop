@@ -9,6 +9,8 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Accept symlink PATH entries for the native AGY capacity observer and pin the followed target image.
+- Resolve the AGY account home via Path.home() when HOME is unset so Windows USERPROFILE installs work.
 - Observe current AGY Flash model access and quota through bounded native metadata commands before admission.
 - Preserve required handoff facts through both packing stages and exclude misleading historical claims without discarding their sources.
 - Disable AGY background self-updates in managed native launch recipes and the shipped interactive profile.
