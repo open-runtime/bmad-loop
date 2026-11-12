@@ -1,6 +1,6 @@
 # ADR 0003: Bounded reasoning jobs and portable session handoff
 
-- **Status:** Implemented; release-specific qualification and target-project delivery remain gated
+- **Status:** Implemented with a confirmed typed prelaunch authentication gap; qualification and target-project delivery remain gated
 - **Date:** 2026-11-06
 - **Extends:** [ADR 0002](0002-native-sdlc-campaign.md) and its [implementation contract](0002-campaign-implementation.md)
 - **Delivery:** Initial campaign PR and reviewed follow-up releases, before qualified target-project activation
@@ -39,7 +39,9 @@ and keep implementation, normal-runtime coverage, native qualification and
 activation separate. Native qualification, both writable continuation directions,
 full-history semantic evidence, merged installation and generic onboarding have
 been demonstrated. Each follow-up candidate requires applicable affected checks and
-independent reviews; real selected REM delivery is a separate acceptance gate.
+independent reviews. First qualify hosted two-story delivery in a separate
+disposable repository. The old REM pilot remains retired with its evidence and
+branches preserved; fresh REM activation is a later, separately authorized gate.
 
 The accepted completion extension in ADR 0002 includes these subsequent gates in
 the current work. Its native route proofs, managed hcom communication, writable
@@ -49,6 +51,9 @@ Every changed candidate requires applicable qualification, and installation-boun
 routes require renewal when their paths or dependencies change. Unchanged semantic
 proofs may be retained after validation. Real target delivery and live operator checks
 remain separate from scripted load, canary and onboarding proofs.
+Writable handoff, managed messaging, live controls and current load qualification
+remain unfulfilled rollout gates. A narrow Claude/Grok delivery does not establish
+these gates or qualify every requested native route.
 
 Before any coding or reasoning launch, a stopped campaign may renew equivalent
 route proofs after its deterministic workspace preparation has been reconciled.
@@ -279,6 +284,25 @@ staleness. Emit typed quota, authentication, transport, cancellation and limit
 outcomes even when no result JSON exists. A completed process with invalid output
 is different from an uncertain live process; neither becomes a generic successful
 empty result. These receipts feed the same bounded recovery and capacity paths.
+
+**Confirmed implementation gap:** A trusted launcher's authentication refusal
+before native JSON output currently becomes a generic failed receipt when the
+stdout parser finds no frames. The typed prelaunch authentication requirement
+above is therefore not fully implemented.
+
+The proposed repair is a versioned, private error record from the pinned trusted
+launcher, bound to the exact request, generation, launch and owned process birth.
+Accept only explicit authentication codes from the prelaunch boundary; carry their
+sanitized provenance through the receipt, native binding and interruption records.
+Do not classify arbitrary stderr, model or tool prose as authentication. Missing,
+ambiguous or mismatched evidence remains visibly failed or unknown. Preserve
+lifecycle settlement, unknown usage, attempt budgets and owner sign-in authority.
+
+Required zero-token tests cover an authenticated refusal with empty stdout,
+propagation through both interruption paths, and rejection of spoofed prose,
+wrong request/generation/process identity, duplicate or missing records and
+post-launch injection. This is proposed work, not an implemented recovery path;
+typed classification alone does not authorize retries or credential changes.
 
 Allow parallel snapshot readers without granting them the unit's write lease.
 All reasoning jobs count toward campaign and provider session/token budgets.
@@ -829,7 +853,8 @@ preserves unresolved contradictions, and yields no invented approval or completi
 Passing this finite corpus does not promise lossless compression of arbitrary
 histories. Measure input/output work, latency, failure recovery, delivered
 throughput and working-context size before advertising scale. Original merge,
-exact-install and selected REM-delivery gates still apply.
+exact-install and target-delivery gates still apply: disposable delivery first,
+with fresh REM activation separately authorized later.
 
 Parent tracking closes independent epics concurrently, with at most sixteen
 pending parent scopes and the shared I/O bound. Each scope keeps its own durable
@@ -1205,7 +1230,8 @@ These are native adapter/handoff stage proofs with small histories, not a claim
 of actual provider quota exhaustion, full native supervisor execution or GitHub
 delivery. The normal supervisor's quota/recovery path has separate scripted
 integration coverage. Installed route revalidation, the current full-corpus
-trial and real REM delivery remain required.
+trial and real target delivery remain required. The current rollout qualifies a
+separate disposable repository before any fresh REM activation.
 
 A subsequent concurrent regression exposed excessive macOS process-observation
 latency. The direct-child observation repair changes a dependency of tool-bearing
@@ -1217,8 +1243,9 @@ that distinction; it does not rewrite old receipts or relax cleanup deadlines.
 Those regression and load results qualify their named earlier candidates.
 The delivery completion extension requires fresh final checks and
 reviews after its changes. Hosted Actions remain disabled; unrun platform gates
-remain explicit. Merge, exact-commit installation, canonical-base update and REM
-activation are required completion work, not satisfied by earlier qualification.
+remain explicit. Merge, exact-commit installation, canonical-base update and
+disposable target delivery remain required; later fresh REM activation has its
+own authorization and qualification gates. Earlier evidence does not satisfy them.
 
 The final source candidate `8a7b4a9e` passed the complete regression and both load
 cases recorded in ADR 0002. All eight native routes and both writable continuation
