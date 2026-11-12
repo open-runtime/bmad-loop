@@ -447,3 +447,149 @@ def test_v2_proposal_boundary_before_any_proof(prepared, tmp_path, fault):
         CampaignError, match="Native streaming limits|exact helper/worker dependencies"
     ):
         campaign_native_limits.validate(cap)
+
+
+def _marker_stream_cli(path, fault):
+    """Emit synthetic seven-byte JSON deltas; no recorded provider content."""
+    path.write_text(
+        f"FAULT = {fault!r}\n" + """import json,re,sys,time
+wire=json.loads(sys.stdin.read())
+text=wire['message']['content']
+source=json.loads(next(line for line in text.splitlines() if line.startswith('{"source_id":')))['content']
+expected={'nonce':re.search(r'QUALIFICATION NONCE ([a-f0-9]+)',source).group(1),
+          'markers':re.findall(r'CANARY [0-9]+: ([a-f0-9]+)',source)}
+session='generated-stream-session'
+def emit(value):
+    print(json.dumps(value),flush=True)
+def event(kind,**fields):
+    emit({'type':'stream_event','session_id':session,'parent_tool_use_id':None,
+          'uuid':'00000000-0000-4000-8000-000000000001',
+          'api_message_id':'msg-generated-000000000000000000000001',
+          'event':{'type':kind,**fields}})
+emit({'type':'system','model':'gpt-test','session_id':session})
+event('message_start',message={'id':'msg-one','usage':{'output_tokens':2}})
+event('content_block_start',index=0,content_block={'type':'tool_use','name':'StructuredOutput','id':'structured','input':{}})
+payload=json.dumps(expected,separators=(',',':'))
+for pos in range(0,len(payload),7):
+    event('content_block_delta',index=0,delta={'type':'input_json_delta','partial_json':payload[pos:pos+7]})
+if FAULT=='wire':
+    for _ in range(1100):
+        event('content_block_delta',index=0,delta={'type':'input_json_delta','partial_json':' '*2048})
+event('content_block_stop',index=0)
+output=16385 if FAULT=='output' else 13692
+event('message_delta',delta={'stop_reason':'end_turn'},usage={'output_tokens':output})
+if FAULT=='output':
+    time.sleep(10)
+event('message_stop')
+if FAULT=='messages':
+    event('message_start',message={'id':'msg-two','usage':{'output_tokens':1}})
+    time.sleep(10)
+else:
+    emit({'type':'result','session_id':session,'subtype':'success','num_turns':1,
+          'structured_output':expected,'usage':{'input_tokens':12,'output_tokens':output,
+          'iterations':[{'type':'message','output_tokens':output}]}})
+""",
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.parametrize("fault", ["none", "output", "messages", "wire"])
+def test_partial_marker_canary_qualifies_then_validates_without_refunding_bounds(
+    prepared, tmp_path, fault
+):
+    from bmad_loop.campaign_headless import validate_probe_capability
+    from bmad_loop.campaign_qualification import qualify
+
+    runner, _, _, candidate, original = prepared
+    script = tmp_path / "generated-markers.py"
+    _marker_stream_cli(script, fault)
+    cap = bounded(
+        {
+            **{key: value for key, value in original.items() if key != "qualification"},
+            "argv": [
+                original["binary"],
+                str(script),
+                "--print",
+                "--output-format",
+                "stream-json",
+                "--include-partial-messages",
+                "--tools",
+                "",
+                "--strict-mcp-config",
+                "--mcp-config",
+                '{"mcpServers":{}}',
+            ],
+            "input_mode": "claude-stream-stdin",
+            "input_tokens": 81920,
+            "output_tokens": 16384,
+            "max_turns": 1,
+            "dependencies": [{"path": str(script), "sha256": file_digest(script)}],
+        }
+    )
+    cap["native_limits"] = dict(campaign_native_limits.CLAUDE_STREAM_LIMITS)
+    helper = Path(campaign_native_stream.__file__).resolve()
+    cap["dependencies"].append({"path": str(helper), "sha256": file_digest(helper)})
+    validate_probe_capability(cap, candidate)
+    proposal = tmp_path / "marker-proposal.json"
+    write_json(proposal, cap)
+    directory = tmp_path / "marker-canary"
+    report = qualify(
+        proposal, directory, input_bytes=65536, output_tokens=16384, timeout_s=15, runner=runner
+    )
+    receipt = report["receipt"]
+    assert receipt["quiescent"] and receipt["processes_quiescent"], receipt
+    assert receipt["wire_output_limit_bytes"] == 16384 * 128 + 65536
+    wire_bytes = (directory / "stdout.jsonl").stat().st_size
+    assert wire_bytes > 16384 * 16 + 65536
+    if fault == "none":
+        assert report["ok"], report
+        assert wire_bytes < receipt["wire_output_limit_bytes"]
+        assert len(receipt["result"]["markers"]) == 256
+        assert receipt["usage"]["output_tokens"] == 13692
+        assert receipt["turns"] == 1
+        assert receipt["native_stream_accounting"]["terminal_usage_complete"] is True
+        earned = read_json(Path(report["capability_path"]))
+        validate_capability(earned, candidate)
+        assert earned["output_tokens"] == 16384 and earned["max_turns"] == 1
+    else:
+        assert report["ok"] is False
+        assert receipt["outcome"] == "limit", receipt
+        assert (
+            receipt["limit_kind"]
+            == {
+                "output": "native-output-tokens",
+                "messages": "native-request-count",
+                "wire": "stdout-wire-bytes",
+            }[fault]
+        )
+        if fault in {"output", "messages"}:
+            frames = [
+                json.loads(line) for line in (directory / "stdout.jsonl").read_text().splitlines()
+            ]
+            assert not any(frame.get("type") == "result" for frame in frames)
+        assert not (directory / "capability.json").exists()
+
+
+@pytest.mark.parametrize(
+    "protocol,permissions,partial,expected",
+    [
+        ("claude-stream", "no-tools", False, 327680),
+        ("claude-stream", "no-tools", True, 2162688),
+        ("claude-stream", "workspace-tools", True, 327680),
+        ("claude-stream", "read-only-tools", True, 327680),
+        ("bmad-test-v1", "no-tools", True, 327680),
+        ("grok-json", "no-tools", True, 327680),
+        ("grok-json", "workspace-tools", True, 851968),
+        ("muse-json", "no-tools", True, 2359296),
+    ],
+)
+def test_partial_stream_allowance_preserves_other_recipes(protocol, permissions, partial, expected):
+    from bmad_loop.campaign_headless_worker import _wire_output_limit
+    from bmad_loop.campaign_jobs import JobLimits
+
+    assert (
+        _wire_output_limit(
+            protocol, permissions, 65536, JobLimits(81920, 16384, 1, 15), claude_streaming=partial
+        )
+        == expected
+    )

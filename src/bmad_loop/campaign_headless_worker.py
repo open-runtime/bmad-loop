@@ -27,10 +27,22 @@ from .childrun import kill_tree
 from .process_host import get_process_host
 
 
-def _wire_output_limit(protocol: str, permissions: str, input_bytes: int, limits: JobLimits) -> int:
+def _wire_output_limit(
+    protocol: str,
+    permissions: str,
+    input_bytes: int,
+    limits: JobLimits,
+    *,
+    claude_streaming: bool = False,
+) -> int:
     """Bound transport bytes separately from native model output and turn usage."""
     wire_limit = limits.output_tokens * 16 + 65536
-    if protocol == "muse-json":
+    if protocol == "claude-stream" and permissions == "no-tools" and claude_streaming:
+        # Partial JSON deltas carry a native envelope even for a few payload
+        # bytes. Reserve finite framing overhead separately from model tokens;
+        # the v2 token/message accounting and record/frame bounds still apply.
+        wire_limit = limits.output_tokens * 128 + 65536
+    elif protocol == "muse-json":
         # MSP echoes input and emits a separate native envelope per output delta.
         wire_limit = input_bytes * 3 + limits.output_tokens * 128 + 65536
     elif protocol == "grok-json" and permissions in {"read-only-tools", "workspace-tools"}:
@@ -221,14 +233,16 @@ def child_main(path: Path) -> int:
             # The launcher can otherwise replace the pinned native executable
             # after qualification and before exec. Account routing is unchanged.
             environment["MUSE_NO_AUTO_UPDATE"] = "1"
+        from .campaign_native_limits import streaming
+
         wire_limit = _wire_output_limit(
             capability["protocol"],
             envelope["permissions"],
             envelope["input"]["bytes"],
             request.limits,
+            claude_streaming=streaming(capability),
         )
         receipt["wire_output_limit_bytes"] = wire_limit
-        from .campaign_native_limits import streaming
 
         if streaming(capability):
             from .campaign_native_stream import ClaudeStream

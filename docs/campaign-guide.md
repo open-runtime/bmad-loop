@@ -1236,6 +1236,10 @@ The worker checks every 100ms; this is reactive containment, so a native retry
 may already have started. Partial usage stays a lower bound and cannot earn a
 successful grant. Existing recipes remain unchanged. Adding v2 requires fresh
 qualification binding the exact launcher, helper, stream and completed receipt.
+V2 budgets partial-message framing separately from model output. The additional
+wire allowance covers repeated stream metadata; it does not increase token,
+turn, time, record or frame limits. Exceeding either allowance still rejects the
+job, and changed worker dependencies require fresh transport qualification.
 
 `bmad-loop campaign trial-handoff SNAPSHOTS --capability CAPABILITY --directory PRIVATE_DIRECTORY --parallel 4 --json`
 exercises sealed history through qualified native map/reduce jobs and production

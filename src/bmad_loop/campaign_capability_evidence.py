@@ -167,6 +167,7 @@ def _validate(capability, candidate) -> None:
                     capability["permissions"],
                     envelope["input"]["bytes"],
                     JobLimits(**limits),
+                    claude_streaming=streaming(capability),
                 ),
             )
             with regular_reader(path.parent / "stdout.jsonl") as source:

@@ -1395,6 +1395,14 @@ usage once and reconcile it with terminal usage and native iterations when
 provided. Malformed, nested or incomplete accounting cannot earn qualification.
 Existing v1 recipes and proofs retain their original contract.
 
+The v2 transport receives a separate finite allowance for partial-message
+framing. Small JSON deltas repeat envelope metadata, and completed messages can
+repeat the accumulated payload; wire bytes therefore do not measure model tokens.
+This allowance changes neither output tokens nor model-message counts, record
+and frame limits, elapsed time or owned-process containment. Legacy recipes keep
+their existing wire allowance. A worker change requires fresh matching native
+qualification; a previously rejected wire-limit receipt remains rejected.
+
 The disposable worker incrementally reads bounded JSONL records every 100ms.
 Typed `max_tokens`, excess observed output or another model request beyond the
 allowance causes owned-process cancellation. This is reactive containment: a
