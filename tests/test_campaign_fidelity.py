@@ -361,7 +361,7 @@ def test_map_proof_ignores_unused_audit_schema_and_reducer_prompt(proof, monkeyp
 
 @pytest.mark.parametrize(
     ("purpose", "prior_version"),
-    [("handoff_reduce", "history-reduce-v5"), ("handoff_final", "history-final-v1")],
+    [("handoff_reduce", "history-reduce-v6"), ("handoff_final", "history-final-v2")],
 )
 def test_prior_synthesis_native_proof_cannot_qualify_repaired_prompt(proof, purpose, prior_version):
     from pathlib import Path

@@ -1340,10 +1340,12 @@ def _reduce(runtime, snapshot, unit, value):
     from .campaign_summary import (
         FINAL_PROMPT_VERSION,
         SummaryJobSpec,
+        owner_quote_references,
         plan_reduction,
         summary_prompt,
         summary_schema,
     )
+    from .campaign_summary_quotes import resolve_owner_quotes
     from .campaign_summary_routes import enabled
 
     if any(_job(runtime, snapshot, key)["state"] != "applied" for key in value["jobs"]):
@@ -1408,6 +1410,12 @@ def _reduce(runtime, snapshot, unit, value):
                 "retained_jobs": list(value["jobs"]),
             }
         }
+    # Resolve once for this frontier, before either the final-fit decision or
+    # intermediate partitioning. Every candidate group pays for its exact spans.
+    owner_quotes = resolve_owner_quotes(
+        tuple(HistorySnapshot(**row) for row in value["capture"]["sources"]),
+        owner_quote_references([result for _, result in children]),
+    )
     stage = "intermediate"
     if staged:
         candidate, cap = _summary_route(
@@ -1419,6 +1427,7 @@ def _reduce(runtime, snapshot, unit, value):
             _root(runtime, snapshot, value) / "reductions",
             artifact_bytes=0,
             project_native_events=True,
+            owner_quotes=owner_quotes,
         )
         if len(final_plan) == 1:
             stage = "final"
@@ -1436,6 +1445,7 @@ def _reduce(runtime, snapshot, unit, value):
         _root(runtime, snapshot, value) / "reductions",
         artifact_bytes=artifact_limit,
         project_native_events=True,
+        owner_quotes=owner_quotes,
     )
     jobs = []
     for planned_spec in planned:

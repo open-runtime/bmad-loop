@@ -10,6 +10,7 @@ breaking changes may land in a minor release.
 ### Fixed
 
 - Preserve source-supported action timing and authority in intermediate and final handoff summaries.
+- Supply authenticated owner quote spans inline before sizing and partitioning handoff reductions.
 
 ## [0.16.0] — 2026-11-11
 

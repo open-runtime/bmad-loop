@@ -401,7 +401,9 @@ def test_post_audit_context_fit_retains_omitted_summary_retrieval(campaign, monk
     from bmad_loop import campaign_handoff_context as context
     from bmad_loop.campaign_headless import read_json
     from bmad_loop.campaign_reasoning_results import apply_result
-    from bmad_loop.campaign_summary import SummaryJobSpec, plan_reduction
+    from bmad_loop.campaign_summary import SummaryJobSpec, owner_quote_references, plan_reduction
+    from bmad_loop.campaign_summary_quotes import resolve_owner_quotes
+    from bmad_loop.campaign_transcripts import HistorySnapshot
 
     runtime, snapshot, unit, receipt = campaign
     assert flow.intercept_terminal(runtime, snapshot, unit, receipt)
@@ -419,6 +421,10 @@ def test_post_audit_context_fit_retains_omitted_summary_retrieval(campaign, monk
         ((child_spec, flow._applied(child)),),
         flow._budget(candidate, flow._cap(snapshot, candidate)),
         runtime.store.root / "test-reduction",
+        owner_quotes=resolve_owner_quotes(
+            tuple(HistorySnapshot(**raw) for raw in value["capture"]["sources"]),
+            owner_quote_references([flow._applied(child)]),
+        ),
     )[0]
     row = copy.deepcopy(child)
     row["id"] = reducer.id

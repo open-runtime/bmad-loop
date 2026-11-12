@@ -6,7 +6,7 @@ import json
 from dataclasses import replace
 
 import pytest
-from test_campaign_handoff_context import budget, capture, native_row, result
+from test_campaign_handoff_context import budget, capture, native_row, quotes, result
 from test_campaign_handoff_flow import campaign as campaign
 from test_campaign_handoff_flow import complete_audits, complete_maps
 from test_campaign_handoff_retry import dispatch, finish, start, valid_result
@@ -44,7 +44,11 @@ def test_prompt_embeds_the_exact_native_job_schema(tmp_path, kind):
         value["facts"][0]["source_quote"] = "Keep every commit."
         validated = validate_summary(job, value, events)
         job = plan_reduction(
-            ((job, validated),), budget(), tmp_path / "reduce", artifact_bytes=4000
+            ((job, validated),),
+            budget(),
+            tmp_path / "reduce",
+            artifact_bytes=4000,
+            owner_quotes=quotes(history, validated),
         )[0]
     elif kind == "correction":
         job = corrective_spec(job, attempt=1, receipt_sha256="receipt", reason="Missing obligation")
@@ -172,7 +176,11 @@ def test_synthesis_preserves_obligation_timing_and_qualifies_child_inferences(
     leaf = plan_maps(events, budget(), tmp_path / "maps")[0]
     child = validate_summary(leaf, result(leaf, events), events)
     job = plan_reduction(
-        ((leaf, child),), budget(), tmp_path / "reduce", artifact_bytes=artifact_bytes
+        ((leaf, child),),
+        budget(),
+        tmp_path / "reduce",
+        artifact_bytes=artifact_bytes,
+        owner_quotes=quotes(history, child),
     )[0]
     if stage == "final":
         job = replace(job, prompt_version=FINAL_PROMPT_VERSION)
@@ -184,7 +192,8 @@ def test_synthesis_preserves_obligation_timing_and_qualifies_child_inferences(
         "Do not turn delivery postconditions into prerequisites for editing, continuation or merge.",
         "Do not invent owner approval requirements or review waivers.",
         "Pending review or verification describes unfinished work, not an instruction to leave it undone.",
-        "Child summaries and quote previews are fallible paraphrases, not new authority.",
+        "Child summaries are fallible paraphrases, not new authority.",
+        "The owner_quotes table supplies authenticated exact source spans;",
         "Use exact source text when supplied. If it is not supplied, attribute the child claim",
         "retrieve retained originals before acting on a disputed requirement.",
         "Keep contradictions visible rather than choosing an unsupported resolution.",
@@ -229,8 +238,8 @@ def test_leaf_instructions_remain_byte_identical_for_existing_extract_contract(
 @pytest.mark.parametrize(
     ("stage", "prior", "current"),
     [
-        ("intermediate", "history-reduce-v5", REDUCE_PROMPT_VERSION),
-        ("final", "history-final-v1", FINAL_PROMPT_VERSION),
+        ("intermediate", "history-reduce-v6", REDUCE_PROMPT_VERSION),
+        ("final", "history-final-v2", FINAL_PROMPT_VERSION),
     ],
 )
 def test_saved_synthesis_contract_requires_fresh_request_after_fidelity_repair(

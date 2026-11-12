@@ -499,6 +499,9 @@ available independently of every lossy summary or native import.
 5. Reduce by workstream and chronology. Each reducer receives relevant source
    references and ledger entries as well as child summaries. Retain a summary tree
    for targeted retrieval; do not discard intermediate artifacts after reduction.
+   Resolve referenced owner quotes against authenticated captured events and supply
+   their exact text inline, deduplicated by span identity. Include those bytes before
+   budgeting and partitioning; a hash or paraphrase is not the original instruction.
    Packet indexes retain every validated summary node, its immutable input and
    semantic child identities. Retry dependencies remain separate provenance.
    Final summaries omitted while fitting initial or audited context stay retrievable;
@@ -892,8 +895,8 @@ successors continue under their existing claim and enter a fresh fenced handoff
 only after normal observation establishes their interruption and quiescence.
 Extraction and reduction prompts embed their exact job-bound native schema,
 including eligible citations and quote IDs. Leaf instructions retain the
-`history-extract-v3` contract. The revised `history-reduce-v6` and
-`history-final-v2` contracts require fresh intermediate and final semantic
+`history-extract-v3` contract and leaf result schema. The revised `history-reduce-v7` and
+`history-final-v3` contracts require fresh intermediate and final semantic
 qualification. Earlier synthesis receipts remain historical evidence, not grants
 for the new prompts; unchanged extraction, audit and finite-contract proofs
 retain their own validity.
@@ -1317,10 +1320,16 @@ strings. A model-result rejection permits two immutable corrective attempts and
 retains the rejected receipts. Source corruption or uncertain native lifecycle is
 not a semantic retry.
 
-Reducer presentation exposes native citations and exact owner-quote references,
-with child identities retained for coverage. Internal fact IDs remain in the
-hash-bound original artifact rather than competing with eligible citations in
-the model input. Existing frozen trial requests remain immutable. The operator
+Reducer presentation exposes native citations, exact owner-quote references and
+their authenticated source text, with child identities retained for coverage.
+Quote resolution verifies owner provenance, event identity, offsets and content
+hash before including each referenced span. Repeated references share one inline
+span; missing or inconsistent source evidence refuses preparation. Exact text
+remains context, not a new approval or authority grant.
+
+Internal fact IDs remain in the hash-bound original artifact rather than competing
+with eligible citations in the model input. Existing frozen trial requests remain
+immutable. The operator
 trial can reconcile an exhausted legacy reducer through one recorded presentation
 revision, retaining all three prior attempts and allowing one additional native
 attempt. This does not reset campaign lifetime retry counters or reinterpret an

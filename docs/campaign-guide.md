@@ -606,6 +606,15 @@ retained indexes identify the actual source artifacts available for retrieval.
 Passing structural checks or a native transport probe does not establish semantic
 fidelity or authorize continuation.
 
+Reducers receive exact authenticated owner spans referenced by their children,
+not only quote IDs or paraphrase previews. The coordinator verifies provenance,
+offsets and hashes, deduplicates the spans, and includes their inline bytes before
+budgeting and partitioning. Missing or inconsistent source evidence stops
+preparation; exact quotes grant no additional authority. Leaf extraction and its
+result schema remain unchanged. Intermediate `history-reduce-v7` and final
+`history-final-v3` require fresh purpose-bound semantic proof; earlier receipts
+remain historical evidence under their original contracts.
+
 `reasoning.history_max_bytes` bounds each captured source stream (512 MiB by
 default, at most 1 GiB). It is frozen independently of per-model input and output
 limits. Large history is sealed and parsed incrementally, then partitioned into
