@@ -17,6 +17,7 @@ from bmad_loop.campaign_summary import (
     LEGACY_FINAL_PROMPT_VERSION,
     SummaryResultRejected,
     corrective_spec,
+    final_artifact_envelope_size,
     final_input_size,
     load_input,
     plan_maps,
@@ -24,6 +25,7 @@ from bmad_loop.campaign_summary import (
     project_final_input,
     project_reduction_input,
     split_reduction_input,
+    summary_contract_current,
     summary_prompt,
     summary_schema,
     validate_summary,
@@ -67,11 +69,11 @@ def sources(tmp_path):
 
 def selection(job, ids=None):
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "job_id": job.id,
         "input_sha256": job.input_sha256,
         "covered_ids": list(job.primary_ids),
-        "selected_fact_ids": list(load_input(job)["fact_catalog"]) if ids is None else ids,
+        "ranked_fact_ids": list(load_input(job)["fact_catalog"]) if ids is None else ids,
     }
 
 
@@ -91,7 +93,7 @@ def test_conditional_rule_and_child_hold_claim_are_never_new_control_text(tmp_pa
     assert validated["omitted_fact_ids"] == []
     assert payload["owner_quotes"] == load_input(reduce)["owner_quotes"]
     assert [fact["selected_from"]["catalog_id"] for fact in validated["facts"]] == raw[
-        "selected_fact_ids"
+        "ranked_fact_ids"
     ]
     originals = {fact["id"]: fact for fact in child["facts"]}
     for actual in validated["facts"]:
@@ -121,16 +123,18 @@ def test_model_cannot_write_prose_controls_or_clear_gaps(tmp_path, sources, fiel
 
 
 @pytest.mark.parametrize(
-    "change", ["duplicate", "unknown", "wrong-child", "wrong-input", "schema-bool"]
+    "change", ["duplicate", "unknown", "missing", "wrong-child", "wrong-input", "schema-bool"]
 )
 def test_closed_selection_rejects_stale_or_invented_references(tmp_path, sources, change):
     events, _, reduce = sources
     job = project_final_input(reduce, tmp_path / "final")
     raw = selection(job)
     if change == "duplicate":
-        raw["selected_fact_ids"].append(raw["selected_fact_ids"][0])
+        raw["ranked_fact_ids"].append(raw["ranked_fact_ids"][0])
     elif change == "unknown":
-        raw["selected_fact_ids"] = ["unknown"]
+        raw["ranked_fact_ids"] = ["unknown"]
+    elif change == "missing":
+        raw["ranked_fact_ids"].pop()
     elif change == "wrong-child":
         raw["covered_ids"] = ["another-child"]
     elif change == "wrong-input":
@@ -149,8 +153,10 @@ def test_omitted_source_claims_and_gaps_remain_complete(tmp_path, sources):
     path.write_bytes(encoded(source))
     reduce = replace(reduce, input_path=str(path), input_sha256=digest(source))
     job = project_final_input(reduce, tmp_path / "final")
-    raw = selection(job, [])
-    validated = validate_summary(job, raw, events)
+    job = replace(job, artifact_bytes=9000)
+    job = replace(job, artifact_bytes=final_artifact_envelope_size(job))
+    raw = selection(job)
+    validated = validate_summary(job, raw, events, observed_output_tokens=100)
     assert validated["gaps"] == ["Missing a native tail"]
     assert validated["complete"] is False
     assert validated["facts"] == []
@@ -193,7 +199,7 @@ def test_expanded_attributed_claims_are_charged_to_artifact_budget(tmp_path, sou
     # The model's short selection fits; the actual successor-facing expansion does not.
     job = replace(job, artifact_bytes=len(encoded(raw)) + 128)
     assert len(encoded(raw)) < job.artifact_bytes
-    with pytest.raises(SummaryResultRejected, match="Expanded final source claims exceed"):
+    with pytest.raises(SummaryResultRejected, match="Final ranking envelope exceeds"):
         validate_summary(job, raw, events, observed_output_tokens=100)
 
 
@@ -209,10 +215,8 @@ def test_corrective_selection_prompt_exposes_findings_and_expanded_budget(tmp_pa
     prompt = summary_prompt(correction)
     assert correction.correction_reason in prompt
     assert "findings as fallible context" in prompt
-    assert (
-        "Python-expanded artifact, including exact quoted text and provenance, must fit 9000 UTF-8 bytes"
-        in prompt
-    )
+    assert "Do not calculate byte sizes or choose a subset" in prompt
+    assert "complete ranked_fact_ids permutation" in prompt
     assert summary_schema(correction)["properties"]["job_id"]["enum"] == [correction.id]
     assert set(summary_schema(correction)["properties"]) == set(selection(correction))
     assert load_input(correction) == load_input(original)
@@ -327,3 +331,231 @@ def test_final_contracts_change_without_reusing_legacy_proof_headers():
         digest(semantic_contract("handoff_final_audit", AUDIT_SCHEMA))
         != "006141d9e942da9ef5c7eacf2980f5668c827b4689655fe294ea9b90fbefc6b4"
     )
+
+
+def test_v4_saved_selection_validates_explicitly_without_current_grant(tmp_path, sources):
+    events, _, reduce = sources
+    source = load_input(reduce)
+    payload = final.input_payload(
+        source,
+        {"path": reduce.input_path, "sha256": reduce.input_sha256, "job_id": reduce.id},
+        version="history-final-v4",
+    )
+    path = tmp_path / "historical-v4.json"
+    path.write_bytes(encoded(payload))
+    old = replace(
+        reduce,
+        input_path=str(path),
+        input_sha256=digest(payload),
+        input_tokens=len(encoded(payload)),
+        prompt_version="history-final-v4",
+    )
+    ids = list(payload["fact_catalog"])
+    raw = {
+        "schema_version": 2,
+        "job_id": old.id,
+        "input_sha256": old.input_sha256,
+        "covered_ids": list(old.primary_ids),
+        "selected_fact_ids": ids[:1],
+    }
+    value = validate_summary(old, raw, events)
+    assert value["final_contract"] == "history-final-v4"
+    assert value["selected_fact_ids"] == ids[:1]
+    assert value["omitted_fact_ids"] == ids[1:]
+    assert "packing" not in value and "omitted_facts" not in value
+    final.validate_attribution(value["facts"][0], version="history-final-v4")
+    assert summary_schema(old)["properties"]["schema_version"]["enum"] == [2]
+    assert "selected_fact_ids" in summary_schema(old)["properties"]
+    assert not summary_contract_current(
+        {
+            "purpose": "handoff_reduce",
+            "coordinates": {
+                "summary_stage": "final",
+                "summary_spec": {"prompt_version": old.prompt_version},
+            },
+        }
+    )
+    current = project_final_input(old, tmp_path / "current")
+    assert current.prompt_version == final.VERSION == "history-final-v5"
+    assert current.input_sha256 != old.input_sha256
+    assert "ranked_fact_ids" in summary_schema(current)["properties"]
+
+
+def test_packing_omits_context_without_resolving_unfinished_work(tmp_path, sources):
+    events, child, reduce = sources
+    source = load_input(reduce)
+    source["children"][0]["summary"]["facts"][-1]["kind"] = "next_action"
+    path = tmp_path / "unfinished.json"
+    path.write_bytes(encoded(source))
+    job = project_final_input(
+        replace(reduce, input_path=str(path), input_sha256=digest(source), artifact_bytes=9000),
+        tmp_path / "packed",
+    )
+    job = replace(job, artifact_bytes=final_artifact_envelope_size(job))
+    value = validate_summary(job, selection(job), events, observed_output_tokens=100)
+    assert value["facts"] == []
+    assert value["semantic_fidelity"] == "unqualified"
+    assert value["ranked_fact_ids"] == value["omitted_fact_ids"]
+    assert len(value["omitted_facts"]) == len(child["facts"])
+    catalog = load_input(job)["fact_catalog"]
+    for omitted in value["omitted_facts"]:
+        assert omitted == {"catalog_id": omitted["catalog_id"], "reason": "artifact-byte-budget"}
+        ref = catalog[omitted["catalog_id"]]
+        original = next(
+            f for f in source["children"][0]["summary"]["facts"] if f["id"] == ref["fact_id"]
+        )
+        assert ref["child_result_sha256"] == digest(source["children"][0]["summary"])
+        if original["kind"] == "next_action":
+            assert original["text"] == "Review remains unfinished."
+    assert load_input(job)["owner_quotes"] == load_input(reduce)["owner_quotes"]
+    assert len(encoded(value)) <= job.artifact_bytes
+
+
+def test_impossible_envelope_refuses_before_request_schema_or_prompt(tmp_path, sources):
+    _, _, reduce = sources
+    job = project_final_input(replace(reduce, artifact_bytes=9000), tmp_path / "final")
+    impossible = replace(job, artifact_bytes=1)
+    for operation in (summary_schema, summary_prompt):
+        with pytest.raises(CampaignError, match="before launch"):
+            operation(impossible)
+    with pytest.raises(CampaignError, match="before launch"):
+        project_final_input(replace(reduce, artifact_bytes=1), tmp_path / "impossible")
+
+
+def test_final_v4_proof_digests_are_stale_and_audit_prompt_unchanged():
+    current = semantic_contract("handoff_final", AUDIT_SCHEMA)
+    prior = {
+        **current,
+        "prompt_version": "history-final-v4",
+        "summary_schema_digest": digest(final.schema_template(version="history-final-v4")),
+        "summary_job_schema_digest": digest(final.schema_template(version="history-final-v4")),
+    }
+    assert current["prompt_version"] == "history-final-v5"
+    assert digest(current) != digest(prior)
+    audit = semantic_contract("handoff_final_audit", AUDIT_SCHEMA)
+    assert audit["prompt_version"] == "history-final-audit-v2"
+    assert audit["summary_schema_digest"] != prior["summary_schema_digest"]
+
+
+def ranked_payload(texts):
+    child = {
+        "job_id": "child",
+        "structural_coverage": True,
+        "gaps": [],
+        "facts": [
+            {
+                "id": "fact-" + str(index),
+                "kind": "next_action",
+                "text": text,
+                "citations": ["event"],
+                "authority": "context",
+            }
+            for index, text in enumerate(texts)
+        ],
+    }
+    payload = final.input_payload(
+        {"children": [{"job_id": "child", "summary": child}], "owner_quotes": {}},
+        {"path": "source", "sha256": "a" * 64, "job_id": "source"},
+    )
+    ids = list(payload["fact_catalog"])
+    result = {
+        "schema_version": 3,
+        "job_id": "job",
+        "input_sha256": "b" * 64,
+        "covered_ids": ["child"],
+        "ranked_fact_ids": ids,
+    }
+    return result, payload
+
+
+def packing_metadata(limit, result):
+    return {
+        "structural_coverage": True,
+        "semantic_fidelity": "unqualified",
+        "complete": True,
+        "output_measurement": {"kind": "native-receipt", "tokens": 32768},
+        "reduction_budget": {"artifact_byte_limit": limit, "result_bytes": len(encoded(result))},
+    }
+
+
+def pack(result, payload, limit, metadata):
+    return final.expand(
+        result,
+        payload,
+        job_id="job",
+        input_sha256="b" * 64,
+        children=("child",),
+        artifact_bytes=limit,
+        metadata=metadata,
+    )
+
+
+def test_exact_full_normalized_unicode_boundary_and_one_byte_below():
+    raw, payload = ranked_payload(
+        ['First: 🧭 café\\"\n', "Second unfinished review: 日本語", "Third: 😀"]
+    )
+    raw["ranked_fact_ids"].reverse()
+    limit = 10000
+    for _ in range(4):
+        full = pack(raw, payload, 0, packing_metadata(limit, raw))
+        measured = len(encoded(full))
+        if measured == limit:
+            break
+        limit = measured
+    else:
+        raise AssertionError("Byte-length fixed point did not converge")
+    exact = pack(raw, payload, limit, packing_metadata(limit, raw))
+    assert len(encoded(exact)) == limit
+    assert exact["selected_fact_ids"] == raw["ranked_fact_ids"]
+    assert exact["omitted_facts"] == []
+    assert exact["output_measurement"]["tokens"] == 32768
+    assert exact["reduction_budget"]["result_bytes"] == len(encoded(raw))
+    smaller = pack(raw, payload, limit - 1, packing_metadata(limit - 1, raw))
+    assert smaller["selected_fact_ids"] == raw["ranked_fact_ids"][:-1]
+    assert smaller["omitted_fact_ids"] == raw["ranked_fact_ids"][-1:]
+    assert len(encoded(smaller)) <= limit - 1
+    for fact in exact["facts"]:
+        final.validate_attribution(fact)
+    assert len(encoded(exact)) > len(encoded(exact).decode())  # Actual UTF-8, not character count.
+
+
+def test_packing_skips_oversized_whole_fact_then_preserves_remaining_rank_order():
+    raw, payload = ranked_payload(
+        ["Large context " * 1000, "Second unfinished task", "Third unfinished task"]
+    )
+    limit = 3000
+    value = pack(raw, payload, limit, packing_metadata(limit, raw))
+    assert value["selected_fact_ids"] == raw["ranked_fact_ids"][1:]
+    assert value["omitted_fact_ids"] == raw["ranked_fact_ids"][:1]
+    assert [f["selected_from"]["catalog_id"] for f in value["facts"]] == raw["ranked_fact_ids"][1:]
+    assert value["omitted_facts"] == [
+        {"catalog_id": raw["ranked_fact_ids"][0], "reason": "artifact-byte-budget"}
+    ]
+    original = payload["children"][0]["summary"]["facts"]
+    assert value["facts"][0]["text"] == final.attribution_text("child", original[1]["text"])
+    assert original[0]["text"] == "Large context " * 1000
+    assert len(encoded(value)) <= limit
+
+
+def test_packing_serializes_each_fact_only_once(monkeypatch):
+    raw, payload = ranked_payload([f"Task {i} 🧭" for i in range(100)])
+    calls = []
+    original = final.encoded
+
+    def count(value):
+        calls.append(value)
+        return original(value)
+
+    monkeypatch.setattr(final, "encoded", count)
+    value = pack(raw, payload, 50000, packing_metadata(50000, raw))
+    assert len(calls) == 2 * len(raw["ranked_fact_ids"]) + 2
+    assert len(encoded(value)) <= 50000
+    assert len(value["selected_fact_ids"]) + len(value["omitted_fact_ids"]) == 100
+
+
+def test_no_source_facts_has_valid_empty_complete_ranking():
+    raw, payload = ranked_payload([])
+    value = pack(raw, payload, 2000, packing_metadata(2000, raw))
+    assert value["ranked_fact_ids"] == value["selected_fact_ids"] == value["omitted_fact_ids"] == []
+    assert value["facts"] == value["omitted_facts"] == []
+    assert len(encoded(value)) < 2000

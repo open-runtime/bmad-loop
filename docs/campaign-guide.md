@@ -606,16 +606,19 @@ retained indexes identify the actual source artifacts available for retrieval.
 Passing structural checks or a native transport probe does not establish semantic
 fidelity or authorize continuation.
 
-The final model selects and orders bound source fact IDs instead of writing new
-instructions. Python renders the selected text as explicitly attributed historical
+The final model ranks every bound source fact ID instead of writing new
+instructions or estimating serialized sizes. Python fits whole facts to the exact
+artifact budget and renders their text as explicitly attributed historical
 summary claims, with source references. Exact owner instructions, canonical
 acceptance and captured current controller holds are retained independently of
 that selection. A historical rule to honor holds does not establish that a hold
 is currently active. The controller rechecks current controls before continuation;
 publication and external operator holds still have their own admission checks.
-Unselected facts remain in the retrievable source tree, and inherited gaps remain
-visible. Expanded attributed text must fit the same packet budget as other
-history; an ID-only response cannot bypass context limits.
+Unselected facts remain in the retrievable source tree with explicit budget
+omissions, and inherited gaps remain visible. The complete ranking is retained.
+Expanded attributed text and its metadata must fit the same packet budget as other
+history; an ID-only response cannot bypass context limits. A structurally valid
+packing still requires independent full-source review for material unfinished work.
 
 When a completed independent audit rejects a final summary, staged handoff can
 request up to two corrected selections from the same source and recorded findings.

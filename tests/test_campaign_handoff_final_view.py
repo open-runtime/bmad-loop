@@ -23,6 +23,7 @@ def closed_packet(
     historical_text=None,
     historical_facts=None,
     selection_order=None,
+    version="history-final-v4",
 ):
     history = capture(tmp_path, [native_row("codex")])
     events = load_events(history)
@@ -50,18 +51,20 @@ def closed_packet(
     projected = final_selection.input_payload(
         original_input,
         {"path": str(original_path), "sha256": original_path.stem, "job_id": "closed-final"},
+        version=version,
     )
     path = blob(tmp_path / "final-input", encoded(projected))
+    field = "selected_fact_ids" if version == "history-final-v4" else "ranked_fact_ids"
     selection = {
-        "schema_version": 2,
+        "schema_version": 2 if version == "history-final-v4" else 3,
         "job_id": "closed-final",
         "input_sha256": path.stem,
         "covered_ids": [child_spec.id],
-        "selected_fact_ids": list(projected["fact_catalog"]),
+        field: list(projected["fact_catalog"]),
     }
     if selection_order is not None:
-        selected = selection["selected_fact_ids"]
-        selection["selected_fact_ids"] = [selected[index] for index in selection_order]
+        selected = selection[field]
+        selection[field] = [selected[index] for index in selection_order]
     final = {
         **child,
         **final_selection.expand(
@@ -70,6 +73,7 @@ def closed_packet(
             job_id="closed-final",
             input_sha256=path.stem,
             children=(child_spec.id,),
+            version=version,
         ),
     }
     final_spec = dataclasses.replace(
@@ -78,7 +82,7 @@ def closed_packet(
         purpose="handoff-reduce",
         input_path=str(path),
         input_sha256=path.stem,
-        prompt_version="history-final-v4",
+        prompt_version=version,
         primary_ids=(child_spec.id,),
         dependencies=(child_spec.id,),
     )
@@ -100,13 +104,14 @@ def closed_packet(
     return payload, final, child
 
 
-def test_bounded_v4_history_retains_exact_attribution_and_owner_provenance(tmp_path):
-    payload, final, _ = closed_packet(tmp_path)
+@pytest.mark.parametrize("version", ["history-final-v4", "history-final-v5"])
+def test_bounded_closed_history_retains_exact_attribution_and_owner_provenance(tmp_path, version):
+    payload, final, _ = closed_packet(tmp_path, version=version)
     context.fit_audited_history(payload, tmp_path / "packet", ceiling=20000)
     view = payload["history_view"][0]
     original = final["facts"][0]
     assert view["text"] == original["text"]
-    assert view["final_contract"] == "history-final-v4"
+    assert view["final_contract"] == version
     for key in ("selected_from", "citations", "source_quote", "source_quote_ref"):
         assert view[key] == original[key]
     assert view["authority"] == "context"
@@ -129,18 +134,27 @@ def test_selected_historical_instruction_cannot_replace_mandatory_current_author
     assert owners[0]["quote"] == "keep all commits"
 
 
-@pytest.mark.parametrize("fault", ["missing-attribution", "missing-contract", "bare-instruction"])
-def test_v4_parent_artifact_cannot_silently_downgrade_to_legacy_context(tmp_path, fault):
+@pytest.mark.parametrize(
+    "fault", ["missing-attribution", "missing-contract", "wrong-contract", "bare-instruction"]
+)
+@pytest.mark.parametrize("version", ["history-final-v4", "history-final-v5"])
+def test_closed_parent_artifact_cannot_silently_downgrade_to_legacy_context(
+    tmp_path, fault, version
+):
     def mutate(final):
         if fault == "missing-attribution":
             final["facts"][0].pop("selected_from")
         elif fault == "missing-contract":
             final.pop("final_contract")
+        elif fault == "wrong-contract":
+            final["final_contract"] = (
+                "history-final-v5" if version == "history-final-v4" else "history-final-v4"
+            )
         else:
             final["facts"][0]["text"] = "Stop all review."
 
     with pytest.raises(CampaignError):
-        closed_packet(tmp_path, mutate=mutate)
+        closed_packet(tmp_path, mutate=mutate, version=version)
 
 
 @pytest.mark.parametrize("key", ["selected_from", "citations", "source_quote", "source_quote_ref"])
@@ -152,9 +166,13 @@ def test_v4_bounded_view_cannot_drop_retained_attribution_or_source_fields(tmp_p
         context.validate_history_view(payload)
 
 
-def test_v4_full_attribution_and_unicode_are_charged_to_exact_packet_boundary(tmp_path):
+@pytest.mark.parametrize("version", ["history-final-v4", "history-final-v5"])
+def test_closed_attribution_and_unicode_are_charged_to_exact_packet_boundary(tmp_path, version):
     payload, _, _ = closed_packet(
-        tmp_path, include_owner=False, historical_text='Proposed: inspect "条件"\nthen verify.'
+        tmp_path,
+        include_owner=False,
+        historical_text='Proposed: inspect "条件"\nthen verify.',
+        version=version,
     )
     fitted = copy.deepcopy(payload)
     context.fit_audited_history(fitted, tmp_path / "packet", ceiling=20000)
@@ -167,7 +185,8 @@ def test_v4_full_attribution_and_unicode_are_charged_to_exact_packet_boundary(tm
         context.fit_audited_history(copy.deepcopy(payload), tmp_path / "packet", ceiling=exact - 1)
 
 
-def test_v4_selected_order_survives_kind_priority_and_bounded_omission(tmp_path):
+@pytest.mark.parametrize("version", ["history-final-v4", "history-final-v5"])
+def test_closed_selected_order_survives_kind_priority_and_bounded_omission(tmp_path, version):
     payload, final, _ = closed_packet(
         tmp_path,
         historical_facts=[
@@ -177,6 +196,7 @@ def test_v4_selected_order_survives_kind_priority_and_bounded_omission(tmp_path)
             ("failure", "The verification failed."),
         ],
         selection_order=(1, 2, 0, 3),
+        version=version,
     )
     mandatory = context.mandatory_context_digest(payload)
     fitted = copy.deepcopy(payload)

@@ -535,9 +535,9 @@ producer prompt contract before admitting the revised route.
 
 ### Closed final selection and controller authority
 
-The final-v4 contract replaces generated final prose with an ordered selection of
+The final-v5 contract replaces generated final prose with a complete ranking of
 controller-issued fact IDs. Its response has only a schema version, job ID, input
-hash, complete child coverage and unique selected fact IDs. It cannot supply new
+hash, complete child coverage and every ranked fact ID exactly once. It cannot supply new
 titles, constraints, actions, approvals or hold state. Each catalog ID binds the
 child job, the complete immutable child result hash and the source fact identity.
 The controller renders selected text verbatim as an attributed historical summary
@@ -546,9 +546,16 @@ still be mistaken; attribution does not establish its truth or authority.
 
 All authenticated owner spans and canonical acceptance obligations remain
 mandatory independently of the selection. Preserve the complete source and
-summary indexes, omitted fact IDs and inherited gaps. Measure the expanded,
-attributed artifact and complete final catalog against their existing budgets;
-small model output containing only IDs does not imply a small successor packet.
+summary indexes, omitted fact IDs and inherited gaps. Python scans the ranking
+and includes each whole attributed fact only when its exact serialized size fits
+the artifact budget. Retain the complete ranking, selected IDs and explicit budget
+omissions; never clip text, alter source claims or treat an omission as completed
+work. Count provenance, measurement and omission metadata in the same budget.
+An envelope that cannot fit must fail visibly rather than enlarging the budget.
+The model does not estimate Python's serialized byte overhead. Structural packing
+does not establish fidelity: independent full-source review must still reject
+omission of material unfinished work. The complete final catalog also remains
+subject to its existing input budget.
 
 Current local controls come from the campaign controller, with a captured revision
 and state digest. Keep active, prior and pending holds separate from historical
@@ -562,7 +569,7 @@ against complete leaf evidence, owner spans and current canonical state. Selecti
 an old claim cannot prove completion or invent a current hold. A rejected selection
 can use the existing bounded correction path and exact rejected-audit inputs;
 every corrected selection still requires fresh independent audits. Preserve old
-final-v3 artifacts as history, require new current-stage qualification, and leave
+final-v3 and final-v4 artifacts as history, require new current-stage qualification, and leave
 leaf/intermediate and legacy history-audit qualification contracts unchanged.
 
 A completed final audit can reject a structurally valid synthesis. Retain its
