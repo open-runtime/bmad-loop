@@ -9,6 +9,7 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Budget Claude partial-message framing separately from model output while preserving native token and turn limits.
 - Preserve source-supported action timing and authority in intermediate and final handoff summaries.
 - Supply authenticated owner quote spans inline before sizing and partitioning handoff reductions.
 - Correct rejected final handoff summaries within a durable two-attempt budget and require fresh independent audits.
