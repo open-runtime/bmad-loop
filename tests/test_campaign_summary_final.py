@@ -69,11 +69,13 @@ def sources(tmp_path):
 
 def selection(job, ids=None):
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "job_id": job.id,
         "input_sha256": job.input_sha256,
         "covered_ids": list(job.primary_ids),
         "ranked_fact_ids": list(load_input(job)["fact_catalog"]) if ids is None else ids,
+        "required_fact_ids": [],
+        "excluded_fact_ids": [],
     }
 
 
@@ -215,8 +217,9 @@ def test_corrective_selection_prompt_exposes_findings_and_expanded_budget(tmp_pa
     prompt = summary_prompt(correction)
     assert correction.correction_reason in prompt
     assert "findings as fallible context" in prompt
-    assert "Do not calculate byte sizes or choose a subset" in prompt
+    assert "Do not calculate byte sizes" in prompt
     assert "complete ranked_fact_ids permutation" in prompt
+    assert "required_fact_ids" in prompt and "excluded_fact_ids" in prompt
     assert summary_schema(correction)["properties"]["job_id"]["enum"] == [correction.id]
     assert set(summary_schema(correction)["properties"]) == set(selection(correction))
     assert load_input(correction) == load_input(original)
@@ -376,7 +379,7 @@ def test_v4_saved_selection_validates_explicitly_without_current_grant(tmp_path,
         }
     )
     current = project_final_input(old, tmp_path / "current")
-    assert current.prompt_version == final.VERSION == "history-final-v5"
+    assert current.prompt_version == final.VERSION == "history-final-v6"
     assert current.input_sha256 != old.input_sha256
     assert "ranked_fact_ids" in summary_schema(current)["properties"]
 
@@ -422,7 +425,7 @@ def test_impossible_envelope_refuses_before_request_schema_or_prompt(tmp_path, s
         project_final_input(replace(reduce, artifact_bytes=1), tmp_path / "impossible")
 
 
-def test_final_v4_proof_digests_are_stale_and_audit_prompt_unchanged():
+def test_prior_final_proof_digests_are_stale_and_required_context_audit_is_versioned():
     current = semantic_contract("handoff_final", AUDIT_SCHEMA)
     prior = {
         **current,
@@ -430,10 +433,10 @@ def test_final_v4_proof_digests_are_stale_and_audit_prompt_unchanged():
         "summary_schema_digest": digest(final.schema_template(version="history-final-v4")),
         "summary_job_schema_digest": digest(final.schema_template(version="history-final-v4")),
     }
-    assert current["prompt_version"] == "history-final-v5"
+    assert current["prompt_version"] == "history-final-v6"
     assert digest(current) != digest(prior)
     audit = semantic_contract("handoff_final_audit", AUDIT_SCHEMA)
-    assert audit["prompt_version"] == "history-final-audit-v2"
+    assert audit["prompt_version"] == "history-final-audit-v3"
     assert audit["summary_schema_digest"] != prior["summary_schema_digest"]
 
 
@@ -459,11 +462,13 @@ def ranked_payload(texts):
     )
     ids = list(payload["fact_catalog"])
     result = {
-        "schema_version": 3,
+        "schema_version": 4,
         "job_id": "job",
         "input_sha256": "b" * 64,
         "covered_ids": ["child"],
         "ranked_fact_ids": ids,
+        "required_fact_ids": [],
+        "excluded_fact_ids": [],
     }
     return result, payload
 
@@ -559,3 +564,228 @@ def test_no_source_facts_has_valid_empty_complete_ranking():
     assert value["ranked_fact_ids"] == value["selected_fact_ids"] == value["omitted_fact_ids"] == []
     assert value["facts"] == value["omitted_facts"] == []
     assert len(encoded(value)) < 2000
+
+
+def test_required_reviews_survive_optional_pressure_and_excluded_hold_stays_source_only():
+    # Authored analogue of the actual 153 failure: four separately supported
+    # pending reviews and a misleading mixed action, not a replayed native result.
+    raw, payload = ranked_payload(
+        [
+            "Background context " * 300,
+            "Do not merge; finish claim 3 review.",
+            *[f"Claim {i} review remains pending." for i in range(4)],
+            "Other context " * 300,
+        ]
+    )
+    ids = raw["ranked_fact_ids"]
+    raw["required_fact_ids"] = list(reversed(ids[2:6]))
+    raw["excluded_fact_ids"] = ids[1:2]
+    before = copy.deepcopy(payload)
+    value = pack(raw, payload, 6000, packing_metadata(6000, raw))
+    assert value["selected_fact_ids"] == ids[2:6]
+    assert [json.loads(f["text"].split(": ", 1)[1]) for f in value["facts"]] == [
+        f"Claim {i} review remains pending." for i in range(4)
+    ]
+    assert value["omitted_facts"] == [
+        {"catalog_id": ids[0], "reason": "artifact-byte-budget"},
+        {"catalog_id": ids[1], "reason": "model-excluded-context"},
+        {"catalog_id": ids[6], "reason": "artifact-byte-budget"},
+    ]
+    assert payload == before
+    assert payload["children"][0]["summary"]["facts"][1]["text"].startswith("Do not merge")
+    assert value["semantic_fidelity"] == "unqualified"
+    assert all(f["authority"] == "context" for f in value["facts"])
+    assert len(encoded(value)) <= 6000
+    final.validate_packing(value)
+
+
+def test_required_facts_fit_exactly_or_refuse_instead_of_silently_skipping():
+    raw, payload = ranked_payload(["Review 日本語 🧭", "Second unfinished review"])
+    raw["required_fact_ids"] = list(raw["ranked_fact_ids"])
+    limit = 10000
+    for _ in range(4):
+        measured = len(encoded(pack(raw, payload, 0, packing_metadata(limit, raw))))
+        if measured == limit:
+            break
+        limit = measured
+    else:
+        raise AssertionError("Exact normalized boundary did not stabilize")
+    exact = pack(raw, payload, limit, packing_metadata(limit, raw))
+    assert len(encoded(exact)) == limit
+    assert exact["selected_fact_ids"] == raw["ranked_fact_ids"]
+    with pytest.raises(CampaignError, match="required source facts exceed"):
+        pack(raw, payload, limit - 1, packing_metadata(limit - 1, raw))
+
+
+@pytest.mark.parametrize("field", ["required_fact_ids", "excluded_fact_ids"])
+@pytest.mark.parametrize("damage", ["unknown", "duplicate", "wrong-type", "missing"])
+def test_classified_references_must_be_unique_known_lists(field, damage):
+    raw, payload = ranked_payload(["Review pending"])
+    key = raw["ranked_fact_ids"][0]
+    if damage == "unknown":
+        raw[field] = ["f" * 64]
+    elif damage == "duplicate":
+        raw[field] = [key, key]
+    elif damage == "wrong-type":
+        raw[field] = key
+    else:
+        del raw[field]
+    with pytest.raises(CampaignError, match="unique ranked references|model-written content"):
+        pack(raw, payload, 9000, packing_metadata(9000, raw))
+
+
+def test_required_and_excluded_references_cannot_overlap():
+    raw, payload = ranked_payload(["Review pending"])
+    raw["required_fact_ids"] = raw["ranked_fact_ids"][:]
+    raw["excluded_fact_ids"] = raw["ranked_fact_ids"][:]
+    with pytest.raises(CampaignError, match="disjoint"):
+        pack(raw, payload, 9000, packing_metadata(9000, raw))
+
+
+def test_excluded_context_never_displays_even_with_unlimited_artifact_space():
+    raw, payload = ranked_payload(["Unsupported standing hold", "Actual pending review"])
+    raw["excluded_fact_ids"] = raw["ranked_fact_ids"][:1]
+    value = pack(raw, payload, 0, packing_metadata(9000, raw))
+    assert value["selected_fact_ids"] == raw["ranked_fact_ids"][1:]
+    assert value["omitted_facts"] == [
+        {"catalog_id": raw["ranked_fact_ids"][0], "reason": "model-excluded-context"}
+    ]
+    assert len(payload["fact_catalog"]) == 2
+
+
+def test_v6_all_excluded_preflight_bounds_every_disjoint_classification_envelope():
+    import itertools
+
+    raw, payload = ranked_payload(["α", "🧭", "第三"])
+    ids = raw["ranked_fact_ids"]
+    raw["excluded_fact_ids"] = ids[:]
+
+    def envelope(value):
+        return final.minimum_artifact_bytes(
+            value,
+            payload,
+            job_id="job",
+            input_sha256="b" * 64,
+            children=("child",),
+            metadata=packing_metadata(9999, value),
+        )
+
+    worst = envelope(raw)
+    for labels in itertools.product(range(3), repeat=len(ids)):
+        candidate = {
+            **raw,
+            "required_fact_ids": [identity for identity, label in zip(ids, labels) if label == 1],
+            "excluded_fact_ids": [identity for identity, label in zip(ids, labels) if label == 2],
+        }
+        assert envelope(candidate) <= worst
+
+
+@pytest.mark.parametrize(
+    "damage",
+    ["required-lost", "excluded-selected", "order", "reason", "omitted-id", "fact-id", "owner"],
+)
+def test_retained_v6_packing_rejects_inconsistent_presentation(damage):
+    raw, payload = ranked_payload(["Optional context", "Required review", "Excluded claim"])
+    ids = raw["ranked_fact_ids"]
+    raw["required_fact_ids"] = ids[1:2]
+    raw["excluded_fact_ids"] = ids[2:]
+    value = pack(raw, payload, 9000, packing_metadata(9000, raw))
+    assert value["selected_fact_ids"] == [ids[1], ids[0]]
+    if damage == "required-lost":
+        value["required_fact_ids"].append(ids[2])
+        value["excluded_fact_ids"] = []
+    elif damage == "excluded-selected":
+        value["excluded_fact_ids"].append(ids[0])
+    elif damage == "order":
+        value["selected_fact_ids"].reverse()
+        value["facts"].reverse()
+    elif damage == "reason":
+        value["omitted_facts"][0]["reason"] = "artifact-byte-budget"
+    elif damage == "omitted-id":
+        value["omitted_fact_ids"] = []
+    elif damage == "fact-id":
+        value["facts"][0]["selected_from"]["fact_id"] = "invented"
+    else:
+        value["facts"][0]["authority"] = "owner"
+    with pytest.raises(CampaignError, match="Final"):
+        final.validate_packing(value)
+
+
+@pytest.mark.parametrize(
+    "version,schema_hash,input_hash,expanded_hash",
+    [
+        (
+            "history-final-v4",
+            "b3e539da53204d04f429409902c29b0c9561e3ac1fc60d323a811394ed5a80bd",
+            "fc9fe400b5816bfb06cb8c2182cead3d33ac962a342bad6d7739251cfef5193d",
+            "fccef772a94727e7f23104e5738e3550f42261e4349cacf9aacf19f1d46d2efc",
+        ),
+        (
+            "history-final-v5",
+            "c7d0c1b605cb60c8e8558a23f1f4cd65a0178309bdf6e29097bf6d124e5f6e75",
+            "7b5ae32177e6f9cf8240646d573125e23b814c97a12826d9ce1c30682b6dcfdb",
+            "6702239b3b4dcace8edc252097d10c5a225067c25f1f9da52f5a3838a4790e82",
+        ),
+    ],
+)
+def test_historical_v4_v5_schema_input_and_normalized_bytes_unchanged(
+    version, schema_hash, input_hash, expanded_hash
+):
+    # Digests recorded from the released implementation before v6 edits.
+    source = {
+        "children": [
+            {
+                "job_id": "child",
+                "summary": {
+                    "job_id": "child",
+                    "structural_coverage": True,
+                    "gaps": ["Missing tail"],
+                    "facts": [
+                        {
+                            "id": "one",
+                            "kind": "next_action",
+                            "text": 'Review 日本語 🧭 \\"',
+                            "citations": ["event"],
+                            "authority": "context",
+                        },
+                        {
+                            "id": "two",
+                            "kind": "progress",
+                            "text": "Other review remains pending.",
+                            "citations": ["event"],
+                            "authority": "context",
+                        },
+                    ],
+                },
+            }
+        ],
+        "owner_quotes": {},
+    }
+    payload = final.input_payload(
+        source, {"path": "source", "sha256": "a" * 64, "job_id": "source"}, version=version
+    )
+    raw = {
+        "schema_version": 2 if version.endswith("v4") else 3,
+        "job_id": "job",
+        "input_sha256": "b" * 64,
+        "covered_ids": ["child"],
+        "selected_fact_ids" if version.endswith("v4") else "ranked_fact_ids": list(
+            reversed(payload["fact_catalog"])
+        ),
+    }
+    metadata = packing_metadata(1800, raw)
+    metadata["complete"] = False
+    metadata["output_measurement"]["tokens"] = 12939
+    expanded = final.expand(
+        raw,
+        payload,
+        job_id="job",
+        input_sha256="b" * 64,
+        children=("child",),
+        version=version,
+        artifact_bytes=1800,
+        metadata=metadata,
+    )
+    assert digest(final.schema_template(version=version)) == schema_hash
+    assert digest(payload) == input_hash
+    assert digest(expanded) == expanded_hash

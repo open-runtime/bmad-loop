@@ -77,6 +77,10 @@ seed_files = [".agents/hooks.json"]
 # The file a parent conversation writes when it spawns a child (see above).
 subagent_spawn_marker = ".system_generated/subagents/{session_id}.json"
 
+[env]
+# AGY accepts only literal true here; 1 still permits background replacement.
+AGY_CLI_DISABLE_AUTO_UPDATE = "true"
+
 [hooks]
 dialect = "antigravity-hooks-json"
 config_path = ".agents/hooks.json"

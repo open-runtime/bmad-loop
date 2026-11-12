@@ -105,6 +105,10 @@ def _read_summary_row(row):
             raise CampaignError("Retained final selection contract is missing or unsupported")
         for fact in summary.get("facts", []):
             validate_attribution(fact, version=version)
+        if version == "history-final-v6":
+            from .campaign_summary_final import validate_packing
+
+            validate_packing(summary)
     return summary
 
 
@@ -186,6 +190,10 @@ def _history_facts(payload):
                         if key in fact
                     },
                 )
+                if summary["final_contract"] == "history-final-v6":
+                    result[identity]["required_context"] = (
+                        fact["selected_from"]["catalog_id"] in summary["required_fact_ids"]
+                    )
     return result
 
 
@@ -236,6 +244,10 @@ def validate_history_view(payload):
         if identity in seen or facts.get(identity) != row:
             raise CampaignError("Handoff history view differs from its immutable parent fact")
         seen.add(identity)
+    if any(row.get("required_context") and identity not in seen for identity, row in facts.items()):
+        raise HistoryContextRecoveryNeeded(
+            "Required historical context is missing from the successor"
+        )
     reference = payload.get("omitted_history_fact_index")
     if not isinstance(reference, dict):
         raise CampaignError("Handoff history fact omission index is missing")
@@ -383,6 +395,32 @@ def fit_audited_history(payload, artifact_root, *, ceiling):
     for (parent, _), row in facts.items():
         kind = None if row.get("final_contract") in CLOSED_VERSIONS else row["kind"]
         grouped.setdefault((kind, parent), []).append(row)
+
+    def include(row, *, required=False):
+        nonlocal current_bytes
+        selected = payload["history_view"]
+        omitted_count = len(facts) - len(selected)
+        proposed_bytes = (
+            current_bytes
+            + len(encoded(row))
+            + bool(selected)
+            + len(str(omitted_count - 1))
+            - len(str(omitted_count))
+        )
+        if proposed_bytes <= ceiling:
+            selected.append(row)
+            current_bytes = proposed_bytes
+        elif required:
+            raise HistoryContextRecoveryNeeded(
+                "Required historical context exceeds the successor packet budget"
+            )
+
+    # Final-artifact fidelity is insufficient if this second fitting pass drops
+    # its required context. Reserve every required whole fact across all parents.
+    for parent in parents:
+        for row in grouped.get((None, parent), []):
+            if row.get("required_context"):
+                include(row, required=True)
     for kind in (None, *priorities):
         queues = [grouped.get((kind, parent), []) for parent in parents]
         if kind is not None:
@@ -391,18 +429,8 @@ def fit_audited_history(payload, artifact_root, *, ceiling):
             for queue in queues:
                 if position >= len(queue):
                     continue
-                selected = payload["history_view"]
-                omitted_count = len(facts) - len(selected)
-                proposed_bytes = (
-                    current_bytes
-                    + len(encoded(queue[position]))
-                    + bool(selected)
-                    + len(str(omitted_count - 1))
-                    - len(str(omitted_count))
-                )
-                if proposed_bytes <= ceiling:
-                    selected.append(queue[position])
-                    current_bytes = proposed_bytes
+                if not queue[position].get("required_context"):
+                    include(queue[position])
     content = _fact_omissions(facts, payload["history_view"])
     payload["omitted_history_fact_index"] = _fact_index_reference(index_root, content)
     blob(index_root, encoded(content))

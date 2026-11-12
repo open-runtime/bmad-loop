@@ -1,6 +1,7 @@
 """AGY native argument rewriting keeps all model commands inside scoped tools."""
 
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -21,6 +22,52 @@ from bmad_loop import (
 from bmad_loop.campaign_execution_qualification import qualify
 from bmad_loop.campaign_headless import HeadlessRunner, file_digest, read_json, validate_capability
 from bmad_loop.campaign_model import RoleCandidate
+
+
+def test_scoped_main_passes_forced_update_setting_to_native(tmp_path, monkeypatch):
+    native, source, schema, grants = (
+        tmp_path / name for name in ("native", "input", "schema", "grants")
+    )
+    native.write_text("not executed")
+    source.write_text("fixed writer input")
+    schema.write_text(json.dumps({"type": "object"}))
+    grants.write_text(json.dumps({"scopes": ["owned"], "config_digest": "frozen"}))
+    (tmp_path / "request.json").write_text(
+        json.dumps({"request": {"limits": {"output_tokens": 4096}}})
+    )
+    monkeypatch.setenv("AGY_CLI_DISABLE_AUTO_UPDATE", "1")
+    monkeypatch.setenv("HCOM_DIR", str(tmp_path / "owned-room"))
+    before = dict(os.environ)
+    calls = []
+
+    def native_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        assert kwargs["env"] == {**before, "AGY_CLI_DISABLE_AUTO_UPDATE": "true"}
+        assert json.loads(kwargs["input"])["message"]["content"] == "fixed writer input"
+        return subprocess.CompletedProcess(argv, 19)
+
+    monkeypatch.setattr(campaign_agy_scoped.subprocess, "run", native_run)
+    result = campaign_agy_scoped.main(
+        [
+            "--native",
+            str(native),
+            "--input",
+            str(source),
+            "--schema",
+            str(schema),
+            "--grants",
+            str(grants),
+            "--model",
+            "gemini-test",
+            "--effort",
+            "high",
+            "--max-invocations",
+            "1",
+        ]
+    )
+    assert result == 19 and len(calls) == 1
+    assert calls[0][0][0] == str(native)
+    assert dict(os.environ) == before
 
 
 @pytest.mark.parametrize("over_budget", [False, True], ids=["large-input", "over-budget"])

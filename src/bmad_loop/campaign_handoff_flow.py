@@ -1815,7 +1815,16 @@ def _audit_plan(runtime, snapshot, unit, value):
                     "conflict that prevents faithful continuation in ambiguities. A contextual "
                     "claim clearly attributed as historical is not itself an asserted owner "
                     "instruction; inspect whether the exact sources and canonical state resolve "
-                    "its implications. Never waive a real hold or acceptance requirement."
+                    "its implications. Every source-supported material unfinished obligation, "
+                    "pending review, failure and unresolved contradiction must have a faithful "
+                    "selected representation marked in required_fact_ids, so later packet fitting "
+                    "cannot drop it. A shared citation or related action does not replace its "
+                    "pending review. Inspect excluded_fact_ids against the complete leaf source: "
+                    "exclude misleading inferences or redundancy only when useful material work "
+                    "remains faithfully required elsewhere. Exclusion cannot waive work, resolve "
+                    "a source conflict or grant clearance. Reject missing or wrong-only source "
+                    "representations; ranking cannot reconstruct them. Never waive a real hold "
+                    "or acceptance requirement."
                 )
             prompt += json.dumps(
                 {

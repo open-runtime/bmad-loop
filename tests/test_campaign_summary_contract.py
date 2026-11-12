@@ -188,10 +188,10 @@ def test_synthesis_preserves_obligation_timing_and_qualifies_child_inferences(
         job = project_final_input(job, tmp_path / "final")
     prompt = summary_prompt(job)
     if stage == "final":
-        assert "Return references only" in prompt
-        assert "whole historically attributed source claims" in prompt
+        assert "Return a complete ranked_fact_ids permutation" in prompt
+        assert "required whole historically attributed facts" in prompt
         assert (
-            "Exact owner spans and current controller controls remain separate mandatory context"
+            "Exact owner spans, canonical obligations and current controller controls remain separate mandatory context"
             in prompt
         )
         footer = json.loads(prompt[prompt.rindex('{"input_sha256"') :])
@@ -203,6 +203,8 @@ def test_synthesis_preserves_obligation_timing_and_qualifies_child_inferences(
             "input_sha256",
             "covered_ids",
             "ranked_fact_ids",
+            "required_fact_ids",
+            "excluded_fact_ids",
         }
         assert load_input(job)["owner_quotes"]
         return

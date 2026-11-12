@@ -14,9 +14,10 @@ from typing import Any
 from .campaign_model import CampaignError
 from .campaign_transcripts import digest, encoded
 
-CLOSED_VERSIONS = ("history-final-v4", "history-final-v5")
+CLOSED_VERSIONS = ("history-final-v4", "history-final-v5", "history-final-v6")
 VERSION = CLOSED_VERSIONS[-1]
-PACKING = "whole-fact-rank-scan-v1"
+PACKING = "whole-fact-required-rank-scan-v1"
+EXCLUDED_REASON = "model-excluded-context"
 PRESENTATION = "historical-summary-claim"
 
 
@@ -127,7 +128,7 @@ def input_payload(
     if version not in CLOSED_VERSIONS:
         raise CampaignError("Unknown closed final input contract")
     return {
-        "schema_version": 2 if version == CLOSED_VERSIONS[0] else 3,
+        "schema_version": 2 + CLOSED_VERSIONS.index(version),
         "citation_presentation": version,
         "source_input": dict(source_ref),
         "children": copy.deepcopy(source["children"]),
@@ -148,12 +149,12 @@ def schema(
         raise CampaignError("Unknown closed final schema contract")
     legacy = version == CLOSED_VERSIONS[0]
     field = "selected_fact_ids" if legacy else "ranked_fact_ids"
-    return {
+    result = {
         "type": "object",
         "additionalProperties": False,
         "required": ["schema_version", "job_id", "input_sha256", "covered_ids", field],
         "properties": {
-            "schema_version": {"type": "integer", "enum": [2 if legacy else 3]},
+            "schema_version": {"type": "integer", "enum": [2 + CLOSED_VERSIONS.index(version)]},
             "job_id": {"type": "string", "enum": [job_id]},
             "input_sha256": {"type": "string", "enum": [input_sha256]},
             "covered_ids": {
@@ -170,6 +171,15 @@ def schema(
             },
         },
     }
+    if version == VERSION:
+        for name in ("required_fact_ids", "excluded_fact_ids"):
+            result["required"].append(name)
+            result["properties"][name] = {
+                "type": "array",
+                "items": {"type": "string", **({"enum": list(ids)} if ids else {})},
+                "maxItems": len(ids),
+            }
+    return result
 
 
 def schema_template(*, version: str = VERSION) -> dict[str, Any]:
@@ -189,11 +199,14 @@ def _validated_ids(result, payload, job_id, input_sha256, children, version):
         raise CampaignError("Final child frontier differs from its request")
     legacy = version == CLOSED_VERSIONS[0]
     field = "selected_fact_ids" if legacy else "ranked_fact_ids"
+    fields = {"schema_version", "job_id", "input_sha256", "covered_ids", field}
+    if version == VERSION:
+        fields.update(("required_fact_ids", "excluded_fact_ids"))
     if (
         not isinstance(result, dict)
-        or set(result) != {"schema_version", "job_id", "input_sha256", "covered_ids", field}
+        or set(result) != fields
         or type(result.get("schema_version")) is not int
-        or result["schema_version"] != (2 if legacy else 3)
+        or result["schema_version"] != 2 + CLOSED_VERSIONS.index(version)
         or result.get("job_id") != job_id
         or result.get("input_sha256") != input_sha256
     ):
@@ -214,7 +227,27 @@ def _validated_ids(result, payload, job_id, input_sha256, children, version):
         raise CampaignError("Final selection invented or duplicated a source fact")
     if not legacy and set(ordered) != set(indexed):
         raise CampaignError("Final ranking must include every source fact exactly once")
+    if version == VERSION:
+        _classifications(result, ordered)
     return indexed, ordered
+
+
+def _classifications(result, ordered):
+    groups = []
+    known = set(ordered)
+    for name in ("required_fact_ids", "excluded_fact_ids"):
+        values = result.get(name)
+        if (
+            not isinstance(values, list)
+            or not all(isinstance(value, str) and value in known for value in values)
+            or len(values) != len(set(values))
+        ):
+            raise CampaignError("Final required/excluded facts must be unique ranked references")
+        groups.append(set(values))
+    required, excluded = groups
+    if required & excluded:
+        raise CampaignError("Final required and excluded references must be disjoint")
+    return required, excluded
 
 
 def _gaps(payload):
@@ -223,20 +256,26 @@ def _gaps(payload):
     )
 
 
-def _omission(ref):
-    return {"catalog_id": ref["catalog_id"], "reason": "artifact-byte-budget"}
+def _omission(ref, *, excluded=False):
+    return {
+        "catalog_id": ref["catalog_id"],
+        "reason": EXCLUDED_REASON if excluded else "artifact-byte-budget",
+    }
 
 
-def _empty_ranked(result, payload, indexed, ordered, metadata):
+def _empty_ranked(result, payload, indexed, ordered, metadata, version):
+    excluded = set(result["excluded_fact_ids"]) if version == VERSION else set()
     value = {
         **result,
         "facts": [],
         "gaps": _gaps(payload),
-        "final_contract": VERSION,
+        "final_contract": version,
         "selected_fact_ids": [],
         "omitted_fact_ids": list(ordered),
-        "omitted_facts": [_omission(indexed[identity]) for identity in ordered],
-        "packing": PACKING,
+        "omitted_facts": [
+            _omission(indexed[identity], excluded=identity in excluded) for identity in ordered
+        ],
+        "packing": PACKING if version == VERSION else "whole-fact-rank-scan-v1",
     }
     if metadata:
         if set(metadata).intersection(value):
@@ -253,10 +292,18 @@ def minimum_artifact_bytes(
     input_sha256: str,
     children: tuple[str, ...],
     metadata: dict[str, Any] | None = None,
+    version: str = VERSION,
 ) -> int:
-    """Exact v5 envelope with all omitted provenance and no displayed source facts."""
-    indexed, ordered = _validated_ids(result, payload, job_id, input_sha256, children, VERSION)
-    return len(encoded(_empty_ranked(result, payload, indexed, ordered, metadata)))
+    """Exact ranked envelope before adding facts, not proof that required facts fit.
+
+    For v6 preflight, all-excluded classification reserves the largest disjoint
+    classification lists and omission records. Actual required facts are checked
+    during expansion. Historical v5 accounting remains available explicitly.
+    """
+    if version == CLOSED_VERSIONS[0]:
+        raise CampaignError("Final packing envelope requires a ranking contract")
+    indexed, ordered = _validated_ids(result, payload, job_id, input_sha256, children, version)
+    return len(encoded(_empty_ranked(result, payload, indexed, ordered, metadata, version)))
 
 
 def expand(
@@ -270,7 +317,7 @@ def expand(
     artifact_bytes: int = 0,
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Render exact attributed claims; v5 packs whole facts in model rank order.
+    """Render exact attributed claims; v6 packs required facts before optional context.
 
     Each fact and omission is serialized once for additive list accounting. The
     final full serialization independently verifies the computed byte count.
@@ -306,15 +353,20 @@ def expand(
             "final_contract": version,
             "omitted_fact_ids": [identity for identity in indexed if identity not in selected],
         }
-    value = _empty_ranked(result, payload, indexed, ordered, metadata)
+    required, excluded = _classifications(result, ordered) if version == VERSION else (set(), set())
+    value = _empty_ranked(result, payload, indexed, ordered, metadata, version)
     size = len(encoded(value))
     if artifact_bytes and size > artifact_bytes:
         raise CampaignError("Final ranking envelope exceeds artifact byte limit")
-    selected, facts, omitted = [], [], []
+    selected, facts = [], []
+    omitted = {ref["catalog_id"]: ref for ref in value["omitted_facts"]}
     remaining = len(ordered)
-    for identity in ordered:
+    scan = [identity for identity in ordered if identity in required] + [
+        identity for identity in ordered if identity not in required and identity not in excluded
+    ]
+    for identity in scan:
         fact = render(identity)
-        omission = _omission(indexed[identity])
+        omission = omitted[identity]
         # Two lists gain a member (facts/selected IDs), two lose one
         # (omission provenance/omitted IDs). Exact encoded IDs cancel.
         delta = (
@@ -323,19 +375,70 @@ def expand(
         if delta < 0:
             raise CampaignError("Final omission provenance unexpectedly exceeds its full fact")
         if artifact_bytes and size + delta > artifact_bytes:
-            omitted.append(omission)
+            if identity in required:
+                raise CampaignError("Final required source facts exceed artifact byte limit")
             continue
         selected.append(identity)
         facts.append(fact)
+        del omitted[identity]
         remaining -= 1
         size += delta
     value.update(
         facts=facts,
         selected_fact_ids=selected,
-        omitted_fact_ids=[ref["catalog_id"] for ref in omitted],
-        omitted_facts=omitted,
+        omitted_fact_ids=list(omitted),
+        omitted_facts=list(omitted.values()),
     )
     actual = len(encoded(value))
     if actual != size or artifact_bytes and actual > artifact_bytes:
         raise CampaignError("Final deterministic packing byte accounting differs")
+    if version == VERSION:
+        validate_packing(value)
     return value
+
+
+def validate_packing(value: dict[str, Any]) -> None:
+    """Check retained v6 packing/attribution; source truth still requires its audit.
+
+    Exclusion describes context presentation, never owner approval, current
+    control state or permission to discard the immutable source catalog.
+    """
+    if value.get("final_contract") != VERSION or value.get("packing") != PACKING:
+        raise CampaignError("Final packing contract is not current v6")
+    ordered, selected = value.get("ranked_fact_ids"), value.get("selected_fact_ids")
+    if (
+        not isinstance(ordered, list)
+        or not all(_sha(identity) for identity in ordered)
+        or len(ordered) != len(set(ordered))
+    ):
+        raise CampaignError("Final packed references lack unique ranked identities")
+    known = set(ordered)
+    if (
+        not isinstance(selected, list)
+        or not all(isinstance(identity, str) and identity in known for identity in selected)
+        or len(selected) != len(set(selected))
+    ):
+        raise CampaignError("Final packed references lack unique ranked identities")
+    required, excluded = _classifications(value, ordered)
+    chosen = set(selected)
+    if not required <= chosen or excluded & chosen:
+        raise CampaignError("Final packing omitted required or displayed excluded source facts")
+    expected = [identity for identity in ordered if identity in required] + [
+        identity for identity in ordered if identity in chosen and identity not in required
+    ]
+    if selected != expected:
+        raise CampaignError("Final packing changed required-first rank order")
+    omitted = [identity for identity in ordered if identity not in chosen]
+    if value.get("omitted_fact_ids") != omitted or value.get("omitted_facts") != [
+        _omission({"catalog_id": identity}, excluded=identity in excluded) for identity in omitted
+    ]:
+        raise CampaignError("Final packing lost omission identities or classification reasons")
+    facts = value.get("facts")
+    if not isinstance(facts, list) or len(facts) != len(selected):
+        raise CampaignError("Final packed facts differ from their selected references")
+    for identity, fact in zip(selected, facts):
+        if not isinstance(fact, dict):
+            raise CampaignError("Final packed source claim is malformed")
+        validate_attribution(fact, version=VERSION)
+        if fact["selected_from"]["catalog_id"] != identity:
+            raise CampaignError("Final packed source claim differs from its selected reference")
