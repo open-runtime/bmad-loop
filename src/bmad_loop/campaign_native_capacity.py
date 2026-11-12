@@ -1,10 +1,12 @@
-"""Native Grok/Muse allowance and model discovery without a model turn.
+"""Native AGY/Grok/Muse allowance and model discovery without a model turn.
 
 Grok's ACP initialization advertises its exact accessible model catalog; its
 read-only billing extension supplies the current included allowance. Muse's MSP
 model/list supplies a provider catalog and usage supplies dated subscription
-allowances. Neither path creates/resumes a session, authenticates interactively,
-changes account settings, or sends inference. Account quota is shared, never a
+allowances. AGY refreshes quota through /usage, then reads its accessible catalog.
+These fixed commands do not create/resume a conversation or send inference;
+AGY may initialize its native manager/auth/logs in an isolated status cwd.
+Account quota is shared, never a
 new allowance per model/effort. Effort qualification stays in route readiness:
 runtime capacity is deliberately keyed by profile/model, not effort.
 """
@@ -223,23 +225,30 @@ def observe(
     candidate: RoleCandidate, project: Path, *, now: float | None = None
 ) -> CapacityObservation | None:
     """Use the configured profile launcher; unsupported overrides stay visible."""
-    if candidate.profile not in {"grok", "muse"}:
+    if candidate.profile not in {"grok", "muse", "antigravity"}:
         return None
     try:
         profile = get_profile(candidate.profile, project)
-        if profile.binary != candidate.profile:
+        agy = candidate.profile == "antigravity"
+        if profile.binary != ("agy" if agy else candidate.profile):
             raise ProbeError("native capacity launcher overrides require a custom capacity command")
-        if profile.launch_args:
+        if profile.launch_args != (("-i",) if agy else ()):
             raise ProbeError("native capacity launch overrides require a custom capacity command")
-        if profile.env:
+        if profile.env != ({"AGY_CLI_DISABLE_AUTO_UPDATE": "true"} if agy else {}):
             raise ProbeError(
                 "native capacity environment overrides require a custom capacity command"
             )
+        if agy:
+            from .campaign_agy_capacity import FLASH_MODELS
+
+            if candidate.model not in FLASH_MODELS:
+                raise ProbeError("native AGY model has no supported exact quota-group mapping")
         from .campaign_reflection_flow import sanitized_actor_env
 
         # Match the headless worker's inherited account environment, without
         # borrowing its parent actor identity or enrolling a probe session.
-        # Headless jobs do not apply profile.env; neither may this observer.
+        # Headless jobs do not apply arbitrary profile.env overrides. AGY's
+        # provider-owned update suppression is applied by its shared helper.
         env = sanitized_actor_env(
             {
                 key: value
@@ -253,6 +262,13 @@ def observe(
             raise ProbeError("native capacity configured launcher is unavailable")
         observed = time.time() if now is None else now
         deadline = time.monotonic() + TIMEOUT_S
+        if agy:
+            from .campaign_agy_capacity import from_agy, read_agy
+
+            raw = read_agy(binary, env, deadline)
+            return from_agy(
+                raw, candidate, observed_at=observed, now=time.time() if now is None else now
+            )
         if candidate.profile == "grok":
             raw = _read_grok(binary, project, env, deadline)
             return from_grok(

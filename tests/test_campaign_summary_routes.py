@@ -238,16 +238,24 @@ def test_audit_reservation_checks_all_production_stages(campaign):
 
 
 def test_agy_default_capacity_is_unknown_without_inference(tmp_path, monkeypatch):
-    from bmad_loop import campaign_capacity
+    from bmad_loop import campaign_capacity, campaign_native_capacity
+    from bmad_loop.campaign_scheduler import CapacityObservation
 
     monkeypatch.setattr(
         campaign_capacity, "run_argv", lambda *a, **k: pytest.fail("AGY must not call TeamRouter")
+    )
+    monkeypatch.setattr(
+        campaign_native_capacity,
+        "observe",
+        lambda *a, **k: CapacityObservation(
+            False, known=False, reason="native metadata unavailable"
+        ),
     )
     result = campaign_capacity.observe(
         RoleCandidate("antigravity", "gemini-3.8-flash-high", "high"), tmp_path
     )
     assert not result.available and not result.known
-    assert "explicit" in result.reason
+    assert result.reason == "native metadata unavailable"
 
 
 def _fill_summary(runtime, snapshot, row, *, near_limit=False):

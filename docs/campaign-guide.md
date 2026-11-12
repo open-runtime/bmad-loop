@@ -258,11 +258,28 @@ An installed binary, a local model preset, past successful work or recorded spen
 alone does not establish current quota. Invalid or unavailable native telemetry
 remains a visible capacity wait.
 
+AGY combines its fixed `/usage` command with the current `models` catalog.
+The built-in observer maps the exact Flash 3.8 high, medium and low IDs to the
+Gemini quota group and requires a positive, unexpired weekly allowance. It
+does not infer Argon access from Flash access. Unsupported models, additional
+quota-window schemas or unavailable telemetry require an explicit
+`capacity_command` or an eligible fallback.
+
+Both AGY queries share one deadline. Each command's captured output and the
+accepted combined output are bounded. They use private working and coordination
+directories, preserve the inherited account environment and disable native
+self-updates. They verify zero model turns and tokens, plus unchanged native
+executable and global settings. Native authentication and manager initialization
+may still occur.
+
 The built-in native observers support the shipped `grok` and `muse` launcher
 names without profile environment or argument overrides. Qualified headless
 workers use their capability recipe, so a custom profile launcher or environment
 cannot silently select a different account for the capacity probe. Such profiles
 require an explicit `capacity_command` that observes the actual worker route.
+AGY supports the shipped `antigravity` profile and its update-disable setting;
+other launcher, argument or provider-environment overrides likewise require a
+custom command.
 
 TeamRouter's eligible account count is not a concurrency ceiling. When route
 telemetry does not advertise slots, the configured campaign and role limits bound
@@ -584,8 +601,10 @@ candidates = [
 ```
 
 These preferences require local qualification for the exact route, effort,
-permissions and purpose. Use a supported capacity observer or an explicit
-`capacity_command` for AGY; unknown allowance selects an eligible fallback.
+permissions and purpose. The built-in AGY observer supports the exact Flash
+models described above. Other AGY models, including the Argon preference shown
+here, need a supported explicit `capacity_command`; unknown allowance selects
+an eligible fallback.
 Existing role and shared-session limits also constrain these jobs.
 
 A higher-order final selection runs even when only one leaf summary remains.

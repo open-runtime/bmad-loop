@@ -9,6 +9,7 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Observe current AGY Flash model access and quota through bounded native metadata commands before admission.
 - Preserve required handoff facts through both packing stages and exclude misleading historical claims without discarding their sources.
 - Disable AGY background self-updates in managed native launch recipes and the shipped interactive profile.
 - Pack complete ranked handoff facts deterministically within exact artifact budgets while retaining all omissions and source audits.
