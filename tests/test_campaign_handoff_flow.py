@@ -145,6 +145,9 @@ def campaign(prepared, project, tmp_path):
         }
         # Closed final selection has a separate schema from legacy history.
         # Each synthetic receipt declares precisely the contracts it exercises.
+        from bmad_loop.campaign_handoff_obligations import (
+            final_schema_template as final_audit_schema,
+        )
         from bmad_loop.campaign_summary_final import schema_template as final_schema_template
 
         final_bindings = [
@@ -162,6 +165,7 @@ def campaign(prepared, project, tmp_path):
         final_proof.update(
             summary_schema_digest=digest(final_schema_template()),
             summary_job_schema_digest=digest(final_schema_template()),
+            audit_schema_digest=digest(final_audit_schema()),
             route_bindings=final_bindings,
             audit_prompt_version=FINAL_AUDIT_PROMPT_VERSION,
             independent_review={
@@ -354,6 +358,11 @@ def complete_audits(runtime, snapshot, unit):
             "covered_span_ids": [span["span_id"] for span in coord["owner_spans"]],
             "obligation_ids": coord["obligation_ids"],
             "ambiguities": [],
+            **(
+                {"final_verdict": "passed", "final_findings": []}
+                if coord.get("final_frontier")
+                else {}
+            ),
             "constraints": [
                 {
                     "span_id": span["span_id"],

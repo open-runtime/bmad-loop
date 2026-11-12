@@ -121,3 +121,80 @@ def test_inherited_lineage_duplicates_do_not_create_unmapped_obligations():
     inherited = event(original.record.text, identity="inherited-1")
     inherited.duplicate_of = original.id
     assert obligations.owner_spans([original, inherited]) == obligations.owner_spans([original])
+
+
+def test_final_assessment_is_separate_from_resolvable_source_authority():
+    events, coordinates, result = case("Preserve an explicit hold if one exists.")
+    legacy_schema = obligations.bound_schema(coordinates)
+    coordinates.update(final_frontier=["final"], audit_prompt_version="history-final-audit-v3")
+    assert obligations.bound_schema(coordinates) == legacy_schema
+    assert obligations.validate(result, coordinates, events)["ambiguities"] == []
+    with pytest.raises(CampaignError, match="Obsolete final audit"):
+        obligations.final_assessment(result, coordinates, current=True)
+    coordinates["audit_prompt_version"] = "history-final-audit-v4"
+    result.update(
+        final_verdict="repair_required", final_findings=["Selected claim invents a hold."]
+    )
+    result["constraints"][0][
+        "interpretation"
+    ] = "This is conditional; no current hold is established."
+    normalized = obligations.validate(result, coordinates, events)
+    assert normalized["ambiguities"] == []
+    assert (
+        obligations.final_assessment(normalized, coordinates, current=True)
+        == result["final_findings"]
+    )
+    schema = obligations.bound_schema(coordinates)
+    assert {"final_verdict", "final_findings"} <= set(schema["required"])
+    result.update(final_verdict="passed", final_findings=[])
+    assert obligations.final_assessment(result, coordinates, current=True) == []
+    assert "final_verdict" not in legacy_schema["properties"]
+    assert "final_findings" not in obligations.AUDIT_SCHEMA["required"]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "no-verdict",
+        "no-findings",
+        "passed-findings",
+        "repair-empty",
+        "empty-finding",
+        "unknown-verdict",
+        "object-verdict",
+    ],
+)
+def test_final_assessment_refuses_missing_or_contradictory_artifact_verdict(mutation):
+    events, coordinates, result = case()
+    coordinates.update(final_frontier=["final"], audit_prompt_version="history-final-audit-v4")
+    result.update(final_verdict="passed", final_findings=[])
+    if mutation == "no-verdict":
+        del result["final_verdict"]
+    elif mutation == "no-findings":
+        del result["final_findings"]
+    elif mutation == "passed-findings":
+        result["final_findings"] = ["Defective artifact"]
+    elif mutation == "repair-empty":
+        result["final_verdict"] = "repair_required"
+    elif mutation == "empty-finding":
+        result.update(final_verdict="repair_required", final_findings=["  "])
+    else:
+        result["final_verdict"] = {} if mutation == "object-verdict" else "resolved"
+    with pytest.raises(CampaignError, match="missing or inconsistent"):
+        obligations.validate(result, coordinates, events)
+
+
+@pytest.mark.parametrize("version", [None, "history-final-audit-v99", {}])
+def test_unsupported_final_audit_version_is_not_legacy_history(version):
+    events, coordinates, result = case()
+    coordinates.update(final_frontier=["final"], audit_prompt_version=version)
+    with pytest.raises(CampaignError, match="Unsupported final audit"):
+        obligations.bound_schema(coordinates)
+    with pytest.raises(CampaignError, match="Unsupported final audit"):
+        obligations.validate(result, coordinates, events)
+
+
+def test_current_final_assessment_requires_frontier_binding():
+    _, coordinates, result = case()
+    with pytest.raises(CampaignError, match="lacks its frontier"):
+        obligations.final_assessment(result, coordinates, current=True)

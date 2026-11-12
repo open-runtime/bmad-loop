@@ -107,6 +107,8 @@ def audit_result(row, ambiguity=True):
         "covered_owner_ids": c["owner_ids"],
         "covered_span_ids": [s["span_id"] for s in c["owner_spans"]],
         "obligation_ids": c["obligation_ids"],
+        "final_verdict": "passed",
+        "final_findings": [],
         "constraints": [
             {
                 "span_id": s["span_id"],
@@ -196,6 +198,195 @@ def test_failed_final_repairs_through_receipt_apply_reaudit_and_packet(audited_f
     assert packet["history_view"] and all(row["required_context"] for row in packet["history_view"])
     assert len(unit.evidence["handoff_final_repairs"][unit.claim.launch_id]) == 1
     assert original["request"] == old_request and original["receipt"] == old_receipt
+
+
+def test_resolved_source_still_rejects_bad_v6_required_claim_until_repair_and_reaudit(campaign):
+    runtime, snapshot, unit, receipt = campaign
+    owner_text = (
+        "Preserve an explicit operator hold if one exists; this rule does not impose a hold."
+    )
+    pending = "The implementation still needs its pending review."
+    unsupported = "The owner has imposed an active hold. Do not merge."
+    source = Path(receipt["sessions"][0]["transcript_path"])
+    source.write_text(
+        "\n".join(
+            json.dumps(record)
+            for record in (
+                {"type": "event_msg", "payload": {"type": "user_message", "message": owner_text}},
+                {
+                    "type": "response_item",
+                    "payload": {"type": "message", "role": "assistant", "content": pending},
+                },
+            )
+        )
+        + "\n"
+    )
+    staged(snapshot)
+    snapshot.config_revision += 1
+    flow.intercept_terminal(runtime, snapshot, unit, receipt)
+    step(runtime, snapshot, unit, "handoff-capture")
+    step(runtime, snapshot, unit, "handoff-plan")
+    value = unit.evidence["handoff"]
+    for key in value["jobs"]:
+        row = snapshot.jobs[key]
+        spec = SummaryJobSpec(**row["request"]["coordinates"]["summary_spec"])
+        quote_id = next(iter(quote_catalog(spec)))
+        source_events = load_input(spec)["primary"]
+        owner_id = next(e["event_id"] for e in source_events if e["owner_input"])
+        pending_id = next(e["event_id"] for e in source_events if e["text"] == pending)
+        result = {
+            "schema_version": 1,
+            "job_id": key,
+            "input_sha256": spec.input_sha256,
+            "covered_ids": list(spec.primary_ids),
+            "gaps": [],
+            "facts": [
+                {
+                    "kind": "owner_request",
+                    "text": owner_text,
+                    "source_quote_id": quote_id,
+                    "citations": [owner_id],
+                    "authority": "context",
+                },
+                {
+                    "kind": "next_action",
+                    "text": pending,
+                    "source_quote_id": "",
+                    "citations": [pending_id],
+                    "authority": "context",
+                },
+                {
+                    "kind": "constraint",
+                    "text": unsupported,
+                    "source_quote_id": "",
+                    "citations": [owner_id],
+                    "authority": "context",
+                },
+            ],
+        }
+        finish(runtime, snapshot, row, result, "openai")
+        assert row["state"] == "applied"
+    step(runtime, snapshot, unit, "handoff-audit-plan")
+    original = snapshot.jobs[value["jobs"][0]]
+    finish(runtime, snapshot, original, final_result(original), "openai")
+    assert original["state"] == "applied"  # Closed v6 structural validity is not semantic approval.
+    old_summary = flow._applied(original)
+    bad_id = next(
+        f["selected_from"]["catalog_id"] for f in old_summary["facts"] if unsupported in f["text"]
+    )
+    assert bad_id in old_summary["required_fact_ids"]
+    old_final = copy.deepcopy(original)
+    step(runtime, snapshot, unit, "handoff-audit-plan")
+    old_audits = list(value["audits"])
+    for key in old_audits:
+        audit = snapshot.jobs[key]
+        actual_input = json.loads(Path(audit["request"]["inputs"][0]["path"]).read_text())
+        assert unsupported in json.dumps(actual_input) and pending in json.dumps(actual_input)
+        assert "AS-IS" in audit["request"]["prompt"]
+        result = audit_result(audit, False)
+        result.update(
+            final_verdict="repair_required",
+            final_findings=["Required selected claim invents an active owner hold."],
+        )
+        for constraint in result["constraints"]:
+            constraint["interpretation"] = (
+                "Conditional rule; current evidence establishes no active owner hold."
+            )
+        finish(runtime, snapshot, audit, result, "anthropic")
+        assert audit["state"] == "failed" and audit["application"] == "rejected"
+    assert flow.resume_proposal(snapshot, unit, runtime) is None
+    assert not value.get("packet")
+    step(runtime, snapshot, unit, "handoff-final-repair")
+    repair = snapshot.jobs[value["jobs"][0]]
+    evidence = json.loads(Path(repair["request"]["inputs"][1]["path"]).read_text())
+    assert evidence["rejections"][0]["finding"]["final_verdict"] == "repair_required"
+    assert evidence["rejections"][0]["finding"]["ambiguities"] == []
+    corrected = final_result(repair)
+    assert bad_id in corrected["ranked_fact_ids"]  # Exact old catalog remains available.
+    corrected["required_fact_ids"].remove(bad_id)
+    corrected["excluded_fact_ids"] = [bad_id]
+    finish(runtime, snapshot, repair, corrected, "openai")
+    assert repair["state"] == "applied" and flow.resume_proposal(snapshot, unit, runtime) is None
+    step(runtime, snapshot, unit, "handoff-audit-plan")
+    assert set(value["audits"]).isdisjoint(old_audits)
+    for key in value["audits"]:
+        audit = snapshot.jobs[key]
+        assert audit["request"]["coordinates"]["final_frontier"] == [repair["id"]]
+        finish(runtime, snapshot, audit, audit_result(audit, False), "anthropic")
+        assert audit["state"] == "applied"
+    step(runtime, snapshot, unit, "handoff-assemble")
+    step(runtime, snapshot, unit, "handoff-release")
+    assert flow.resume_proposal(snapshot, unit, runtime) is not None
+    packet = json.loads(Path(value["packet"]["path"]).read_text())
+    assert pending in json.dumps(packet["history_view"])
+    assert unsupported not in json.dumps(packet["history_view"])
+    assert any(owner_text in row["source_quote"] for row in packet["resolved_constraints"])
+    assert original == old_final
+    assert len(unit.evidence["handoff_final_repairs"][unit.claim.launch_id]) == 1
+
+
+@pytest.mark.parametrize("mutation", ["missing", "version", "schema"])
+def test_saved_final_audit_contract_change_refreshes_without_erasing_evidence(
+    audited_final, mutation
+):
+    runtime, snapshot, unit, _ = audited_final
+    value = unit.evidence["handoff"]
+    for key in value["audits"]:
+        row = snapshot.jobs[key]
+        finish(runtime, snapshot, row, audit_result(row, False), "anthropic")
+    step(runtime, snapshot, unit, "handoff-assemble")
+    step(runtime, snapshot, unit, "handoff-release")
+    assert flow.resume_proposal(snapshot, unit, runtime) is not None
+    audits = [copy.deepcopy(flow._job(runtime, snapshot, key)) for key in value["audits"]]
+    packet_path = Path(value["packet"]["path"])
+    packet_bytes = packet_path.read_bytes()
+    context = value["capture"]["audit_context"]
+    if mutation == "missing":
+        del context["final_audit_contract"]
+    elif mutation == "version":
+        context["final_audit_contract"]["prompt_version"] = "history-final-audit-v3"
+    else:
+        context["final_audit_contract"]["schema_digest"] = "obsolete"
+    snapshot = runtime.store.save(snapshot, snapshot.revision)
+    snapshot = runtime.store.load(snapshot.id)
+    unit = snapshot.units[unit.id]
+    assert flow.resume_proposal(snapshot, unit, runtime) is None
+    assert not flow.job_launch_allowed(snapshot, audits[0])
+    assert [p.kind for p in flow.proposals(runtime, snapshot)] == ["handoff-refresh"]
+    step(runtime, snapshot, unit, "handoff-refresh")
+    assert unit.evidence["handoff"]["phase"] == "capture"
+    assert packet_path.read_bytes() == packet_bytes
+    assert [flow._job(runtime, snapshot, row["id"]) for row in audits] == audits
+
+
+@pytest.mark.parametrize("mutation", ["result-fields", "frontier", "version", "capture-context"])
+def test_current_final_application_refuses_obsolete_or_stripped_metadata(audited_final, mutation):
+    runtime, snapshot, unit, _ = audited_final
+    value = unit.evidence["handoff"]
+    row = snapshot.jobs[value["audits"][0]]
+    finish(runtime, snapshot, row, audit_result(row, False), "anthropic")
+    assert row["state"] == "applied"
+    # The current application boundary validates even a structurally accepted
+    # retained receipt; it does not rely solely on the request JSON schema.
+    coordinates = row["request"]["coordinates"]
+    if mutation == "result-fields":
+        del row["result"]["final_verdict"]
+        del row["result"]["final_findings"]
+        match = "missing or inconsistent"
+    elif mutation == "frontier":
+        del coordinates["final_frontier"]
+        match = "lacks its frontier"
+    elif mutation == "version":
+        coordinates["audit_prompt_version"] = "history-final-audit-v3"
+        match = "Obsolete final audit"
+    else:
+        del value["capture"]["audit_context"]["final_audit_contract"]
+        match = "contract or frontier changed"
+    with pytest.raises(CampaignError, match=match):
+        flow.apply_audit(runtime, snapshot, row)
+    assert not value.get(
+        "final_repair_pending"
+    )  # Invalid authority is not repairable model feedback.
 
 
 def test_two_repairs_exhaust_without_reset_after_persistence_and_config_refresh(audited_final):

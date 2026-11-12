@@ -103,6 +103,10 @@ def owner_spans(events):
 
 def bound_schema(coordinates):
     schema = copy.deepcopy(AUDIT_SCHEMA)
+    if coordinates.get("final_frontier"):
+        version = _final_version(coordinates)
+        if version == "history-final-audit-v4":
+            schema = final_schema_template()
     props = schema["properties"]
     for name in ("handoff_id", "capture_digest"):
         props[name]["enum"] = [coordinates[name]]
@@ -119,6 +123,51 @@ def bound_schema(coordinates):
     if spans:
         props["constraints"]["items"]["properties"]["span_id"]["enum"] = spans
     return schema
+
+
+def final_schema_template():
+    """Assess the submitted artifact separately from unresolved source authority."""
+    schema = copy.deepcopy(AUDIT_SCHEMA)
+    schema["required"].extend(["final_verdict", "final_findings"])
+    schema["properties"].update(
+        final_verdict={"type": "string", "enum": ["passed", "repair_required"]},
+        final_findings={"type": "array", "items": {"type": "string", "minLength": 1}},
+    )
+    return schema
+
+
+def _final_version(coordinates):
+    version = coordinates.get("audit_prompt_version")
+    if not isinstance(version, str) or version not in {
+        "history-final-audit-v3",
+        "history-final-audit-v4",
+    }:
+        raise CampaignError("Unsupported final audit contract version")
+    return version
+
+
+def final_assessment(result, coordinates, *, current=False):
+    """Read retained v3 evidence, but require v4 for current artifact admission."""
+    if not coordinates.get("final_frontier"):
+        if current:
+            raise CampaignError("Current final audit lacks its frontier binding")
+        return []
+    version = _final_version(coordinates)
+    if version != "history-final-audit-v4":
+        if current:
+            raise CampaignError("Obsolete final audit cannot authorize current continuation")
+        return []
+    findings = result.get("final_findings")
+    verdict = result.get("final_verdict")
+    if (
+        not isinstance(findings, list)
+        or any(not isinstance(item, str) or not item.strip() for item in findings)
+        or not isinstance(verdict, str)
+        or verdict not in {"passed", "repair_required"}
+        or (verdict == "passed") != (not findings)
+    ):
+        raise CampaignError("Final audit verdict and findings are missing or inconsistent")
+    return list(findings)
 
 
 def batches(spans, *, content, input_bound, output_bound):
@@ -150,6 +199,7 @@ def batches(spans, *, content, input_bound, output_bound):
 
 def validate(result, coordinates, events):
     """Reconstruct all quotes locally and reject omission or invented exclusion."""
+    final_assessment(result, coordinates)
     canonical = {row["span_id"]: row for row in owner_spans(events)}
     spans = coordinates.get("owner_spans")
     if not isinstance(spans, list) or any(

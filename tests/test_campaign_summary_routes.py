@@ -90,7 +90,11 @@ def test_single_leaf_requires_final_synthesis_before_owner_audit(campaign, damag
             "covered_owner_ids": coord["owner_ids"],
             "covered_span_ids": [span["span_id"] for span in coord["owner_spans"]],
             "obligation_ids": coord["obligation_ids"],
-            "ambiguities": ["Final source claim contradicts unfinished work"] if incorrect else [],
+            "ambiguities": [],
+            "final_verdict": "repair_required" if incorrect else "passed",
+            "final_findings": (
+                ["Final source claim contradicts unfinished work"] if incorrect else []
+            ),
             "constraints": [
                 {
                     "span_id": span["span_id"],

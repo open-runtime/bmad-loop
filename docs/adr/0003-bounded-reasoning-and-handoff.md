@@ -594,14 +594,33 @@ and must not leave a stale stop after release. Recheck controls at continuation
 launch; existing external hold-channel and publication admission checks retain
 their independent authority.
 
-Final-audit-v3 checks source attribution, coverage, ordering, required/excluded
+Final-audit-v4 checks source attribution, coverage, ordering, required/excluded
 classification and material omissions
 against complete leaf evidence, owner spans and current canonical state. Selecting
-an old claim cannot prove completion or invent a current hold. A rejected selection
+an old claim cannot prove completion or invent a current hold. The final-only
+result separates `final_verdict` (`passed` or `repair_required`) and
+`final_findings` from unresolved source `ambiguities`. A passed artifact has no
+findings; a repair verdict requires concrete findings. Either artifact findings
+or source ambiguities block continuation. The auditor assesses the submitted
+frontier as it stands: resolving a claim's meaning in constraint prose does not
+change the retained selection, clear a false instruction or repair an omission.
+
+This distinction addresses a native audit that recognized an unsupported
+standing-hold claim but returned no ambiguity after resolving its meaning. That
+failed result remains failed. Qualification must include structurally valid
+final-v6 selections with wrong required claims, as well as true holds and omitted
+unfinished reviews. Historical malformed or older-schema artifacts alone do not
+prove current final-v6 behavior.
+
+A rejected selection
 can use the existing bounded correction path and exact rejected-audit inputs;
 every corrected selection still requires fresh independent audits. Preserve old
-final-v3, final-v4 and final-v5 artifacts as history, require new current-stage qualification, and leave
+final-v3, final-v4 and final-v5 artifacts and final-audit-v3 receipts as history,
+require new current-stage qualification, and leave
 leaf/intermediate and legacy history-audit qualification contracts unchanged.
+The captured audit context binds the active stage's prompt version and schema;
+an obsolete final audit cannot authorize a current continuation. Context renewal
+preserves original evidence, attempt debt and the final-repair budget.
 
 A completed final audit can reject a structurally valid synthesis. Retain its
 validated findings and stop admitting audits of that unchanged final; observe
