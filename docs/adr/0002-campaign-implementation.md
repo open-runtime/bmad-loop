@@ -25,7 +25,10 @@ interpreting owner intent. A corrected interpretation cannot silently repair a
 false claim retained in that selection. Typed artifact findings require the
 existing bounded correction and fresh complete audit before continuation.
 Exact owner requirements and controller-observed holds remain separate mandatory
-context. Changed controls invalidate continuation before writer admission; each
+context. Audits require historical material work in the selected catalog but do
+not demand duplicate historical facts for controller-only holds or canonical state.
+Selected claims that contradict, clear or weaken that mandatory state still fail.
+Changed controls invalidate continuation before writer admission; each
 new final-selection or final-audit contract requires its own native qualification.
 
 ## Implementation goals and traceability

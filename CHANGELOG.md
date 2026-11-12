@@ -9,6 +9,7 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Audit controller-only holds as mandatory current state without requiring fabricated historical facts.
 - Reject defective final handoff artifacts independently of resolved owner intent, preserving bounded repair and fresh audit requirements.
 - Preserve native AGY quota reset deadlines through interruption, restart and prepared-launch admission while allowing eligible fallbacks.
 - Observe current AGY Flash model access and quota through bounded native metadata commands before admission.

@@ -325,7 +325,7 @@ def test_resolved_source_still_rejects_bad_v6_required_claim_until_repair_and_re
     assert len(unit.evidence["handoff_final_repairs"][unit.claim.launch_id]) == 1
 
 
-@pytest.mark.parametrize("mutation", ["missing", "version", "schema"])
+@pytest.mark.parametrize("mutation", ["missing", "version", "prior-v4", "schema"])
 def test_saved_final_audit_contract_change_refreshes_without_erasing_evidence(
     audited_final, mutation
 ):
@@ -343,8 +343,10 @@ def test_saved_final_audit_contract_change_refreshes_without_erasing_evidence(
     context = value["capture"]["audit_context"]
     if mutation == "missing":
         del context["final_audit_contract"]
-    elif mutation == "version":
-        context["final_audit_contract"]["prompt_version"] = "history-final-audit-v3"
+    elif mutation in {"version", "prior-v4"}:
+        context["final_audit_contract"]["prompt_version"] = (
+            "history-final-audit-v4" if mutation == "prior-v4" else "history-final-audit-v3"
+        )
     else:
         context["final_audit_contract"]["schema_digest"] = "obsolete"
     snapshot = runtime.store.save(snapshot, snapshot.revision)
@@ -359,7 +361,9 @@ def test_saved_final_audit_contract_change_refreshes_without_erasing_evidence(
     assert [flow._job(runtime, snapshot, row["id"]) for row in audits] == audits
 
 
-@pytest.mark.parametrize("mutation", ["result-fields", "frontier", "version", "capture-context"])
+@pytest.mark.parametrize(
+    "mutation", ["result-fields", "frontier", "version", "prior-v4", "capture-context"]
+)
 def test_current_final_application_refuses_obsolete_or_stripped_metadata(audited_final, mutation):
     runtime, snapshot, unit, _ = audited_final
     value = unit.evidence["handoff"]
@@ -376,8 +380,10 @@ def test_current_final_application_refuses_obsolete_or_stripped_metadata(audited
     elif mutation == "frontier":
         del coordinates["final_frontier"]
         match = "lacks its frontier"
-    elif mutation == "version":
-        coordinates["audit_prompt_version"] = "history-final-audit-v3"
+    elif mutation in {"version", "prior-v4"}:
+        coordinates["audit_prompt_version"] = (
+            "history-final-audit-v4" if mutation == "prior-v4" else "history-final-audit-v3"
+        )
         match = "Obsolete final audit"
     else:
         del value["capture"]["audit_context"]["final_audit_contract"]
@@ -387,6 +393,52 @@ def test_current_final_application_refuses_obsolete_or_stripped_metadata(audited
     assert not value.get(
         "final_repair_pending"
     )  # Invalid authority is not repairable model feedback.
+
+
+def test_final_audit_separates_controller_only_hold_from_historical_catalog(audited_final):
+    from bmad_loop.campaign_model import Hold
+    from bmad_loop.campaign_transcripts import digest
+
+    runtime, snapshot, unit, final = audited_final
+    value = unit.evidence["handoff"]
+    original = copy.deepcopy(final)
+    spec = SummaryJobSpec(**final["request"]["coordinates"]["summary_spec"])
+    source = load_input(spec)
+    hold = Hold("operator", "Wait for explicit resolution", id="controller-only-hold")
+    unit.hold = hold
+    state = flow._controller_controls(snapshot, unit)
+    controls = {
+        "observed_revision": snapshot.revision,
+        "state": state,
+        "state_digest": digest(state),
+    }
+    # Exercise the real planner with explicit current controller evidence. This
+    # is not a native semantic outcome or permission to dispatch through a hold.
+    value["capture"]["current"]["controller_controls"] = controls
+    requests = flow._audit_plan(runtime, snapshot, unit, value)["requests"]
+    assert requests
+    assert hold.id not in json.dumps(source["children"])
+    assert hold.id not in source["fact_catalog"]
+    assert set(final["result"]["required_fact_ids"]) <= set(source["fact_catalog"])
+    for request in requests:
+        actual = json.loads(Path(request["inputs"][0]["path"]).read_text())
+        assert actual["current_state"]["controller_controls"] == controls
+        assert actual["final_frontier"] == [
+            {"job_id": final["id"], "summary": flow._applied(final)}
+        ]
+        assert request["coordinates"]["audit_prompt_version"] == "history-final-audit-v5"
+        prompt = request["prompt"]
+        assert (
+            "Current controller controls and canonical obligations are separate mandatory context"
+            in prompt
+        )
+        assert "Absence of that duplicate historical fact is not an omission" in prompt
+        assert (
+            "For historical leaf-source content, every source-supported material unfinished obligation"
+            in prompt
+        )
+        assert "contradicts, clears or weakens those controls or obligations" in prompt
+    assert final == original  # No synthetic hold fact, reranking, or source rewrite.
 
 
 def test_two_repairs_exhaust_without_reset_after_persistence_and_config_refresh(audited_final):

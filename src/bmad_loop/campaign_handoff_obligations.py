@@ -105,7 +105,7 @@ def bound_schema(coordinates):
     schema = copy.deepcopy(AUDIT_SCHEMA)
     if coordinates.get("final_frontier"):
         version = _final_version(coordinates)
-        if version == "history-final-audit-v4":
+        if version in {"history-final-audit-v4", "history-final-audit-v5"}:
             schema = final_schema_template()
     props = schema["properties"]
     for name in ("handoff_id", "capture_digest"):
@@ -141,21 +141,24 @@ def _final_version(coordinates):
     if not isinstance(version, str) or version not in {
         "history-final-audit-v3",
         "history-final-audit-v4",
+        "history-final-audit-v5",
     }:
         raise CampaignError("Unsupported final audit contract version")
     return version
 
 
 def final_assessment(result, coordinates, *, current=False):
-    """Read retained v3 evidence, but require v4 for current artifact admission."""
+    """Read retained v3/v4 evidence, but require the current artifact contract."""
+    from .campaign_fidelity import FINAL_AUDIT_PROMPT_VERSION
+
     if not coordinates.get("final_frontier"):
         if current:
             raise CampaignError("Current final audit lacks its frontier binding")
         return []
     version = _final_version(coordinates)
-    if version != "history-final-audit-v4":
-        if current:
-            raise CampaignError("Obsolete final audit cannot authorize current continuation")
+    if current and version != FINAL_AUDIT_PROMPT_VERSION:
+        raise CampaignError("Obsolete final audit cannot authorize current continuation")
+    if version == "history-final-audit-v3":
         return []
     findings = result.get("final_findings")
     verdict = result.get("final_verdict")
