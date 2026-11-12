@@ -8,10 +8,12 @@ malicious process running as the owner. No model or tool receives the locator.
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import math
 import os
+import re
 import secrets
 import stat
 import threading
@@ -99,6 +101,14 @@ def validate(capability, *, verify_files=True):
             or file_digest(Path(pin["path"])) != pin["sha256"]
         ):
             raise _error("carrier/producer dependency changed")
+    producer = Path(spec["producer"]["path"])
+    if (
+        Path(spec["producer_helper"]["path"])
+        != producer.parent.parent / "src/codex-prelaunch-failure.js"
+    ):
+        raise _error("producer helper is not its fixed relative import")
+    if verify_files:
+        _validate_carrier_imports(spec)
     argv = capability.get("argv", [])
     if argv.count("--native") != 1 or argv[argv.index("--native") + 1 :][:1] != [
         spec["producer"]["path"]
@@ -114,6 +124,53 @@ def validate(capability, *, verify_files=True):
         from .campaign_codex_appserver import validate_recipe
 
         validate_recipe(capability)
+
+
+def _validate_carrier_imports(spec):
+    """Bind labeled pins to the actual fixed imports, without executing them."""
+    source = Path(spec["producer"]["path"]).read_text(encoding="utf-8")
+    entries = re.findall(r"^const HCOM = (['\"])([^'\"\r\n]+)\1;$", source, re.MULTILINE)
+    if (
+        len(entries) != 1
+        or entries[0][1] != spec["carrier_entry"]["path"]
+        or not re.search(
+            r"^import .+ from ['\"]\.\./src/codex-prelaunch-failure\.js['\"];\s*$",
+            source,
+            re.MULTILINE,
+        )
+    ):
+        raise _error("producer does not import the pinned helper/carrier entry")
+    helper = Path(spec["carrier_helper"]["path"])
+    try:
+        wrapper = ast.parse(Path(spec["carrier_entry"]["path"]).read_text(encoding="utf-8"))
+    except SyntaxError as exc:
+        raise _error("carrier entry is not the supported Python wrapper") from exc
+    inserts = [
+        node
+        for node in ast.walk(wrapper)
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "sys.path.insert"
+    ]
+    imports = [
+        name
+        for node in ast.walk(wrapper)
+        if isinstance(node, ast.Import)
+        for name in node.names
+        if name.name == "remhcom"
+    ]
+    if (
+        helper.name != "remhcom.py"
+        or len(inserts) != 1
+        or inserts[0].keywords
+        or len(inserts[0].args) != 2
+        or not isinstance(inserts[0].args[0], ast.Constant)
+        or type(inserts[0].args[0].value) is not int
+        or inserts[0].args[0].value != 0
+        or not isinstance(inserts[0].args[1], ast.Constant)
+        or inserts[0].args[1].value != str(helper.parent)
+        or len(imports) != 1
+        or imports[0].asname is not None
+    ):
+        raise _error("carrier helper is not its fixed remhcom import")
 
 
 def _directory(path):

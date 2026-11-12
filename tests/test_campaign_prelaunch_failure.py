@@ -29,8 +29,23 @@ def scripted_recipe(monkeypatch):
 def capability(tmp_path):
     pins = {}
     for name in failure.PINS:
-        path = tmp_path / name
-        path.write_text(name)
+        path = {
+            "producer": tmp_path / "teamrouter/scripts/teamrouter-codex.mjs",
+            "producer_helper": tmp_path / "teamrouter/src/codex-prelaunch-failure.js",
+            "carrier_helper": tmp_path / "library/remhcom.py",
+        }.get(name, tmp_path / name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        body = name
+        if name == "producer":
+            body = (
+                "import { publish } from '../src/codex-prelaunch-failure.js';\n"
+                + f"const HCOM = '{tmp_path / 'carrier_entry'}';\n"
+            )
+        elif name == "carrier_entry":
+            body = (
+                f"import sys\nsys.path.insert(0, {str(tmp_path / 'library')!r})\nimport remhcom\n"
+            )
+        path.write_text(body)
         pins[name] = {"path": str(path), "sha256": file_digest(path)}
     paths = [Path(failure.__file__).resolve(), Path(worker.__file__).resolve()]
     return {
@@ -341,6 +356,22 @@ def test_optin_cannot_bypass_maintained_codex_recipe(tmp_path, monkeypatch):
     )
     with pytest.raises(CampaignError, match="recipe changed"):
         failure.validate(capability(tmp_path))
+
+
+@pytest.mark.parametrize("pin", ["producer_helper", "carrier_entry", "carrier_helper"])
+def test_named_pin_cannot_substitute_an_unrelated_existing_dependency(tmp_path, pin):
+    cap = capability(tmp_path)
+    original = Path(cap["prelaunch_failure"][pin]["path"])
+    substitute = tmp_path / "unrelated" / original.name
+    substitute.parent.mkdir()
+    substitute.write_bytes(original.read_bytes())
+    wrong = {"path": str(substitute), "sha256": file_digest(substitute)}
+    cap["prelaunch_failure"][pin] = wrong
+    cap["dependencies"].append(wrong)
+    with pytest.raises(
+        CampaignError, match="fixed relative import|pinned helper/carrier|fixed remhcom import"
+    ):
+        failure.validate(cap)
 
 
 @pytest.mark.parametrize(
