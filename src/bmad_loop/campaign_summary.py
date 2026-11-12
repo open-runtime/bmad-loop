@@ -21,7 +21,8 @@ from .platform_util import atomic_write_text, is_link_like
 TokenCounter = Callable[[str], int]
 EXTRACT_PROMPT_VERSION = "history-extract-v3"
 REDUCE_PROMPT_VERSION = "history-reduce-v7"
-FINAL_PROMPT_VERSION = "history-final-v3"
+FINAL_PROMPT_VERSION = "history-final-v4"
+LEGACY_FINAL_PROMPT_VERSION = "history-final-v3"
 
 
 class SummaryResultRejected(CampaignError):
@@ -316,6 +317,61 @@ def load_input(job: SummaryJobSpec) -> dict[str, Any]:
     return json.loads(data)
 
 
+def _final_payload(job: SummaryJobSpec) -> dict[str, Any]:
+    """Authenticate the complete source behind an existing projected reducer input."""
+    from . import campaign_summary_final as final
+
+    payload = load_input(job)
+    presentation = payload.get("citation_presentation")
+    if presentation in {"native-events-v1", FINAL_PROMPT_VERSION}:
+        reference = payload.get("source_input")
+        if not isinstance(reference, dict) or set(reference) != {"path", "sha256", "job_id"}:
+            raise CampaignError("Final source input binding is malformed")
+        original = replace(
+            job,
+            id=reference["job_id"],
+            input_path=reference["path"],
+            input_sha256=reference["sha256"],
+        )
+        source = load_input(original)
+        expected = (
+            _native_reduction_payload(original, source)
+            if presentation == "native-events-v1"
+            else final.input_payload(source, reference)
+        )
+        if encoded(expected) != encoded(payload):
+            raise CampaignError("Final projected input differs from its complete source")
+    else:
+        source = payload
+        reference = {"path": job.input_path, "sha256": job.input_sha256, "job_id": job.id}
+    _reduction_quotes(
+        [child["summary"] for child in source["children"]], source.get("owner_quotes")
+    )
+    return final.input_payload(source, reference)
+
+
+def final_input_size(job: SummaryJobSpec) -> int:
+    """Measure the same complete reference catalog used by final projection."""
+    return len(encoded(_final_payload(job)))
+
+
+def project_final_input(job: SummaryJobSpec, artifact_root: Path) -> SummaryJobSpec:
+    """Produce a closed final catalog without changing any historical source blob."""
+    payload = _final_payload(job)
+    content = encoded(payload)
+    if load_input(job).get("citation_presentation") == FINAL_PROMPT_VERSION:
+        return replace(job, prompt_version=FINAL_PROMPT_VERSION)
+    path = blob(artifact_root, content)
+    return replace(
+        job,
+        id=digest([job.id, payload, FINAL_PROMPT_VERSION]),
+        input_path=str(path),
+        input_sha256=hashlib.sha256(content).hexdigest(),
+        input_tokens=len(content),
+        prompt_version=FINAL_PROMPT_VERSION,
+    )
+
+
 def quote_catalog(job: SummaryJobSpec) -> dict[str, dict[str, Any]]:
     """Derive selectable quote spans; the model never reconstructs source bytes."""
     payload = load_input(job)
@@ -443,6 +499,59 @@ def validate_summary(
     )
     if output_count > job.output_tokens:
         raise SummaryResultRejected("summary exceeds its qualified output budget")
+    if job.prompt_version == FINAL_PROMPT_VERSION:
+        from . import campaign_summary_final as final
+
+        # Authenticating the complete input is a source boundary, not a model
+        # correction opportunity. The response can select only its known IDs.
+        payload = _final_payload(job)
+        sources = {event.id: event for event in events}
+        for quote in payload["owner_quotes"].values():
+            event = sources.get(quote["event_id"])
+            if (
+                event is None
+                or not event.record.owner_input
+                or event.record.text[quote["start"] : quote["end"]] != quote["text"]
+            ):
+                raise CampaignError("Final owner quote differs from authenticated native evidence")
+        for child in payload["children"]:
+            for fact in child["summary"]["facts"]:
+                if any(ref not in job.event_ids or ref not in sources for ref in fact["citations"]):
+                    raise CampaignError("Final child citation is outside authenticated history")
+        try:
+            expanded = final.expand(
+                result,
+                payload,
+                job_id=job.id,
+                input_sha256=job.input_sha256,
+                children=job.primary_ids,
+            )
+        except CampaignError as exc:
+            raise SummaryResultRejected(str(exc)) from exc
+        validated = {
+            **expanded,
+            "structural_coverage": True,
+            "semantic_fidelity": "unqualified",
+            "complete": not expanded["gaps"],
+            "output_measurement": {
+                "kind": (
+                    "utf8-byte-upper-bound" if observed_output_tokens is None else "native-receipt"
+                ),
+                "tokens": output_count,
+            },
+        }
+        if job.artifact_bytes:
+            if type(job.artifact_bytes) is not int or job.artifact_bytes < 1:
+                raise CampaignError("Invalid summary artifact byte limit")
+            validated["reduction_budget"] = {
+                "artifact_byte_limit": job.artifact_bytes,
+                "result_bytes": len(encoded(result)),
+            }
+            if len(encoded(validated)) > job.artifact_bytes:
+                raise SummaryResultRejected(
+                    "Expanded final source claims exceed reduction byte limit"
+                )
+        return validated
     if (
         result.get("schema_version") != 1
         or result.get("job_id") != job.id
@@ -909,8 +1018,9 @@ def split_reduction_input(job: SummaryJobSpec, artifact_root: Path) -> tuple[Sum
     result = []
     middle = len(children) // 2
     for group in (children[:middle], children[middle:]):
+        final = job.prompt_version == FINAL_PROMPT_VERSION
         value = {
-            **payload,
+            **({"schema_version": 1} if final else payload),
             "children": group,
             "owner_quotes": _reduction_quotes(
                 [child["summary"] for child in group], payload.get("owner_quotes")
@@ -919,25 +1029,24 @@ def split_reduction_input(job: SummaryJobSpec, artifact_root: Path) -> tuple[Sum
         content = encoded(value)
         path = blob(artifact_root, content)
         identifiers = tuple(child["job_id"] for child in group)
-        result.append(
-            replace(
-                job,
-                id=digest([job.id, value, "adaptive-render-v1"]),
-                input_path=str(path),
-                input_sha256=hashlib.sha256(content).hexdigest(),
-                input_tokens=len(content),
-                primary_ids=identifiers,
-                dependencies=identifiers,
-                event_ids=tuple(
-                    dict.fromkeys(
-                        ref
-                        for child in group
-                        for fact in child["summary"]["facts"]
-                        for ref in fact["citations"]
-                    )
-                ),
-            )
+        split = replace(
+            job,
+            id=digest([job.id, value, "adaptive-render-v1"]),
+            input_path=str(path),
+            input_sha256=hashlib.sha256(content).hexdigest(),
+            input_tokens=len(content),
+            primary_ids=identifiers,
+            dependencies=identifiers,
+            event_ids=tuple(
+                dict.fromkeys(
+                    ref
+                    for child in group
+                    for fact in child["summary"]["facts"]
+                    for ref in fact["citations"]
+                )
+            ),
         )
+        result.append(project_final_input(split, artifact_root) if final else split)
     return tuple(result)
 
 
@@ -945,6 +1054,12 @@ def summary_schema(
     job: SummaryJobSpec | None = None, *, quote_ids: tuple[str, ...] | None = None
 ) -> dict[str, Any]:
     """Portable structured-output schema; semantic/source checks remain local."""
+    if job is not None and job.prompt_version == FINAL_PROMPT_VERSION:
+        from . import campaign_summary_final as final
+
+        return final.schema(
+            job.id, job.input_sha256, job.primary_ids, tuple(_final_payload(job)["fact_catalog"])
+        )
     schema: dict[str, Any] = {
         "type": "object",
         "required": ["schema_version", "job_id", "input_sha256", "covered_ids", "facts", "gaps"],
@@ -1024,6 +1139,39 @@ def summary_schema_template() -> dict[str, Any]:
 
 
 def summary_prompt(job: SummaryJobSpec) -> str:
+    if job.prompt_version == FINAL_PROMPT_VERSION:
+        return (
+            "Select and order source fact IDs for the final successor history view. "
+            "The fact_catalog binds each ID to a complete immutable child summary and fact. "
+            "Read all children and preserve retrieval coverage of unfinished work, failures, contradictions and context. "
+            "Choose references only: do not write text, instructions, labels, approval, current holds or state. "
+            "Python renders selected facts as explicitly attributed historical summary claims; their wording is not current authority. "
+            "All exact owner spans and canonical controls remain separate mandatory context, irrespective of selection. "
+            "Unselected facts remain in the complete source index; selection does not resolve or discard their obligations. "
+            "All supplied child gaps are inherited by the controller. Return every covered child ID exactly once and unique selected_fact_ids in presentation order. "
+            "An independent source audit must still reject omission of material unfinished work. "
+            "No tools or external writes. Return only the exact JSON schema. "
+            + (
+                f"The complete Python-expanded artifact, including exact quoted text and provenance, must fit {job.artifact_bytes} UTF-8 bytes. Select a bounded presentation without hiding material unfinished work. "
+                if job.artifact_bytes
+                else ""
+            )
+            + (
+                "A prior completed attempt was rejected: "
+                + job.correction_reason
+                + ". Use the supplied findings as fallible context when selecting references; do not change source evidence or invent current controls. "
+                if job.correction_reason
+                else ""
+            )
+            + encoded(
+                {
+                    "job_id": job.id,
+                    "input_sha256": job.input_sha256,
+                    "primary_ids": job.primary_ids,
+                    "schema": summary_schema(job),
+                }
+            ).decode()
+        )
     synthesis = job.purpose == "handoff-reduce"
     synthesis_guidance = (
         "Preserve each obligation's action, scope, condition and timing. "
@@ -1064,7 +1212,7 @@ def summary_prompt(job: SummaryJobSpec) -> str:
             "Reconcile chronology, supersession and contradictions across children; keep every "
             "unresolved owner obligation and distinguish established facts from uncertainty. "
             "This is the final synthesis, not another independent leaf extraction. "
-            if job.prompt_version == FINAL_PROMPT_VERSION
+            if job.prompt_version == LEGACY_FINAL_PROMPT_VERSION
             else ""
         )
         + (

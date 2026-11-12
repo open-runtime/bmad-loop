@@ -90,6 +90,17 @@ def _read_summary_row(row):
 
         if file_digest(Path(row["input"]["path"])) != row["input"]["sha256"]:
             raise CampaignError("Retained summary input changed")
+    if (
+        row.get("prompt_version") == "history-final-v4"
+        or summary.get("final_contract")
+        or any("selected_from" in fact for fact in summary.get("facts", []))
+    ):
+        from .campaign_summary_final import validate_attribution
+
+        if summary.get("final_contract") != "history-final-v4":
+            raise CampaignError("Retained final selection contract is missing or unsupported")
+        for fact in summary.get("facts", []):
+            validate_attribution(fact)
     return summary
 
 
@@ -152,6 +163,25 @@ def _history_facts(payload):
                 "authority": "context",
                 "semantic_fidelity": "unqualified",
             }
+            if summary.get("final_contract") == "history-final-v4":
+                # A bounded view must retain the deterministic attribution and
+                # its source evidence, not turn a historical claim into a bare
+                # instruction. Legacy projections keep their original shape.
+                result[identity].update(
+                    final_contract="history-final-v4",
+                    **{
+                        key: fact[key]
+                        for key in (
+                            "selected_from",
+                            "citations",
+                            "source_quote",
+                            "source_quote_ref",
+                            "source_quote_id",
+                            "fragment_provenance",
+                        )
+                        if key in fact
+                    },
+                )
     return result
 
 
@@ -341,14 +371,18 @@ def fit_audited_history(payload, artifact_root, *, ceiling):
             )
         )
     }
-    # Newer final nodes first, round-robin within each kind so one workstream
-    # cannot consume every historical slot. No model decides what has authority.
+    # Closed selections retain their model-selected order across kinds. Older
+    # nodes keep the legacy kind priority/reversal. Within either presentation,
+    # round-robin newer final nodes first; neither view decides authority.
     parents = list(dict.fromkeys(parent for parent, _ in facts))[::-1]
     grouped = {}
     for (parent, _), row in facts.items():
-        grouped.setdefault((row["kind"], parent), []).append(row)
-    for kind in priorities:
-        queues = [grouped.get((kind, parent), [])[::-1] for parent in parents]
+        kind = None if row.get("final_contract") == "history-final-v4" else row["kind"]
+        grouped.setdefault((kind, parent), []).append(row)
+    for kind in (None, *priorities):
+        queues = [grouped.get((kind, parent), []) for parent in parents]
+        if kind is not None:
+            queues = [queue[::-1] for queue in queues]
         for position in range(max((len(queue) for queue in queues), default=0)):
             for queue in queues:
                 if position >= len(queue):

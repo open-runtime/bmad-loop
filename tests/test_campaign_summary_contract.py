@@ -20,9 +20,11 @@ from bmad_loop.campaign_summary import (
     FINAL_PROMPT_VERSION,
     REDUCE_PROMPT_VERSION,
     corrective_spec,
+    load_input,
     plan_maps,
     plan_reduction,
     plan_remaining_maps,
+    project_final_input,
     summary_contract_current,
     summary_prompt,
     summary_schema,
@@ -183,8 +185,27 @@ def test_synthesis_preserves_obligation_timing_and_qualifies_child_inferences(
         owner_quotes=quotes(history, child),
     )[0]
     if stage == "final":
-        job = replace(job, prompt_version=FINAL_PROMPT_VERSION)
+        job = project_final_input(job, tmp_path / "final")
     prompt = summary_prompt(job)
+    if stage == "final":
+        assert "Choose references only" in prompt
+        assert "explicitly attributed historical summary claims" in prompt
+        assert (
+            "All exact owner spans and canonical controls remain separate mandatory context"
+            in prompt
+        )
+        footer = json.loads(prompt[prompt.rindex('{"input_sha256"') :])
+        assert footer["schema"] == summary_schema(job)
+        assert footer["primary_ids"] == [leaf.id]
+        assert set(footer["schema"]["properties"]) == {
+            "schema_version",
+            "job_id",
+            "input_sha256",
+            "covered_ids",
+            "selected_fact_ids",
+        }
+        assert load_input(job)["owner_quotes"]
+        return
     # These are rendered model instructions, not a claim that a scripted model
     # established semantic fidelity. The native independent audit remains required.
     for instruction in (

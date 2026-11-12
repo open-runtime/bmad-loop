@@ -13,6 +13,12 @@ policy, migration and installation qualification remain activation prerequisites
 The accepted [reasoning-job and handoff contract](0003-bounded-reasoning-and-handoff.md)
 extends this work without weakening its acceptance or publication gates.
 
+Final handoff views use the ADR 0003 closed selection contract: the model orders
+immutable source references, and Python renders attributed historical claims.
+Exact owner requirements and controller-observed holds remain separate mandatory
+context. Changed controls invalidate continuation before writer admission; each
+new final-selection or final-audit contract requires its own native qualification.
+
 ## Implementation goals and traceability
 
 The initial implementation and released follow-ups established the historical

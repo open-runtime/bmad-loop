@@ -9,6 +9,7 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Bind final handoff selection to source fact IDs and preserve historical attribution alongside current controller holds.
 - Include authenticated rejected-audit source context in final handoff corrections within existing input budgets.
 - Repartition quiescent handoff reducers after native wall-time limits while preserving completed maps and lifetime retry debt.
 - Budget Claude partial-message framing separately from model output while preserving native token and turn limits.

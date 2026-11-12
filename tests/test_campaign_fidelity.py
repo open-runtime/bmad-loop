@@ -323,6 +323,7 @@ def test_final_audit_binds_final_prompt_not_history_audit(proof):
     cap, path = proof
     evidence = read_json(path)
     bindings = [route_binding(cap, "handoff_final_audit")]
+    evidence.update(expected)
     evidence.update(
         route_bindings=bindings,
         audit_schema_digest=digest(flow.AUDIT_SCHEMA),
@@ -361,7 +362,11 @@ def test_map_proof_ignores_unused_audit_schema_and_reducer_prompt(proof, monkeyp
 
 @pytest.mark.parametrize(
     ("purpose", "prior_version"),
-    [("handoff_reduce", "history-reduce-v6"), ("handoff_final", "history-final-v2")],
+    [
+        ("handoff_reduce", "history-reduce-v6"),
+        ("handoff_final", "history-final-v2"),
+        ("handoff_final", "history-final-v3"),
+    ],
 )
 def test_prior_synthesis_native_proof_cannot_qualify_repaired_prompt(proof, purpose, prior_version):
     from pathlib import Path

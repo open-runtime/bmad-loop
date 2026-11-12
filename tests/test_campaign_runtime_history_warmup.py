@@ -42,7 +42,7 @@ class ObservedReasoning(ScriptedReasoning):
             assert pid is not None and runs.probe_liveness(pid, identity) == "alive"
         self.launches.append(copy.deepcopy(request))
         if request["purpose"] == "handoff_reduce":
-            from bmad_loop.campaign_summary import SummaryJobSpec, load_input
+            from bmad_loop.campaign_summary import FINAL_PROMPT_VERSION, SummaryJobSpec, load_input
 
             envelope = read_json(path)
             spec = SummaryJobSpec(**coordinates["summary_spec"])
@@ -57,6 +57,14 @@ class ObservedReasoning(ScriptedReasoning):
                     fact for child in source["children"] for fact in child["summary"]["facts"]
                 ],
             }
+            if spec.prompt_version == FINAL_PROMPT_VERSION:
+                result = {
+                    "schema_version": 2,
+                    "job_id": request["id"],
+                    "input_sha256": spec.input_sha256,
+                    "covered_ids": list(spec.primary_ids),
+                    "selected_fact_ids": list(source["fact_catalog"]),
+                }
             return {
                 "state": "finished",
                 "receipt": {

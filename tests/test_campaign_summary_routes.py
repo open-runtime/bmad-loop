@@ -27,7 +27,7 @@ def staged(snapshot):
 @pytest.mark.parametrize("damaged", [False, True])
 def test_single_leaf_requires_final_synthesis_before_owner_audit(campaign, damaged):
     from bmad_loop.campaign_reasoning_results import apply_result
-    from bmad_loop.campaign_summary import FINAL_PROMPT_VERSION
+    from bmad_loop.campaign_summary import FINAL_PROMPT_VERSION, SummaryJobSpec, load_input
 
     runtime, snapshot, unit, receipt = campaign
     staged(snapshot)
@@ -44,15 +44,15 @@ def test_single_leaf_requires_final_synthesis_before_owner_audit(campaign, damag
     assert final["id"] != leaf["id"] and value["phase"] == "summarize"
     assert final["request"]["coordinates"]["summary_stage"] == "final"
     assert final["request"]["coordinates"]["summary_spec"]["prompt_version"] == FINAL_PROMPT_VERSION
-    assert "final successor synthesis" in final["request"]["prompt"]
+    assert "Select and order source fact IDs" in final["request"]["prompt"]
+    spec = SummaryJobSpec(**final["request"]["coordinates"]["summary_spec"])
     result = {
-        **leaf["result"],
+        "schema_version": 2,
         "job_id": final["id"],
-        "input_sha256": final["request"]["coordinates"]["summary_spec"]["input_sha256"],
+        "input_sha256": spec.input_sha256,
         "covered_ids": [leaf["id"]],
+        "selected_fact_ids": [] if damaged else list(load_input(spec)["fact_catalog"]),
     }
-    if damaged:
-        result["facts"] = []
     final.update(
         state="validated",
         validation="valid",
@@ -211,9 +211,9 @@ def test_legacy_reducer_proof_does_not_qualify_final_synthesis(campaign):
     value["independent_review"]["sha256"] = file_digest(receipt)
     write_json(proof, value)
     cap["semantic_qualification"]["sha256"] = file_digest(proof)
-    cap["semantic_qualification"]["proofs"][0]["sha256"] = file_digest(proof)
+    cap["semantic_qualification"]["proofs"] = [{"path": str(proof), "sha256": file_digest(proof)}]
     validate(cap, flow.AUDIT_SCHEMA, candidate=candidate, purpose="handoff_reduce")
-    with pytest.raises(CampaignError, match="semantic contract"):
+    with pytest.raises(CampaignError, match="does not match|semantic contract"):
         validate(cap, flow.AUDIT_SCHEMA, candidate=candidate, purpose="handoff_final")
 
 
@@ -246,7 +246,12 @@ def test_agy_default_capacity_is_unknown_without_inference(tmp_path, monkeypatch
 def _fill_summary(runtime, snapshot, row, *, near_limit=False):
     """Script only summary output; use the actual native-input/validation path."""
     from bmad_loop.campaign_reasoning_results import apply_result
-    from bmad_loop.campaign_summary import SummaryJobSpec, load_input
+    from bmad_loop.campaign_summary import (
+        FINAL_PROMPT_VERSION,
+        SummaryJobSpec,
+        SummaryResultRejected,
+        load_input,
+    )
     from bmad_loop.campaign_transcripts import encoded
 
     spec = SummaryJobSpec(**row["request"]["coordinates"]["summary_spec"])
@@ -274,6 +279,28 @@ def _fill_summary(runtime, snapshot, row, *, near_limit=False):
             "observed_models": ["gpt-test", "grok-4.7"],
         },
     )
+    if spec.prompt_version == FINAL_PROMPT_VERSION:
+        result = {
+            "schema_version": 2,
+            "job_id": spec.id,
+            "input_sha256": spec.input_sha256,
+            "covered_ids": list(spec.primary_ids),
+            "selected_fact_ids": [],
+        }
+        row["result"] = row["receipt"]["result"] = result
+        # A closed final cannot pad prose. Select every whole claim that fits
+        # its actual expanded attribution, leaving the rest indexed for retrieval.
+        for identity in source["fact_catalog"]:
+            result["selected_fact_ids"].append(identity)
+            try:
+                apply_result(runtime, snapshot, row)
+            except SummaryResultRejected as exc:
+                assert "Expanded final" in str(exc)
+                result["selected_fact_ids"].pop()
+        apply_result(runtime, snapshot, row)
+        assert flow._applied(row)["facts"]
+        row["state"] = "applied"
+        return spec
     apply_result(runtime, snapshot, row)
     if near_limit:
         current = len(encoded(flow._applied(row)))
@@ -285,7 +312,7 @@ def _fill_summary(runtime, snapshot, row, *, near_limit=False):
     return spec
 
 
-def test_reserved_audit_envelope_renders_near_limit_leaves_and_final(campaign):
+def test_reserved_audit_envelope_renders_near_limit_leaves_and_bounded_final(campaign):
     import json
     from pathlib import Path
 
@@ -358,7 +385,9 @@ def test_reserved_audit_envelope_renders_near_limit_leaves_and_final(campaign):
         )
         content = json.loads(Path(request.inputs[0]["path"]).read_text())
         seen.update(part["id"] for part in content["history"]["primary"])
-        assert len(encoded(content["final_frontier"][0]["summary"])) > final_limit * 0.9
+        final_summary = content["final_frontier"][0]["summary"]
+        assert final_summary["facts"] and len(encoded(final_summary)) <= final_limit
+        assert all(fact["selected_from"] for fact in final_summary["facts"])
     assert seen == {
         part
         for key in leaves
