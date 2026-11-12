@@ -50,10 +50,16 @@ Each changed release requires the integrated candidate, updated documentation,
 affected production-path regression coverage and independent reviews. Renew native
 proofs when their installed paths, dependencies or contracts change; retain valid
 unchanged evidence. Merge, exact-commit installation and canonical-base update have
-been demonstrated and remain requirements for later releases. The selected REM
-pilot must prove real parallel delivery, operator reflection and communication,
-and live-worker drain/resume. A green suite, disabled automations or a locally
-completed story cannot substitute for those target-project gates.
+been demonstrated and remain requirements for later releases. The old REM pilot
+is retired; retain its evidence and branches without recreating or resuming it.
+First qualify real hosted delivery of two stories in a separate disposable
+repository. Fresh REM activation is a later, separately authorized rollout.
+
+Writable handoff, managed messaging, live operator controls and load qualification
+remain separate unfulfilled rollout gates, with earlier candidate evidence
+retained. A narrow Claude/Grok delivery does not establish those capabilities or
+all requested native routes. A green suite, disabled automations or a locally
+completed story cannot substitute for actual delivery and applicable live checks.
 
 The earlier `276daa62` implementation passed its integrated regression suite,
 packaging and static checks, and two independent reviews found no open findings.

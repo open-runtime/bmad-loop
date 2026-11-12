@@ -39,19 +39,20 @@ from checks that each changed release and target-project pilot must still satisf
 The owner's administrative-publication decision supersedes this ADR's strict-only
 REM activation requirement; strict and queue modes retain their existing contracts.
 
-| Delivery goal                                | Implementation and acceptance                                                                                                                                                                                              | Status                                                                                                                                                                                    |
-| -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| D1 — Hold and route admission                | Headless hold before preparation/launch; inherited developer; shared frozen launcher/permission readiness; standalone writer capabilities; no attempt charge while unavailable; old snapshot compatibility                 | Implemented; focused regressions and ablations passed                                                                                                                                     |
-| D2 — Owner-authorized publication            | Repository-bound opt-in; ordinary exact-head GitHub merge with authorized administrative fallback; no independent GitHub approver requirement; durable uncertain execution and landing verification/repair before tracking | Implemented and regression tested; real target delivery requires separate activation evidence                                                                                             |
-| D3 — Native routes and writable continuation | Qualify enabled Claude/Codex/Grok/AGY/Muse model/effort/permission recipes; real writable Claude↔Codex continuation; installation-bound proofs                                                                             | Earlier releases earned nine tool grants and demonstrated both writable directions; changed native dependencies, final-selection contracts and installed paths require applicable renewal |
-| D4 — Managed communication                   | Own actor per unit/job; factual bridge status; durable safe-boundary steering; accepting/closing/closed generations; no identity borrowing or reopened writers; Paradev bindings                                           | Implemented; actual isolated hcom and scripted managed-load qualification passed                                                                                                          |
-| D5 — Final candidate qualification           | Full suite, type/lint/package checks, 48 stories/24 epics/eight verification slots with managed communication, two independent candidate-bound reviews                                                                     | Prior suite, load, package and review checkpoints passed; every follow-up candidate requires applicable affected checks and independent review                                            |
-| D6 — Deployment and REM delivery             | History-preserving PR merge, exact fork installation and canonical base, refreshed fork setup skill, controlled two-epic real delivery, verified automation responsibility and concurrency configuration                   | Merged installation and generic onboarding demonstrated; each release and target require applicable renewal and selected delivery evidence                                                |
+| Delivery goal                                | Implementation and acceptance                                                                                                                                                                                                                  | Status                                                                                                                                                                                    |
+| -------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| D1 — Hold and route admission                | Headless hold before preparation/launch; inherited developer; shared frozen launcher/permission readiness; standalone writer capabilities; no attempt charge while unavailable; old snapshot compatibility                                     | Implemented; focused regressions and ablations passed                                                                                                                                     |
+| D2 — Owner-authorized publication            | Repository-bound opt-in; ordinary exact-head GitHub merge with authorized administrative fallback; no independent GitHub approver requirement; durable uncertain execution and landing verification/repair before tracking                     | Implemented and regression tested; real target delivery requires separate activation evidence                                                                                             |
+| D3 — Native routes and writable continuation | Qualify enabled Claude/Codex/Grok/AGY/Muse model/effort/permission recipes; real writable Claude↔Codex continuation; installation-bound proofs                                                                                                 | Earlier releases earned nine tool grants and demonstrated both writable directions; changed native dependencies, final-selection contracts and installed paths require applicable renewal |
+| D4 — Managed communication                   | Own actor per unit/job; factual bridge status; durable safe-boundary steering; accepting/closing/closed generations; no identity borrowing or reopened writers; Paradev bindings                                                               | Implemented; actual isolated hcom and scripted managed-load qualification passed                                                                                                          |
+| D5 — Final candidate qualification           | Full suite, type/lint/package checks, 48 stories/24 epics/eight verification slots with managed communication, two independent candidate-bound reviews                                                                                         | Prior suite, load, package and review checkpoints passed; every follow-up candidate requires applicable affected checks and independent review                                            |
+| D6 — Deployment and target delivery          | History-preserving PR merge, exact fork installation and canonical base, refreshed fork setup skill, hosted two-story disposable delivery, verified automation responsibility and concurrency, then separately authorized fresh REM activation | Merged installation and generic onboarding demonstrated; disposable delivery and later REM activation remain separate gates                                                               |
 
 The completion contract includes
 accepted reviews, synchronization with main, history-preserving merge, exact-commit
-installation, canonical-base update and qualified REM activation. Do not mark the
-ultimate objective complete at the review-ready boundary.
+installation, canonical-base update and target delivery. Qualify the disposable
+repository first; fresh REM activation remains a later, separately authorized
+gate. Do not mark the ultimate objective complete at the review-ready boundary.
 Renew only proofs invalidated by an installed path, dependency or contract change;
 validate unchanged retained semantic evidence without repeating its inference.
 Installed startup readiness does not establish actual parallel target delivery,
@@ -60,23 +61,27 @@ identity reflection, outside-peer communication or live-worker drain/resume.
 ### Portable operations extension — accepted 2026-11-11
 
 The next follow-up implements the following additional goals. Earlier release
-qualification does not establish these new behaviors. Preserve the existing REM
-pilot's evidence and selected branches; it remains stopped until affected startup
-and route qualifications pass. Its selected work is issues #1582 and #529.
-The owner-authorized November 10 cleanup archived its three workspaces and retained
-the selected branches in preservation draft PRs #2331 and #2332. Recovery must use
-verified adoption of those branches, not recreate deleted native identities or
-blindly resume a snapshot whose workspaces no longer exist. Those drafts contain
-specifications, not delivered implementations. Active unrelated REM sessions remain
-outside this recovery operation.
+qualification does not establish these new behaviors. The old REM pilot is
+retired, not a pending migration or resume target. Preserve its evidence and
+selected branches without recreating its workspaces, native identities or campaign.
+Its historical selection was issues #1582 and #529; the November 10 cleanup
+archived three workspaces and retained specifications in preservation draft PRs
+#2331 and #2332. Those records do not establish delivered implementations.
 
-| Goal                         | Contract and completion evidence                                                                                                                                                                                                                                            |
-| ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| P1 — Entity reflection       | Initiative-prefixed epic folders, stable story/worktree labels, phase tabs, actual session actors and explicitly labeled controller endpoints. Stopped reflection creates no workers or workspaces; preserve manual overrides and unrelated tags.                           |
-| P2 — Portable continuation   | Stage-specific ordered summary pools, stronger final synthesis, independent audit-family reservation, exact qualified fallbacks and incremental managed-history capture. Normal-runtime interruption recovery retains the same worktree/PR and every unresolved obligation. |
-| P3 — Repository organization | Separate audit/reconcile authority; complete issue/PR/milestone/ref/worktree inventory; automatic evidence-backed links, allowed labels, consolidation and duplicate/superseded closures. No branch, worktree or history deletion.                                          |
-| P4 — Startup configuration   | Explicit revision-checked route/grouping changes before unit work; immutable prior specifications, templates and capabilities; retain ended optional jobs and confirmed allocation/tracking history. Preview and apply never resume the campaign.                           |
-| P5 — Deployment and delivery | Deploy reviewed TeamRouter quota repair through maintained native setup, merge and install the reviewed BMAD follow-up, renew affected route proofs, migrate the stopped pilot, and deliver both selected REM stories through review, merge and tracking reconciliation.    |
+First qualify real hosted delivery of two stories in a separate disposable
+repository. Fresh REM activation requires a later owner-authorized rollout, not
+restoration of the retired pilot. Writable handoff, managed messaging, live
+operator controls and load qualification remain separate unfulfilled rollout
+gates. A narrow Claude/Grok delivery cannot establish all native routes or those
+capabilities. Unrelated REM sessions remain outside this work.
+
+| Goal                         | Contract and completion evidence                                                                                                                                                                                                                                                                                                                 |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| P1 — Entity reflection       | Initiative-prefixed epic folders, stable story/worktree labels, phase tabs, actual session actors and explicitly labeled controller endpoints. Stopped reflection creates no workers or workspaces; preserve manual overrides and unrelated tags.                                                                                                |
+| P2 — Portable continuation   | Stage-specific ordered summary pools, stronger final synthesis, independent audit-family reservation, exact qualified fallbacks and incremental managed-history capture. Normal-runtime interruption recovery retains the same worktree/PR and every unresolved obligation.                                                                      |
+| P3 — Repository organization | Separate audit/reconcile authority; complete issue/PR/milestone/ref/worktree inventory; automatic evidence-backed links, allowed labels, consolidation and duplicate/superseded closures. No branch, worktree or history deletion.                                                                                                               |
+| P4 — Startup configuration   | Explicit revision-checked route/grouping changes before unit work; immutable prior specifications, templates and capabilities; retain ended optional jobs and confirmed allocation/tracking history. Preview and apply never resume the campaign.                                                                                                |
+| P5 — Deployment and delivery | Deploy reviewed TeamRouter quota repair through maintained native setup, merge and install the reviewed BMAD follow-up, renew affected route proofs, and deliver two stories in a separate disposable repository through review, hosted merge and tracking reconciliation. Keep the old REM pilot retired; fresh REM activation is a later gate. |
 
 Native subagents implement reflection, handoff/history and repository audit in
 parallel; the primary owns shared configuration, integration, documentation and
@@ -130,8 +135,9 @@ actor when it contains multiple sessions. Historical phase views reattach exact
 retained terminals and never create a substitute live session.
 
 REM's committed 2026-11-10 owner policy removes mandatory cross-family publication
-review while retaining its native review cycle. The stopped pilot's revision 8
-predates that direction. Support explicit startup adoption through
+review while retaining its native review cycle. The retired pilot's revision 8
+predates that direction and remains historical evidence. For eligible campaigns,
+support explicit startup adoption through
 `--review-policy-source COMMIT:PATH`: bind a committed regular document in current
 local ancestry, permit only `github.require_independent_review`, append
 that exact decision source if absent, and archive the old/new value and source.
@@ -483,9 +489,10 @@ changed native grants and pass provenance, process-identity and generic onboardi
 checks. Install with runtime constraints exported from that commit's frozen lock
 and the tested interpreter; a Git source pin alone permits dependency drift.
 Retain the export with installation evidence, and qualify dependency updates as
-separate candidates. Preserve old live/paused environments. The REM pilot requires maintained
-source configuration, actual full-graph dispatch validation, current ownership,
-selected acceptance and CI, native/independent reviews, merge, landing and tracking.
+separate candidates. Preserve old live/paused environments. Each target rollout
+requires maintained source configuration, actual full-graph dispatch validation,
+current ownership, selected acceptance and CI, native/independent reviews, merge,
+landing and tracking.
 Ticket-local dependency lists alone are insufficient: source import must include
 inherited epic prerequisites. Disabled/archived automations and finite run logs do
 not establish complete historical worker drain; scoped coexistence preserves peers.
@@ -1888,6 +1895,14 @@ issue and PR first; private native enrollment is a separate identity.
 
 ## REM activation and delivery of this PR
 
+The original REM-first sequence below is superseded by the accepted rollout
+direction: keep the old pilot retired, preserve its evidence and branches, and
+first qualify hosted two-story delivery in a separate disposable repository.
+REM-specific contracts apply only to a later, freshly authorized activation.
+They do not authorize restoring or resuming the old pilot. Handoff, managed
+messaging, live controls and load qualification remain separate gates; a limited
+delivery result cannot be promoted to general unattended readiness.
+
 Ship the entire framework in PR 18; each implementation stage is a commit/check,
 not a separate capability PR. Do not restore exploratory stash files wholesale:
 compare them against this contract and retain only compatible implementation.
@@ -1938,15 +1953,18 @@ publisher admissions before enabling the new coordinator. Drain or preserve
 old in-flight runs and their launcher environments. Disable only the replaced
 automations after their native replacement is qualified; retain unrelated jobs.
 
-Stamp the version and release notes using repository scripts inside this same
-PR before final review/CI. Then merge through this repository's policy, install
-the exact merged fork SHA with uv and the Paradev extra, update the canonical
-Paradev base and verify installed provenance.
+Stamp the version and release notes using repository scripts before final
+review/CI. Then merge through this repository's policy, install the exact merged
+fork SHA in a private versioned prefix with uv and the Paradev extra, and verify
+installed provenance. Disposable qualification may use that private installation
+before global installation or canonical Paradev base promotion.
 Do not rewrite environments used by live old workers. Smoke-test package import,
 CLI/JSON, profiles, native mux selection and scripted zero-token PTY lifecycle.
-Only then perform REM preflight and the staged opt-in activation above.
+Only then qualify the disposable target. Global promotion and REM preflight
+remain later qualification steps; fresh REM activation requires separate owner
+authorization.
 
-The implementation handoff is complete only when the merged fork SHA is both
+Later REM activation is complete only when the merged fork SHA is both
 the canonical Paradev base and the verified global installation, the REM-specific
 launch/source/merge contracts qualify, and preflight reports no unresolved gate
 to the requested autonomous mode. Exercise the full campaign on scripted,
