@@ -859,6 +859,11 @@ it does not prove exhaustion or authorize bypassing the observer. Preserve the
 current work and let normal observation and cooldown handling determine readiness.
 
 For a semantic rejection, inspect the retained result and independent findings.
+Final-summary audits report artifact defects in `final_findings`, separately from
+unresolved owner or scope `ambiguities`. A corrected interpretation does not fix
+the submitted summary: `final_verdict = "repair_required"` blocks continuation
+and requires a new selection followed by fresh independent audits. Neither kind
+of finding grants approval or clears an operator hold.
 Use the existing bounded correction path where supported; changed capacity alone
 cannot repair a fidelity failure. Failed qualification requires genuine matching
 evidence before that route can be admitted. Do not regrade an earlier result,

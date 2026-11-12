@@ -326,7 +326,6 @@ def test_final_audit_binds_final_prompt_not_history_audit(proof):
     evidence.update(expected)
     evidence.update(
         route_bindings=bindings,
-        audit_schema_digest=digest(flow.AUDIT_SCHEMA),
         audit_prompt_version=HISTORY_AUDIT_PROMPT_VERSION,
     )
     receipt_path = Path(evidence["independent_review"]["native_receipt_path"])
@@ -358,6 +357,30 @@ def test_map_proof_ignores_unused_audit_schema_and_reducer_prompt(proof, monkeyp
     monkeypatch.setattr(summary, "FINAL_PROMPT_VERSION", "changed-unused-final-prompt")
     flow.validate_fidelity_qualification(cap, purpose="handoff_map")
     assert path.read_bytes() == manifest
+
+
+def test_final_artifact_assessment_schema_changes_only_final_audit_contract(monkeypatch):
+    from bmad_loop import campaign_handoff_obligations as obligations
+
+    purposes = [
+        ("handoff_map", ""),
+        ("handoff_reduce", ""),
+        ("handoff_final", ""),
+        ("handoff_audit", ""),
+        ("handoff_final_audit", ""),
+        ("constraint_reduce", "constraints-v1"),
+        ("constraint_audit", "constraints-v1"),
+        ("recovery_extract", "recovery-v1"),
+        ("recovery_audit", "recovery-v1"),
+    ]
+    before = {key: semantic_contract(key[0], flow.AUDIT_SCHEMA, key[1]) for key in purposes}
+    assert before[("handoff_final_audit", "")]["audit_schema_digest"] == digest(
+        obligations.final_schema_template()
+    )
+    assert before[("handoff_audit", "")]["audit_schema_digest"] == digest(obligations.AUDIT_SCHEMA)
+    monkeypatch.setattr(obligations, "final_schema_template", lambda: {"changed-final-only": True})
+    after = {key: semantic_contract(key[0], flow.AUDIT_SCHEMA, key[1]) for key in purposes}
+    assert [key for key in purposes if before[key] != after[key]] == [("handoff_final_audit", "")]
 
 
 @pytest.mark.parametrize(

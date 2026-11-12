@@ -20,6 +20,10 @@ insufficient budget at both final-artifact and successor-packet fitting. Retain 
 complete ranking and distinguish budget omissions from contextual exclusions;
 independent source review still rejects omitted material unfinished work or
 unsupported exclusion. Selection cannot repair missing or wrong-only source facts.
+Final review assesses the submitted selection as it stands, separately from
+interpreting owner intent. A corrected interpretation cannot silently repair a
+false claim retained in that selection. Typed artifact findings require the
+existing bounded correction and fresh complete audit before continuation.
 Exact owner requirements and controller-observed holds remain separate mandatory
 context. Changed controls invalidate continuation before writer admission; each
 new final-selection or final-audit contract requires its own native qualification.

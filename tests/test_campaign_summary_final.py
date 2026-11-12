@@ -436,7 +436,7 @@ def test_prior_final_proof_digests_are_stale_and_required_context_audit_is_versi
     assert current["prompt_version"] == "history-final-v6"
     assert digest(current) != digest(prior)
     audit = semantic_contract("handoff_final_audit", AUDIT_SCHEMA)
-    assert audit["prompt_version"] == "history-final-audit-v3"
+    assert audit["prompt_version"] == "history-final-audit-v4"
     assert audit["summary_schema_digest"] != prior["summary_schema_digest"]
 
 

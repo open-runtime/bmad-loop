@@ -11,7 +11,7 @@ from .campaign_jobs import digest
 from .campaign_model import CampaignError
 
 HISTORY_AUDIT_PROMPT_VERSION = "history-audit-v3"
-FINAL_AUDIT_PROMPT_VERSION = "history-final-audit-v3"
+FINAL_AUDIT_PROMPT_VERSION = "history-final-audit-v4"
 
 PURPOSES = {
     "handoff_map",
@@ -99,7 +99,11 @@ def semantic_contract(purpose, audit_schema, contract=""):
         result["summary_job_schema_digest"] = digest(
             final_schema_template() if purpose == "handoff_final" else summary_schema_template()
         )
-    if purpose in {"handoff_audit", "handoff_final_audit"}:
+    if purpose == "handoff_final_audit":
+        from .campaign_handoff_obligations import final_schema_template as final_audit_schema
+
+        result["audit_schema_digest"] = digest(final_audit_schema())
+    elif purpose == "handoff_audit":
         result["audit_schema_digest"] = digest(audit_schema)
     return result
 
