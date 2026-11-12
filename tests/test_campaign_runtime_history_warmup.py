@@ -59,11 +59,11 @@ class ObservedReasoning(ScriptedReasoning):
             }
             if spec.prompt_version == FINAL_PROMPT_VERSION:
                 result = {
-                    "schema_version": 2,
+                    "schema_version": 3,
                     "job_id": request["id"],
                     "input_sha256": spec.input_sha256,
                     "covered_ids": list(spec.primary_ids),
-                    "selected_fact_ids": list(source["fact_catalog"]),
+                    "ranked_fact_ids": list(source["fact_catalog"]),
                 }
             return {
                 "state": "finished",

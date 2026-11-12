@@ -39,19 +39,24 @@ def test_single_leaf_requires_final_synthesis_before_owner_audit(campaign, damag
     value = unit.evidence["handoff"]
     leaf = snapshot.jobs[value["jobs"][0]]
     assert leaf["request"]["coordinates"]["summary_stage"] == "leaf"
+    if damaged:
+        # A model-authored leaf can contain a wrong progress claim. The closed
+        # final preserves attribution but still needs independent source review.
+        leaf["result"]["facts"][0]["text"] = "All work is complete."
+        apply_result(runtime, snapshot, leaf)
     step(runtime, snapshot, unit, "handoff-audit-plan")
     final = snapshot.jobs[value["jobs"][0]]
     assert final["id"] != leaf["id"] and value["phase"] == "summarize"
     assert final["request"]["coordinates"]["summary_stage"] == "final"
     assert final["request"]["coordinates"]["summary_spec"]["prompt_version"] == FINAL_PROMPT_VERSION
-    assert "Select and order source fact IDs" in final["request"]["prompt"]
+    assert "Rank" in final["request"]["prompt"]
     spec = SummaryJobSpec(**final["request"]["coordinates"]["summary_spec"])
     result = {
-        "schema_version": 2,
+        "schema_version": 3,
         "job_id": final["id"],
         "input_sha256": spec.input_sha256,
         "covered_ids": [leaf["id"]],
-        "selected_fact_ids": [] if damaged else list(load_input(spec)["fact_catalog"]),
+        "ranked_fact_ids": list(load_input(spec)["fact_catalog"]),
     }
     final.update(
         state="validated",
@@ -72,8 +77,8 @@ def test_single_leaf_requires_final_synthesis_before_owner_audit(campaign, damag
         coord = row["request"]["coordinates"]
         # Script only the model's comparison, consuming the actual emitted input.
         frontier = content.get("final_frontier", [{"summary": content["summary"]}])
-        missing = not any(
-            fact["kind"] == "owner_request"
+        incorrect = any(
+            "All work is complete." in fact["text"]
             for child in frontier
             for fact in child["summary"]["facts"]
         )
@@ -83,7 +88,7 @@ def test_single_leaf_requires_final_synthesis_before_owner_audit(campaign, damag
             "covered_owner_ids": coord["owner_ids"],
             "covered_span_ids": [span["span_id"] for span in coord["owner_spans"]],
             "obligation_ids": coord["obligation_ids"],
-            "ambiguities": ["Final synthesis omitted the leaf owner obligation"] if missing else [],
+            "ambiguities": ["Final source claim contradicts unfinished work"] if incorrect else [],
             "constraints": [
                 {
                     "span_id": span["span_id"],
@@ -118,7 +123,7 @@ def test_single_leaf_requires_final_synthesis_before_owner_audit(campaign, damag
             },
         )
         assert row["state"] == "validated"
-        with pytest.raises(CampaignError, match="Final synthesis omitted"):
+        with pytest.raises(CampaignError, match="Final source claim contradicts"):
             flow.apply_audit(runtime, snapshot, row)
         assert value["phase"] == "audit"
         return
@@ -249,7 +254,6 @@ def _fill_summary(runtime, snapshot, row, *, near_limit=False):
     from bmad_loop.campaign_summary import (
         FINAL_PROMPT_VERSION,
         SummaryJobSpec,
-        SummaryResultRejected,
         load_input,
     )
     from bmad_loop.campaign_transcripts import encoded
@@ -281,22 +285,14 @@ def _fill_summary(runtime, snapshot, row, *, near_limit=False):
     )
     if spec.prompt_version == FINAL_PROMPT_VERSION:
         result = {
-            "schema_version": 2,
+            "schema_version": 3,
             "job_id": spec.id,
             "input_sha256": spec.input_sha256,
             "covered_ids": list(spec.primary_ids),
-            "selected_fact_ids": [],
+            "ranked_fact_ids": list(source["fact_catalog"]),
         }
         row["result"] = row["receipt"]["result"] = result
-        # A closed final cannot pad prose. Select every whole claim that fits
-        # its actual expanded attribution, leaving the rest indexed for retrieval.
-        for identity in source["fact_catalog"]:
-            result["selected_fact_ids"].append(identity)
-            try:
-                apply_result(runtime, snapshot, row)
-            except SummaryResultRejected as exc:
-                assert "Expanded final" in str(exc)
-                result["selected_fact_ids"].pop()
+        # The model ranks every fact; production Python packs the bounded view.
         apply_result(runtime, snapshot, row)
         assert flow._applied(row)["facts"]
         row["state"] = "applied"

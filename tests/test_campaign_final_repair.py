@@ -82,14 +82,18 @@ def finish(runtime, snapshot, row, result, family, *, harvest=False, output_toke
     return snapshot
 
 
-def final_result(row, *, missing=False):
+def final_result(row, *, reverse=False):
     spec = SummaryJobSpec(**row["request"]["coordinates"]["summary_spec"])
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "job_id": row["id"],
         "input_sha256": spec.input_sha256,
         "covered_ids": list(spec.primary_ids),
-        "selected_fact_ids": [] if missing else list(load_input(spec)["fact_catalog"]),
+        "ranked_fact_ids": (
+            list(load_input(spec)["fact_catalog"])[::-1]
+            if reverse
+            else list(load_input(spec)["fact_catalog"])
+        ),
     }
 
 
@@ -111,7 +115,7 @@ def audit_result(row, ambiguity=True):
             for s in c["owner_spans"]
         ],
         "ambiguities": (
-            ["The final omitted the owner requirement; do not infer approval"] if ambiguity else []
+            ["The source claim remains ambiguous; do not infer approval"] if ambiguity else []
         ),
     }
 
@@ -138,7 +142,7 @@ def audited_final(campaign, request):
             output_tokens=final["request"]["limits"]["output_tokens"] + 1,
         )
         assert final["state"] == "failed" and final["failure_attempts"] == attempt + 1
-    finish(runtime, snapshot, final, final_result(final, missing=True), "openai")
+    finish(runtime, snapshot, final, final_result(final, reverse=True), "openai")
     assert final["state"] == "applied"
     step(runtime, snapshot, unit, "handoff-audit-plan")
     return runtime, snapshot, unit, final
@@ -196,7 +200,7 @@ def test_two_repairs_exhaust_without_reset_after_persistence_and_config_refresh(
         value = unit.evidence["handoff"]
         repair = snapshot.jobs[value["jobs"][0]]
         assert repair["request"]["coordinates"]["final_repair"]["attempt"] == attempt
-        finish(runtime, snapshot, repair, final_result(repair, missing=True), "openai")
+        finish(runtime, snapshot, repair, final_result(repair, reverse=True), "openai")
         step(runtime, snapshot, unit, "handoff-audit-plan")
         # Ordinary SQLite save/load, retaining the actual immutable attempts.
         snapshot = runtime.store.save(snapshot, snapshot.revision)
@@ -243,7 +247,7 @@ def test_two_repairs_exhaust_without_reset_after_persistence_and_config_refresh(
             assert row["state"] == "applied"
     step(runtime, snapshot, unit, "handoff-audit-plan")
     final = snapshot.jobs[value["jobs"][0]]
-    finish(runtime, snapshot, final, final_result(final, missing=True), "openai")
+    finish(runtime, snapshot, final, final_result(final, reverse=True), "openai")
     step(runtime, snapshot, unit, "handoff-audit-plan")
     reject(runtime, snapshot, unit)
     jobs_before = set(snapshot.jobs)
@@ -410,8 +414,15 @@ def test_small_fallback_cannot_omit_extra_repair_evidence_from_its_budget(audite
     assert old.input_tokens <= flow._budget(small, small_cap).payload_tokens
     extra = repair["request"]["inputs"][1]
     content = json.loads(Path(extra["path"]).read_text())
-    # Real bounded immutable input bytes, not inflated token bookkeeping.
-    content["retained_finding_detail"] = "Required exact contextual detail. " * 400
+    # Include real immutable bytes between the two routes' payload ceilings.
+    # Normalized final metadata is part of the retained evidence and may grow.
+    small_budget = flow._budget(small, small_cap).payload_tokens
+    main_budget = flow._budget(main, flow._cap(snapshot, main, "reasoning")).payload_tokens
+    assert small_budget < main_budget
+    content["retained_finding_detail"] = ""
+    target = max(small_budget + 1, old.input_tokens + len(encoded(content)))
+    assert target < main_budget
+    content["retained_finding_detail"] = "x" * (target - old.input_tokens - len(encoded(content)))
     raw = encoded(content)
     path = blob(runtime.store.directory(snapshot.id) / "large-repair-finding", raw)
     extra.update(path=str(path), sha256=digest(content), tokens=len(raw))
@@ -679,8 +690,9 @@ def test_nonowner_caution_is_inlined_for_repair_then_fresh_audit_and_release(cam
         assert row["state"] == "applied"
     step(runtime, snapshot, unit, "handoff-audit-plan")
     original = snapshot.jobs[value["jobs"][0]]
-    # A final can still omit useful context, but cannot invent a new hold.
-    finish(runtime, snapshot, original, final_result(original, missing=True), "openai")
+    # Full ranking cannot restore contextual nuance absent from the leaf claim.
+    # The scripted independent verdict below exercises bounded repair and source retention.
+    finish(runtime, snapshot, original, final_result(original, reverse=True), "openai")
     assert original["state"] == "applied"  # Selection needs an independent semantic audit.
     old_input = load_input(SummaryJobSpec(**original["request"]["coordinates"]["summary_spec"]))
     assert exact_context not in json.dumps(old_input)

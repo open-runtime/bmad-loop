@@ -14,6 +14,7 @@ from typing import Any
 
 from .campaign_model import CampaignError
 from .campaign_summary import ContextBudget, SummaryJobSpec, TokenCounter, byte_token_bound
+from .campaign_summary_final import CLOSED_VERSIONS
 from .campaign_transcripts import HistorySnapshot, blob, digest, encoded, load_events
 
 
@@ -91,16 +92,19 @@ def _read_summary_row(row):
         if file_digest(Path(row["input"]["path"])) != row["input"]["sha256"]:
             raise CampaignError("Retained summary input changed")
     if (
-        row.get("prompt_version") == "history-final-v4"
+        row.get("prompt_version") in CLOSED_VERSIONS
         or summary.get("final_contract")
         or any("selected_from" in fact for fact in summary.get("facts", []))
     ):
         from .campaign_summary_final import validate_attribution
 
-        if summary.get("final_contract") != "history-final-v4":
+        version = summary.get("final_contract")
+        if version not in CLOSED_VERSIONS or (
+            row.get("prompt_version") in CLOSED_VERSIONS and row["prompt_version"] != version
+        ):
             raise CampaignError("Retained final selection contract is missing or unsupported")
         for fact in summary.get("facts", []):
-            validate_attribution(fact)
+            validate_attribution(fact, version=version)
     return summary
 
 
@@ -163,12 +167,12 @@ def _history_facts(payload):
                 "authority": "context",
                 "semantic_fidelity": "unqualified",
             }
-            if summary.get("final_contract") == "history-final-v4":
+            if summary.get("final_contract") in CLOSED_VERSIONS:
                 # A bounded view must retain the deterministic attribution and
                 # its source evidence, not turn a historical claim into a bare
                 # instruction. Legacy projections keep their original shape.
                 result[identity].update(
-                    final_contract="history-final-v4",
+                    final_contract=summary["final_contract"],
                     **{
                         key: fact[key]
                         for key in (
@@ -377,7 +381,7 @@ def fit_audited_history(payload, artifact_root, *, ceiling):
     parents = list(dict.fromkeys(parent for parent, _ in facts))[::-1]
     grouped = {}
     for (parent, _), row in facts.items():
-        kind = None if row.get("final_contract") == "history-final-v4" else row["kind"]
+        kind = None if row.get("final_contract") in CLOSED_VERSIONS else row["kind"]
         grouped.setdefault((kind, parent), []).append(row)
     for kind in (None, *priorities):
         queues = [grouped.get((kind, parent), []) for parent in parents]
