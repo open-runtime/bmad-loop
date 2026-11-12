@@ -40,6 +40,9 @@ PROCESS_HOST = "BMAD_LOOP_PROCESS_HOST"
 #: Overrides the user-scoped state root that per-run control-plane state lives
 #: under (see :func:`runs.state_root`), replacing the whole platform cascade.
 STATE_DIR = "BMAD_LOOP_STATE_DIR"
+#: Controller-only locator for the opt-in trusted prelaunch refusal handshake.
+#: Always removed from inherited/caller environment before a worker sets it.
+TEAMROUTER_PREFLIGHT_CONTEXT = "TEAMROUTER_BMAD_PREFLIGHT_CONTEXT"
 
 
 def session_timeout_s() -> float | None:

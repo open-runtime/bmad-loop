@@ -1,6 +1,6 @@
 # ADR 0003: Bounded reasoning jobs and portable session handoff
 
-- **Status:** Implemented with a confirmed typed prelaunch authentication gap; qualification and target-project delivery remain gated
+- **Status:** Implemented with an opt-in typed prelaunch authentication contract; qualification and target-project delivery remain gated
 - **Date:** 2026-11-06
 - **Extends:** [ADR 0002](0002-native-sdlc-campaign.md) and its [implementation contract](0002-campaign-implementation.md)
 - **Delivery:** Initial campaign PR and reviewed follow-up releases, before qualified target-project activation
@@ -285,24 +285,29 @@ outcomes even when no result JSON exists. A completed process with invalid outpu
 is different from an uncertain live process; neither becomes a generic successful
 empty result. These receipts feed the same bounded recovery and capacity paths.
 
-**Confirmed implementation gap:** A trusted launcher's authentication refusal
-before native JSON output currently becomes a generic failed receipt when the
-stdout parser finds no frames. The typed prelaunch authentication requirement
-above is therefore not fully implemented.
+The opt-in `teamrouter-codex-inspection-auth-v1` capability recognizes only a
+verified `CANONICAL_REFRESH_QUARANTINED` refusal before native execution during
+TeamRouter's hcom hook inspection. Its private, bounded refusal/ACK/confirmation
+transcript binds the exact request, generation, launch and capability. The worker
+independently observes the held producer's live birth, pinned executable/script
+and complete owned ancestry before recording the actors and acknowledging it.
+The producer confirms that ACK within two seconds and its existing startup
+deadline. The worker must observe confirmation before expiry.
 
-The proposed repair is a versioned, private error record from the pinned trusted
-launcher, bound to the exact request, generation, launch and owned process birth.
-Accept only explicit authentication codes from the prelaunch boundary; carry their
-sanitized provenance through the receipt, native binding and interruption records.
-Do not classify arbitrary stderr, model or tool prose as authentication. Missing,
-ambiguous or mismatched evidence remains visibly failed or unknown. Preserve
-lifecycle settlement, unknown usage, attempt budgets and owner sign-in authority.
+Classification additionally requires empty native stdout, the pinned recipe's
+failed exit and ordinary process quiescence; it cannot override cancellation,
+timeout or limit outcomes. Receipt hashes retain the sanitized provenance through
+native bindings and both interruption paths. Usage remains unknown and no native
+session is invented. Arbitrary stderr, model or tool prose has no authority;
+missing, ambiguous, late or mismatched evidence remains visibly failed or unknown.
+The locator is controller-owned and stripped from inherited environment. A new
+qualification must pin the producer, its helper, carrier and consuming code;
+historical capabilities without this contract keep their original behavior.
 
-Required zero-token tests cover an authenticated refusal with empty stdout,
-propagation through both interruption paths, and rejection of spoofed prose,
-wrong request/generation/process identity, duplicate or missing records and
-post-launch injection. This is proposed work, not an implemented recovery path;
-typed classification alone does not authorize retries or credential changes.
+Zero-token tests cover the authenticated empty-stream refusal, both interruption
+paths, file and identity mismatches, transcript races and terminal overrides.
+This contract does not establish a qualified deployed route, authorize retries,
+change attempt budgets or transfer owner sign-in authority to the controller.
 
 Allow parallel snapshot readers without granting them the unit's write lease.
 All reasoning jobs count toward campaign and provider session/token budgets.

@@ -124,6 +124,8 @@ def child_main(path: Path) -> int:
     reason = ""
     limit_kind = ""
     stream = None
+    prelaunch = None
+    ordinary_terminal = False
     started = time.monotonic()
 
     def stopped():
@@ -246,6 +248,19 @@ def child_main(path: Path) -> int:
         from .campaign_headless_context import restore
 
         environment, native_context = restore(environment, os.environ, envelope.get("presentation"))
+        from .envvars import TEAMROUTER_PREFLIGHT_CONTEXT
+
+        environment.pop(TEAMROUTER_PREFLIGHT_CONTEXT, None)
+        if "prelaunch_failure" in capability:
+            from .campaign_prelaunch_failure import Channel
+
+            prelaunch = Channel(
+                directory,
+                envelope,
+                identity,
+                remaining_s=max(0, request.limits.timeout_s - (time.monotonic() - started)),
+            )
+            environment.update(prelaunch.environment())
         if native_context:
             receipt["native_terminal"] = native_context
         from .campaign_native_limits import environment as native_limit_environment
@@ -300,6 +315,8 @@ def child_main(path: Path) -> int:
             known[process.pid] = stamp
             while True:
                 record_tree()
+                if prelaunch is not None:
+                    prelaunch.poll(process.pid, stamp, host, known, record_tree)
                 if stream is not None:
                     stream.read(stream_source)
                     if stream.limit_kind:
@@ -378,6 +395,7 @@ def child_main(path: Path) -> int:
                 limit_kind=limit_kind,
             )
         else:
+            ordinary_terminal = True
             native = parse_output(
                 (directory / "stdout.jsonl").read_text(encoding="utf-8"),
                 protocol=capability["protocol"],
@@ -416,6 +434,17 @@ def child_main(path: Path) -> int:
         receipt["processes_quiescent"] = all(
             host.liveness_of(pid, stamp) == "dead" for pid, stamp in known.items()
         )
+        if prelaunch is not None:
+            prelaunch.finish(
+                receipt,
+                returncode=process.returncode if process is not None else None,
+                stdout_bytes=(
+                    (directory / "stdout.jsonl").stat().st_size
+                    if (directory / "stdout.jsonl").exists()
+                    else None
+                ),
+                ordinary_terminal=ordinary_terminal,
+            )
         receipt["finished_at"] = time.time()
         _stamp_quota_reset(receipt)
         write_json(directory / "receipt.json", receipt)
