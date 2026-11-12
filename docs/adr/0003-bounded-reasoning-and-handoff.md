@@ -125,8 +125,10 @@ before admitting summary work, without occupying a live session slot. Retain
 all contributing families through retries and merges of summary trees; unavailable
 independence causes a visible wait, not relabeling. Model identifiers, effort,
 permissions and context limits require actual native and semantic qualification;
-the catalog alone is not proof. AGY requires a supported capacity observation or
-explicit capacity command; unknown capacity uses an eligible fallback.
+the catalog alone is not proof. AGY's built-in observer pairs the exact supported
+Flash model catalog entries with current Gemini weekly allowance. Argon and
+other unsupported mappings require an explicit capacity command; unknown
+capacity uses an eligible fallback.
 
 Freeze `reasoning.history_max_bytes` independently from model context limits:
 512 MiB per source by default, at most 1 GiB, with a separate 64 MiB record
@@ -225,6 +227,16 @@ routes use their supported model-catalog and billing/allowance queries without
 creating a conversation or starting inference. Provider-process observation is
 bounded and cleans up its owned process on failures. These deterministic reads
 do not move model reasoning into the controller.
+
+AGY metadata observation pairs fixed `/usage` and `models` commands under one
+deadline, bounding each capture and the accepted aggregate output. Admit only supported exact model-to-quota
+group mappings with fresh, positive applicable allowance. Unknown models or
+additional quota-window schemas fail visibly rather than silently ignoring a
+constraint. Preserve the worker's account environment, isolate coordination and
+cwd, suppress native self-updates, and reject executable or global settings drift.
+Require successful zero-turn, zero-token command envelopes; a catalog alone or
+a historical quota snapshot cannot authorize work. Custom capacity commands
+retain precedence for other routes and provider configuration overrides.
 
 Quota knowledge, model access and concurrency knowledge are separate facts.
 Providers and custom observers may report unknown concurrency while proving
