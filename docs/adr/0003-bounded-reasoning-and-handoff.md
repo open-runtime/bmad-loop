@@ -541,8 +541,16 @@ budget independently of refresh, route selection, configuration and restart.
 Ordinary native failure budgets still apply.
 
 Each correction is a new immutable job with the same authenticated source,
-the rejected final, the audit findings and canonical obligations. Findings are
-context, not owner authority. Do not classify free-form ambiguity text as approval
+the rejected final, the audit findings and canonical obligations. Authenticate
+the rejected audit request and input hashes, then include its complete source
+context, including nonowner leaf history, leaf summaries and owner spans.
+Deduplicate identical inputs by content hash. Replace shared canonical state,
+obligations or the final frontier with explicit references only after exact
+equality with evidence already inline. Count the full projected input against
+the existing payload and rendered-request limits; missing, corrupt or oversized
+evidence refuses preparation without clipping.
+
+Findings are context, not owner authority. Do not classify free-form ambiguity text as approval
 or assume a correction can resolve missing owner evidence. Recheck source hashes,
 current context, ownership and quiescence before replacing the active frontier.
 Retain all prior results, contributors and audit history. Any corrected final
@@ -1361,14 +1369,20 @@ provider or incomplete-result failures are ineligible. Final stream sizes and
 the whole-job deadline are checked again after owned descendants drain.
 
 Campaign recovery can split a quiescent multi-child reducer after a typed native
-output-token limit. Splits retain whole child summaries and their source coverage,
-reuse applied or pending siblings, and preserve the original extraction frontier.
-Attempt debt stays attached to the original children through both splitting and
-subsequent combination. Splits consume the existing eight-round reduction bound;
-an unknown worker claim prevents replacement. Other limit kinds retry the current
-reducer without re-extracting the complete conversation. Scripted regression
-coverage follows failed receipt, persisted cooldown, restart, splitting, successful
-combination, auditing and successor assembly through the normal proposal path.
+output-token or wall-time limit. Both the claim and receipt must confirm
+quiescence; corrective jobs and single-child inputs do not take this split path.
+Splits retain whole child summaries and their source coverage, reuse applied or
+pending siblings, and preserve the original extraction frontier. Attempt debt
+stays attached to the original children through splitting and subsequent
+combination. Splits consume the existing eight-round reduction bound and remaining
+lifetime attempts; exhaustion still holds continuation. No split extends the
+native deadline or converts an incomplete output into an accepted result.
+
+An unknown worker claim prevents replacement. Other limit kinds retry the current
+reducer within the existing budget without re-extracting the complete conversation.
+Scripted regression coverage follows failed receipt, persisted cooldown, restart,
+splitting, successful combination, auditing and successor assembly through the
+normal proposal path.
 
 Planning treats the earned input allowance separately from the total context
 window. Output consumes total context, but is not charged a second time against

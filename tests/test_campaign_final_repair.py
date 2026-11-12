@@ -2,6 +2,7 @@
 
 import copy
 import dataclasses
+import hashlib
 import json
 from pathlib import Path
 
@@ -160,8 +161,9 @@ def reject(runtime, snapshot, unit):
 
 def test_failed_final_repairs_through_receipt_apply_reaudit_and_packet(audited_final):
     runtime, snapshot, unit, original = audited_final
-    old_request, old_receipt = copy.deepcopy(original["request"]), copy.deepcopy(
-        original["receipt"]
+    old_request, old_receipt = (
+        copy.deepcopy(original["request"]),
+        copy.deepcopy(original["receipt"]),
     )
     audit = reject(runtime, snapshot, unit)
     original_audit = copy.deepcopy(audit)
@@ -456,6 +458,12 @@ def test_late_sibling_findings_stale_a_planned_repair_without_spending_credit(au
     row = snapshot.jobs[value["jobs"][0]]
     evidence = json.loads(Path(row["request"]["inputs"][1]["path"]).read_text())
     assert len(evidence["rejections"]) == 2
+    # Two real audit jobs can report on the same exact source. Keep both
+    # findings/identities while inlining the source only once.
+    assert len(evidence["audited_inputs_by_sha256"]) == 1
+    assert (
+        evidence["rejections"][0]["audited_inputs"] == evidence["rejections"][1]["audited_inputs"]
+    )
     assert len(unit.evidence["handoff_final_repairs"][unit.claim.launch_id]) == 1
 
 
@@ -498,3 +506,245 @@ def test_all_original_raw_sources_authenticate_even_without_owner_quotes(tmp_pat
     Path(history.raw_path).write_bytes(Path(history.raw_path).read_bytes() + b"altered")
     with pytest.raises(CampaignError, match="original native history changed"):
         flow._repair_sources(value)
+
+
+@pytest.mark.parametrize("damage", ["missing", "wrong_bytes"])
+def test_repair_requires_exact_rejected_audit_input_before_spending_credit(audited_final, damage):
+    runtime, snapshot, unit, _ = audited_final
+    row = reject(runtime, snapshot, unit)
+    path = Path(row["request"]["inputs"][0]["path"])
+    if damage == "missing":
+        path.unlink()
+    else:
+        content = json.loads(path.read_text())
+        content["history"]["primary"][0]["text"] = "A different source, not an owner instruction"
+        path.write_text(json.dumps(content))
+    jobs = set(snapshot.jobs)
+    before = copy.deepcopy(unit.evidence.get("handoff_final_repairs"))
+    action = OutboxAction(
+        "repair-input-damage",
+        "handoff-final-repair",
+        unit.id,
+        {"handoff_id": unit.evidence["handoff"]["id"]},
+        snapshot.generation,
+    )
+    with pytest.raises(CampaignError, match="rejected audit input"):
+        flow.perform(runtime, snapshot, action)
+    assert set(snapshot.jobs) == jobs
+    assert unit.evidence.get("handoff_final_repairs") == before
+    assert not unit.bindings.get("handoff_ready")
+
+
+def test_audited_projection_retains_unknown_fields_and_refuses_stale_shared_context(audited_final):
+    from bmad_loop.campaign_jobs import digest
+    from bmad_loop.campaign_transcripts import blob, encoded
+
+    runtime, snapshot, unit, _ = audited_final
+    row = reject(runtime, snapshot, unit)
+    descriptor = copy.deepcopy(unit.evidence["handoff"]["final_repair_pending"]["findings"][0])
+    saved = flow._applied({"applied_result": descriptor})
+    content = json.loads(Path(row["request"]["inputs"][0]["path"]).read_text())
+    content["future_exact_context"] = {"unresolved_proposal": "Reread before replaying old writes"}
+    raw = encoded(content)
+    path = blob(runtime.store.directory(snapshot.id) / "future-audit-context", raw)
+    content_digest = hashlib.sha256(raw).hexdigest()
+    saved["request"]["inputs"][0].update(path=str(path), sha256=content_digest, tokens=len(raw))
+    descriptor["request_digest"] = digest(saved["request"])
+    shared = {
+        key: content[key] for key in ("canonical_obligations", "current_state", "final_frontier")
+    }
+    projected = {}
+    flow._final_repair_audit_inputs(saved, descriptor, shared, projected)
+    output = projected[content_digest]
+    assert {**output["content"], **{key: shared[key] for key in output["shared_fields"]}} == content
+    assert output["content"]["future_exact_context"] == content["future_exact_context"]
+    with pytest.raises(CampaignError, match="rejected audit request changed"):
+        flow._final_repair_audit_inputs(
+            saved, {**descriptor, "request_digest": "0" * 64}, shared, {}
+        )
+    with pytest.raises(CampaignError, match="context is stale: current_state"):
+        flow._final_repair_audit_inputs(saved, descriptor, {**shared, "current_state": {}}, {})
+
+
+def test_initial_repair_route_pays_for_complete_rejected_audit_context(audited_final):
+    from bmad_loop.campaign_model import RoleCandidate
+    from bmad_loop.campaign_summary import load_input
+    from bmad_loop.campaign_transcripts import encoded
+
+    runtime, snapshot, unit, original = audited_final
+    reject(runtime, snapshot, unit)
+    value = unit.evidence["handoff"]
+    response = flow._final_repair(runtime, snapshot, unit, value)
+    repair = response["final_repair"]
+    evidence = json.loads(Path(repair["inputs"][1]["path"]).read_text())
+    old = SummaryJobSpec(**original["request"]["coordinates"]["summary_spec"])
+    assert load_input(old)
+    full = old.input_tokens + len(encoded(evidence))
+    without_context = old.input_tokens + len(
+        encoded(
+            {
+                **evidence,
+                "audited_inputs_by_sha256": {},
+            }
+        )
+    )
+    assert without_context < full
+    main = flow._candidate(repair["candidates"][0])
+    small = RoleCandidate(main.profile, "gpt-small-audit-context", main.effort, "openai")
+    # The synthetic canary reserves4096 proposal bytes before constructing its
+    # actual input. The earned bound below, not the proposal, selects the route.
+    small_cap = runtime.fixture_cap(small, input_tokens=2 * (without_context + 16384) + 4096)
+    assert without_context <= flow._budget(small, small_cap).payload_tokens < full
+    snapshot.spec = dataclasses.replace(
+        snapshot.spec,
+        role_pools=tuple(
+            (name, (small, *pool) if name == "map" else pool)
+            for name, pool in snapshot.spec.role_pools
+        ),
+    )
+    snapshot.config_snapshot["reasoning_capabilities"][small.profile + ":" + small.model] = {
+        "reasoning": small_cap,
+    }
+    response = flow._final_repair(runtime, snapshot, unit, value)
+    assert response["final_repair"]["candidates"][0]["model"] == main.model
+    assert not unit.evidence.get("handoff_final_repairs")  # planning spends no credit
+
+
+def test_nonowner_caution_is_inlined_for_repair_then_fresh_audit_and_release(campaign):
+    from bmad_loop.campaign_headless import render_input
+    from bmad_loop.campaign_summary import load_input
+
+    runtime, snapshot, unit, receipt = campaign
+    # Synthetic equivalent of a historical partial receipt and an agent's
+    # caution; neither is a new owner hold on the current successor.
+    exact_context = "Historical tool receipt: phase partial; the predecessor preserved staged and untracked work."
+    historical_proposal = "Agent proposal: reread the old receipt before replaying its writes; no new owner duty is established."
+    source = Path(receipt["sessions"][0]["transcript_path"])
+    source.write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": text,
+                    },
+                }
+            )
+            for text in (exact_context, historical_proposal)
+        )
+        + "\n"
+    )
+    staged(snapshot)
+    snapshot.config_revision += 1
+    flow.intercept_terminal(runtime, snapshot, unit, receipt)
+    step(runtime, snapshot, unit, "handoff-capture")
+    step(runtime, snapshot, unit, "handoff-plan")
+    value = unit.evidence["handoff"]
+
+    def contextual_result(row, text):
+        spec = SummaryJobSpec(**row["request"]["coordinates"]["summary_spec"])
+        assert quote_catalog(spec) == {}
+        return {
+            "schema_version": 1,
+            "job_id": row["id"],
+            "input_sha256": spec.input_sha256,
+            "covered_ids": list(spec.primary_ids),
+            "gaps": [],
+            "facts": [
+                {
+                    "kind": "next_action",
+                    "text": text,
+                    "source_quote_id": "",
+                    "citations": list(spec.event_ids),
+                    "authority": "context",
+                }
+            ],
+        }
+
+    for key in value["jobs"]:
+        row = snapshot.jobs[key]
+        finish(runtime, snapshot, row, contextual_result(row, historical_proposal), "openai")
+        assert row["state"] == "applied"
+    step(runtime, snapshot, unit, "handoff-audit-plan")
+    original = snapshot.jobs[value["jobs"][0]]
+    finish(
+        runtime,
+        snapshot,
+        original,
+        contextual_result(
+            original,
+            "Do not start the successor absent instruction; reconcile partial before any effect.",
+        ),
+        "openai",
+    )
+    assert original["state"] == "applied"  # Structural context labels are not semantic approval.
+    old_input = load_input(SummaryJobSpec(**original["request"]["coordinates"]["summary_spec"]))
+    assert exact_context not in json.dumps(old_input)
+    step(runtime, snapshot, unit, "handoff-audit-plan")
+    old_audits = list(value["audits"])
+    for key in old_audits:
+        audit = snapshot.jobs[key]
+        result = audit_result(audit)
+        assert result["covered_owner_ids"] == result["covered_span_ids"] == []
+        result["ambiguities"] = [
+            "The final turns an old agent proposal into a current continuation hold."
+        ]
+        finish(runtime, snapshot, audit, result, "anthropic")
+        assert audit["state"] == "failed"
+    assert not unit.bindings.get("handoff_ready") and not value.get("packet")
+    step(runtime, snapshot, unit, "handoff-final-repair")
+    repair = snapshot.jobs[value["jobs"][0]]
+    evidence = json.loads(Path(repair["request"]["inputs"][1]["path"]).read_text())
+    inline = evidence["audited_inputs_by_sha256"]
+    texts = [
+        fragment["text"]
+        for row in inline.values()
+        for fragment in row["content"]["history"]["primary"]
+    ]
+    assert exact_context in texts and historical_proposal in texts
+    rendered, _ = render_input(
+        request_from_dict(repair["request"]),
+        flow._cap(snapshot, flow._candidate(repair["request"]["candidates"][0]), "reasoning"),
+    )
+    assert exact_context.encode() in rendered and historical_proposal.encode() in rendered
+    for key in old_audits:
+        source = snapshot.jobs[key]["request"]["inputs"][0]
+        original_audit_input = json.loads(Path(source["path"]).read_text())
+        projected = inline[source["sha256"]]
+        assert projected["content"]["summary"] == original_audit_input["summary"]
+        assert projected["content"]["owner_spans"] == []
+        # Reconstruct every original field: deduplication loses no semantics.
+        restored = dict(projected["content"])
+        for name in projected["shared_fields"]:
+            reference = evidence["audited_input_shared_fields"][name]
+            restored[name] = (
+                [
+                    {"job_id": item["job_id"], "summary": evidence[item["summary_evidence_field"]]}
+                    for item in reference
+                ]
+                if name == "final_frontier"
+                else evidence[reference["evidence_field"]]
+            )
+        assert restored == original_audit_input
+    assert evidence["audited_input_shared_fields"]["final_frontier"] == [
+        {"job_id": original["id"], "summary_evidence_field": "previous_final"}
+    ]
+    corrected = contextual_result(
+        repair,
+        "The predecessor's agent proposed rereading its partial receipt. This historical proposal establishes no current owner hold.",
+    )
+    finish(runtime, snapshot, repair, corrected, "openai")
+    assert repair["state"] == "applied"
+    step(runtime, snapshot, unit, "handoff-audit-plan")
+    assert set(value["audits"]).isdisjoint(old_audits)
+    for key in value["audits"]:
+        audit = snapshot.jobs[key]
+        assert audit["request"]["coordinates"]["final_frontier"] == [repair["id"]]
+        finish(runtime, snapshot, audit, audit_result(audit, False), "anthropic")
+        assert audit["state"] == "applied"
+    step(runtime, snapshot, unit, "handoff-assemble")
+    step(runtime, snapshot, unit, "handoff-release")
+    assert value["phase"] == "ready" and flow.resume_proposal(snapshot, unit, runtime) is not None
+    assert len(unit.evidence["handoff_final_repairs"][unit.claim.launch_id]) == 1

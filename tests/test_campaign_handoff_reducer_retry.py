@@ -117,22 +117,32 @@ def reducing(campaign):
     return runtime, snapshot, unit, maps
 
 
-def failed_frontier(campaign):
+def failed_frontier(campaign, limit_kind="native-output-tokens"):
     runtime, snapshot, unit, maps = reducing(campaign)
     failed, kept = None, []
     for _ in list(unit.evidence["handoff"]["jobs"]):
         launch = dispatch(reasoning, runtime, snapshot, "reasoning-launch")
         row = snapshot.jobs[launch.payload["job_id"]]
         if failed is None and len(row["request"]["dependencies"]) > 1:
-            failed = finish(runtime, snapshot, launch, "limit", limit_kind="native-output-tokens")
+            failed = finish(
+                runtime,
+                snapshot,
+                launch,
+                "limit",
+                limit_kind=limit_kind,
+                input_complete=limit_kind != "wall-time",
+            )
         else:
             kept.append(apply_completed(runtime, snapshot, launch, 30)["id"])
     assert failed and kept
     return runtime, snapshot, unit, maps, failed, kept
 
 
-def test_output_limit_splits_then_combines_and_resumes_without_losing_siblings(campaign):
-    runtime, snapshot, unit, maps, failed, kept = failed_frontier(campaign)
+@pytest.mark.parametrize("limit_kind", ["native-output-tokens", "wall-time"])
+def test_reducer_limit_splits_then_combines_and_resumes_without_losing_siblings(
+    campaign, limit_kind
+):
+    runtime, snapshot, unit, maps, failed, kept = failed_frontier(campaign, limit_kind)
     old = SummaryJobSpec(**failed["request"]["coordinates"]["summary_spec"])
     originals = {key: snapshot.jobs[key]["request_digest"] for key in [*maps, *kept]}
     value = unit.evidence["handoff"]
@@ -194,7 +204,7 @@ def test_output_limit_splits_then_combines_and_resumes_without_losing_siblings(c
     assert all(handoff._job(runtime, snapshot, key)["state"] == "applied" for key in originals)
 
 
-@pytest.mark.parametrize("kind", ["wall-time", "native-turns", "stdout-wire-bytes", ""])
+@pytest.mark.parametrize("kind", ["native-turns", "stdout-wire-bytes", ""])
 def test_other_limits_retry_same_reducer_without_partition_or_reextract(campaign, kind):
     runtime, snapshot, unit, maps, failed, kept = failed_frontier(campaign)
     failed["receipt"]["limit_kind"] = kind
@@ -210,8 +220,9 @@ def test_other_limits_retry_same_reducer_without_partition_or_reextract(campaign
     assert retried[0]["failure_attempts"] == 1 and value["map_jobs"] == maps
 
 
-def test_reducer_split_cannot_reset_lifetime_attempts_or_round_bound(campaign):
-    runtime, snapshot, unit, _, failed, _ = failed_frontier(campaign)
+@pytest.mark.parametrize("limit_kind", ["native-output-tokens", "wall-time"])
+def test_reducer_split_cannot_reset_lifetime_attempts_or_round_bound(campaign, limit_kind):
+    runtime, snapshot, unit, _, failed, _ = failed_frontier(campaign, limit_kind)
     value = unit.evidence["handoff"]
     value["reduction_level"] = 8
     with pytest.raises(CampaignError, match="eight qualified rounds"):
