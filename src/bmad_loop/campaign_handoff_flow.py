@@ -1546,12 +1546,14 @@ def _summary_replan(runtime, snapshot, unit, value):
             raise CampaignError("Cannot replace a reducer with unknown native quiescence")
         old = SummaryJobSpec(**row["request"]["coordinates"]["summary_spec"])
         stage = row["request"]["coordinates"].get("summary_stage", "")
+        # Repartition authenticated input, never partial native output. Smaller
+        # groups can fit either limit; their original failure debt still applies.
         split = (
             row["state"] == "failed"
             and claim.get("quiescent") is True
             and receipt.get("quiescent") is True
             and receipt.get("outcome") == "limit"
-            and receipt.get("limit_kind") == "native-output-tokens"
+            and receipt.get("limit_kind") in {"native-output-tokens", "wall-time"}
             and not old.correction_of
             and len(load_input(old).get("children", [])) > 1
         )
@@ -2007,6 +2009,53 @@ def _record_final_rejection(runtime, snapshot, unit, value, row, normalized):
         )
 
 
+def _final_repair_audit_inputs(saved, descriptor, shared, inputs):
+    """Inline exact bounded audit context; findings cannot replace source evidence."""
+    from .campaign_headless import MAX_RECORD_BYTES
+    from .campaign_jobs import digest as request_digest
+    from .campaign_transcripts import regular_reader
+
+    request = request_from_dict(saved["request"])
+    if (
+        request.id != descriptor["audit_job"]
+        or request_digest(saved["request"]) != descriptor["request_digest"]
+        or request.purpose != "handoff_audit"
+        or not request.inputs
+    ):
+        raise CampaignError("Final repair rejected audit request changed")
+    references = []
+    for source in request.inputs:
+        limit = min(request.limits.input_tokens, MAX_RECORD_BYTES)
+        try:
+            with regular_reader(Path(source["path"])) as stream:
+                data = stream.read(limit + 1)
+        except OSError as exc:
+            raise CampaignError("Final repair rejected audit input is unavailable") from exc
+        if len(data) > limit or hashlib.sha256(data).hexdigest() != source["sha256"]:
+            raise CampaignError("Final repair rejected audit input changed or exceeds its bound")
+        try:
+            content = json.loads(data)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise CampaignError("Final repair rejected audit input is invalid") from exc
+        if not isinstance(content, dict):
+            raise CampaignError("Final repair rejected audit input must be an object")
+        shared_fields = []
+        for key, expected in shared.items():
+            if key in content:
+                if encoded(content[key]) != encoded(expected):
+                    raise CampaignError("Final repair rejected audit context is stale: " + key)
+                del content[key]
+                shared_fields.append(key)
+        # All other fields remain complete, including history primary/halo,
+        # leaf summary, owner spans, exclusion evidence and future input fields.
+        projected = {"content": content, "shared_fields": shared_fields}
+        prior = inputs.setdefault(source["sha256"], projected)
+        if prior != projected:
+            raise CampaignError("Final repair audit input digest has conflicting content")
+        references.append(dict(source))
+    return references
+
+
 def _final_repair(runtime, snapshot, unit, value):
     """Create a contextual correction, with a lifetime cap and fresh audit debt."""
     from .campaign_headless import render_input
@@ -2051,16 +2100,33 @@ def _final_repair(runtime, snapshot, unit, value):
     )
     if source.get("owner_quotes") != quotes:
         raise CampaignError("Final repair exact owner quote table changed")
-    findings = []
+    previous_final = _applied(previous)
+    shared = {
+        "canonical_obligations": value["capture"]["obligations"],
+        "current_state": value["capture"]["current"],
+        "final_frontier": [{"job_id": previous["id"], "summary": previous_final}],
+    }
+    findings, audited_inputs = [], {}
     for descriptor in pending["findings"]:
         saved = _applied({"applied_result": descriptor})
-        findings.append({"source": descriptor, "finding": saved["normalized"]})
+        references = _final_repair_audit_inputs(saved, descriptor, shared, audited_inputs)
+        findings.append(
+            {"source": descriptor, "finding": saved["normalized"], "audited_inputs": references}
+        )
     evidence = {
         "authority": "context-only; no source or acceptance authority",
-        "previous_final": _applied(previous),
+        "previous_final": previous_final,
         "rejections": findings,
         "canonical_obligations": value["capture"]["obligations"],
         "current_state": value["capture"]["current"],
+        "audited_inputs_by_sha256": audited_inputs,
+        "audited_input_shared_fields": {
+            "canonical_obligations": {"evidence_field": "canonical_obligations"},
+            "current_state": {"evidence_field": "current_state"},
+            "final_frontier": [
+                {"job_id": previous["id"], "summary_evidence_field": "previous_final"}
+            ],
+        },
         "unresolved": True,
     }
     data = encoded(evidence)

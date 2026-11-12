@@ -616,6 +616,14 @@ an unresolved result still blocks writable continuation.
 `campaign status --json` reports pending repair, the attempts used and the audit
 job IDs without exposing private source text or findings.
 
+Corrections include the rejected audit's authenticated source inputs, including
+nonowner leaf history, leaf summaries and owner spans. Identical inputs are
+deduplicated; shared context uses explicit references only when it exactly
+matches evidence already included. All projected bytes count toward the existing
+input limits. Missing, changed or oversized evidence blocks preparation without
+truncation. This does not increase the two-correction budget or remove the fresh
+independent audit requirement.
+
 Reducers receive exact authenticated owner spans referenced by their children,
 not only quote IDs or paraphrase previews. The coordinator verifies provenance,
 offsets and hashes, deduplicates the spans, and includes their inline bytes before
@@ -788,6 +796,18 @@ discovery wait when no more specific admission reason applies. A partial invento
 does not authorize new work. Optional portfolio reasoning waits for an owned
 workspace when reflection is enabled; refreshing unchanged inventory does not
 create a new analysis merely because its observation time changed.
+
+For a capacity wait, inspect `status --json` and the affected job's `--details`.
+Admission needs a fresh valid observation or another eligible candidate already
+in the frozen pool. A timed-out or malformed quota query means unknown capacity;
+it does not prove exhaustion or authorize bypassing the observer. Preserve the
+current work and let normal observation and cooldown handling determine readiness.
+
+For a semantic rejection, inspect the retained result and independent findings.
+Use the existing bounded correction path where supported; changed capacity alone
+cannot repair a fidelity failure. Failed qualification requires genuine matching
+evidence before that route can be admitted. Do not regrade an earlier result,
+reset exhausted attempts or treat an unqualified fallback as available.
 
 If startup stopped before any unit worker launched, `requalify` can renew the frozen
 native route proofs after an installation update. Supply freshly qualified routes
@@ -1274,13 +1294,19 @@ turn an earlier rejected result into a successful receipt. Retry cooldowns are
 persisted per failed attempt, so polling and restart do not continually postpone
 the only available route.
 
-When a stopped reducer exceeds its native output-token allowance, recovery can
-split its input at whole-child summary boundaries. Completed sibling summaries,
-source coverage and retry counts survive; the pipeline does not restart all
-history extraction. Unknown worker state blocks replacement. At eight completed
-reduction rounds, or when a completed frontier stops shrinking, the campaign
-records limited compaction and retains its complete artifacts for audited context
-selection. Failed, live or structurally incomplete jobs cannot use that fallback.
+When a reducer reaches a confirmed native output-token or wall-time limit,
+recovery can split its input at whole-child summary boundaries. This requires
+quiescence confirmed by both claim and receipt, more than one child, and an
+original rather than corrective job. Completed sibling summaries, source coverage
+and lifetime retry debt survive; history extraction does not restart. The split
+uses the remaining attempt and reduction-round budgets without extending native
+deadlines. Exhausted attempts remain exhausted, and unknown worker state blocks
+replacement.
+
+At eight completed reduction rounds, or when a completed frontier stops shrinking,
+the campaign records limited compaction and retains its complete artifacts for
+audited context selection. Failed, live or structurally incomplete jobs cannot use
+that fallback.
 
 Completed job receipts and validated results allow the same command to resume;
 changed sources, route or limits require a new trial directory. Failure stops new
