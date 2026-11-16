@@ -45,7 +45,7 @@ def merged_graphql(pr, *, merge_commit=None, repository="a/b"):
                     "nameWithOwner": repository,
                     "pullRequest": {
                         "id": pr["node_id"],
-                        "databaseId": pr["id"],
+                        "fullDatabaseId": pr["id"],
                         "number": pr["number"],
                         "merged": pr["merged"],
                         "headRefOid": pr["head"]["sha"],
@@ -89,7 +89,7 @@ def test_current_rest_merge_identity_is_normalized_through_joined_graphql(merged
     [
         ("repository", "other/repo"),
         ("id", "PR_foreign"),
-        ("databaseId", 102),
+        ("fullDatabaseId", 102),
         ("number", 2),
         ("headRefOid", "d" * 40),
         ("baseRefName", "other"),
@@ -128,6 +128,28 @@ def test_get_preserves_native_error_status_for_read_observation(status):
         GithubGateway(transport, "a/b").issue(7)
     assert error.value.status == status
     assert transport.calls == [("GET", "repos/a/b/issues/7", None)]
+
+
+@pytest.mark.parametrize("representation", [str, int])
+def test_merged_pull_joins_full_64_bit_database_identity(representation):
+    transport = FakeTransport()
+    pr = {
+        "id": 3_000_000_000,
+        "number": 7,
+        "node_id": "PR_large",
+        "merged": True,
+        "head": {"sha": "a" * 40},
+        "base": {"ref": "main", "repo": {"full_name": "a/b"}},
+    }
+    transport.responses["GET", "repos/a/b/pulls/7"] = ApiResponse(200, pr, {})
+    response = merged_graphql(pr, merge_commit="b" * 40)
+    response.data["data"]["repository"]["pullRequest"]["fullDatabaseId"] = representation(pr["id"])
+    transport.responses["POST", "graphql"] = response
+    result = GithubGateway(transport, "a/b").pull(7)
+    assert result["merge_commit_sha"] == "b" * 40
+    query = transport.calls[-1][2]["query"]
+    assert "fullDatabaseId" in query
+    assert " databaseId " not in query
 
 
 def test_optional_intake_issue_cancellation_uses_owned_native_identity_and_not_planned():

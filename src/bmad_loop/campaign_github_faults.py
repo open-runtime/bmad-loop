@@ -16,7 +16,7 @@ def retry_at(fault, *, now, attempts=1, wall_clock=time.time):
     backoff = min(900, floor * 2 ** min(max(0, attempts - 1), 4))
     deadline = fault.get("retry_at")
     remaining = max(0, deadline - wall_clock()) if deadline is not None else 0
-    duration = fault.get("retry_after_s") or 0
+    duration = (fault.get("retry_after_s") or 0) if deadline is None else 0
     return now + max(backoff, remaining, duration)
 
 
@@ -28,3 +28,47 @@ def mutation_observation(intent, *, now):
         data["github_fault"] = intent.fault
         deadline = retry_at(intent.fault, now=now)
     return Observation(state, data, intent.error, deadline)
+
+
+def status_waits(snapshot, *, limit=200):
+    """Expose bounded actionable faults without publishing mutation payloads."""
+    from .sanitize import scrub_text
+
+    rows = []
+    total = 0
+    for action in snapshot.outbox:
+        if action.state == "confirmed" or not (action.error or action.next_retry_at):
+            continue
+        total += 1
+        if len(rows) >= limit:
+            continue
+        fault = action.receipt.get("github_fault") or (action.receipt.get("intent") or {}).get(
+            "fault"
+        )
+        item = {
+            "id": action.id,
+            "unit": action.unit,
+            "kind": action.kind,
+            "state": action.state,
+            "reason": scrub_text(action.error),
+            "next_retry_at": action.next_retry_at or None,
+            "next_action": (
+                "operator reconciliation required"
+                if action.state == "rejected"
+                else "reconcile existing effect after retry deadline"
+            ),
+        }
+        if fault:
+            item["github_fault"] = {
+                key: fault.get(key)
+                for key in (
+                    "schema_version",
+                    "category",
+                    "certainty",
+                    "status",
+                    "retry_at",
+                    "request_id",
+                )
+            }
+        rows.append(item)
+    return {"total": total, "items": rows, "truncated": total > len(rows)}

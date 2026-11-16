@@ -125,10 +125,11 @@ class GhTransport:
             path = path.removeprefix("https://api.github.com/")
         if path.startswith(("-", "http:", "https:")) or "\n" in path:
             raise GithubError("Refusing a non-GitHub API path")
+        query = (payload or {}).get("query")
         read = method in {"GET", "HEAD"} or (
             path == "graphql"
-            and isinstance((payload or {}).get("query"), str)
-            and re.match(r"\s*query\b", payload["query"]) is not None
+            and isinstance(query, str)
+            and re.match(r"\s*query\b", query) is not None
         )
         request_id = hashlib.sha256(
             json.dumps([method, path, payload], sort_keys=True).encode()
@@ -423,7 +424,7 @@ class GithubGateway:
             "POST",
             "graphql",
             {
-                "query": "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){nameWithOwner pullRequest(number:$number){id databaseId number merged headRefOid baseRefName mergeCommit{oid}}}}",
+                "query": "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){nameWithOwner pullRequest(number:$number){id fullDatabaseId number merged headRefOid baseRefName mergeCommit{oid}}}}",
                 "variables": {"owner": owner, "name": name, "number": number},
             },
         )
@@ -439,6 +440,9 @@ class GithubGateway:
             repository = response.data["data"]["repository"]
             merged = repository["pullRequest"]
             merge_commit = merged["mergeCommit"]["oid"]
+            database_id = merged["fullDatabaseId"]
+            if isinstance(database_id, str) and re.fullmatch(r"[1-9][0-9]{0,18}", database_id):
+                database_id = int(database_id)
             valid = (
                 repository["nameWithOwner"].casefold() == self.repository.casefold()
                 and pr["base"]["repo"]["full_name"].casefold() == self.repository.casefold()
@@ -451,8 +455,9 @@ class GithubGateway:
                 and merged["id"] == pr["node_id"]
                 and type(pr["id"]) is int
                 and pr["id"] > 0
-                and type(merged["databaseId"]) is int
-                and merged["databaseId"] == pr["id"]
+                and type(database_id) is int
+                and 0 < database_id < 2**63
+                and database_id == pr["id"]
                 and merged["merged"] is True
                 and isinstance(pr["head"]["sha"], str)
                 and bool(pr["head"]["sha"])

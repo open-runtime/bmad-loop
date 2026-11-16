@@ -416,6 +416,14 @@ Configured `github.hold_labels` (default `bmad:hold`) apply to fresh publication
 and merge retries. Read-only reconciliation of an issued merge continues while
 held, without authorizing another merge write.
 
+`campaign status --json` includes bounded `waiting_effects`: the effect identity,
+reason, next reconciliation action and persisted retry time, plus GitHub fault
+category, certainty, HTTP status and request identity when known. The projection
+reports its total and truncation without exposing mutation payloads. Rate-limit
+deadlines survive restart; a refused mutation requires operator reconciliation,
+and an uncertain effect is observed before any authorized resubmission. Historical
+records without typed faults retain their original reason and unknown fault data.
+
 `github.review_users` and `github.review_teams` recruit reviewers on the exact
 candidate. Requests are durable and reconciled after lost acknowledgements.
 An independent model review does not supply an eligible GitHub approval.

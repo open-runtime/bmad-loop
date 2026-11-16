@@ -396,6 +396,7 @@ def status_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
 
     """Project execution identities; omit private configuration and evidence."""
     from .campaign_external_provenance import summary as external_provenance_summary
+    from .campaign_github_faults import status_waits
     from .campaign_intake_baseline import admission_waits
     from .campaign_metrics import document as timing_document
     from .campaign_operator import diagnostics
@@ -713,6 +714,7 @@ def status_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
             if key in snapshot.bindings.get("communication", {})
         },
         "outbox": action_counts(snapshot),
+        "waiting_effects": status_waits(snapshot),
     }
 
 

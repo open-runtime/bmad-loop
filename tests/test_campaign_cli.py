@@ -273,6 +273,35 @@ def test_status_and_list_are_observer_projections_without_private_config(runtime
     assert calls == []
 
 
+def test_status_reports_persisted_fault_wait_without_mutation_payload(runtime, capsys):
+    from bmad_loop.campaign_store import add_action
+
+    store, snapshot, calls = runtime
+    action = add_action(snapshot, "github", "s:e:u", {"token": "private-mutation-token"})
+    action.state, action.error, action.next_retry_at = "sent_unknown", "rate limit", 900
+    action.receipt = {
+        "github_fault": {
+            "schema_version": 1,
+            "category": "rate_limit",
+            "certainty": "unknown",
+            "status": 429,
+            "retry_at": 900,
+            "request_id": "request-7",
+            "payload": "private-receipt",
+        }
+    }
+    store.save(snapshot, snapshot.revision)
+    assert cli.main(["campaign", "status", snapshot.id, "--json"]) == 0
+    raw = capsys.readouterr().out
+    wait = json.loads(raw)["campaign"]["waiting_effects"]
+    assert wait["total"] == 1 and not wait["truncated"]
+    assert wait["items"][0]["next_retry_at"] == 900
+    assert wait["items"][0]["github_fault"]["category"] == "rate_limit"
+    assert wait["items"][0]["github_fault"]["request_id"] == "request-7"
+    assert "private-mutation-token" not in raw and "private-receipt" not in raw
+    assert calls == []
+
+
 @pytest.mark.parametrize("pending, attempts", [(True, 0), (False, 2)])
 def test_status_exposes_current_final_repair_without_private_findings(
     runtime, capsys, pending, attempts

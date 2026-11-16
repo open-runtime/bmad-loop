@@ -14,7 +14,7 @@ from bmad_loop.campaign_github import (
     MutationIntent,
     UncertainMutation,
 )
-from bmad_loop.campaign_github_faults import mutation_observation
+from bmad_loop.campaign_github_faults import mutation_observation, retry_at
 from bmad_loop.campaign_store import add_action
 from bmad_loop.campaign_supervisor import CampaignSupervisor, Observation
 
@@ -67,6 +67,13 @@ def test_graphql_query_transport_failure_is_observation_not_uncertain_mutation(m
     assert type(error.value) is GithubError
     assert error.value.certainty == "observation_failed"
     assert len(error.value.request_id) == 64
+
+
+def test_persisted_fault_does_not_charge_expired_retry_duration_again():
+    fault = {"category": "rate_limit", "retry_at": 700, "retry_after_s": 600}
+    assert retry_at(fault, now=100, wall_clock=lambda: 100) == 700
+    assert retry_at(fault, now=701, wall_clock=lambda: 701) == 761
+    assert retry_at(fault, now=1000, wall_clock=lambda: 701) == 1060
 
 
 def test_definitive_mutation_refusal_projects_rejected_with_evidence():
