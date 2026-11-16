@@ -1,6 +1,6 @@
 # ADR 0003: Bounded reasoning jobs and portable session handoff
 
-- **Status:** Implemented with an opt-in typed prelaunch authentication contract; qualification and target-project delivery remain gated
+- **Status:** Partially implemented with an opt-in typed prelaunch authentication contract; audit repairs and unattended qualification remain open
 - **Date:** 2026-11-06
 - **Extends:** [ADR 0002](0002-native-sdlc-campaign.md) and its [implementation contract](0002-campaign-implementation.md)
 - **Delivery:** Initial campaign PR and reviewed follow-up releases, before qualified target-project activation
@@ -1136,6 +1136,17 @@ Reintroducing a waived criterion makes it required again. This operation never
 clears another owner hold or supplies a GitHub review approval.
 
 ## Qualification achieved and remaining gates
+
+The results below are historical evidence for their exact subjects. They do not
+establish current unattended readiness. Keep delivery of two independent disposable
+stories separate from recovery, writable Claude→Codex and Codex→Claude continuation,
+managed check-ins for every advertised route, live controls and sustained parallel
+operation. Continuation must retain the same worktree, branch, PR, dirty work,
+unfinished acceptance, contributing families, attempts and unresolved approvals.
+Unknown capacity yields an explained wait or an earned fallback, including the
+configured Flash/Argon preferences. Controller bridge replies must identify their
+bridge role; direct model replies and TeamRouter-managed/native routes remain
+distinguishable. A failed or expired grant stays failed or expired until renewed.
 
 The sealed whole-conversation trial processed 28 sources containing 191,223,107
 captured bytes and 53,494 unique events through 809 maps and 69 reducers. An actual

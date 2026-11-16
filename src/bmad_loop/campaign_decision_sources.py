@@ -24,6 +24,33 @@ _LOCATION = re.compile(
 )
 
 
+def controller_comment(snapshot, source: EvidenceSource, *, prior_projections=()) -> bool:
+    """Recognize exact acknowledged controller text, never an account or marker.
+
+    Explicitly configured comment sources have the same publication provenance
+    boundary as discovered discussions. A new comment or an edited projection
+    from the publishing account remains ordinary authenticated evidence.
+    """
+    matched = _LOCATION.fullmatch(source.identity)
+    if source.kind != "github" or not matched or not matched.group(4):
+        return False
+    if not source.author_id.isdecimal():
+        return False
+    from .campaign_runtime_intake import _owned_projection
+
+    observation = {
+        "kind": "comment",
+        "object_id": matched.group(4),
+        "payload": {"body": source.content, "user": {"id": int(source.author_id)}},
+    }
+    return _owned_projection(snapshot, observation) or any(
+        prior.repository == snapshot.repository
+        and prior.common_dir == snapshot.common_dir
+        and _owned_projection(prior, observation)
+        for prior in prior_projections
+    )
+
+
 def configured_locations(
     sources: tuple[str, ...], *, scope: tuple[str, ...]
 ) -> tuple[EvidenceLocation, ...]:

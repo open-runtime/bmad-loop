@@ -306,6 +306,7 @@ def collect_context(
     mapped_sources: tuple[EvidenceSource, ...] = (),
     facts: tuple[ObservedFact, ...] = (),
     mapped_unavailable: tuple[str, ...] = (),
+    prior_projections=(),
 ) -> dict[str, Any]:
     """Bounded read-only I/O effect. Save its returned packet before dispatch."""
     unit = snapshot.units[unit_id]
@@ -316,7 +317,7 @@ def collect_context(
     if verify.rev_parse_head(workspace) != coordinates.head:
         raise CampaignError("recovery candidate moved before context collection")
     if mode == "decision":
-        from .campaign_decision_sources import configured_locations
+        from .campaign_decision_sources import configured_locations, controller_comment
 
         locations = configured_locations(snapshot.spec.decisions.sources, scope=(unit_id,))
         locations += tuple(
@@ -335,7 +336,11 @@ def collect_context(
             coordinates,
             unit.hold,
             unit.hold.reason,
-            (*collection.sources, *mapped_sources),
+            tuple(
+                source
+                for source in (*collection.sources, *mapped_sources)
+                if not controller_comment(snapshot, source, prior_projections=prior_projections)
+            ),
             facts,
             allowed_paths=unit.spec.scopes,
             unavailable=(
@@ -448,6 +453,29 @@ def apply_context(snapshot: CampaignSnapshot, unit_id: str, result: Mapping[str,
     add_event(snapshot, "recovery-context-collected", unit=unit_id, mode=result["mode"])
 
 
+def preserve_failed_diagnosis(snapshot, unit, request, receipt) -> bool:
+    """Keep the unresolved condition authoritative when its diagnosis is invalid.
+
+    A rejected read-only proposal is evidence about a failed resolution attempt;
+    it does not replace the original approval, acceptance or technical condition.
+    The attempted-context and lifetime counters remain unchanged.
+    """
+    if request.get("result_contract") not in {"decision-v1", "resolution-v1"} or not unit.hold:
+        return False
+    unit.evidence.setdefault("resolution_failures", []).append(
+        {"hold": dataclasses.asdict(unit.hold), "receipt": dict(receipt)}
+    )
+    add_event(
+        snapshot,
+        "recovery-proposal-rejected",
+        unit=unit.id,
+        hold=unit.hold.id,
+        launch=receipt.get("launch_id", ""),
+        reason=receipt.get("error", "Invalid diagnosis result"),
+    )
+    return True
+
+
 def prepare(snapshot: CampaignSnapshot, unit_id: str, payload: Mapping[str, Any]) -> None:
     """Run within prepare-effect, before the launch claim becomes durable."""
     if payload.get("result_contract") not in {"decision-v1", "resolution-v1"}:
@@ -472,6 +500,7 @@ def validate_stage_result(
     mapped_sources: tuple[EvidenceSource, ...] = (),
     facts: tuple[ObservedFact, ...] | None = None,
     mapped_unavailable: tuple[str, ...] = (),
+    prior_projections=(),
 ) -> dict[str, Any]:
     """I/O executor validates fresh source/head bindings after read-only session."""
     unit = snapshot.units[unit_id]
@@ -506,6 +535,7 @@ def validate_stage_result(
             mapped_sources=mapped_sources,
             facts=facts or (),
             mapped_unavailable=mapped_unavailable,
+            prior_projections=prior_projections,
         )
         refreshed = decision_context(fresh["packet"])
         fresh_sources = {source.id: source for source in refreshed.sources}

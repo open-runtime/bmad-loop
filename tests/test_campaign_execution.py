@@ -157,3 +157,18 @@ def test_legacy_controls_refuse_campaign_child(tmp_path):
     assert legacy_control_refusal(tmp_path) is None
     (tmp_path / "campaign-worker.json").write_text("{}", encoding="utf-8")
     assert "campaign resume/reconcile" in legacy_control_refusal(tmp_path)
+
+
+def test_historical_execution_envelope_retains_unknown_argv_authority(project, tmp_path):
+    import hashlib
+
+    original = envelope(project, tmp_path)
+    path, _ = original.save()
+    raw = json.loads(path.read_text())
+    raw.pop("verify_commands", None)
+    text = json.dumps(raw, sort_keys=True, separators=(",", ":"))
+    path.write_text(text)
+    restored = CampaignExecution.load(path, hashlib.sha256(text.encode()).hexdigest())
+    assert restored.verify_commands is None
+    assert restored.policy == original.policy
+    assert restored.save() == (path, hashlib.sha256(text.encode()).hexdigest())

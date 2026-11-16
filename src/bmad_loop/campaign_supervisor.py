@@ -155,9 +155,23 @@ class CampaignSupervisor:
             try:
                 observation = future.result()
             except Exception as exc:
-                observation = Observation(
-                    "unknown", reason=f"{type(exc).__name__}: {exc}", retry_at=self.clock() + 5
-                )
+                from .campaign_github import GithubError
+
+                if isinstance(exc, GithubError):
+                    from .campaign_github_faults import retry_at
+
+                    fault = exc.to_dict()
+                    attempts = action.receipt.get("github_fault_attempts", 0) + 1
+                    observation = Observation(
+                        "unknown",
+                        {"github_fault": fault, "github_fault_attempts": attempts},
+                        reason=f"{type(exc).__name__}: {exc}",
+                        retry_at=retry_at(fault, now=self.clock(), attempts=attempts),
+                    )
+                else:
+                    observation = Observation(
+                        "unknown", reason=f"{type(exc).__name__}: {exc}", retry_at=self.clock() + 5
+                    )
             if observation.state not in {"confirmed", "unknown", "rejected", "waiting"}:
                 raise CampaignError("driver returned an invalid effect state")
             if observation.state == "confirmed":
@@ -178,6 +192,7 @@ class CampaignSupervisor:
             elif observation.state == "rejected":
                 action.state = "rejected"
                 action.error = observation.reason
+                action.receipt = {**action.receipt, **observation.data}
                 if action.unit in snapshot.units:
                     unit = snapshot.units[action.unit]
                     rejected_hold = Hold(
@@ -307,6 +322,8 @@ class CampaignSupervisor:
             snapshot = self._save(snapshot)
         for action in tuple(snapshot.outbox):
             if action.state == "sent_unknown":
+                if action.next_retry_at and action.next_retry_at > self.clock():
+                    continue
                 snapshot = self._submit(snapshot, action, executor, reconcile=True)
         while self._active:
             snapshot = self._commands(snapshot)

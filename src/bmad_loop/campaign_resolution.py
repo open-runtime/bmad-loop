@@ -245,6 +245,8 @@ def validate_proposal(
     ):
         raise CampaignError("resolution verification must contain argv arrays")
     verification = tuple(tuple(command) for command in commands)
+    if any(command not in context.expected_verification for command in verification):
+        raise CampaignError("resolution cannot expand frozen verification authority")
     if action in {"repair", "reverify"} and not set(context.expected_verification).issubset(
         verification
     ):

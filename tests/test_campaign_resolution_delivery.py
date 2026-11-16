@@ -167,3 +167,25 @@ def test_repair_followups_consume_a_lifetime_budget(project):
     for _ in range(snapshot.spec.resolution.max_attempts_per_unit * 2):
         prepare(unit, payload)
     assert next_step(snapshot, unit).kind == "resolution-exhausted"
+
+
+def test_persisted_resolution_commands_are_rechecked_against_frozen_authority(project):
+    snapshot, unit = accepted(project)
+    accepted_proposal = unit.evidence["accepted_resolution"]
+    accepted_proposal.update(action="reverify", verification=[["controller-secret-reader"]])
+    original = snapshot.clone()
+    with pytest.raises(CampaignError, match="frozen verification"):
+        next_step(snapshot, unit)
+    assert snapshot == original
+
+
+def test_pending_verify_payload_does_not_supply_execution_authority(project):
+    import dataclasses
+
+    from bmad_loop.campaign_resolution_delivery import execution_commands
+
+    snapshot, unit = accepted(project)
+    snapshot.spec = dataclasses.replace(snapshot.spec, verify_commands=(("approved-test",),))
+    assert execution_commands(snapshot, unit, {}) == (("approved-test",),)
+    with pytest.raises(CampaignError, match="frozen verification"):
+        execution_commands(snapshot, unit, {"commands": [["controller-secret-reader"]]})

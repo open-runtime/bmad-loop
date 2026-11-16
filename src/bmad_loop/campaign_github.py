@@ -9,10 +9,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import subprocess
+import time
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass, replace
+from email.utils import parsedate_to_datetime
 from typing import Any, Literal, Protocol
 from urllib.parse import parse_qsl, urlencode, urlsplit
 
@@ -23,14 +26,77 @@ JsonObject = dict[str, Any]
 class GithubError(RuntimeError):
     """An observation/effect failed; absence must not be inferred."""
 
-    def __init__(self, message: str, *, status: int = 0, retry_after_s: float | None = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int = 0,
+        retry_after_s: float | None = None,
+        category: str = "",
+        certainty: str = "observation_failed",
+        retry_at: float | None = None,
+        request_id: str = "",
+    ):
         super().__init__(message)
         self.status = status
         self.retry_after_s = retry_after_s
+        self.category = category or (
+            "authentication"
+            if status == 401
+            else (
+                "permission"
+                if status == 403
+                else (
+                    "rate_limit"
+                    if status == 429
+                    else "transient" if status == 0 or status >= 500 else "refused"
+                )
+            )
+        )
+        self.certainty = certainty
+        self.retry_at = retry_at
+        self.request_id = request_id
+
+    def to_dict(self) -> JsonObject:
+        return {
+            "schema_version": 1,
+            "category": self.category,
+            "certainty": self.certainty,
+            "status": self.status,
+            "retry_at": self.retry_at,
+            "retry_after_s": self.retry_after_s,
+            "request_id": self.request_id,
+        }
 
 
 class UncertainMutation(GithubError):
     """The request may have reached GitHub. Reconcile before another effect."""
+
+    def __init__(self, message: str, **kwargs):
+        super().__init__(message, **{**kwargs, "certainty": "unknown"})
+
+
+def _retry_deadline(headers: dict[str, str], now: float) -> float | None:
+    """Keep the strongest server deadline; malformed headers cannot shorten it."""
+    deadlines = []
+    retry = headers.get("retry-after", "")
+    try:
+        delay = float(retry)
+        if math.isfinite(delay) and delay >= 0:
+            deadlines.append(now + delay)
+    except ValueError:
+        try:
+            deadlines.append(parsedate_to_datetime(retry).timestamp())
+        except (ValueError, TypeError, OverflowError):
+            pass
+    if headers.get("x-ratelimit-remaining") == "0":
+        try:
+            reset = float(headers.get("x-ratelimit-reset", ""))
+            if math.isfinite(reset):
+                deadlines.append(reset)
+        except ValueError:
+            pass
+    return max([now, *deadlines]) if deadlines else None
 
 
 @dataclass(frozen=True)
@@ -47,17 +113,26 @@ class GithubTransport(Protocol):
 class GhTransport:
     """Authenticated gh CLI, no shell, credentials in output, or sleeping retries."""
 
-    def __init__(self, *, timeout_s: float = 45, executable: str = "gh"):
+    def __init__(self, *, timeout_s: float = 45, executable: str = "gh", clock=time.time):
         if timeout_s <= 0:
             raise ValueError("GitHub timeout must be positive")
         self.timeout_s = timeout_s
         self.executable = executable
+        self.clock = clock
 
     def request(self, method: str, path: str, payload: JsonObject | None = None) -> ApiResponse:
         if path.startswith("https://api.github.com/"):
             path = path.removeprefix("https://api.github.com/")
         if path.startswith(("-", "http:", "https:")) or "\n" in path:
             raise GithubError("Refusing a non-GitHub API path")
+        read = method in {"GET", "HEAD"} or (
+            path == "graphql"
+            and isinstance((payload or {}).get("query"), str)
+            and re.match(r"\s*query\b", payload["query"]) is not None
+        )
+        request_id = hashlib.sha256(
+            json.dumps([method, path, payload], sort_keys=True).encode()
+        ).hexdigest()
         argv = [
             self.executable,
             "api",
@@ -85,14 +160,19 @@ class GhTransport:
                 check=False,
             )
         except (OSError, subprocess.TimeoutExpired, UnicodeError) as exc:
-            error = UncertainMutation if method not in {"GET", "HEAD"} else GithubError
-            raise error(f"GitHub {method} transport interrupted: {type(exc).__name__}") from exc
+            error = GithubError if read else UncertainMutation
+            raise error(
+                f"GitHub {method} transport interrupted: {type(exc).__name__}",
+                request_id=request_id,
+            ) from exc
         output = result.stdout.replace("\r\n", "\n")
         header, separator, raw = output.partition("\n\n")
         match = re.match(r"HTTP/\S+ (\d{3})", header)
         if not separator or not match:
-            error = UncertainMutation if method not in {"GET", "HEAD"} else GithubError
-            raise error(f"GitHub {method} returned no parseable HTTP response")
+            error = GithubError if read else UncertainMutation
+            raise error(
+                f"GitHub {method} returned no parseable HTTP response", request_id=request_id
+            )
         status = int(match.group(1))
         headers = {
             key.lower(): value.strip()
@@ -100,20 +180,54 @@ class GhTransport:
             if ":" in row
             for key, value in [row.split(":", 1)]
         }
+        request_id = headers.get("x-github-request-id") or request_id
+        now = self.clock()
+        retry_at = _retry_deadline(headers, now)
+        rate_limited = (
+            status == 429
+            or status == 403
+            and (
+                retry_at is not None
+                or headers.get("x-ratelimit-remaining") == "0"
+                or "rate limit" in raw.lower()
+            )
+        )
+        if status >= 400 and status != 409:
+            category = (
+                "rate_limit"
+                if rate_limited
+                else (
+                    "authentication"
+                    if status == 401
+                    else (
+                        "permission"
+                        if status == 403
+                        else "transient" if status >= 500 else "refused"
+                    )
+                )
+            )
+            if category == "rate_limit" and retry_at is None:
+                retry_at = now + 60
+            error = UncertainMutation if not read and status >= 500 else GithubError
+            raise error(
+                f"GitHub {method} request refused (HTTP {status})",
+                status=status,
+                category=category,
+                certainty="observation_failed" if read else "refused",
+                retry_at=retry_at,
+                retry_after_s=max(0, retry_at - now) if retry_at is not None else None,
+                request_id=request_id,
+            )
         try:
             data = json.loads(raw) if raw.strip() else None
         except ValueError as exc:
-            error = UncertainMutation if method not in {"GET", "HEAD"} else GithubError
-            raise error("GitHub returned invalid JSON", status=status) from exc
-        if status >= 400 and status != 409:
-            retry = headers.get("retry-after")
-            raise GithubError(
-                f"GitHub {method} request refused (HTTP {status})",
-                status=status,
-                retry_after_s=float(retry) if retry and retry.isdigit() else None,
-            )
+            error = GithubError if read else UncertainMutation
+            raise error(
+                "GitHub returned invalid JSON", status=status, request_id=request_id
+            ) from exc
         if result.returncode and status < 400:
-            raise GithubError(f"gh failed after HTTP {status}", status=status)
+            error = GithubError if read else UncertainMutation
+            raise error(f"gh failed after HTTP {status}", status=status, request_id=request_id)
         return ApiResponse(status, data, headers)
 
 
@@ -131,6 +245,7 @@ class MutationIntent:
     generation: int = 0
     coordinates: JsonObject | None = None
     retry_after_s: float | None = None
+    fault: JsonObject | None = None
 
     def to_dict(self) -> JsonObject:
         return asdict(self)
@@ -295,7 +410,72 @@ class GithubGateway:
         )
 
     def pull(self, number: int) -> JsonObject:
-        return self.get(f"{self.root}/pulls/{number}")
+        pr = self.get(f"{self.root}/pulls/{number}")
+        if not isinstance(pr, dict):
+            raise GithubError("Unexpected GitHub PR schema")
+        if pr.get("merged") is not True:
+            return pr
+        # REST 2026-03-10 no longer supplies merge_commit_sha. Join the
+        # authoritative GraphQL mergeCommit to the same complete PR identity;
+        # never substitute the target tip or a REST test-merge candidate.
+        owner, name = self.repository.split("/", 1)
+        response = self.transport.request(
+            "POST",
+            "graphql",
+            {
+                "query": "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){nameWithOwner pullRequest(number:$number){id databaseId number merged headRefOid baseRefName mergeCommit{oid}}}}",
+                "variables": {"owner": owner, "name": name, "number": number},
+            },
+        )
+        if (
+            response.status != 200
+            or not isinstance(response.data, dict)
+            or response.data.get("errors")
+        ):
+            raise GithubError(
+                "GitHub merged PR identity observation failed", status=response.status
+            )
+        try:
+            repository = response.data["data"]["repository"]
+            merged = repository["pullRequest"]
+            merge_commit = merged["mergeCommit"]["oid"]
+            valid = (
+                repository["nameWithOwner"].casefold() == self.repository.casefold()
+                and pr["base"]["repo"]["full_name"].casefold() == self.repository.casefold()
+                and type(pr["number"]) is int
+                and pr["number"] == number
+                and type(merged["number"]) is int
+                and merged["number"] == number
+                and isinstance(pr["node_id"], str)
+                and bool(pr["node_id"])
+                and merged["id"] == pr["node_id"]
+                and type(pr["id"]) is int
+                and pr["id"] > 0
+                and type(merged["databaseId"]) is int
+                and merged["databaseId"] == pr["id"]
+                and merged["merged"] is True
+                and isinstance(pr["head"]["sha"], str)
+                and bool(pr["head"]["sha"])
+                and merged["headRefOid"] == pr["head"]["sha"]
+                and isinstance(pr["base"]["ref"], str)
+                and bool(pr["base"]["ref"])
+                and merged["baseRefName"] == pr["base"]["ref"]
+                and isinstance(merge_commit, str)
+                and re.fullmatch(r"[0-9a-f]{40}", merge_commit) is not None
+            )
+        except (KeyError, TypeError, AttributeError) as exc:
+            raise GithubError("Merged PR identity coverage is incomplete") from exc
+        if not valid:
+            raise GithubError("Merged PR GraphQL identity does not match REST observation")
+        return {
+            **pr,
+            "merge_commit_sha": merge_commit,
+            "merge_commit_observation": {
+                "source": "graphql.mergeCommit",
+                "repository": repository["nameWithOwner"],
+                **merged,
+            },
+        }
 
     def issue(self, number: int) -> JsonObject:
         return self.get(f"{self.root}/issues/{number}")
@@ -418,12 +598,16 @@ class GithubGateway:
         try:
             response = self.transport.request(intent.method, intent.path, intent.payload)
         except UncertainMutation as exc:
-            return replace(intent, error=str(exc))
+            return replace(
+                intent, error=str(exc), fault=exc.to_dict(), retry_after_s=exc.retry_after_s
+            )
         except GithubError as exc:
             # 5xx/rate limit may follow acceptance at an intermediary. Retain uncertainty.
-            if exc.status in {400, 401, 404, 405, 410, 422}:
-                return replace(intent, state="rejected", error=str(exc))
-            return replace(intent, error=str(exc), retry_after_s=exc.retry_after_s)
+            if exc.status in {400, 401, 403, 404, 405, 410, 422} and exc.category != "rate_limit":
+                return replace(intent, state="rejected", error=str(exc), fault=exc.to_dict())
+            return replace(
+                intent, error=str(exc), retry_after_s=exc.retry_after_s, fault=exc.to_dict()
+            )
         if response.status not in {200, 201, 202, 204, 409}:
             return replace(intent, error=f"Unexpected effect response: HTTP {response.status}")
         receipt = response.data if isinstance(response.data, dict) else {"value": response.data}

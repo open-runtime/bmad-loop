@@ -52,6 +52,7 @@ def envelope(repo, directory, policy=None, profiles=None):
         directory,
         policy,
         profiles or runsetup.resolve_profiles(policy, repo),
+        verify_commands=((sys.executable, "-c", "print('zero-token verification')"),),
     )
 
 
@@ -509,6 +510,9 @@ def test_reaped_owned_process_still_requires_unchanged_workspace(
 
 def test_child_failed_verification_is_not_an_acceptance_receipt(project, tmp_path):
     context = envelope(project.project, tmp_path / "execution")
+    context = dataclasses.replace(
+        context, verify_commands=((sys.executable, "-c", "raise SystemExit(17)"),)
+    )
     path = workers.prepare_launch(
         context,
         worker_request(
@@ -546,6 +550,9 @@ def test_verification_observes_ignored_story_sources_outside_output_folder(proje
                 "from pathlib import Path; Path('hidden_sources/story.md').write_text('mutated')",
             ]
         ],
+    )
+    context = dataclasses.replace(
+        context, verify_commands=tuple(tuple(command) for command in request["commands"])
     )
     with pytest.raises(CampaignError, match="changed candidate content"):
         workers._verify(request, context)
@@ -675,3 +682,85 @@ def test_local_completion_receipt_requires_a_persisted_legacy_run(tmp_path, proj
     (tmp_path / "receipt.json").write_text(json.dumps({**receipt, "outcome": "locally_complete"}))
     with pytest.raises(CampaignError, match="legacy run|run identity|run_dir"):
         workers.observe(tmp_path, expected=startup)
+
+
+def test_verification_rejects_argv_outside_frozen_envelope_before_execution(
+    project, tmp_path, monkeypatch
+):
+    context = envelope(project.project, tmp_path / "execution")
+    request = worker_request(project.project, context, commands=[["unapproved-command"]])
+    monkeypatch.setattr(workers.childrun, "run_argv", lambda *a, **k: pytest.fail("executed"))
+    with pytest.raises(CampaignError, match="frozen verification"):
+        workers._verify(request, context)
+    legacy = dataclasses.replace(context, verify_commands=None)
+    with pytest.raises(CampaignError, match="unknown verification authority"):
+        workers._verify(worker_request(project.project, legacy), legacy)
+
+
+def test_verification_environment_excludes_controller_github_credentials(
+    project, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("GH_TOKEN", "synthetic-controller-token")
+    monkeypatch.setenv("GITHUB_TOKEN", "synthetic-controller-token")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "synthetic-provider-token")
+    command = [
+        sys.executable,
+        "-c",
+        "import os; assert 'GH_TOKEN' not in os.environ; "
+        "assert 'GITHUB_TOKEN' not in os.environ; "
+        "assert os.environ['ANTHROPIC_API_KEY'] == 'synthetic-provider-token'; print('isolated')",
+    ]
+    context = dataclasses.replace(
+        envelope(project.project, tmp_path / "execution"), verify_commands=(tuple(command),)
+    )
+    receipt = workers._verify(worker_request(project.project, context, commands=[command]), context)
+    assert receipt["outcome"] == "verified"
+    assert receipt["commands"][0]["stdout"].strip() == "isolated"
+
+
+def test_module_child_spawn_separates_controller_tokens_and_keeps_provider_auth(
+    project, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("GH_TOKEN", "synthetic-controller-token")
+    monkeypatch.setenv("GITHUB_TOKEN", "synthetic-controller-token")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "synthetic-provider-token")
+    command = [
+        sys.executable,
+        "-c",
+        "import os; assert 'GH_TOKEN' not in os.environ; "
+        "assert 'GITHUB_TOKEN' not in os.environ; "
+        "assert os.environ['ANTHROPIC_API_KEY'] == 'synthetic-provider-token'",
+    ]
+    context = dataclasses.replace(
+        envelope(project.project, tmp_path / "execution"), verify_commands=(tuple(command),)
+    )
+    path = workers.prepare_launch(
+        context, worker_request(project.project, context, commands=[command])
+    )
+    original = workers.subprocess.Popen
+
+    def checked_spawn(*args, **kwargs):
+        assert "GH_TOKEN" not in kwargs["env"]
+        assert "GITHUB_TOKEN" not in kwargs["env"]
+        assert kwargs["env"]["ANTHROPIC_API_KEY"] == "synthetic-provider-token"
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(workers.subprocess, "Popen", checked_spawn)
+    process = workers.spawn(path)
+    monkeypatch.setattr(workers.subprocess, "Popen", original)
+    try:
+        assert process.wait(timeout=20) == 0
+        observed = workers.observe(context.directory, expected=json.loads(path.read_text()))
+        assert observed["receipt"]["outcome"] == "verified"
+    finally:
+        if process.poll() is None:
+            process.terminate()
+        process.wait(timeout=20)
+        workers._OWNED_LAUNCHES.pop(context.directory.resolve(), None)
+
+
+def test_legacy_flag_cannot_bypass_explicit_frozen_campaign_verification(project, tmp_path):
+    context = envelope(project.project, tmp_path / "execution")
+    request = worker_request(project.project, context, legacy_verify=True)
+    with pytest.raises(CampaignError, match="legacy verifier cannot replace"):
+        workers._verify(request, context)

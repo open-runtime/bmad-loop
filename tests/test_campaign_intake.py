@@ -39,6 +39,22 @@ def issue(number, body="Acceptance", updated="2026-11-05T10:00:00Z"):
     }
 
 
+def test_disabled_intake_is_complete_preserves_cursor_and_never_discovers(monkeypatch):
+    gateway = Gateway()
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("disabled discovery called GitHub")
+
+    for name in ("issues", "issue", "comments"):
+        monkeypatch.setattr(gateway, name, forbidden)
+    cursor = "2026-11-05T10:00:00Z"
+    batch = GithubIntake(gateway).poll(
+        mode="off", cursor=cursor, selected_numbers=(7,), mapped_numbers=(8,), labels=("work",)
+    )
+    assert batch.complete and batch.next_cursor == cursor
+    assert batch.observations == () and batch.pending_count == 0
+
+
 def test_backlog_batches_equal_timestamps_never_skip_after_restart():
     gateway = Gateway()
     gateway.rows = [issue(number) for number in range(1, 8)]

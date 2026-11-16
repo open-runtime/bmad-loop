@@ -19,6 +19,38 @@ from .campaign_resolution import ResolutionResult
 from .campaign_supervisor import Observation, Proposal
 
 
+def execution_commands(
+    snapshot: Any, unit: Any, payload: dict[str, Any]
+) -> tuple[tuple[str, ...], ...]:
+    """Derive executable argv from frozen authority, including resumed proposals.
+
+    A previously accepted model artifact is retained evidence, not a command
+    grant. Compare it again at dispatch so historical permissive validation
+    cannot turn a restart into extra controller execution authority.
+    """
+    expected = tuple(tuple(command) for command in snapshot.spec.verify_commands)
+    accepted = payload.get("resolution_proposal")
+    commands = expected
+    if accepted:
+        current = unit.evidence.get("accepted_resolution", {})
+        packet = unit.evidence.get("active_resolution_packet", {})
+        if accepted != current:
+            raise CampaignError("verification does not match its accepted diagnosis")
+        proposed = tuple(tuple(command) for command in accepted.get("verification", ()))
+        if any(command not in expected for command in proposed):
+            raise CampaignError("resolution cannot expand frozen verification authority")
+        command = tuple(accepted.get("command", ()))
+        if command:
+            allowed = tuple(tuple(row) for row in packet.get("repair_commands", ()))
+            if accepted.get("cause_code") != "environment" or command not in allowed:
+                raise CampaignError("environment repair command is not explicitly authorized")
+            commands = (command, *expected)
+    requested = tuple(tuple(command) for command in payload.get("commands", ()))
+    if requested and requested != commands:
+        raise CampaignError("worker commands differ from frozen verification authority")
+    return commands
+
+
 def next_step(snapshot: Any, unit: Any) -> Proposal | None:
     accepted = unit.evidence["accepted_resolution"]
     identity = accepted["id"]
@@ -33,9 +65,10 @@ def next_step(snapshot: Any, unit: Any) -> Proposal | None:
         accepted["action"] in {"reverify", "retry", "reprobe"}
         or repaired.get("resolution_id") == identity
     ):
-        commands = [list(command) for command in accepted["verification"]]
-        if accepted.get("command"):
-            commands.insert(0, list(accepted["command"]))
+        commands = [
+            list(command)
+            for command in execution_commands(snapshot, unit, {"resolution_proposal": accepted})
+        ]
         return Proposal(
             "launch",
             unit.id,

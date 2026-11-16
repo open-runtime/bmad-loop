@@ -806,3 +806,70 @@ def test_persisted_legacy_audit_contract_refreshes_before_any_writer_admission(
     assert old_bytes == [Path(row["artifact_path"]).read_bytes() for row in old_audits]
     if old_packet:
         assert Path(old_packet["path"]).read_bytes() == old_packet_bytes
+
+
+def test_single_writer_route_recovers_only_after_fresh_eligible_capacity(campaign):
+    runtime, snapshot, unit, receipt = campaign
+    previous = snapshot.spec.candidates("execution")[0]
+    snapshot.spec = dataclasses.replace(
+        snapshot.spec,
+        role_pools=tuple(
+            (name, (previous,) if name == "writers" else pool)
+            for name, pool in snapshot.spec.role_pools
+        ),
+    )
+    snapshot.config_revision += 1
+    eligible = [False]
+    calls = []
+
+    def role(snapshot, role, *, allowed_candidates, **kwargs):
+        calls.append((role, allowed_candidates))
+        if role != "execution":
+            return allowed_candidates[0]
+        return previous if eligible[0] and previous in allowed_candidates else None
+
+    runtime._role = role
+    flow.intercept_terminal(runtime, snapshot, unit, receipt)
+    value = unit.evidence["handoff"]
+    assert value["candidate"] is None
+    assert not flow.proposals(runtime, snapshot)
+    snapshot = runtime.store.save(snapshot, snapshot.revision)
+    snapshot = runtime.store.load(snapshot.id)
+    unit = snapshot.units[unit.id]
+    assert not flow.proposals(runtime, snapshot)
+    eligible[0] = True
+    proposal = flow.proposals(runtime, snapshot)[0]
+    assert proposal.kind == "handoff-route"
+    action = OutboxAction(
+        "fresh-route", proposal.kind, unit.id, proposal.payload, snapshot.generation
+    )
+    flow.apply(runtime, snapshot, action, flow.perform(runtime, snapshot, action))
+    assert unit.evidence["handoff"]["candidate"] == dataclasses.asdict(previous)
+    assert flow.proposals(runtime, snapshot)[0].kind == "handoff-capture"
+    assert unit.claim.launch_id == "original" and unit.claim.quiescent
+    assert calls and any(role == "execution" for role, _ in calls)
+    for kind in ("handoff-capture", "handoff-plan"):
+        step(runtime, snapshot, unit, kind)
+    complete_maps(runtime, snapshot, unit)
+    step(runtime, snapshot, unit, "handoff-audit-plan")
+    complete_audits(runtime, snapshot, unit)
+    step(runtime, snapshot, unit, "handoff-assemble")
+    step(runtime, snapshot, unit, "handoff-release")
+    continuation = flow.resume_proposal(snapshot, unit, runtime=runtime)
+    assert continuation is not None and continuation.payload["candidate"] == dataclasses.asdict(
+        previous
+    )
+    assert unit.bindings["pr"] == 17 and unit.claim.launch_id == "original"
+    assert unit.evidence["handoff"]["phase"] == "ready"
+    assert unit.hold is None
+
+
+def test_active_handoff_retarget_is_explicitly_rejected_and_preserves_progress(campaign):
+    runtime, snapshot, unit, receipt = campaign
+    flow.intercept_terminal(runtime, snapshot, unit, receipt)
+    before = copy.deepcopy(unit.evidence["handoff"])
+    hold = unit.hold
+    requested = dataclasses.asdict(snapshot.spec.candidates("execution")[0])
+    with pytest.raises(CampaignError, match="active handoff.*retarget"):
+        flow.control(runtime, snapshot, {"unit": unit.id, "payload": {"candidate": requested}})
+    assert unit.evidence["handoff"] == before and unit.hold == hold

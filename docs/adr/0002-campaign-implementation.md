@@ -1,6 +1,6 @@
 # ADR 0002 implementation contract
 
-- **Status:** Implemented; release-specific qualification and target-project delivery remain gated
+- **Status:** Partially implemented; audit repairs, delivery and unattended qualification remain open
 - **Date:** 2026-11-05
 - **Parent:** [Native SDLC campaign](0002-native-sdlc-campaign.md)
 - **Delivery:** Initial campaign PR and reviewed follow-up releases preserve the same delivery contract
@@ -32,6 +32,38 @@ Changed controls invalidate continuation before writer admission; each
 new final-selection or final-audit contract requires its own native qualification.
 
 ## Implementation goals and traceability
+
+The historical G0–G8 identifiers below retain their original meaning. The current
+repair work uses a separate G0–G6 acceptance ledger: reconciliation/documentation,
+command and preservation authority, GitHub delivery/recovery, repository intake
+and organization, autonomous recovery, reasoning/handoff/messaging, and operator
+visibility/parallelism. Historical passing rows do not close that repair ledger.
+In particular, typed child-pause receipts, single-use continuation permits and the
+proposed `campaign inbox`, `campaign answer` and `campaign rearm` interfaces remain
+unfinished. Existing `campaign reconcile` supplies observation without granting
+worker launch or permission to replay an uncertain mutation. Bot-thread resolution
+remains manual; automatic resolution requires explicitly configured identities,
+linked fixes, independent current-head verification and fresh thread evidence.
+Human objections remain protected even within a bot-created thread.
+
+Controller verification derives executable argv from frozen approved configuration.
+Diagnosis results may propose commands but cannot expand that authority; persisted
+proposals are revalidated at dispatch and the child checks the frozen binding.
+Child environments exclude `GH_*` and `GITHUB_*` credentials while retaining provider
+authentication. This environment separation does not establish confinement of
+file-backed credentials or system credential helpers; that remains a separate
+unfulfilled security requirement. Rejected diagnosis artifacts retain the original
+hold and failed-attempt evidence instead of inventing a replacement condition.
+
+Disabled issue discovery returns a complete empty batch without moving its cursor;
+mapped issue, comment, review and PR observations remain stage-boundary obligations.
+Merged PR identity is normalized centrally from joined REST and GraphQL evidence,
+including repository, native PR identity, head, target and actual merge commit.
+GitHub faults retain category, certainty, retry deadline and request identity.
+Rate-limit waits survive coordinator restart; a definitive mutation refusal is
+visible as a refusal, while uncertain effects remain subject to readback before
+any authorized retry. Legacy fault records remain readable with missing evidence
+visibly unknown.
 
 The initial implementation and released follow-ups established the historical
 G0–G8 foundation below. The delivery goals distinguish established qualification
@@ -1893,7 +1925,7 @@ wait for bridge closure. CLI `endpoints`, `messages` and `steer` expose address,
 acceptance and application separately. Titles put the public hcom name, epic,
 issue and PR first; private native enrollment is a separate identity.
 
-## REM activation and delivery of this PR
+## Disposable delivery and later REM activation
 
 The original REM-first sequence below is superseded by the accepted rollout
 direction: keep the old pilot retired, preserve its evidence and branches, and
@@ -1903,8 +1935,9 @@ They do not authorize restoring or resuming the old pilot. Handoff, managed
 messaging, live controls and load qualification remain separate gates; a limited
 delivery result cannot be promoted to general unattended readiness.
 
-Ship the entire framework in PR 18; each implementation stage is a commit/check,
-not a separate capability PR. Do not restore exploratory stash files wholesale:
+PR 18 is merged. Deliver audit repairs through staged reviewed follow-up PRs, then
+freeze one integrated candidate before expensive qualification or deployment.
+Do not restore exploratory stash files wholesale:
 compare them against this contract and retain only compatible implementation.
 Keep REM-specific logic out of portable orchestration; support trusted project
 policy/evidence and merge-command adapters with exact-head receipts.
@@ -2008,6 +2041,30 @@ controlled target pilot alongside draft PR creation, main synchronization,
 review/fix/merge, tracking reconciliation and interruption recovery.
 
 ## Required qualification matrix
+
+Qualify the same frozen bytes on Python 3.11 and the intended installed interpreter
+with the required suite, typecheck, lint, documentation and packaging checks. Run
+one full suite at a time and investigate load-dependent failures. Exercise the
+48-story/24-epic workload with eight verification slots and 32 shared sessions,
+including independent review and reasoning budgets. Also run a four-hour scripted
+recovery soak with crashes, quota/authentication waits, delayed acknowledgements,
+concurrent GitHub edits and stop/resume; retain control latency, API traffic, state
+growth, resource limits and eventual delivery. A shorter historical load case does
+not satisfy that soak. Obtain two independent reviews of the same candidate for
+security/publication and runtime/handoff/messaging/throughput.
+
+Native qualification has a separate ceiling of two concurrent bounded attempts.
+Reuse proof only when maintained validators accept its exact subject and
+dependencies. Diagnose the retained Grok attempt 267 using zero-inference startup,
+import, grant and sandbox traces before spending more inference. A successful
+benign launcher trace alone does not explain a prior stall or qualify the route.
+TeamRouter deployment requires its maintained procedure and a compatible shared
+service restart window. Observe successful Codex sign-in before renewing its
+dependent proofs. Preserve existing workers' environments and do independent work
+while prerequisites are unavailable. Promote the global executable and canonical
+Paradev base only after the merged candidate's applicable gates pass; verify exact
+commit provenance at both locations. Do not change GitHub Actions or organization
+settings to obtain a passing disposable result.
 
 Use existing sandbox fixtures and scripted coding sessions; no live/E2E gate
 spends LLM tokens. Each negative gate gets its required ablation check.

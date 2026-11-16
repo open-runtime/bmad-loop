@@ -545,12 +545,14 @@ def after_apply(runtime, snapshot, action, data):
 
         apply_worker(runtime, snapshot, unit, data["receipt"])
     elif data["receipt"].get("outcome") == "invalid_stage_result":
+        from .campaign_resolution_flow import preserve_failed_diagnosis
         from .campaign_usage import finalize_stage_usage
 
         finalize_stage_usage(snapshot, unit, data["receipt"])
-        runtime._set_hold(
-            unit, Hold("invalid_stage_result", data["receipt"]["error"], id=data["launch_id"])
-        )
+        if not preserve_failed_diagnosis(snapshot, unit, debt["request"], data["receipt"]):
+            runtime._set_hold(
+                unit, Hold("invalid_stage_result", data["receipt"]["error"], id=data["launch_id"])
+            )
         if (
             unit.spec.kind == "planning"
             and data["receipt"]["stage"] in snapshot.spec.planning.stages

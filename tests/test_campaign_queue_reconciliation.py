@@ -48,6 +48,7 @@ class TerminalTransport(Transport):
         elif path == "graphql" and "dequeuePullRequest" not in payload["query"]:
             pr = result.data["data"]["repository"]["pullRequest"]
             pr.update(merged=self.merged, state="CLOSED" if self.merged or self.closed else "OPEN")
+            pr["mergeCommit"] = {"oid": self.merge_commit} if self.merged else None
             if self.merged or self.closed:
                 pr["mergeQueueEntry"] = None
         return result

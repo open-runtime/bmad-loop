@@ -472,3 +472,97 @@ def test_owner_holds_cannot_enter_technical_diagnosis_to_bypass_decision_review(
     snapshot = state(project, hold="owner_stop")
     with pytest.raises(CampaignError, match="decision evidence review first"):
         collect_context(project.project, snapshot, "s:project:u", "diagnosis")
+
+
+@pytest.mark.parametrize("action", ["repair", "reverify", "retry", "reprobe"])
+def test_diagnosis_cannot_schedule_model_proposed_controller_commands(project, action):
+    snapshot = state(project)
+    snapshot.spec = dataclasses.replace(snapshot.spec, verify_commands=(("approved-test",),))
+    unit = snapshot.units["s:project:u"]
+    context = collect_context(project.project, snapshot, unit.id, "diagnosis")
+    apply_context(snapshot, unit.id, context)
+    launch = proposals(snapshot, project.project, candidate(), now=10)[0]
+    prepare(snapshot, unit.id, launch.payload)
+    original = snapshot.clone()
+    packet = context["packet"]
+    receipt = {
+        "outcome": "stage_complete",
+        "head": packet["coordinates"]["head"],
+        "artifact": diagnosis(
+            packet, action=action, verification=[["approved-test"], ["controller-secret-reader"]]
+        ),
+    }
+    with pytest.raises(CampaignError, match="frozen verification"):
+        validate_stage_result(project.project, snapshot, unit.id, receipt)
+    assert snapshot == original
+    assert unit.hold.id == "hold-1"
+
+
+@pytest.mark.parametrize("hold", ["verification_failed", "operator", "required_approval"])
+@pytest.mark.parametrize("contract", ["decision-v1", "resolution-v1"])
+@pytest.mark.parametrize("outcome", ["invalid_stage_result", "failed"])
+def test_terminal_failed_diagnosis_preserves_original_hold_and_dirty_work(
+    project, tmp_path, hold, contract, outcome
+):
+    from types import SimpleNamespace
+
+    from bmad_loop.campaign_runtime import CampaignRuntime
+    from bmad_loop.campaign_store import CampaignStore
+
+    snapshot = state(project, hold=hold)
+    unit = snapshot.units["s:project:u"]
+    snapshot.spec = dataclasses.replace(snapshot.spec, units=(unit.spec,))
+    unit.evidence["contributing_models"] = [{"family": "claude", "model": "writer"}]
+    unit.evidence["uncertain_external_action"] = {"id": "retained-write", "state": "unknown"}
+    unit.evidence["required_findings"] = [{"id": "unfinished-acceptance"}]
+    unit.resolution_attempts = 2
+    unit.attempt = 3
+    unit.claim = WorkerClaim(
+        unit.id, unit.attempt, snapshot.generation, "diagnosis", role="escalation"
+    )
+    store = CampaignStore(tmp_path / "store")
+    snapshot = store.create(snapshot)
+    unit = snapshot.units[unit.id]
+    request = store.directory(snapshot.id) / "workers" / "diagnosis" / "request.json"
+    request.parent.mkdir(parents=True)
+    request.write_text(json.dumps({"result_contract": contract}))
+    tracked = project.project / "retained.txt"
+    tracked.write_text("staged\n")
+    git(project.project, "add", tracked.name)
+    tracked.write_text("unstaged\n")
+    (project.project / "untracked.txt").write_text("untracked\n")
+    before = {
+        "head": verify.rev_parse_head(project.project),
+        "index": git(project.project, "diff", "--cached"),
+        "worktree": git(project.project, "diff"),
+        "untracked": (project.project / "untracked.txt").read_bytes(),
+        "hold": dataclasses.asdict(unit.hold),
+        "attempts": (unit.attempt, unit.resolution_attempts),
+    }
+    runtime = CampaignRuntime(project.project, store)
+    receipt = {
+        "outcome": outcome,
+        "launch_id": "diagnosis",
+        "head": before["head"],
+        "stage": "decision_review" if contract == "decision-v1" else "escalation",
+        "error": "Scripted rejected diagnosis",
+    }
+    runtime._apply_worker(
+        snapshot,
+        unit,
+        SimpleNamespace(payload={"launch_id": "diagnosis"}),
+        {"state": "finished", "receipt": receipt},
+    )
+    assert dataclasses.asdict(unit.hold) == before["hold"]
+    assert (unit.attempt, unit.resolution_attempts) == before["attempts"]
+    assert unit.claim.quiescent
+    assert unit.evidence["resolution_failures"][-1]["receipt"] == receipt
+    assert unit.evidence["required_findings"] == [{"id": "unfinished-acceptance"}]
+    assert unit.evidence["uncertain_external_action"]["state"] == "unknown"
+    assert unit.evidence["contributing_models"] == [{"family": "claude", "model": "writer"}]
+    assert verify.rev_parse_head(project.project) == before["head"]
+    assert git(project.project, "diff", "--cached") == before["index"]
+    assert git(project.project, "diff") == before["worktree"]
+    assert (project.project / "untracked.txt").read_bytes() == before["untracked"]
+    saved = store.save(snapshot, snapshot.revision)
+    assert dataclasses.asdict(store.load(saved.id).units[unit.id].hold) == before["hold"]

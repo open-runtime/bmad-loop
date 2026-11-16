@@ -180,54 +180,58 @@ def _fallback(snapshot, role, previous, requested=None, *, unit, permissions=Non
 
 def _available_alternative(runtime, snapshot, value):
     """Use fresh shared admission observations without changing an explicit choice."""
-    if (
-        value.get("requested_candidate")
-        or not value.get("candidate")
-        or not hasattr(runtime, "_role")
-    ):
+    if value.get("requested_candidate") or not hasattr(runtime, "_role"):
         return None
     role = value.get("route_role", value["role"])
     permissions = _permission(value)
     unit = snapshot.units[value["predecessor"]["unit"]]
-    selected = _candidate(value["candidate"])
-    try:
-        _target_cap(snapshot, selected, role, unit=unit, permissions=permissions)
-    except CampaignError:
-        pass
-    else:
-        if (
-            runtime._role(
-                snapshot,
-                role,
-                permissions=permissions,
-                allowed_candidates=(selected,),
-                **_unit_admission(unit),
-            )
-            is not None
-        ):
-            return None
-    allowed = []
+    selected = _candidate(value["candidate"]) if value.get("candidate") else None
+    if selected is not None:
+        try:
+            _target_cap(snapshot, selected, role, unit=unit, permissions=permissions)
+        except CampaignError:
+            pass
+        else:
+            if (
+                runtime._role(
+                    snapshot,
+                    role,
+                    permissions=permissions,
+                    allowed_candidates=(selected,),
+                    **_unit_admission(unit),
+                )
+                is not None
+            ):
+                return None
+    alternatives, previous = [], []
     for candidate in snapshot.spec.candidates(role):
-        if candidate == selected or (candidate.profile, candidate.model) == tuple(
-            value["previous_route"]
-        ):
+        if candidate == selected:
             continue
         try:
             _target_cap(snapshot, candidate, role, unit=unit, permissions=permissions)
         except CampaignError:
             continue
-        allowed.append(candidate)
-    return (
-        runtime._role(
+        group = (
+            previous
+            if (candidate.profile, candidate.model) == tuple(value["previous_route"])
+            else alternatives
+        )
+        group.append(candidate)
+    # Prefer eligible alternatives. The predecessor route becomes eligible only
+    # through the same fresh capacity/fault checks used by ordinary admission.
+    for allowed in (alternatives, previous):
+        if not allowed:
+            continue
+        candidate = runtime._role(
             snapshot,
             role,
             permissions=permissions,
             allowed_candidates=tuple(allowed),
             **_unit_admission(unit),
         )
-        if allowed
-        else None
-    )
+        if candidate is not None:
+            return candidate
+    return None
 
 
 def control(runtime, snapshot, command) -> None:
@@ -253,6 +257,10 @@ def control(runtime, snapshot, command) -> None:
 def begin(runtime, snapshot, unit, *, requested=None, reason, receipt=None):
     old = unit.evidence.get("handoff")
     if old and old.get("phase") in ACTIVE:
+        if requested is not None:
+            raise CampaignError(
+                "An active handoff cannot be retargeted; its bound continuation is still in progress"
+            )
         return
     claim = unit.claim
     if (
@@ -696,6 +704,8 @@ def proposals(runtime, snapshot):
         if not unit.hold or unit.hold.id != value["id"]:
             continue  # an operator hold remains authoritative
         if not value.get("candidate"):
+            if hasattr(runtime, "_role"):
+                continue  # Fresh admission above found no eligible route yet.
             target = _fallback(
                 snapshot,
                 value.get("route_role", value["role"]),

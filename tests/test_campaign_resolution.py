@@ -361,3 +361,15 @@ def test_repair_resume_cannot_jump_past_acceptance(target):
     with pytest.raises(CampaignError, match="cannot bypass"):
         apply_resolution(snapshot, unit.id, proposal, result(proposal))
     assert snapshot == before
+
+
+@pytest.mark.parametrize("action", ["repair", "reverify", "retry", "reprobe", "wait"])
+def test_model_verification_cannot_add_executable_authority(action):
+    ctx = context()
+    expanded = [*map(list, ctx.expected_verification), ["controller-secret-reader"]]
+    with pytest.raises(CampaignError, match="frozen verification"):
+        validate_proposal(
+            artifact(ctx, action=action, verification=expanded),
+            ctx,
+            ResolutionSpec(mode="bounded-auto"),
+        )
