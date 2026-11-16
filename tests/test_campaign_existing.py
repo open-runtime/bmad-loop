@@ -21,8 +21,16 @@ from bmad_loop import verify
 from bmad_loop.campaign_existing import terminal_path, verify_existing
 from bmad_loop.campaign_model import CampaignError, SourceSelector, UnitSpec
 
+EXISTING_VERIFICATION = (
+    (
+        sys.executable,
+        "-c",
+        "from pathlib import Path; assert Path('existing.py').read_text() == 'accepted existing behavior\\n'",
+    ),
+)
 
-def request(project, source, unit, tmp_path):
+
+def request(project, source, unit, tmp_path, *, approved_commands=EXISTING_VERIFICATION):
     from bmad_loop import platform_util
 
     if not platform_util.HANDLE_ANCHORED_WRITES:
@@ -33,14 +41,12 @@ def request(project, source, unit, tmp_path):
         "workspace": str(project.project),
         "source": asdict(source),
         "unit": asdict(unit),
-        "commands": [
-            [
-                sys.executable,
-                "-c",
-                "from pathlib import Path; assert Path('existing.py').read_text() == 'accepted existing behavior\\n'",
-            ]
-        ],
-    }, SimpleNamespace(directory=tmp_path / "worker-state", policy=policy_mod.loads(""))
+        "commands": [list(command) for command in approved_commands],
+    }, SimpleNamespace(
+        directory=tmp_path / "worker-state",
+        policy=policy_mod.loads(""),
+        verify_commands=approved_commands,
+    )
 
 
 def seed_code(project):
@@ -147,8 +153,13 @@ def test_status_alone_never_ignores_verification_failure(project, tmp_path):
     seed_code(project)
     source = SourceSelector("sprint-status", id="s")
     unit = UnitSpec("s:project:1-1-existing", "s", "1", "Existing", selector="1-1-existing")
-    req, envelope = request(project, source, unit, tmp_path)
-    req["commands"] = [[sys.executable, "-c", "raise SystemExit(1)"]]
+    req, envelope = request(
+        project,
+        source,
+        unit,
+        tmp_path,
+        approved_commands=((sys.executable, "-c", "raise SystemExit(1)"),),
+    )
     before = verify.rev_parse_head(project.project)
     result = verify_existing(req, envelope)
     assert result["outcome"] == "verification_failed"

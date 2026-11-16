@@ -111,7 +111,7 @@ class Transport:
                             "nameWithOwner": group.repository,
                             "pullRequest": {
                                 "id": "PR_1",
-                                "databaseId": 101,
+                                "fullDatabaseId": 101,
                                 "number": group.pr_number,
                                 "headRefOid": group.pr_head,
                                 "baseRefName": group.target,

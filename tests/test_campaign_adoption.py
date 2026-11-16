@@ -10,6 +10,7 @@ import types
 
 import pytest
 from conftest import git
+from test_campaign_github import merged_graphql
 
 from bmad_loop import campaign_adoption as adoption
 from bmad_loop.campaign_github import ApiResponse, GithubGateway
@@ -159,12 +160,16 @@ def case(project, tmp_path):
         pr=pr,
     )
     value.resolver = lambda name, **kwargs: (value.provider, lambda *args: value.service)
-    value.gateway = GithubGateway(
-        types.SimpleNamespace(
-            request=lambda method, path, payload=None: ApiResponse(200, value.pr, {})
-        ),
-        "a/b",
-    )
+
+    def request(method, path, payload=None):
+        if path == "graphql":
+            assert method == "POST" and "mergeCommit" in payload["query"]
+            assert payload["variables"]["number"] == value.pr["number"]
+            return merged_graphql(value.pr, merge_commit=head)
+        assert method == "GET" and path == "repos/a/b/pulls/7"
+        return ApiResponse(200, value.pr, {})
+
+    value.gateway = GithubGateway(types.SimpleNamespace(request=request), "a/b")
     return value
 
 

@@ -68,6 +68,11 @@ class ScriptedReasoning:
                 "covered_span_ids": [span["span_id"] for span in coordinate["owner_spans"]],
                 "obligation_ids": coordinate["obligation_ids"],
                 "ambiguities": [],
+                **(
+                    {"final_verdict": "passed", "final_findings": []}
+                    if "final_verdict" in request["output_schema"].get("required", ())
+                    else {}
+                ),
                 "constraints": [
                     {
                         "span_id": span["span_id"],
@@ -104,23 +109,38 @@ class ScriptedReasoning:
 
 
 @pytest.fixture
-def scripted_reasoning(tmp_path, prepared, monkeypatch):
-    from bmad_loop.campaign_handoff_flow import AUDIT_SCHEMA
+def scripted_reasoning(tmp_path, prepared, monkeypatch, request):
+    from bmad_loop.campaign_fidelity import FINAL_AUDIT_PROMPT_VERSION
+    from bmad_loop.campaign_handoff_obligations import bound_schema
 
-    _, _, request, candidate, capability = prepared
+    variant = getattr(request, "param", "history")
+    _, _, original, candidate, capability = prepared
+    coordinates = {
+        **original.coordinates,
+        "handoff_id": "handoff",
+        "capture_digest": "capture",
+        "owner_ids": [],
+        "owner_spans": [],
+        "obligation_ids": [],
+        **(
+            {
+                "final_frontier": ["final-fixture"],
+                "audit_prompt_version": (
+                    "history-final-audit-v3"
+                    if variant == "legacy-final"
+                    else FINAL_AUDIT_PROMPT_VERSION
+                ),
+            }
+            if variant != "history"
+            else {}
+        ),
+    }
     request = dataclasses.replace(
-        request,
+        original,
         purpose="handoff_audit",
         role="handoff_audit",
-        coordinates={
-            **request.coordinates,
-            "handoff_id": "handoff",
-            "capture_digest": "capture",
-            "owner_ids": [],
-            "owner_spans": [],
-            "obligation_ids": [],
-        },
-        output_schema=AUDIT_SCHEMA,
+        coordinates=coordinates,
+        output_schema=bound_schema(coordinates),
     )
     runner = ScriptedReasoning()
     path = runner.prepare(
@@ -140,6 +160,29 @@ def scripted_reasoning(tmp_path, prepared, monkeypatch):
 
     monkeypatch.setattr(runner, "_launch", launched)
     return runner, path, launches
+
+
+@pytest.mark.parametrize(
+    "scripted_reasoning", ["history", "legacy-final", "current-final"], indirect=True
+)
+def test_scripted_history_audit_satisfies_current_contract(scripted_reasoning):
+    from bmad_loop.campaign_handoff_obligations import final_assessment, validate
+    from bmad_loop.campaign_jobs import validate_result
+
+    runner, path, _ = scripted_reasoning
+    request = read_json(path)["request"]
+    result = runner.launch(path)["receipt"]["result"]
+    validate_result(result, request["output_schema"])
+    validate(result, request["coordinates"], [])
+    if request["coordinates"].get("final_frontier"):
+        assert (
+            final_assessment(
+                result,
+                request["coordinates"],
+                current="final_verdict" in request["output_schema"]["required"],
+            )
+            == []
+        )
 
 
 def test_scripted_observation_cannot_complete_a_rejected_launch(scripted_reasoning):

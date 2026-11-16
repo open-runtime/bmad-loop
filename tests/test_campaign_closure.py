@@ -162,14 +162,20 @@ def test_historical_complete_closure_verifies_both_native_products_without_devel
         "accepted historical closure",
         [layout.project / path for path in artifact["artifacts"]],
     )
+    approved_commands = ((sys.executable, "-c", "pass"),)
     request = {
         "workspace": str(layout.project),
         "source": asdict(source),
         "unit": asdict(unit),
-        "commands": [[sys.executable, "-c", "pass"]],
+        "commands": [list(command) for command in approved_commands],
     }
     result = verify_existing(
-        request, SimpleNamespace(directory=tmp_path / "worker", policy=policy.Policy())
+        request,
+        SimpleNamespace(
+            directory=tmp_path / "worker",
+            policy=policy.Policy(),
+            verify_commands=approved_commands,
+        ),
     )
     assert result["outcome"] == "existing_verified"
     assert [row["kind"] for row in result["source_artifacts"]] == [
