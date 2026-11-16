@@ -382,8 +382,8 @@ def begin(runtime, snapshot, unit, *, requested=None, reason, receipt=None):
     )
 
 
-def intercept_terminal(runtime, snapshot, unit, receipt) -> bool:
-    """Called only after normal worker observation proves coding descendants stopped."""
+def record_terminal_capacity(runtime, snapshot, unit, receipt) -> None:
+    """Retain observed quota debt independently of permission to hand off."""
     if (
         (receipt.get("interruption") or {}).get("kind") == "quota"
         and unit.claim
@@ -421,6 +421,11 @@ def intercept_terminal(runtime, snapshot, unit, receipt) -> bool:
                 reason="native quota interruption",
                 quota_retry_at=deadline,
             )
+
+
+def intercept_terminal(runtime, snapshot, unit, receipt) -> bool:
+    """Called only after normal worker observation proves coding descendants stopped."""
+    record_terminal_capacity(runtime, snapshot, unit, receipt)
     value = unit.evidence.get("handoff")
     if value and unit.claim and unit.claim.launch_id != value["predecessor"]["launch_id"]:
         value["phase"] = "continuing"

@@ -501,17 +501,22 @@ def test_diagnosis_cannot_schedule_model_proposed_controller_commands(project, a
 @pytest.mark.parametrize("hold", ["verification_failed", "operator", "required_approval"])
 @pytest.mark.parametrize("contract", ["decision-v1", "resolution-v1"])
 @pytest.mark.parametrize("outcome", ["invalid_stage_result", "failed"])
+@pytest.mark.parametrize("interruption", [None, "quota", "transport"])
+@pytest.mark.parametrize("worker_state", ["finished", "interrupted"])
 def test_terminal_failed_diagnosis_preserves_original_hold_and_dirty_work(
-    project, tmp_path, hold, contract, outcome
+    project, tmp_path, hold, contract, outcome, interruption, worker_state
 ):
     from types import SimpleNamespace
 
     from bmad_loop.campaign_runtime import CampaignRuntime
-    from bmad_loop.campaign_store import CampaignStore
+    from bmad_loop.campaign_store import CampaignStore, add_action
 
     snapshot = state(project, hold=hold)
     unit = snapshot.units["s:project:u"]
     snapshot.spec = dataclasses.replace(snapshot.spec, units=(unit.spec,))
+    snapshot.spec = dataclasses.replace(
+        snapshot.spec, reasoning=dataclasses.replace(snapshot.spec.reasoning, enabled=True)
+    )
     unit.evidence["contributing_models"] = [{"family": "claude", "model": "writer"}]
     unit.evidence["uncertain_external_action"] = {"id": "retained-write", "state": "unknown"}
     unit.evidence["required_findings"] = [{"id": "unfinished-acceptance"}]
@@ -547,16 +552,38 @@ def test_terminal_failed_diagnosis_preserves_original_hold_and_dirty_work(
         "stage": "decision_review" if contract == "decision-v1" else "escalation",
         "error": "Scripted rejected diagnosis",
     }
+    if interruption:
+        receipt["interruption"] = {"kind": interruption}
+    add_action(
+        snapshot,
+        "launch",
+        unit.id,
+        {"candidate": {"profile": "claude", "model": "scripted-model"}},
+        action_id="diagnosis",
+    )
+    data = {"state": "finished", "receipt": receipt}
+    expected = receipt
+    if worker_state == "interrupted":
+        data = {
+            "state": "interrupted",
+            "head": before["head"],
+            "quiescence_confirmed": True,
+            "interruption": receipt.get("interruption"),
+        }
+        expected = {**data, "outcome": "interrupted"}
     runtime._apply_worker(
         snapshot,
         unit,
         SimpleNamespace(payload={"launch_id": "diagnosis"}),
-        {"state": "finished", "receipt": receipt},
+        data,
     )
     assert dataclasses.asdict(unit.hold) == before["hold"]
     assert (unit.attempt, unit.resolution_attempts) == before["attempts"]
     assert unit.claim.quiescent
-    assert unit.evidence["resolution_failures"][-1]["receipt"] == receipt
+    assert "handoff" not in unit.evidence
+    assert unit.evidence["resolution_failures"][-1]["receipt"] == expected
+    if interruption == "quota":
+        assert "diagnosis" in unit.evidence["quota_fault_observations"]
     assert unit.evidence["required_findings"] == [{"id": "unfinished-acceptance"}]
     assert unit.evidence["uncertain_external_action"]["state"] == "unknown"
     assert unit.evidence["contributing_models"] == [{"family": "claude", "model": "writer"}]

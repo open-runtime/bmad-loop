@@ -5920,7 +5920,12 @@ class CampaignRuntime:
         if not request_path.exists():
             return False
         request = json.loads(request_path.read_text(encoding="utf-8"))
-        return preserve_failed_diagnosis(snapshot, unit, request, receipt)
+        if not preserve_failed_diagnosis(snapshot, unit, request, receipt):
+            return False
+        from .campaign_handoff_flow import record_terminal_capacity
+
+        record_terminal_capacity(self, snapshot, unit, receipt)
+        return True
 
     def _apply_worker(self, snapshot, unit, action, data) -> None:
         claim = unit.claim
@@ -5954,6 +5959,9 @@ class CampaignRuntime:
             from .campaign_usage import apply as apply_usage
 
             apply_usage(snapshot, unit, data, role=claim.role)
+            if self._preserve_diagnosis_failure(snapshot, unit, {**data, "outcome": "interrupted"}):
+                unit.bindings["head"] = data["head"]
+                return
             from .campaign_handoff_flow import intercept_terminal
 
             if intercept_terminal(self, snapshot, unit, data):
@@ -5984,8 +5992,6 @@ class CampaignRuntime:
                 "revision": data["head"],
                 "detail": "worker interrupted after coding actors were confirmed stopped",
             }
-            if self._preserve_diagnosis_failure(snapshot, unit, {**data, "outcome": "interrupted"}):
-                return
             self._set_hold(
                 unit,
                 Hold(
@@ -6057,12 +6063,12 @@ class CampaignRuntime:
 
             if any(row.get("role") == "dev" for row in receipt["sessions"]):
                 record_contributors(snapshot, unit, receipt)
-        if intercept_terminal(self, snapshot, unit, receipt):
-            return
         outcome = receipt["outcome"]
         if outcome != "stage_complete" and self._preserve_diagnosis_failure(
             snapshot, unit, receipt
         ):
+            return
+        if intercept_terminal(self, snapshot, unit, receipt):
             return
         if outcome == "stage_complete":
             directory = self.store.directory(snapshot.id) / "workers" / claim.launch_id
