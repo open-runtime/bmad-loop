@@ -11,8 +11,13 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 
 from . import verify
+from .campaign_model import CampaignError
 from .campaign_publication import PublicationController, PublicationRequirements
 from .campaign_supervisor import Observation
+
+
+class ExternalLandingStale(CampaignError):
+    """A completed observation needs fresh authority before it can be adopted."""
 
 
 @dataclass(frozen=True)

@@ -28,14 +28,13 @@ OTHER = "f" * 40
 UNIT = "source:project:owned"
 
 
-@pytest.fixture(params=["json", "sqlite"])
-def external_landing_case(tmp_path, request):
+def make_landing_case(tmp_path, storage, acceptance):
     spec = UnitSpec(
         UNIT,
         "source",
         "epic",
         "Owned story",
-        acceptance=("Preserve the accepted product", "Retain published history"),
+        acceptance=acceptance,
         scopes=("src/owned",),
     )
     coordinates = {
@@ -100,7 +99,7 @@ def external_landing_case(tmp_path, request):
             )
         ],
     )
-    store = CampaignStore(tmp_path / "authority", storage=request.param)
+    store = CampaignStore(tmp_path / "authority", storage=storage)
     snapshot = store.create(snapshot)
     proof = ExternalLandingEvidence(
         repository=snapshot.repository,
@@ -124,6 +123,61 @@ def external_landing_case(tmp_path, request):
         pr_number=41,
     )
     return store, snapshot, proof
+
+
+@pytest.fixture(params=["json", "sqlite"])
+def external_landing_case(tmp_path, request):
+    return make_landing_case(
+        tmp_path,
+        request.param,
+        ("Preserve the accepted product", "Retain published history"),
+    )
+
+
+@pytest.fixture(params=["json", "sqlite"])
+def accepted_empty_landing_case(tmp_path, request):
+    from bmad_loop.campaign_acceptance import provenance
+    from bmad_loop.campaign_landing_acceptance import acceptance, candidate
+
+    # Start a separate campaign with no declared criteria. Never remove an
+    # existing obligation from a retained campaign's acceptance ledger.
+    case = make_landing_case(tmp_path / "empty-acceptance", request.param, ())
+    store, _, _ = case
+    snapshot = land(case)
+    unit = snapshot.units[UNIT]
+    assert unit.spec.acceptance == ()
+    assert unit.evidence["acceptance"]["criteria"] == []
+    selected = candidate(unit)
+    assert selected.head == MERGE
+    commands = [{"argv": ["scripted-verifier", "check"], "returncode": 0}]
+    verification = {
+        "outcome": "verified",
+        "head": MERGE,
+        "launch_id": "landing-verify",
+        "commands": commands,
+        "proof": provenance(
+            tmp_path,
+            MERGE,
+            [row["argv"] for row in commands],
+            config_revision=selected.config_revision,
+        ),
+    }
+    review = {
+        "outcome": "stage_complete",
+        "head": MERGE,
+        "launch_id": "landing-review",
+        "provider_family": "claude",
+        "validated": {"verdict": "approved", "coordinates": asdict(selected)},
+        "artifact": {"acceptance_evidence": []},
+    }
+    debt = unit.evidence["landing_acceptance"]
+    debt.update(state="accepted", verification=verification, review=review)
+    debt["acceptance"] = acceptance(unit, review)
+    assert debt["acceptance"]["complete"] and debt["acceptance"]["criteria"] == []
+    saved = store.save(snapshot, snapshot.revision)
+    restored = store.load(saved.id)
+    assert restored.units[UNIT].evidence["landing_acceptance"] == debt
+    return store, restored
 
 
 def land(case):
@@ -447,3 +501,61 @@ def test_accepted_landing_repair_remains_bound_to_its_original_product(
     restored = store.load(snapshot.id)
     assert restored.units[UNIT] == accepted.units[UNIT]
     assert restored.units[repair_id] == accepted.units[repair_id]
+
+
+def test_empty_acceptance_landing_still_requires_exact_executed_receipts(
+    accepted_empty_landing_case,
+):
+    from bmad_loop.campaign_acceptance import digest
+
+    store, snapshot = accepted_empty_landing_case
+    debt = snapshot.units[UNIT].evidence["landing_acceptance"]
+    proof = debt["verification"]["proof"]
+    assert proof["head"] == debt["merge_commit"] == MERGE
+    assert proof["recipe_digest"] == digest(proof["recipe"])
+    assert proof["environment_digest"] == digest(proof["environment"])
+    assert debt["review"]["validated"]["coordinates"]["head"] == MERGE
+    assert store.load(snapshot.id).units[UNIT].evidence["acceptance"]["criteria"] == []
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "missing_proof",
+        "recipe_digest",
+        "environment_digest",
+        "head",
+        "base",
+        "source_revision",
+        "graph_revision",
+        "config_revision",
+        "failed_command",
+    ],
+)
+def test_empty_acceptance_landing_cannot_hide_stale_or_failed_receipts(
+    accepted_empty_landing_case, damage
+):
+    store, accepted = accepted_empty_landing_case
+    snapshot = accepted.clone()
+    debt = snapshot.units[UNIT].evidence["landing_acceptance"]
+    assert debt["state"] == "accepted" and debt["acceptance"]["complete"]
+    assert debt["acceptance"]["criteria"] == []
+    if damage == "missing_proof":
+        debt["verification"].pop("proof")
+    elif damage in {"recipe_digest", "environment_digest"}:
+        debt["verification"]["proof"][damage] = "different-digest"
+    elif damage == "failed_command":
+        assert debt["verification"]["outcome"] == "verified"
+        debt["verification"]["commands"][0]["returncode"] = 1
+    else:
+        coordinates = debt["review"]["validated"]["coordinates"]
+        coordinates[damage] = {
+            "head": OTHER,
+            "base": OTHER,
+            "source_revision": "another-source",
+            "graph_revision": 2,
+            "config_revision": "2",
+        }[damage]
+    with pytest.raises(CampaignError, match="exact merged-product acceptance"):
+        store.save(snapshot, snapshot.revision)
+    assert store.load(snapshot.id).units[UNIT] == accepted.units[UNIT]

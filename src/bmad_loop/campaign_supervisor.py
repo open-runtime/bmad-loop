@@ -174,9 +174,26 @@ class CampaignSupervisor:
                     )
             if observation.state not in {"confirmed", "unknown", "rejected", "waiting"}:
                 raise CampaignError("driver returned an invalid effect state")
+            landing_boundary = observation.state == "confirmed" and bool(
+                observation.data.get("external_landing")
+            )
+            if landing_boundary and changed:
+                snapshot = self._save(snapshot)
+                changed = False
+                action = next(row for row in snapshot.outbox if row.id == action_id)
             if observation.state == "confirmed":
                 # Driver validates receipt coordinates before any state mutation.
-                self.driver.apply(snapshot, action, observation)
+                from .campaign_external_merge import ExternalLandingStale
+
+                try:
+                    self.driver.apply(snapshot, action, observation)
+                except ExternalLandingStale as exc:
+                    if not landing_boundary:
+                        raise
+                    observation = Observation(
+                        "waiting", observation.data, reason=str(exc), retry_at=self.clock() + 5
+                    )
+            if observation.state == "confirmed":
                 action.state = "confirmed"
                 from .campaign_boundary_receipts import project as project_receipt
 
@@ -232,6 +249,11 @@ class CampaignSupervisor:
                 snapshot, action, state=observation.state, data=observation.data, now=self.clock()
             )
             changed = True
+            if landing_boundary:
+                # Preserve the adoption's exact authority revision before an
+                # unrelated completed effect can change the campaign graph.
+                snapshot = self._save(snapshot)
+                changed = False
         return self._save(snapshot) if changed else snapshot
 
     def _dispatch_ready(

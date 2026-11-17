@@ -897,7 +897,8 @@ def _validate_external_landing_debt(unit, snapshot) -> None:
             ):
                 raise CampaignError("external landing requires its completed linked repair proof")
         else:
-            from .campaign_landing_acceptance import acceptance
+            from .campaign_acceptance import receipts_current
+            from .campaign_landing_acceptance import acceptance, candidate
 
             verification = debt.get("verification", {})
             review = debt.get("review", {})
@@ -914,6 +915,14 @@ def _validate_external_landing_debt(unit, snapshot) -> None:
                 or not review.get("launch_id")
                 or review.get("validated", {}).get("verdict") != "approved"
                 or not debt.get("acceptance", {}).get("complete")
+                or not receipts_current(verification, review, candidate(unit))
+                or any(
+                    command.get("returncode") != 0
+                    or command.get("timed_out")
+                    or command.get("interrupted")
+                    or command.get("spawn_error")
+                    for command in verification.get("commands", [])
+                )
                 or not acceptance(unit, review).get("complete")
                 or (
                     snapshot.spec.github.require_independent_review
