@@ -274,6 +274,23 @@ def test_pending_external_landing_cannot_be_accepted_by_state_alone(external_lan
     assert restored.units[UNIT] == original.units[UNIT]
 
 
+def test_pending_external_landing_cannot_complete_tracking(external_landing_case):
+    store, _, _ = external_landing_case
+    original = land(external_landing_case)
+    snapshot = original.clone()
+    unit = snapshot.units[UNIT]
+    assert unit.state == UnitState.MERGED_PENDING_SYNC
+    assert unit.evidence["landing_acceptance"]["state"] == "pending"
+    unit.state = UnitState.DELIVERED
+    with pytest.raises(
+        CampaignError,
+        match="cannot complete without accepted merged-product evidence",
+    ):
+        store.save(snapshot, snapshot.revision)
+    restored = store.load(snapshot.id)
+    assert restored.units[UNIT] == original.units[UNIT]
+
+
 @pytest.mark.parametrize("revision", ["graph_revision", "config_revision"])
 def test_initial_external_landing_save_cannot_change_revision_at_once(
     external_landing_case, revision

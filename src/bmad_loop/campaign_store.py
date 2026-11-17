@@ -878,6 +878,10 @@ def _validate_external_landing_debt(unit, snapshot) -> None:
         or merge.get("canonical_head") != expected["canonical_head"]
     ):
         raise CampaignError("external landing merge identity changed")
+    if unit.state == UnitState.DELIVERED and debt["state"] != "accepted":
+        raise CampaignError(
+            "external landing cannot complete without accepted merged-product evidence"
+        )
     if debt["state"] == "accepted":
         repaired = debt.get("repaired")
         if repaired:
