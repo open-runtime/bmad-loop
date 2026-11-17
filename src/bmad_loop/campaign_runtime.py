@@ -5840,6 +5840,21 @@ class CampaignRuntime:
                         evidence={"merge": data["merge"]},
                     ),
                 )
+            elif data.get("external_landing"):
+                from .campaign_external_merge import ExternalLandingEvidence
+                from .campaign_store import reconcile_external_landing
+
+                raw = dict(data["external_landing"])
+                raw["parents"] = tuple(raw["parents"])
+                raw["checkpoint_heads"] = tuple(raw["checkpoint_heads"])
+                proof = ExternalLandingEvidence(**raw)
+                if (
+                    data.get("merge", {}).get("merge_commit") != proof.merge_commit
+                    or data.get("merge", {}).get("canonical_head") != proof.canonical_head
+                ):
+                    raise CampaignError("External landing observation names a different merge")
+                reconcile_external_landing(snapshot, unit.id, proof)
+                unit.evidence["observed_external_merge"] = data["merge"]
             elif data.get("external_merge"):
                 from .campaign_external_merge import ExternalMergeEvidence
                 from .campaign_store import reconcile_external_merge

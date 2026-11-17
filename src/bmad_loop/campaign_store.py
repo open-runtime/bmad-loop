@@ -40,7 +40,7 @@ from .platform_util import atomic_write_text, file_lock
 from .statemachine import check_campaign_transition
 
 if TYPE_CHECKING:
-    from .campaign_external_merge import ExternalMergeEvidence
+    from .campaign_external_merge import ExternalLandingEvidence, ExternalMergeEvidence
 
 
 class RevisionConflict(CampaignError):
@@ -266,6 +266,27 @@ class CampaignStore:
                     raise CampaignError("configuration change requires quiescent reasoning jobs")
             for key, unit in previous.units.items():
                 replacement = snapshot.units.get(key)
+                if unit.evidence.get("external_landing"):
+                    if (
+                        replacement is None
+                        or replacement.evidence.get("external_landing")
+                        != unit.evidence["external_landing"]
+                    ):
+                        raise CampaignError("observed external landing identity is immutable")
+                    prior_writers = set(unit.evidence.get("developer_families", ()))
+                    next_writers = set(replacement.evidence.get("developer_families", ()))
+                    if unit.evidence.get("developer_family"):
+                        prior_writers.add(unit.evidence["developer_family"])
+                    if replacement.evidence.get("developer_family"):
+                        next_writers.add(replacement.evidence["developer_family"])
+                    if not prior_writers.issubset(next_writers) or (
+                        unit.evidence.get("developer_attribution_incomplete")
+                        and not replacement.evidence.get("developer_attribution_incomplete")
+                    ):
+                        raise CampaignError(
+                            "external landing must retain every contributing family"
+                        )
+                    _validate_external_landing_debt(replacement, snapshot)
                 if unit.state == UnitState.DELIVERED and (
                     replacement is None
                     or replacement.spec != unit.spec
@@ -287,6 +308,69 @@ class CampaignStore:
                         reconcile_prior_delivery(
                             audit, key, PriorDeliveryProof(**replacement.evidence["prior_delivery"])
                         )
+                    elif (
+                        unit.state == UnitState.READY_TO_PUBLISH
+                        and replacement.state == UnitState.MERGED_PENDING_SYNC
+                        and replacement.evidence.get("external_landing")
+                    ):
+                        from .campaign_external_merge import ExternalLandingEvidence
+
+                        raw = dict(replacement.evidence["external_landing"])
+                        raw["parents"] = tuple(raw["parents"])
+                        raw["checkpoint_heads"] = tuple(raw["checkpoint_heads"])
+                        # Audit against persisted authority, not a replacement
+                        # that could have removed a hold or claimed quiescence.
+                        audit = previous.clone()
+                        if (
+                            snapshot.graph_revision != previous.graph_revision
+                            or snapshot.config_revision != previous.config_revision
+                        ):
+                            raise CampaignError("external landing authority revision changed")
+                        reconcile_external_landing(audit, key, ExternalLandingEvidence(**raw))
+                        expected = audit.units[key]
+                        for evidence_key in ("external_landing", "landing_acceptance", "merge"):
+                            if _json(replacement.evidence.get(evidence_key)) != _json(
+                                expected.evidence[evidence_key]
+                            ):
+                                raise CampaignError(
+                                    "external landing requires its exact pending acceptance debt"
+                                )
+                        if any(
+                            getattr(replacement, field) != getattr(unit, field)
+                            for field in (
+                                "spec",
+                                "claim",
+                                "hold",
+                                "attempt",
+                                "failure_attempts",
+                                "resolution_attempts",
+                                "review_attempts",
+                            )
+                        ):
+                            raise CampaignError(
+                                "external landing cannot rewrite retained unit authority"
+                            )
+                        if any(
+                            replacement.bindings.get(field) != unit.bindings.get(field)
+                            for field in (
+                                "workspace",
+                                "branch",
+                                "pr",
+                                "source_revision",
+                            )
+                        ) or any(
+                            replacement.evidence.get(field) != unit.evidence.get(field)
+                            for field in (
+                                "developer_family",
+                                "developer_families",
+                                "developer_attribution_incomplete",
+                                "acceptance",
+                                "usage",
+                            )
+                        ):
+                            raise CampaignError(
+                                "external landing must preserve ownership and acceptance obligations"
+                            )
                     elif (
                         unit.state == UnitState.READY_TO_PUBLISH
                         and replacement.state == UnitState.MERGED_PENDING_SYNC
@@ -678,10 +762,8 @@ def transition(snapshot: CampaignSnapshot, unit: str, target: UnitState, **detai
     add_event(snapshot, "transition", unit=unit, source=str(source), target=str(target), **details)
 
 
-def reconcile_external_merge(
-    snapshot: CampaignSnapshot, unit_id: str, proof: ExternalMergeEvidence
-) -> None:
-    """Record a canonical external landing without inventing native submission."""
+def _external_merge_unit(snapshot, unit_id, proof):
+    """Validate current authority shared by covered and unaccepted landings."""
     from .campaign_external_merge import ExternalMergeEvidence
     from .statemachine import check_campaign_external_merge
 
@@ -690,7 +772,6 @@ def reconcile_external_merge(
     integrated = unit.evidence.get("integrated", {})
     if (
         not isinstance(proof, ExternalMergeEvidence)
-        or proof.schema_version != 1
         or proof.repository != snapshot.repository
         or proof.unit_id != unit.id
         or proof.head != integrated.get("head")
@@ -698,7 +779,6 @@ def reconcile_external_merge(
         or proof.target != snapshot.spec.target
         or not proof.merge_commit
         or not proof.canonical_head
-        or not proof.covered_tree
         or not proof.quiescent
         or not proof.parents
         or not unit.claim
@@ -715,13 +795,203 @@ def reconcile_external_merge(
         raise CampaignError(
             "external merge proof is stale, uncovered or does not match accepted unit authority"
         )
-    from dataclasses import asdict
+    return unit
+
+
+def reconcile_external_merge(
+    snapshot: CampaignSnapshot, unit_id: str, proof: ExternalMergeEvidence
+) -> None:
+    """Record a covered canonical landing without inventing native submission."""
+    unit = _external_merge_unit(snapshot, unit_id, proof)
+    if proof.schema_version != 1 or not proof.covered_tree:
+        raise CampaignError(
+            "external merge proof is stale, uncovered or does not match accepted unit authority"
+        )
 
     unit.state = UnitState.MERGED_PENDING_SYNC
-    unit.evidence["external_merge"] = asdict(proof)
+    unit.evidence["external_merge"] = dataclasses.asdict(proof)
     add_event(
         snapshot,
         "external-merge-reconciled",
+        unit=unit.id,
+        head=proof.head,
+        merge_commit=proof.merge_commit,
+        canonical_head=proof.canonical_head,
+    )
+
+
+def _external_landing_debt(proof) -> dict[str, Any]:
+    from .campaign_publication import Candidate
+
+    candidate = Candidate(
+        proof.repository,
+        proof.unit_id,
+        proof.pr_number,
+        proof.head,
+        proof.base,
+        proof.source_revision,
+        proof.graph_revision,
+        str(proof.config_revision),
+        proof.target,
+    )
+    return {
+        "schema_version": 1,
+        "state": "pending",
+        "candidate": dataclasses.asdict(candidate),
+        "merge_commit": proof.merge_commit,
+        "merge_tree": proof.merge_tree,
+        "merge_parents": list(proof.parents),
+        "canonical_head": proof.canonical_head,
+        "reason": "Actual merged product requires selected verification and independent review",
+    }
+
+
+def _validate_external_landing_debt(unit, snapshot) -> None:
+    """Retain the frozen merge obligation across later repair graph revisions."""
+    from .campaign_external_merge import ExternalLandingEvidence
+
+    raw = dict(unit.evidence["external_landing"])
+    raw["parents"] = tuple(raw["parents"])
+    raw["checkpoint_heads"] = tuple(raw["checkpoint_heads"])
+    expected = _external_landing_debt(ExternalLandingEvidence(**raw))
+    debt = unit.evidence.get("landing_acceptance")
+    if (
+        not isinstance(debt, dict)
+        or debt.get("state")
+        not in {
+            "pending",
+            "verifying",
+            "reviewing",
+            "repair_pending",
+            "accepted",
+        }
+        or any(
+            debt.get(key) != value
+            for key, value in expected.items()
+            if key not in {"state", "reason"}
+        )
+    ):
+        raise CampaignError("external landing acceptance debt is missing or rebound")
+    merge = unit.evidence.get("merge", {})
+    if (
+        merge.get("merge_commit") != expected["merge_commit"]
+        or merge.get("canonical_head") != expected["canonical_head"]
+    ):
+        raise CampaignError("external landing merge identity changed")
+    if debt["state"] == "accepted":
+        repaired = debt.get("repaired")
+        if repaired:
+            repair = snapshot.units.get(debt.get("repair_unit"))
+            if (
+                repair is None
+                or repair.state != UnitState.DELIVERED
+                or repair.spec.kind != "landing_repair"
+                or repair.spec.parent != unit.id
+                or repair.bindings.get("landing_parent") != unit.id
+                or repair.evidence.get("landing_original_merge") != expected["merge_commit"]
+                or repaired.get("repair_unit") != repair.id
+                or repaired.get("repair_merge") != repair.evidence.get("merge")
+                or not repaired.get("acceptance", {}).get("complete")
+                or repaired.get("acceptance")
+                != repair.evidence.get("acceptance", {}).get("current")
+            ):
+                raise CampaignError("external landing requires its completed linked repair proof")
+        else:
+            from .campaign_landing_acceptance import acceptance
+
+            verification = debt.get("verification", {})
+            review = debt.get("review", {})
+            writers = set(unit.evidence.get("developer_families", ()))
+            if unit.evidence.get("developer_family"):
+                writers.add(unit.evidence["developer_family"])
+            reviewer = review.get("provider_family")
+            if (
+                verification.get("outcome") != "verified"
+                or verification.get("head") != expected["merge_commit"]
+                or not verification.get("launch_id")
+                or review.get("outcome") != "stage_complete"
+                or review.get("head") != expected["merge_commit"]
+                or not review.get("launch_id")
+                or review.get("validated", {}).get("verdict") != "approved"
+                or not debt.get("acceptance", {}).get("complete")
+                or not acceptance(unit, review).get("complete")
+                or (
+                    snapshot.spec.github.require_independent_review
+                    and (
+                        not writers
+                        or not reviewer
+                        or reviewer in writers
+                        or unit.evidence.get("developer_attribution_incomplete")
+                    )
+                )
+            ):
+                raise CampaignError("external landing requires exact merged-product acceptance")
+
+
+def reconcile_external_landing(
+    snapshot: CampaignSnapshot, unit_id: str, proof: ExternalLandingEvidence
+) -> None:
+    """Atomically record an observed merge and its still-unaccepted product."""
+    from .campaign_external_merge import ExternalLandingEvidence
+
+    unit = _external_merge_unit(snapshot, unit_id, proof)
+    review = unit.evidence.get("review", {}).get("validated", {})
+    coordinates = review.get("coordinates", {})
+    verification = unit.evidence.get("verification", {})
+    writers = set(unit.evidence.get("developer_families", ()))
+    if unit.evidence.get("developer_family"):
+        writers.add(unit.evidence["developer_family"])
+    reviewer = unit.evidence.get("review", {}).get("provider_family")
+    if (
+        not isinstance(proof, ExternalLandingEvidence)
+        or proof.schema_version != 2
+        or proof.covered_tree is not False
+        or not re.fullmatch(r"[a-f0-9]{40}|[a-f0-9]{64}", proof.merge_tree)
+        or type(proof.pr_number) is not int
+        or proof.pr_number <= 0
+        or proof.pr_number != unit.bindings.get("pr", {}).get("number")
+        or verification.get("outcome") != "verified"
+        or verification.get("head") != proof.head
+        or review.get("verdict") != "approved"
+        or (
+            snapshot.spec.github.require_independent_review
+            and (
+                not writers
+                or not reviewer
+                or reviewer in writers
+                or unit.evidence.get("developer_attribution_incomplete")
+            )
+        )
+        or any(
+            coordinates.get(key) != value
+            for key, value in {
+                "head": proof.head,
+                "base": proof.base,
+                "source_revision": proof.source_revision,
+                "graph_revision": proof.graph_revision,
+                "config_revision": proof.config_revision,
+            }.items()
+        )
+        or unit.evidence.get("landing_acceptance")
+    ):
+        raise CampaignError(
+            "external landing proof lacks exact current authority or pending acceptance"
+        )
+    unit.evidence["external_landing"] = dataclasses.asdict(proof)
+    unit.evidence["landing_acceptance"] = _external_landing_debt(proof)
+    from .campaign_publication import MergeReceipt
+
+    unit.evidence["merge"] = dataclasses.asdict(
+        MergeReceipt(
+            "merged_pending_sync",
+            merge_commit=proof.merge_commit,
+            canonical_head=proof.canonical_head,
+        )
+    )
+    unit.state = UnitState.MERGED_PENDING_SYNC
+    add_event(
+        snapshot,
+        "external-landing-observed",
         unit=unit.id,
         head=proof.head,
         merge_commit=proof.merge_commit,

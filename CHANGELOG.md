@@ -9,6 +9,7 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Verify and independently review uncovered external merges before completing tracking; retain pending acceptance across restart.
 - Align ADR index readiness with partial implementation and document campaign `authorize-scope` and required direct-merge settings.
 - Bind diagnosis verification to frozen command authority and retain original holds when recovery proposals fail.
 - Support disabled issue discovery and reconcile actual merged identities through joined GitHub GraphQL evidence.

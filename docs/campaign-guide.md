@@ -502,6 +502,15 @@ linked repair PR and keeps original tracking pending until the repair is accepte
 Landing reviews use the confirmed canonical merge identity; closing or deleting
 the merged PR branch does not block that review or waive landing acceptance.
 
+When another actor merges a ready PR, the campaign verifies that the accepted
+head and retained checkpoints survive in the actual merge and current target.
+An uncovered merged product enters `merged_pending_sync` with durable pending
+acceptance. Verification and independent review run on that exact merge before
+tracking can complete; failed acceptance uses the same bounded linked-repair
+workflow. The original PR, worktree, contributors and acceptance obligations
+remain bound throughout restart. Previously recorded `postmerge_acceptance`
+holds remain an explicit recovery limitation.
+
 Repair drafts retain the original accepted product specification from its exact
 reviewed Git head, including embedded native plan text and source hashes. This
 also works when ticket acceptance lives in the native plan rather than duplicated
