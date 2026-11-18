@@ -36,9 +36,10 @@ results to the successor or treating a summary as proof that ownership ended.
 The initial extension landed in PR 18 alongside the original audit repairs. Follow
 the [G0–G8 traceability matrix](0002-campaign-implementation.md#implementation-goals-and-traceability)
 and keep implementation, normal-runtime coverage, native qualification and
-activation separate. Native qualification, both writable continuation directions,
-full-history semantic evidence, merged installation and generic onboarding have
-been demonstrated. Each follow-up candidate requires applicable affected checks and
+activation separate. Earlier candidate records cover native qualification, writable
+continuation directions, full-history semantic evidence, installation and onboarding;
+they establish current readiness only when maintained validators accept their exact
+subjects and dependencies. Each follow-up candidate requires applicable affected checks and
 independent reviews. First qualify hosted two-story delivery in a separate
 disposable repository. The old REM pilot remains retired with its evidence and
 branches preserved; fresh REM activation is a later, separately authorized gate.

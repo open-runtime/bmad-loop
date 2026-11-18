@@ -14,6 +14,7 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Preserve commit history, index preimages and unresolved finalization effects across Git timeouts; block replay until reconciliation.
 - Verify and independently review uncovered external merges before completing tracking; retain pending acceptance across restart.
 - Align ADR index readiness with partial implementation and document campaign `authorize-scope` and required direct-merge settings.
 - Bind diagnosis verification to frozen command authority and retain original holds when recovery proposals fail.

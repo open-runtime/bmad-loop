@@ -81,6 +81,37 @@ the protection for merge history. A missing same-name branch ref permits its fir
 publication. Git's configured upstream does not override the publisher's explicit
 remote and branch destination.
 
+Finalization records the original HEAD and exact index before staging, with a
+retained recovery ref and an operation record outside the checkout. A timed-out
+Git command triggers bounded cleanup of its observed, birth-identified process
+tree. Incomplete process observations or unsettled pipes remain explicit
+uncertainty; this observation does not guarantee containment of a daemon that
+escaped between samples.
+
+Staging and commit hooks use operation-owned private indexes while the real index remains
+locked. Confirmed completion publishes that private index only after rechecking
+the real index and current HEAD. Unknown writer cleanup retains the owned
+`index.lock` lease, which names its operation record; it is not a stale lock merely
+because the controller stopped.
+
+The commit receives an operation-specific [Git reflog action](https://git-scm.com/docs/git#Documentation/git.txt-GITREFLOGACTION).
+Finalization reads that identity back, retains the commit, and checks its raw parent
+and tree before accepting the current HEAD. A peer moving the branch leaves both
+histories preserved and the operation unresolved. Reflog creation is enabled only
+in the commit process through Git's [runtime configuration](https://git-scm.com/docs/git-config/2.34.0#ENVIRONMENT),
+with existing configuration entries preserved.
+
+A definitive commit refusal can restore only the operation's own unchanged
+branch and index. A lost acknowledgement, possible landed commit, concurrent edit
+or incomplete cleanup leaves the task `committing` and journals
+`finalization-uncertain`, including the recovery record location. The record also
+retains available ticket, park-record and deferred-close preimages. Resume checks
+this record before repeating hooks or bookkeeping and pauses while its outcome
+is unresolved. Retain the record and recovery ref for reconciliation; removing
+them does not prove that the previous commit failed.
+Unresolved outcomes currently require operator-assisted reconciliation; ordinary
+resume does not clear their record or retained index lease.
+
 ## The smart stall check
 
 A dev or review session that stays silent for `limits.dev_stall_grace_s` reaches the stall gate. With `stall_check = "smart"` the gate reads the session's last turn from its own transcript (Claude Code's JSONL, Codex's rollout) and from what its Stop hook reported, and decides in this order:

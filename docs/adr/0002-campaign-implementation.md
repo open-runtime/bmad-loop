@@ -38,13 +38,19 @@ repair work uses a separate G0–G6 acceptance ledger: reconciliation/documentat
 command and preservation authority, GitHub delivery/recovery, repository intake
 and organization, autonomous recovery, reasoning/handoff/messaging, and operator
 visibility/parallelism. Historical passing rows do not close that repair ledger.
-In particular, typed child-pause receipts, single-use continuation permits and the
-proposed `campaign inbox`, `campaign answer` and `campaign rearm` interfaces remain
-unfinished. Existing `campaign reconcile` supplies observation without granting
+Typed child-pause receipts, single-use permits for owned quota/transport development
+continuation, and the read-only `campaign inbox` are implemented. General technical
+rearm and the proposed `campaign answer` and `campaign rearm` interfaces remain
+unfinished; legacy unknown pauses and protected owner/authentication holds do not
+gain continuation authority. Existing `campaign reconcile` supplies observation without granting
 worker launch or permission to replay an uncertain mutation. Bot-thread resolution
 remains manual; automatic resolution requires explicitly configured identities,
 linked fixes, independent current-head verification and fresh thread evidence.
 Human objections remain protected even within a bot-created thread.
+
+The accepted shared-session ceiling covers execution, review, reasoning and
+verification. Existing model-session accounting does not bound all four classes;
+that aggregate ceiling and its sustained-load qualification remain unfinished.
 
 Controller verification derives executable argv from frozen approved configuration.
 Diagnosis results may propose commands but cannot expand that authority; persisted
@@ -54,6 +60,15 @@ authentication. This environment separation does not establish confinement of
 file-backed credentials or system credential helpers; that remains a separate
 unfulfilled security requirement. Rejected diagnosis artifacts retain the original
 hold and failed-attempt evidence instead of inventing a replacement condition.
+
+Local finalization retains original history and index preimages before mutation.
+Staging and commit use private indexes under a lease on the real index; publication
+and compensation require current subject bindings and observed process cleanup.
+Uncertain effects retain their operation record, possible landed history and any
+unresolved index lease. Resume encounters that record before repeating commit
+hooks or bookkeeping. This preservation boundary does not yet provide autonomous
+reconciliation of every unknown local commit outcome, and observed process trees
+do not establish universal daemon containment.
 
 Disabled issue discovery returns a complete empty batch without moving its cursor;
 mapped issue, comment, review and PR observations remain stage-boundary obligations.

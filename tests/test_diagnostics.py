@@ -82,6 +82,20 @@ def test_campaign_review_handoff_identifiers_are_aliased():
     assert result["handoff_id"] != entry["handoff_id"]
 
 
+def test_uncertain_finalization_operation_and_record_remain_private():
+    entry = {
+        "kind": "finalization-uncertain",
+        "operation": "f" * 32,
+        "record": "/private/customer/record.json",
+        "reason": "customer commit outcome unknown",
+    }
+    pseudo = sanitize.Pseudonymizer()
+    result = diagnostics._scrub_entry(entry, pseudo, {}, None)
+    assert result["operation"] == pseudo.alias(entry["operation"], ns="operation")
+    assert result["operation"] != entry["operation"]
+    assert "customer" not in json.dumps(result)
+
+
 # Labelled canaries planted across the run dir. NONE may appear in the dump.
 EMAIL = "victim.canary@example.com"
 STORY_KEY = "1.2-AcmeQuantumBillingEngine"

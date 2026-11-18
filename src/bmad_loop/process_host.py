@@ -25,6 +25,7 @@ import signal
 import subprocess
 import sys
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
@@ -37,6 +38,22 @@ SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)  # portability: SIGKILL abs
 
 class ProcessHostError(Exception):
     """A process-lifecycle operation could not be carried out on this platform."""
+
+
+@dataclass(frozen=True)
+class DescendantObservation:
+    """One bounded observed-tree census, not proof against escaped daemons.
+
+    Only authenticated members are returned. ``complete`` distinguishes an
+    observed empty tree from unavailable, truncated or racing observations.
+    It is not an atomic snapshot of future forks or proof that actors are dead.
+    Previously observed/reparented members remain the caller's responsibility;
+    every recorded identity must be revalidated before signalling.
+    """
+
+    members: dict[int, float | None]
+    complete: bool
+    problem: str = ""
 
 
 class ProcessHost(ABC):
@@ -136,6 +153,17 @@ class ProcessHost(ABC):
             return {}
         return _psutil_descendants(pid)
 
+    def observe_descendants(self, pid: int) -> DescendantObservation:
+        """Strict callers need an explicit backend, never a best-effort fallback."""
+        del pid
+        return DescendantObservation({}, False, "descendant observation unsupported")
+
+    def signal_owned(self, pid: int, identity: float | None, *, force: bool) -> bool:
+        """Signal one observed actor only; legacy tree-kill APIs are not a fallback."""
+        if not _valid_owned_actor(pid, identity):
+            return False
+        raise ProcessHostError("identity-bound single-process signalling unsupported")
+
     def shell_quote(self, arg: str) -> str:
         """Quote ``arg`` for the shell that runs this host's hook commands, so the
         argument-quoting axis sits behind the same seam as ``hook_interpreter``. Not
@@ -170,6 +198,35 @@ class PosixProcessHost(ProcessHost):
         if pid <= 0:
             return
         os.kill(pid, SIGKILL)
+
+    def signal_owned(self, pid: int, identity: float | None, *, force: bool) -> bool:
+        if not _valid_owned_actor(pid, identity):
+            return False
+        try:
+            state = self.liveness_of(pid, identity)
+        except (OSError, ValueError) as exc:
+            raise ProcessHostError("owned process observation failed") from exc
+        if state == "unknown":
+            raise ProcessHostError("owned process identity is unreadable")
+        if state not in {"alive", "dead"}:
+            raise ProcessHostError("owned process liveness is invalid")
+        if state != "alive":
+            return False
+        try:
+            current = self.identity(pid)
+        except (OSError, ValueError) as exc:
+            raise ProcessHostError("owned process identity observation failed") from exc
+        if current is None:
+            raise ProcessHostError("owned process identity became unavailable")
+        if current != identity:
+            return False
+        try:
+            (self.force_kill if force else self.terminate)(pid)
+        except ProcessLookupError:
+            return False
+        except OSError as exc:
+            raise ProcessHostError("owned process signal failed") from exc
+        return True
 
     def is_alive(self, pid: int) -> bool:
         if pid <= 0:
@@ -242,6 +299,15 @@ class PosixProcessHost(ProcessHost):
             return _macos_descendants(pid)
         return super().descendants(pid)
 
+    def observe_descendants(self, pid: int) -> DescendantObservation:
+        if type(pid) is not int or pid <= 0:
+            return DescendantObservation({}, False, "invalid root pid")
+        if sys.platform.startswith("linux"):
+            return _linux_descendant_observation(pid)
+        if sys.platform == "darwin":
+            return _macos_descendant_observation(pid)
+        return super().observe_descendants(pid)
+
     def hook_interpreter(self) -> str:
         return self.shell_quote(str(Path(sys.executable).absolute()))
 
@@ -286,6 +352,31 @@ class WindowsProcessHost(ProcessHost):
             [_taskkill(), "/F", "/T", "/PID", str(pid)], check=False, capture_output=True
         )
 
+    def signal_owned(self, pid: int, identity: float | None, *, force: bool) -> bool:
+        if not _valid_owned_actor(pid, identity):
+            return False
+        try:
+            psutil = _psutil()
+        except Exception as exc:
+            raise ProcessHostError("owned process observation unavailable") from exc
+        try:
+            process = psutil.Process(pid)
+            current = process.create_time()
+            if not _valid_owned_actor(pid, current):
+                raise ProcessHostError("owned process birth identity unavailable")
+            if current != identity or not process.is_running():
+                return False
+            # These psutil methods target this Process, not a recursive /T tree.
+            # psutil also performs its construction-bound PID-reuse check.
+            (process.kill if force else process.terminate)()
+        except Exception as exc:
+            if _psutil_gone(exc, psutil):
+                return False
+            if isinstance(exc, ProcessHostError):
+                raise
+            raise ProcessHostError("owned process signal failed") from exc
+        return True
+
     def is_alive(self, pid: int) -> bool:
         if pid <= 0:
             return False
@@ -298,6 +389,11 @@ class WindowsProcessHost(ProcessHost):
             return _psutil().Process(pid).create_time()
         except Exception:
             return None
+
+    def observe_descendants(self, pid: int) -> DescendantObservation:
+        if type(pid) is not int or pid <= 0:
+            return DescendantObservation({}, False, "invalid root pid")
+        return _psutil_descendant_observation(pid)
 
     def hook_interpreter(self) -> str:
         return self.shell_quote(str(Path(sys.executable).absolute()))
@@ -329,6 +425,19 @@ class WindowsProcessHost(ProcessHost):
         else:
             live = _WINDOWS_BARE_METACHARS
         return tuple(sorted({ch for ch in quoted if ch in live}))
+
+
+def _valid_owned_actor(pid: int, identity: object) -> bool:
+    try:
+        return (
+            type(pid) is int
+            and pid > 0
+            and isinstance(identity, (int, float))
+            and not isinstance(identity, bool)
+            and math.isfinite(identity)
+        )
+    except OverflowError:
+        return False
 
 
 def _proc_starttime(pid: int) -> float | None:
@@ -437,11 +546,12 @@ def _macos_child_reader():
     return reader
 
 
-def _macos_child_pids(pid: int) -> tuple[int, ...]:
+def _macos_child_pids(pid: int, *, strict: bool = False) -> tuple[int, ...]:
     """Kernel-filter direct children, retrying a full buffer within a fixed bound.
 
     proc_listchildpids returns PID count (not bytes). Never substitute psutil's
     host-wide PPID census on failure: preserve the caller's never-raise seam.
+    Strict callers reject invalid entries instead of silently omitting them.
     """
     reader = _macos_child_reader()
     capacity = 64
@@ -452,6 +562,8 @@ def _macos_child_pids(pid: int) -> tuple[int, ...]:
         if count < 0 or (count == 0 and ctypes.get_errno()):
             raise OSError(ctypes.get_errno(), "native child observation failed")
         if count < capacity:
+            if strict and any(value <= 0 for value in children[:count]):
+                raise OSError("native child observation returned an invalid pid")
             return tuple(value for value in children[:count] if value > 0)
         capacity *= 4
     raise OSError("native child observation exceeded its bounded snapshot capacity")
@@ -545,6 +657,246 @@ def _psutil_descendants(pid: int) -> dict[int, float | None]:
     except Exception:  # the kill-path seam must never raise
         return {}
     return out
+
+
+_DESCENDANT_OBSERVATION_LIMIT = 4096
+_CHILDREN_TEXT_LIMIT = 65536
+
+
+def _observation_stamp(value: object) -> float:
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
+        raise ProcessHostError("process identity unavailable")
+    if (sys.platform == "darwin" and value >= -2) or (sys.platform != "darwin" and value < 0):
+        raise ProcessHostError("process identity invalid")
+    return float(value)
+
+
+def _spend_observation(budget: list[int]) -> None:
+    if budget[0] <= 0:
+        raise ProcessHostError("descendant observation bound reached")
+    budget[0] -= 1
+
+
+def _observe_tree(pid, record, children) -> DescendantObservation:
+    """Follow only this root's observed branches, preserving partial evidence."""
+    members: dict[int, float | None] = {}
+    problems: set[str] = set()
+    try:
+        root_stamp, _parent = record(pid)
+        root_stamp = _observation_stamp(root_stamp)
+    except ProcessLookupError:
+        return DescendantObservation({}, True)
+    except Exception as exc:
+        return DescendantObservation(
+            {}, False, f"root observation unavailable: {type(exc).__name__}"
+        )
+    pending = [(pid, root_stamp)]
+    seen = {pid}
+    budget = [_DESCENDANT_OBSERVATION_LIMIT]
+    while pending:
+        parent_pid, parent_stamp = pending.pop()
+        try:
+            _spend_observation(budget)
+            if record(parent_pid)[0] != parent_stamp:
+                raise ProcessHostError("parent generation changed")
+            for child_pid in children(parent_pid, budget):
+                _spend_observation(budget)
+                if type(child_pid) is not int or child_pid <= 0 or child_pid == pid:
+                    raise ProcessHostError("invalid descendant pid")
+                if child_pid in seen:
+                    stamp, ppid = record(child_pid)
+                    if members.get(child_pid) != stamp or ppid != parent_pid:
+                        problems.add("repeated descendant identity changed")
+                    continue
+                seen.add(child_pid)
+                try:
+                    stamp, ppid = record(child_pid)
+                    stamp = _observation_stamp(stamp)
+                    older = (
+                        stamp > parent_stamp if sys.platform == "darwin" else stamp < parent_stamp
+                    )
+                    if older or ppid != parent_pid or record(parent_pid)[0] != parent_stamp:
+                        raise ProcessHostError("descendant ancestry changed")
+                    members[child_pid] = stamp
+                    pending.append((child_pid, stamp))
+                except Exception as exc:
+                    problems.add(f"descendant identity unavailable: {type(exc).__name__}")
+            if record(parent_pid)[0] != parent_stamp:
+                raise ProcessHostError("parent generation changed")
+        except ProcessLookupError:
+            if parent_pid == pid and not members and not problems:
+                return DescendantObservation({}, True)
+            problems.add("observed parent disappeared during census")
+        except Exception as exc:
+            problems.add(f"descendant census incomplete: {type(exc).__name__}")
+        if budget[0] <= 0 and pending:
+            problems.add("descendant observation bound reached")
+            break
+    try:
+        if record(pid)[0] != root_stamp:
+            problems.add("root generation changed during census")
+    except ProcessLookupError:
+        if members:
+            problems.add("root disappeared during census")
+    except Exception as exc:
+        problems.add(f"root recheck unavailable: {type(exc).__name__}")
+    return DescendantObservation(members, not problems, "; ".join(sorted(problems)))
+
+
+def _linux_observed_record(pid: int) -> tuple[float, int]:
+    proc = Path("/proc")  # portability: Linux-only, guarded by observe_descendants()
+    try:
+        raw = (proc / str(pid) / "stat").read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        # A missing procfs mount is not evidence that an individual actor died.
+        own_record = _proc_identity_state(os.getpid())
+        if own_record is None:
+            raise ProcessHostError("procfs process observation unavailable") from exc
+        _observation_stamp(own_record[0])
+        raise ProcessLookupError(pid) from exc
+    values = raw[raw.rindex(")") + 1 :].split()
+    parent = int(values[1])
+    if int(raw[: raw.index("(")].strip()) != pid or parent < 0:
+        raise ProcessHostError("process stat identity malformed")
+    return _observation_stamp(float(values[19])), parent
+
+
+def _linux_observed_children(pid: int, budget: list[int]):
+    """Read per-thread child lists; never add another host-wide /proc census."""
+    task = Path("/proc") / str(pid) / "task"  # portability: Linux-only, guarded by caller
+    for thread in task.iterdir():
+        _spend_observation(budget)
+        if not thread.name.isdigit():
+            continue
+        with (thread / "children").open(encoding="ascii") as stream:
+            raw = stream.read(_CHILDREN_TEXT_LIMIT + 1)
+        for child in raw.split():
+            yield int(child)
+        if len(raw) > _CHILDREN_TEXT_LIMIT:
+            raise ProcessHostError("thread child list exceeded observation bound")
+
+
+def _linux_descendant_observation(pid: int) -> DescendantObservation:
+    return _observe_tree(pid, _linux_observed_record, _linux_observed_children)
+
+
+def _psutil_observed_record(process, psutil) -> tuple[float, int]:
+    stamp = _observation_stamp(_psutil_identity(process))
+    parent = process.ppid()
+    if type(parent) is not int or parent < 0:
+        raise ProcessHostError("process parent unavailable")
+    if not process.is_running():
+        if _psutil_absent(psutil, process.pid):
+            raise ProcessLookupError(process.pid)
+        raise ProcessHostError("process generation changed")
+    return stamp, parent
+
+
+def _psutil_gone(exc: Exception, psutil) -> bool:
+    kind = getattr(psutil, "NoSuchProcess", None)
+    return isinstance(kind, type) and isinstance(exc, kind)
+
+
+def _psutil_absent(psutil, pid: int) -> bool:
+    try:
+        return psutil.pid_exists(pid) is False
+    except Exception:
+        return False  # An unreadable existence check never proves absence.
+
+
+def _macos_descendant_observation(pid: int) -> DescendantObservation:
+    try:
+        psutil = _psutil()
+    except Exception as exc:
+        return DescendantObservation({}, False, f"process census unavailable: {type(exc).__name__}")
+
+    def record(selected):
+        try:
+            return _psutil_observed_record(psutil.Process(selected), psutil)
+        except Exception as exc:
+            if _psutil_gone(exc, psutil) and _psutil_absent(psutil, selected):
+                raise ProcessLookupError(selected) from exc
+            raise
+
+    return _observe_tree(
+        pid, record, lambda parent, _budget: _macos_child_pids(parent, strict=True)
+    )
+
+
+def _psutil_descendant_observation(pid: int) -> DescendantObservation:
+    """Reuse one psutil tree query, never poll a global census per descendant."""
+    members: dict[int, float | None] = {}
+    problems: set[str] = set()
+    try:
+        psutil = _psutil()
+    except Exception as exc:
+        return DescendantObservation({}, False, f"process census unavailable: {type(exc).__name__}")
+    try:
+        root = psutil.Process(pid)
+        root_stamp, _ = _psutil_observed_record(root, psutil)
+        captured = root.children(recursive=True)
+    except Exception as exc:
+        if isinstance(exc, ProcessLookupError) or (
+            _psutil_gone(exc, psutil) and _psutil_absent(psutil, pid)
+        ):
+            return DescendantObservation({}, True)
+        return DescendantObservation({}, False, f"root census unavailable: {type(exc).__name__}")
+    records: dict[int, tuple[float, int | None]] = {pid: (root_stamp, None)}
+    try:
+        observed_children = iter(captured)
+    except Exception as exc:
+        return DescendantObservation({}, False, f"descendant census invalid: {type(exc).__name__}")
+    for index in range(_DESCENDANT_OBSERVATION_LIMIT + 1):
+        try:
+            child = next(observed_children)
+        except StopIteration:
+            break
+        except Exception as exc:
+            problems.add(f"descendant census unavailable: {type(exc).__name__}")
+            break
+        if index >= _DESCENDANT_OBSERVATION_LIMIT:
+            problems.add("descendant observation bound reached")
+            break
+        try:
+            if type(child.pid) is not int or child.pid <= 0 or child.pid == pid:
+                raise ProcessHostError("invalid descendant pid")
+            stamp, parent = _psutil_observed_record(child, psutil)
+            if child.pid in records and records[child.pid] != (stamp, parent):
+                raise ProcessHostError("descendant identity changed")
+            records[child.pid] = (stamp, parent)
+        except Exception as exc:
+            problems.add(f"descendant identity unavailable: {type(exc).__name__}")
+    children_by_parent: dict[int, list[int]] = {}
+    for selected, (_stamp, parent) in records.items():
+        if selected != pid:
+            if parent is None:
+                problems.add("descendant parent unavailable")
+                continue
+            children_by_parent.setdefault(parent, []).append(selected)
+    pending = [pid]
+    seen = {pid}
+    while pending:
+        parent = pending.pop()
+        for selected in children_by_parent.get(parent, ()):
+            stamp = records[selected][0]
+            if selected in seen or stamp < records[parent][0]:
+                problems.add("descendant ancestry changed")
+                continue
+            seen.add(selected)
+            members[selected] = stamp
+            pending.append(selected)
+    if set(records) - seen:
+        problems.add("descendant ancestry unavailable")
+    try:
+        if _psutil_observed_record(root, psutil)[0] != root_stamp:
+            problems.add("root generation changed during census")
+    except ProcessLookupError:
+        if members:
+            problems.add("root disappeared during census")
+    except Exception as exc:
+        if not (_psutil_gone(exc, psutil) and _psutil_absent(psutil, pid) and not members):
+            problems.add(f"root recheck unavailable: {type(exc).__name__}")
+    return DescendantObservation(members, not problems, "; ".join(sorted(problems)))
 
 
 def _psutil():

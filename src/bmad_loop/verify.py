@@ -136,7 +136,7 @@ class GitError(Exception):
 
 class GitSpawnError(GitError):
     """The git child could not be spawned at all (an OSError out of
-    `subprocess.run` — EMFILE, ENOMEM, ENOENT on the git binary). A GitError so
+    `subprocess.Popen` — EMFILE, ENOMEM, ENOENT on the git binary). A GitError so
     every existing guard treats it like any other git failure; a distinct type
     so the rare caller can tell "git said no" from "the machine is broken"
     (#343). The underlying errno stays reachable via ``exc.__cause__.errno``."""
@@ -152,6 +152,19 @@ class GitTimeoutError(GitError):
     all over again. `cmd_validate` is that caller: three probes in a row against
     one hung binary cost three deadlines, and only the first one told the
     operator anything."""
+
+    def __init__(self, message: str, *, capture: object | None = None):
+        super().__init__(message)
+        self.capture = capture
+
+
+class GitFinalizationUncertain(GitError):
+    """Finalization may have changed state; preserved evidence must be reconciled."""
+
+    def __init__(self, message: str, *, operation: str = "", record_path: Path | None = None):
+        super().__init__(message)
+        self.operation = operation
+        self.record_path = record_path
 
 
 class GitNotARepositoryError(GitError):
@@ -1859,7 +1872,7 @@ def _run_git(
     prepared_update: _PreparedRefUpdate | None = None,
 ) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]:
     """Sole spawn point for git subprocesses. Three failures are raised by
-    `subprocess.run` *before* any return code exists — a timeout (#156), a
+    owned process capture *before* any return code exists — a timeout (#156), a
     spawn-level OSError (#343), and a strict-decode fault on the child's output
     (#377) — so left uncaught any of them would bypass every `except GitError`
     guard and crash the run. All are translated here into the GitError taxonomy
@@ -1899,38 +1912,88 @@ def _run_git(
     own short deadline while standing inside the chokepoint."""
     effective_timeout_s = _git_timeout_s if timeout_s is None else timeout_s
     child_env = {**(env if env is not None else os.environ), "LC_ALL": "C"}
+    from .process_host import ProcessHostError
 
     if prepared_update is not None:
+        from .owned_capture import CaptureOwnership, CaptureResult, OwnedProcessTree
+
         if binary or input_data is not None:
             raise ValueError("prepared git execution is text-only")
         deadline = time.monotonic() + effective_timeout_s
         proc: subprocess.Popen[str] | None = None
         prepared = False
         commit_attempted = False
+        tracker: OwnedProcessTree | None = None
+        readers: list[threading.Thread] = []
+        reader_eof = [False, False]
+        captured: CaptureResult | None = None
 
         def remaining() -> float:
             return max(0.0, deadline - time.monotonic())
 
         def stop_child() -> bool:
+            nonlocal captured
             if proc is None:
                 return True
-            if proc.poll() is None:
+            if captured is not None:
+                return captured.ownership.quiescent
+            if tracker is None:
+                return False
+            tree = tracker.cleanup()
+            # A blocked reader owns its descriptor until it finishes. Closing
+            # its TextIOWrapper from here could itself block without a bound.
+            drain_deadline = time.monotonic() + 0.25
+            for reader in readers:
+                if reader.ident is not None:
+                    reader.join(timeout=max(0.0, drain_deadline - time.monotonic()))
+            for position, stream in enumerate((proc.stdout, proc.stderr)):
+                if stream is not None and (
+                    position >= len(readers) or readers[position].ident is None
+                ):
+                    stream.close()
+            if proc.stdin is not None:
                 try:
-                    proc.terminate()
-                    proc.wait(timeout=min(1.0, remaining()))
-                except (OSError, subprocess.TimeoutExpired):
-                    try:
-                        proc.kill()
-                        proc.wait(timeout=1.0)
-                    except (OSError, subprocess.TimeoutExpired):
-                        pass
-            for stream in (proc.stdin, proc.stdout, proc.stderr):
-                if stream is not None:
-                    try:
-                        stream.close()
-                    except OSError:
-                        pass
-            return proc.poll() is not None
+                    proc.stdin.close()
+                except OSError:
+                    pass
+            ownership = CaptureOwnership(
+                root_pid=tree.root_pid,
+                root_identity=tree.root_identity,
+                root_reaped=tree.root_reaped,
+                actors=tree.actors,
+                census_count=tree.census_count,
+                census_complete=tree.census_complete,
+                problems=tree.problems,
+                stdout_eof=reader_eof[0],
+                stderr_eof=reader_eof[1],
+                io_settled=all(not t.is_alive() for t in readers),
+                stdout_captured=reader_eof[0],
+                stderr_captured=reader_eof[1],
+                cleanup_required=True,
+            )
+            captured = CaptureResult(proc.returncode, b"", b"", False, False, 0, True, ownership)
+            return ownership.quiescent
+
+        def cleanup_preserving(error: BaseException) -> bool:
+            nonlocal captured
+            from dataclasses import replace
+
+            try:
+                return stop_child()
+            except BaseException as cleanup_error:
+                error.add_note("Prepared Git cleanup failed: " + type(cleanup_error).__name__)
+                return False
+            finally:
+                if captured is not None:
+                    captured = replace(
+                        captured,
+                        timed_out=captured.timed_out or isinstance(error, GitTimeoutError),
+                        interrupted=captured.interrupted
+                        or isinstance(error, (KeyboardInterrupt, SystemExit)),
+                    )
+                setattr(error, "owned_capture", captured)
+                if isinstance(error, GitTimeoutError):
+                    error.capture = captured
 
         try:
             try:
@@ -1945,6 +2008,8 @@ def _run_git(
                 )
             except OSError as exc:
                 raise GitSpawnError(f"git {cmd[3]} failed to spawn in {repo}") from exc
+            tracker = OwnedProcessTree(proc)
+            tracker.start()
             # `text=True` wraps every pipe in a `TextIOWrapper(newline=None)`,
             # whose WRITE side translates "\n" to `os.linesep` — "\r\n" on
             # Windows — so `update-ref --stdin` would read `start\r` and die with
@@ -1972,20 +2037,29 @@ def _run_git(
                 try:
                     for line in child_stdout:
                         responses.put(line)
+                    reader_eof[0] = True
                 except (OSError, ValueError):
                     pass
                 finally:
                     responses.put(None)
+                    child_stdout.close()
 
             def discard_stderr() -> None:
                 try:
                     while child_stderr.read(8192):
                         pass
+                    reader_eof[1] = True
                 except (OSError, ValueError):
                     pass
+                finally:
+                    child_stderr.close()
 
-            threading.Thread(target=read_responses, daemon=True).start()
-            threading.Thread(target=discard_stderr, daemon=True).start()
+            readers = [
+                threading.Thread(target=read_responses, daemon=True),
+                threading.Thread(target=discard_stderr, daemon=True),
+            ]
+            for reader in readers:
+                reader.start()
 
             def send(line: str, *, begins_commit: bool = False) -> None:
                 nonlocal commit_attempted
@@ -2032,7 +2106,13 @@ def _run_git(
                 ) from exc
             if proc.returncode != 0:
                 raise GitError(f"git prepared ref transaction failed in {repo}")
-            return subprocess.CompletedProcess(cmd, 0, "", "")
+            if not stop_child():
+                raise _GitCommitIndeterminate(
+                    f"git prepared ref transaction cleanup remains uncertain in {repo}"
+                )
+            completed = subprocess.CompletedProcess(cmd, 0, "", "")
+            setattr(completed, "owned_capture", captured)
+            return completed
         except BaseException as exc:
             if prepared and not commit_attempted and proc is not None and proc.poll() is None:
                 try:
@@ -2041,50 +2121,128 @@ def _run_git(
                     child_stdin.close()
                     proc.wait(timeout=remaining())
                 except BaseException as abort_exc:
-                    stop_child()
+                    cleanup_preserving(exc)
                     if not isinstance(exc, GitError):
                         raise exc
-                    raise GitError(
-                        f"git prepared ref transaction abort failed in {repo}"
-                    ) from abort_exc
-            stopped = stop_child()
+                    refused = GitError(f"git prepared ref transaction abort failed in {repo}")
+                    setattr(refused, "owned_capture", captured)
+                    raise refused from abort_exc
+            stopped = cleanup_preserving(exc)
+            setattr(exc, "owned_capture", captured)
+            if isinstance(exc, GitTimeoutError):
+                exc.capture = captured
             if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                 raise
+            if commit_attempted:
+                uncertain = _GitCommitIndeterminate(
+                    f"git prepared ref transaction acknowledgement or cleanup was lost in {repo}"
+                )
+                setattr(uncertain, "owned_capture", captured)
+                raise uncertain from exc
             if not stopped:
                 if not isinstance(
-                    exc, (GitError, BrokenPipeError, OSError, UnicodeError, ValueError)
+                    exc,
+                    (
+                        GitError,
+                        BrokenPipeError,
+                        OSError,
+                        UnicodeError,
+                        ValueError,
+                        ProcessHostError,
+                    ),
                 ):
                     raise
-                raise GitError(
-                    f"git prepared ref transaction process did not terminate in {repo}"
-                ) from exc
-            if commit_attempted:
-                raise _GitCommitIndeterminate(
-                    f"git prepared ref transaction acknowledgement was lost in {repo}"
-                ) from exc
-            if isinstance(exc, (BrokenPipeError, OSError, UnicodeError, ValueError)):
-                raise GitError(f"git prepared ref transaction failed in {repo}") from exc
+                error = GitError(
+                    f"git prepared ref transaction cleanup remains unconfirmed in {repo}"
+                )
+                setattr(error, "owned_capture", captured)
+                raise error from exc
+            if isinstance(
+                exc, (BrokenPipeError, OSError, UnicodeError, ValueError, ProcessHostError)
+            ):
+                error = GitError(f"git prepared ref transaction failed in {repo}")
+                setattr(error, "owned_capture", captured)
+                raise error from exc
             raise
         finally:
-            stop_child()
+            active_error = sys.exc_info()[1]
+            if active_error is not None:
+                cleanup_preserving(active_error)
+            else:
+                stop_child()
 
+    result = None
     try:
-        return subprocess.run(
-            cmd,
-            capture_output=True,
-            text=not binary and input_data is None,
-            input=input_data,
-            timeout=effective_timeout_s,
-            env=child_env,
+        from .owned_capture import capture
+
+        result = capture(
+            lambda: subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE if input_data is not None else None,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=child_env,
+            ),
+            input_data=input_data,
+            timeout_s=effective_timeout_s,
         )
+        if result.timed_out:
+            timeout = subprocess.TimeoutExpired(
+                cmd, effective_timeout_s, output=result.stdout, stderr=result.stderr
+            )
+            raise GitTimeoutError(
+                f"git {cmd[3]} timed out after {effective_timeout_s}s in {repo}",
+                capture=result,
+            ) from timeout
+        if (
+            result.returncode is None
+            or not result.ownership.stdout_captured
+            or not result.ownership.stderr_captured
+            or not result.ownership.stdout_eof
+            or not result.ownership.stderr_eof
+            or not result.ownership.io_settled
+        ):
+            error = GitError(f"git {cmd[3]} capture did not complete in {repo}")
+            setattr(error, "owned_capture", result)
+            raise error
+        if binary or input_data is not None:
+            completed = subprocess.CompletedProcess(
+                cmd, result.returncode, result.stdout, result.stderr
+            )
+        else:
+            # Match subprocess text mode's strict locale/UTF-8 decoding and
+            # universal-newline translation after byte-exact supervision.
+            with io.TextIOWrapper(io.BytesIO(result.stdout), newline=None) as output:
+                stdout = output.read()
+            with io.TextIOWrapper(io.BytesIO(result.stderr), newline=None) as output:
+                stderr = output.read()
+            completed = subprocess.CompletedProcess(cmd, result.returncode, stdout, stderr)
+        setattr(completed, "owned_capture", result)
+        return completed
     except subprocess.TimeoutExpired as exc:
         raise GitTimeoutError(
             f"git {cmd[3]} timed out after {effective_timeout_s}s in {repo}"
         ) from exc
     except UnicodeDecodeError as exc:
-        raise GitError(f"git {cmd[3]} returned undecodable output in {repo}: {exc}") from exc
+        error = GitError(f"git {cmd[3]} returned undecodable output in {repo}: {exc}")
+        setattr(error, "owned_capture", result)
+        raise error from exc
     except OSError as exc:
+        observed = getattr(exc, "owned_capture", None)
+        if observed is not None:
+            error = GitError(f"git {cmd[3]} capture failed after spawning in {repo}: {exc}")
+            setattr(error, "owned_capture", observed)
+            raise error from exc
         raise GitSpawnError(f"git {cmd[3]} failed to spawn in {repo}: {exc}") from exc
+    except ProcessHostError as exc:
+        error = GitError(f"git {cmd[3]} process observation failed in {repo}: {exc}")
+        setattr(error, "owned_capture", getattr(exc, "owned_capture", None))
+        raise error from exc
+
+
+def prepared_ref_update(repo: Path, update: _PreparedRefUpdate) -> subprocess.CompletedProcess[str]:
+    """Execute a prepared direct-ref CAS while retaining owned cleanup evidence."""
+    return _run_git(["git", "-C", str(repo), "update-ref", "--stdin"], repo, prepared_update=update)
 
 
 def _snapshot_ident_env() -> dict[str, str]:
@@ -11051,6 +11209,8 @@ def finalize_commit(
     publication_branch: str | None = None,
     on_plan: Callable[[FinalizationPlan], None] | None = None,
     append_only: bool = False,
+    recovery_context: dict[str, Any] | None = None,
+    interruption_types: tuple[type[BaseException], ...] = (KeyboardInterrupt, SystemExit),
 ) -> str | None:
     """Finalize the story without rewriting published branch or merge history.
 
@@ -11078,26 +11238,15 @@ def finalize_commit(
     precedence over the one-commit-per-story convention; the message template
     and pre_commit hook still govern any new commit.
 
-    Mechanics: stage the working tree (`add -A`), invoke the optional exact-index
-    validator, move HEAD back to `baseline` keeping that same index (`reset
-    --soft`), then commit the accumulated index without restaging. A post-commit
-    HEAD probe and optional committed-tree validator detect an uncertain commit
-    identity, hook mutation, or concurrent-index mutation and roll HEAD back to
-    the original chain before refusing. The rollback leaves working-tree contents
-    untouched, including changes made by hooks before the refusal.
-
-    The no-op arm is validated the same way. "Nothing staged" is read off the
-    index AFTER the staged validator returned, so an index reset to `baseline`
-    inside that window (a concurrent writer — the same class the committed-tree
-    validator exists for) reads as a clean no-op while the validated snapshot
-    says a deliverable was staged. Returning `None` there would leave HEAD at
-    `baseline` with the accepted chain orphaned and let the caller record
-    `baseline` as the commit — a bundle closing without the pending-tracked
-    deliverable it was accepted on (#795 review). So when a committed-tree
-    validator is given, the no-op arm runs it against `baseline` itself: the
-    snapshot must already be IN the baseline tree for "nothing to commit" to be
-    true, and a disagreement restores the original chain and index (`reset
-    --mixed`) before the refusal propagates.
+    Before staging, preserve the exact index and original history in a durable
+    operation record outside the worktree. A private linear chain uses an
+    expected-old ref transaction to select its baseline while keeping the staged
+    index. Commit refusal permits compensation only after owned process cleanup
+    and exact branch/index checks. Timeout, interruption, validation failure
+    after commit, or concurrent edits preserve possible landed history and block
+    replay until the recorded outcome is reconciled. Working-tree contents are
+    never reset. ``recovery_context`` retains caller bookkeeping preimages as
+    evidence; it does not authorize restoration or approval.
 
     Residual-artifacts note (BMAD-METHOD #2563): the skill now commits every file
     of the reviewed diff and deliberately leaves unrelated `git status` residue
@@ -11115,6 +11264,7 @@ def finalize_commit(
     baseline advances and already contains the full tree, return its SHA."""
     if not baseline or baseline == "NO_VCS":
         return None
+    ensure_finalization_settled(repo)
     original_head = rev_parse_head(repo)
     recorded_baseline = baseline
     baseline_oid = rev_parse_revision(repo, baseline)
@@ -11131,72 +11281,197 @@ def finalize_commit(
     adopted = baseline != baseline_oid
     if plan.strategy == "published-target" and adopted and on_baseline_adopted is not None:
         on_baseline_adopted(recorded_baseline, baseline)
-    rc, out = _git(repo, "add", "-A")
-    if rc != 0:
-        raise GitError(f"git add failed: {out}")
-    staged_snapshot = staged_validator() if staged_validator is not None else None
-    if plan.squash:
-        rc, out = _git(repo, "reset", "--soft", baseline)
-        if rc != 0:
-            raise GitError(f"git reset --soft {baseline} failed: {out}")
-    # index now holds the cumulative diff vs baseline; nothing staged → no-op
-    rc, _ = _git(repo, "diff", "--cached", "--quiet")
-    if rc == 0:
-        if committed_validator is not None:
-            try:
-                committed_validator(baseline, staged_snapshot)
-            except BaseException as exc:
-                if append_only:
-                    raise
-                # HEAD already sits at `baseline` and the index is whatever the
-                # concurrent writer left; put both back on the accepted chain.
-                restore_rc, restore_out = _git(repo, "reset", "--mixed", original_head)
-                if restore_rc != 0:
-                    raise GitError(
-                        "no-op tree validation failed; additionally failed to restore "
-                        f"HEAD to {original_head[:12]}: {restore_out}"
-                    ) from exc
-                raise
-        return baseline if adopted else None
-    rc, out = _git(repo, "commit", "-m", message)
-    if rc != 0:
-        if append_only:
-            raise GitError(f"campaign commit failed; branch retained for reconciliation: {out}")
-        # The soft reset already rewound HEAD to baseline; a failed commit would
-        # otherwise leave the branch pointer there, dropping the skill commit chain
-        # from HEAD. Restore HEAD (the working tree is untouched) before raising.
-        restore_rc, restore_out = _git(repo, "reset", "--soft", original_head)
-        if restore_rc != 0:
-            raise GitError(
-                f"git commit failed: {out}; additionally failed to restore HEAD "
-                f"to {original_head[:12]}: {restore_out}"
-            )
-        raise GitError(f"git commit failed: {out}")
+    from . import finalization_recovery
+
+    transaction = None
     try:
-        committed_head = rev_parse_head(repo)
-        if committed_validator is not None:
-            committed_validator(committed_head, staged_snapshot)
-    except BaseException as exc:
-        if append_only:
-            raise GitError(
-                "campaign finalization validation failed; committed history retained for recovery"
-            ) from exc
-        # Restore the accepted skill chain and its index while leaving the
-        # working tree untouched.  A soft reset would retain an ignored path
-        # that a hook force-added, making every replay fail staged validation
-        # even after the accepted bytes were restored.
-        try:
-            restore_rc, restore_out = _git(repo, "reset", "--mixed", original_head)
-        except GitError as restore_exc:
-            restore_rc, restore_out = 1, str(restore_exc)
-        if restore_rc != 0:
-            raise GitError(
-                f"post-commit finalization failed ({type(exc).__name__}: {exc}); "
-                "additionally failed to restore "
-                f"HEAD to {original_head[:12]}: {restore_out}"
-            ) from exc
+        with finalization_recovery.begin(
+            repo, original_head, baseline, message, context=recovery_context
+        ) as transaction:
+            cleanup_proven = True
+            commit_started = False
+            command_pending = False
+            command_observed = False
+            command = ""
+
+            def execute(
+                *args: str,
+                prepared: _PreparedRefUpdate | None = None,
+                env: dict[str, str] | None = None,
+            ):
+                nonlocal cleanup_proven, command_pending, command_observed, command
+                command, command_pending, command_observed = args[0], True, False
+                try:
+                    result = _run_git(
+                        ["git", "-C", str(repo), *args], repo, prepared_update=prepared, env=env
+                    )
+                except BaseException as exc:
+                    observation = getattr(exc, "capture", None) or getattr(
+                        exc, "owned_capture", None
+                    )
+                    cleanup_proven = cleanup_proven and _capture_quiescent(observation)
+                    try:
+                        transaction.observe_command(command, observation)
+                        command_observed = True
+                    except BaseException as record_error:
+                        exc.add_note(
+                            "Finalization command evidence write failed: "
+                            + type(record_error).__name__
+                        )
+                    raise
+                observation = getattr(result, "owned_capture", None)
+                transaction.observe_command(command, observation)
+                command_observed = True
+                cleanup_proven = cleanup_proven and _capture_quiescent(observation)
+                command_pending = False
+                return result
+
+            try:
+                with transaction.staging_index() as stage_index:
+                    transaction.stage_started()
+                    staged = execute(
+                        "add", "-A", env={**os.environ, "GIT_INDEX_FILE": str(stage_index)}
+                    )
+                    if staged.returncode != 0 or not cleanup_proven:
+                        raise GitError("git add did not finish with confirmed process cleanup")
+                    transaction.publish_staged_index(cleanup_proven=cleanup_proven)
+                    transaction.staged()
+                    staged_snapshot = staged_validator() if staged_validator is not None else None
+                    if plan.squash:
+                        transaction.head_move_started(baseline)
+                        execute(
+                            "update-ref",
+                            "--stdin",
+                            prepared=_PreparedRefUpdate(
+                                transaction.branch_ref,
+                                baseline,
+                                original_head,
+                                lambda _remaining: transaction.validate_staged_head(original_head),
+                            ),
+                        )
+                        transaction.head_moved(baseline)
+                    difference = execute("diff", "--cached", "--quiet")
+                    if difference.returncode not in (0, 1):
+                        raise GitError("cannot inspect staged finalization changes")
+                    if not cleanup_proven:
+                        raise GitError("finalization process cleanup remains uncertain")
+                    if difference.returncode == 0:
+                        if committed_validator is not None:
+                            committed_validator(baseline, staged_snapshot)
+                        transaction.completed(baseline)
+                        return baseline if adopted else None
+                    with transaction.private_index() as private_index:
+                        commit_env = transaction.commit_environment(private_index)
+                        transaction.commit_started()
+                        commit_started = True
+                        committed = execute(
+                            "commit",
+                            "-m",
+                            message,
+                            env=commit_env,
+                        )
+                        if committed.returncode != 0:
+                            detail = (committed.stdout + committed.stderr).strip()
+                            if (
+                                committed.returncode > 0
+                                and cleanup_proven
+                                and transaction.restore(cleanup_proven=True)
+                            ):
+                                transaction.refused(
+                                    "Git acknowledged commit refusal after owned cleanup"
+                                )
+                                raise GitError(f"git commit failed: {detail}")
+                            raise GitError(f"git commit refused with unresolved recovery: {detail}")
+                        if not cleanup_proven:
+                            raise GitError(
+                                "git commit returned but owned process cleanup remains uncertain"
+                            )
+                        committed_head = transaction.observe_committed()
+                        if committed_validator is not None:
+                            committed_validator(committed_head, staged_snapshot)
+                        transaction.publish_index(committed_head, cleanup_proven=cleanup_proven)
+                        transaction.completed(committed_head)
+                        return committed_head
+            except BaseException as exc:
+                if transaction.state == "refused":
+                    raise
+                uncertain = GitFinalizationUncertain(
+                    f"finalization outcome requires reconciliation; inspect {transaction.path}",
+                    operation=transaction.id,
+                    record_path=transaction.path,
+                )
+                setattr(exc, "finalization_uncertain", uncertain)
+                settled_refusal = False
+                try:
+                    if command_pending and not command_observed:
+                        observation = getattr(exc, "capture", None) or getattr(
+                            exc, "owned_capture", None
+                        )
+                        transaction.observe_command(command, observation)
+                        cleanup_proven = cleanup_proven and _capture_quiescent(observation)
+                    if isinstance(exc, interruption_types):
+                        # A requested stop must not launch further Git commands
+                        # to compensate. Durable preimages and history already
+                        # preserve the operation for later reconciliation.
+                        transaction.uncertain("Finalization interrupted; compensation deferred")
+                    else:
+                        # A validator's definitive rejection before commit can settle
+                        # only after exact compensation. A timeout, interrupted command,
+                        # or possible landed commit remains pending even if restored.
+                        restored = transaction.restore(cleanup_proven=cleanup_proven)
+                        if restored and not commit_started and not command_pending:
+                            transaction.refused(
+                                "Finalization rejected before commit; owned changes restored"
+                            )
+                            settled_refusal = True
+                        else:
+                            transaction.uncertain(
+                                f"{type(exc).__name__} during finalization command {command or 'none'}"
+                            )
+                except BaseException as recovery_error:
+                    if isinstance(recovery_error, interruption_types) and recovery_error is not exc:
+                        setattr(recovery_error, "finalization_uncertain", uncertain)
+                        raise recovery_error from exc
+                    # In particular, a disk failure must not turn a stop signal
+                    # into an unrelated exception. The durable intent still
+                    # blocks replay if its newest diagnostic cannot be saved.
+                    exc.add_note("Finalization recovery failed: " + type(recovery_error).__name__)
+                if settled_refusal:
+                    delattr(exc, "finalization_uncertain")
+                    raise
+                if isinstance(exc, GitError):
+                    raise uncertain from exc
+                raise
+    except GitFinalizationUncertain:
         raise
-    return committed_head
+    except GitError:
+        # begin() may fail before yielding after persisting its intent. Never
+        # turn that pending operation into an ordinary retryable Git refusal.
+        ensure_finalization_settled(repo)
+        raise
+
+
+def _capture_quiescent(capture: object | None) -> bool:
+    from .owned_capture import CaptureResult
+
+    return isinstance(capture, CaptureResult) and capture.ownership.quiescent
+
+
+def ensure_finalization_settled(repo: Path) -> None:
+    """Refuse replay before hooks/bookkeeping if durable finalization is pending."""
+    from . import finalization_recovery
+
+    try:
+        pending = finalization_recovery.pending(repo)
+    except (OSError, ValueError, GitError) as exc:
+        raise GitFinalizationUncertain("finalization recovery evidence cannot be read") from exc
+    if pending is not None:
+        path = finalization_recovery._root(repo) / pending["id"] / "record.json"
+        raise GitFinalizationUncertain(
+            f"unresolved finalization {pending['id']}; inspect {path}",
+            operation=pending["id"],
+            record_path=path,
+        )
 
 
 def resolve_restore_path(raw: str, root: Path) -> Path:
