@@ -149,7 +149,7 @@ def _acknowledged(intent: MutationIntent, candidate: Candidate) -> bool:
 def execute_requests(
     controller: PublicationController, intent: MutationIntent, *, generation: int
 ) -> MutationIntent:
-    """One authorized send, followed by independent readback even after a lost acknowledgement."""
+    """Send once and reconcile lost acknowledgements, honoring GitHub's retry deadline."""
     candidate = Candidate(**(intent.coordinates or {})["candidate"])
     _observe(controller, candidate)
     if intent.kind != "review_request" or intent.path != (
@@ -157,6 +157,6 @@ def execute_requests(
     ):
         raise GithubError("review request coordinates differ from its outbound operation")
     result = controller.gateway.execute(intent, generation=generation)
-    if result.state == "rejected":
+    if result.state == "rejected" or (result.fault or {}).get("category") == "rate_limit":
         return result
     return reconcile_requests(controller, result)
