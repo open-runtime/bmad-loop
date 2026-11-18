@@ -10,8 +10,8 @@ import argparse
 import hashlib
 import json
 import os
-import signal
 import shutil
+import signal
 import subprocess
 import sys
 import time

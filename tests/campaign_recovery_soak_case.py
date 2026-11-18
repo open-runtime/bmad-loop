@@ -15,8 +15,8 @@ import pytest
 from campaign_runtime_watchdog import ProgressWatchdog
 from conftest import git
 from test_campaign_handoff_flow import campaign as campaign
-from test_campaign_headless import prepared as prepared
 from test_campaign_handoff_runtime import ScriptedReasoning, prepare_quota_handoff
+from test_campaign_headless import prepared as prepared
 from test_campaign_runtime import production_case as production_case
 from test_campaign_runtime import run_case
 
