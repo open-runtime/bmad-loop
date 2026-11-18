@@ -17,7 +17,7 @@ from bmad_loop.campaign_model import (
     UnitState,
     WorkerClaim,
 )
-from bmad_loop.campaign_store import CampaignStore, reconcile_external_landing
+from bmad_loop.campaign_store import CampaignStore, reconcile_external_landing, transition
 
 HEAD = "a" * 40
 BASE = "b" * 40
@@ -184,6 +184,21 @@ def land(case):
     store, snapshot, proof = case
     reconcile_external_landing(snapshot, UNIT, proof)
     return store.save(snapshot, snapshot.revision)
+
+
+@pytest.mark.parametrize("state", ["pending", "verifying", "reviewing", "repair_pending"])
+def test_unaccepted_external_landing_cannot_be_saved_as_delivered(external_landing_case, state):
+    store, _, _ = external_landing_case
+    snapshot = land(external_landing_case)
+    snapshot.units[UNIT].evidence["landing_acceptance"]["state"] = state
+    snapshot = store.save(snapshot, snapshot.revision)
+    transition(snapshot, UNIT, UnitState.DELIVERED)
+    with pytest.raises(CampaignError, match="delivery requires accepted external landing debt"):
+        store.save(snapshot, snapshot.revision)
+    restored = store.load(snapshot.id)
+    assert restored.revision == snapshot.revision
+    assert restored.units[UNIT].state == UnitState.MERGED_PENDING_SYNC
+    assert restored.units[UNIT].evidence["landing_acceptance"]["state"] == state
 
 
 def test_external_landing_atomically_preserves_work_and_adds_pending_debt(external_landing_case):
@@ -485,8 +500,10 @@ def test_accepted_landing_repair_remains_bound_to_its_original_product(
     )
     # Establish that the complete linked-repair store contract actually passes
     # before changing only the parent or original merged-product binding.
+    transition(snapshot, UNIT, UnitState.DELIVERED)
     snapshot = store.save(snapshot, snapshot.revision)
     accepted = store.load(snapshot.id)
+    assert accepted.units[UNIT].state == UnitState.DELIVERED
     assert accepted.units[UNIT].evidence["landing_acceptance"]["state"] == "accepted"
     assert accepted.units[repair_id].state == UnitState.DELIVERED
     assert accepted.units[repair_id].spec.parent == UNIT
@@ -516,6 +533,9 @@ def test_empty_acceptance_landing_still_requires_exact_executed_receipts(
     assert proof["environment_digest"] == digest(proof["environment"])
     assert debt["review"]["validated"]["coordinates"]["head"] == MERGE
     assert store.load(snapshot.id).units[UNIT].evidence["acceptance"]["criteria"] == []
+    transition(snapshot, UNIT, UnitState.DELIVERED)
+    store.save(snapshot, snapshot.revision)
+    assert store.load(snapshot.id).units[UNIT].state == UnitState.DELIVERED
 
 
 @pytest.mark.parametrize(

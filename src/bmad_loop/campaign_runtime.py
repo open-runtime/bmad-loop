@@ -6083,7 +6083,9 @@ class CampaignRuntime:
                 PauseKind.QUOTA_WAIT,
                 PauseKind.TRANSPORT_FAILURE,
             }
-        if pause_handoff_allowed and intercept_terminal(self, snapshot, unit, receipt):
+        if intercept_terminal(
+            self, snapshot, unit, receipt, permit_new_handoff=pause_handoff_allowed
+        ):
             return
         if outcome == "stage_complete":
             directory = self.store.directory(snapshot.id) / "workers" / claim.launch_id
