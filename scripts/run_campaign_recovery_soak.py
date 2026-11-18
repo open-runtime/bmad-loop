@@ -7,9 +7,11 @@ final drain. Results are written in a new directory outside the checkout.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import signal
+import shutil
 import subprocess
 import sys
 import time
@@ -32,6 +34,13 @@ def main() -> int:
     mode.add_argument("--smoke", action="store_true")
     mode.add_argument("--qualify", action="store_true")
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument(
+        "--stage-history",
+        type=Path,
+        action="append",
+        required=True,
+        help="repeat for the original long controller-stage JSONL fixture transcripts",
+    )
     args = parser.parse_args()
     output = args.output.resolve()
     if output.is_relative_to(ROOT) or output.exists():
@@ -44,6 +53,16 @@ def main() -> int:
             "four-hour qualification requires a clean checkout and matching installed runtime"
         )
     output.mkdir(parents=True, mode=0o700)
+    inputs = output / "inputs"
+    inputs.mkdir()
+    histories = []
+    for index, original in enumerate(args.stage_history):
+        path = inputs / f"stage-{index}.jsonl"
+        with original.open("rb") as source, path.open("xb") as target:
+            shutil.copyfileobj(source, target)
+        with path.open("rb") as stream:
+            checksum = hashlib.file_digest(stream, "sha256").hexdigest()
+        histories.append({"source": str(original.resolve()), "path": str(path), "sha256": checksum})
     started = time.monotonic()
     report = {
         "schema_version": 1,
@@ -53,6 +72,7 @@ def main() -> int:
         "python": sys.executable,
         "python_version": sys.version,
         "runtime": subject,
+        "archived_stage_inputs": histories,
         "started_at": time.time(),
         "status": "running",
         "cycles": [],
@@ -105,7 +125,11 @@ def main() -> int:
                 process = subprocess.Popen(
                     command,
                     cwd=ROOT,
-                    env={**os.environ, "RECOVERY_SOAK_REPORT": str(details)},
+                    env={
+                        **os.environ,
+                        "RECOVERY_SOAK_REPORT": str(details),
+                        "RECOVERY_SOAK_HISTORIES": json.dumps(histories),
+                    },
                     stdout=log,
                     stderr=subprocess.STDOUT,
                 )

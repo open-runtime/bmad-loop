@@ -518,6 +518,53 @@ def test_late_available_reprobe_cannot_erase_new_owner_hold(quota_child, monkeyp
     assert "technical_rearm" not in unit.evidence
 
 
+def test_reasoning_disabled_rearm_keeps_oversized_original_history_and_quota_hold(
+    quota_child, monkeypatch, tmp_path
+):
+    from bmad_loop import campaign_handoff_flow, campaign_rearm
+
+    snapshot, unit = quota_child
+    assert not snapshot.spec.reasoning.enabled
+    runtime, action = condition_case(snapshot, unit, tmp_path)
+    monkeypatch.setattr(
+        campaign_handoff_flow, "_target_cap", lambda *_a, **_k: {"input_tokens": 100_000}
+    )
+    path = tmp_path / "original-controller-history.jsonl"
+    hold = copy.deepcopy(unit.hold)
+
+    def captured(*_):
+        raw = path.read_bytes()
+        return {
+            "current": {},
+            "gaps": [],
+            "obligations": ["Keep accepted work"],
+            "native_role": "dev",
+            "sources": [
+                {
+                    "raw_path": str(path),
+                    "raw_sha256": hashlib.sha256(raw).hexdigest(),
+                    "complete_bytes": len(raw),
+                    "captured_bytes": len(raw),
+                    "warnings": [],
+                }
+            ],
+        }
+
+    monkeypatch.setattr(campaign_handoff_flow, "_capture", captured)
+    path.write_text(
+        '{"type":"user","isMeta":true,"message":{"role":"user","content":"Stage input"}}\n'
+    )
+    small = campaign_rearm.observe(runtime, snapshot, action)
+    assert small.data["available"] and small.data["packet"]["purpose"] == "technical_rearm"
+    retained = path.read_bytes() * 700
+    path.write_bytes(retained)
+    with pytest.raises(CampaignError, match="exact history exceeds its input allowance"):
+        campaign_rearm.observe(runtime, snapshot, action)
+    assert path.read_bytes() == retained
+    assert unit.hold == hold and unit.claim.quiescent
+    assert not snapshot.jobs and not unit.evidence.get("continuation_permits")
+
+
 @pytest.mark.parametrize(
     "change",
     [

@@ -226,26 +226,8 @@ def test_scripted_observation_replays_only_recorded_completion(scripted_reasonin
     assert admissions == ["enter", "exit"]
 
 
-@pytest.mark.parametrize(
-    "routes_to_test",
-    [
-        pytest.param(None, id="cross-harness"),
-        pytest.param(
-            (("claude", "claude-opus-5-5"), ("claude", "claude-fable-5-2")), id="opus-to-fable"
-        ),
-        pytest.param(
-            (("claude", "claude-fable-5-2"), ("claude", "claude-opus-5-5")), id="fable-to-opus"
-        ),
-        pytest.param(
-            (("claude", "claude-opus-5-5"), ("codex", "gpt-6.2-astra")), id="opus-to-astra"
-        ),
-        pytest.param(
-            (("codex", "gpt-6.2-astra"), ("claude", "claude-fable-5-2")), id="astra-to-fable"
-        ),
-    ],
-)
-def test_real_worker_quota_continues_same_pr_through_normal_supervisor(
-    campaign, production_case, tmp_path, routes_to_test
+def prepare_quota_handoff(
+    campaign, production_case, tmp_path, routes_to_test, *, summary_routes=()
 ):
     configured_runtime, configured, _, _ = campaign
     case = production_case
@@ -284,7 +266,9 @@ def test_real_worker_quota_continues_same_pr_through_normal_supervisor(
                 for name, pool in configured.spec.role_pools
             ),
         ),
-        reasoning=dataclasses.replace(configured.spec.reasoning, capabilities=str(capabilities)),
+        reasoning=dataclasses.replace(
+            configured.spec.reasoning, capabilities=str(capabilities), summary_routes=summary_routes
+        ),
     )
     from bmad_loop.campaign_runtime import create
 
@@ -351,6 +335,32 @@ def test_real_worker_quota_continues_same_pr_through_normal_supervisor(
         'history=Path(request["execution"]).parent/"stage-history.jsonl"\n    history.write_text(json.dumps({"type":"user","sessionId":"scripted-"+request["launch_id"],"isMeta":True,"message":{"role":"user","content":request["prompt"]}})+"\\n")\n    return SessionResult(status="completed",session_id="scripted-"+request["launch_id"],transcript_path=str(history),native_binding={"profile":request["candidate"]["profile"]},result_json=artifact)',
     )
     script.write_text(body)
+    return snapshot
+
+
+@pytest.mark.parametrize(
+    "routes_to_test",
+    [
+        pytest.param(None, id="cross-harness"),
+        pytest.param(
+            (("claude", "claude-opus-5-5"), ("claude", "claude-fable-5-2")), id="opus-to-fable"
+        ),
+        pytest.param(
+            (("claude", "claude-fable-5-2"), ("claude", "claude-opus-5-5")), id="fable-to-opus"
+        ),
+        pytest.param(
+            (("claude", "claude-opus-5-5"), ("codex", "gpt-6.2-astra")), id="opus-to-astra"
+        ),
+        pytest.param(
+            (("codex", "gpt-6.2-astra"), ("claude", "claude-fable-5-2")), id="astra-to-fable"
+        ),
+    ],
+)
+def test_real_worker_quota_continues_same_pr_through_normal_supervisor(
+    campaign, production_case, tmp_path, routes_to_test
+):
+    case = production_case
+    snapshot = prepare_quota_handoff(campaign, case, tmp_path, routes_to_test)
     deadline = time.monotonic() + 300
 
     stop_requested = False
