@@ -11442,11 +11442,13 @@ def finalize_commit(
                 if isinstance(exc, GitError):
                     raise uncertain from exc
                 raise
-    except finalization_recovery.FinalizationRecoveryError as exc:
+    except GitFinalizationUncertain:
+        raise
+    except GitError:
         # begin() may fail before yielding after persisting its intent. Never
         # turn that pending operation into an ordinary retryable Git refusal.
         ensure_finalization_settled(repo)
-        raise exc
+        raise
 
 
 def _capture_quiescent(capture: object | None) -> bool:
