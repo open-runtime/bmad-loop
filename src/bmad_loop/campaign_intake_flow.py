@@ -15,7 +15,13 @@ import json
 from datetime import datetime
 from typing import Any, Mapping
 
-from .campaign_intake import IntakeBatch, IntakeObservation, TriageProposal, validate_triage
+from .campaign_intake import (
+    IntakeBatch,
+    IntakeObservation,
+    TriageProposal,
+    validate_duplicate_coverage,
+    validate_triage,
+)
 from .campaign_model import (
     CampaignError,
     CampaignSnapshot,
@@ -295,7 +301,18 @@ def packet(
                 "graph_revision": snapshot.graph_revision,
             },
             "units": [],
+            "duplicate_proof": None,
         },
+        "duplicate_contract": (
+            "For duplicate, select one other issue or PR whose native ID and URL in inventory "
+            "match the named story's binding. Put its number in related_issue or related_pr. "
+            "Return duplicate_proof with target_database_id, remaining: [], and coverage: "
+            "[{input_version, field, line, criteria, reason}]. For every nonblank title/body "
+            "line of each issue and body line of each comment, cite its 1-based line number, "
+            "the exact existing acceptance criteria covering it, and explain why. "
+            "acceptance_criteria lists the cited criteria. Use planning or needs_information "
+            "if any requirement, dependency, target identity or coverage is new or uncertain."
+        ),
     }
 
 
@@ -331,7 +348,7 @@ def prepare_triage(
     state["attempts"][attempt_id] = {
         "state": "running",
         "input_versions": list(input_versions),
-        "packet": context,
+        "packet": copy.deepcopy(context),
         "selected_role": dataclasses.asdict(selected_role),
     }
     snapshot.bindings[INBOX] = state
@@ -367,6 +384,146 @@ def _scope_permitted(scope: str, allowed: tuple[str, ...]) -> bool:
         ):
             return True
     return False
+
+
+def _duplicate_target(snapshot, attempt, proposal, proof, observations):
+    """Join the model's choice to the same immutable native identity at launch and readback."""
+    target = snapshot.units[proposal.unit_id]
+    numbers = [("issue", proposal.related_issue), ("pr", proposal.related_pr)]
+    selected = [(kind, number) for kind, number in numbers if number is not None]
+    if len(selected) != 1:
+        raise ValueError("Duplicate must identify one existing owned issue or PR")
+    kind, number = selected[0]
+    if (
+        type(number) is not int
+        or number <= 0
+        or any(row.kind == "issue" and row.number == number for row in observations)
+        or target.spec.kind != "story"
+        or target.state == UnitState.CANCELED
+        or target.hold
+        or proposal.within_scope is not True
+        or not proposal.acceptance_criteria
+        or not set(proposal.acceptance_criteria) <= set(target.spec.acceptance)
+        or not set(proposal.dependencies) <= set(target.spec.after)
+    ):
+        raise ValueError("Duplicate target is uncertain or cannot cover the proposed obligations")
+    binding = target.bindings.get(kind)
+    context = attempt["packet"]
+    frozen = context["bindings"].get(target.id, {}).get(kind)
+    collection, segment = ("issues", "issues") if kind == "issue" else ("pulls", "pull")
+    url = f"https://github.com/{snapshot.repository}/{segment}/{number}"
+    owners = set()
+    for unit in snapshot.units.values():
+        for key in ("issue", "pr"):
+            native = unit.bindings.get(key)
+            if (native.get("number") if isinstance(native, dict) else native) == number:
+                owners.add(unit.id)
+    frozen_specs = [spec for spec in context["existing_units"] if spec["id"] == target.id]
+    if (
+        not isinstance(binding, dict)
+        or not isinstance(frozen, dict)
+        or any(binding.get(k) != frozen.get(k) for k in ("number", "url", "database_id", "node_id"))
+        or _digest(frozen_specs) != _digest([dataclasses.asdict(target.spec)])
+        or type(binding.get("number")) is not int
+        or binding.get("number") != number
+        or binding.get("url") != url
+        or owners != {target.id}
+    ):
+        raise ValueError("Duplicate native target is absent, ambiguous or no longer owned")
+    observed_intent = []
+    for inventory in (context["inventory"], snapshot.bindings["inventory"]):
+        rows = [row for row in inventory.get(collection, ()) if row.get("number") == number]
+        if (
+            inventory.get("complete") is not True
+            or inventory.get("repository", snapshot.repository) != snapshot.repository
+            or len(rows) != 1
+        ):
+            raise ValueError("Duplicate native target is absent or ambiguous in inventory")
+        row = rows[0]
+        observed_intent.append((row.get("title"), row.get("body")))
+        if kind == "pr":
+            head, base = row.get("head") or {}, row.get("base") or {}
+            if (
+                not target.bindings.get("branch")
+                or head.get("ref") != target.bindings["branch"]
+                or base.get("ref") != snapshot.spec.target
+                or any(
+                    (ref.get("repo") or {}).get("full_name") != snapshot.repository
+                    for ref in (head, base)
+                )
+            ):
+                raise ValueError(
+                    "Duplicate PR does not belong to the campaign branch and repository"
+                )
+        if (
+            row.get("html_url") != url
+            or type(row.get("number")) is not int
+            or type(row.get("id")) is not int
+            or row["id"] <= 0
+            or type(proof.get("target_database_id")) is not int
+            or proof["target_database_id"] != row["id"]
+            or not (binding.get("database_id") or binding.get("node_id"))
+            or (binding.get("database_id") is not None and type(binding["database_id"]) is not int)
+            or (binding.get("database_id") is not None and binding["database_id"] != row["id"])
+            or (
+                binding.get("node_id")
+                and (
+                    not isinstance(binding["node_id"], str)
+                    or binding["node_id"] != row.get("node_id")
+                )
+            )
+            or (kind == "issue" and "pull_request" in row)
+            or (
+                row.get("state") != "open"
+                and not (
+                    row.get("state") == "closed"
+                    and target.state == UnitState.DELIVERED
+                    and (
+                        row.get("merged") is True
+                        if kind == "pr"
+                        else row.get("state_reason") == "completed"
+                    )
+                )
+            )
+        ):
+            raise ValueError("Duplicate native target identity or lifecycle differs from inventory")
+    if observed_intent[0] != observed_intent[1]:
+        raise ValueError("Duplicate target's observed product intent changed")
+    return {
+        "unit_id": target.id,
+        "kind": kind,
+        "number": number,
+        "database_id": row["id"],
+        "node_id": row.get("node_id"),
+        "url": url,
+        "inventory_digest": attempt["packet"]["intake_coordinates"]["inventory_digest"],
+    }
+
+
+def duplicate_current(snapshot, attempt, disposition):
+    """Recheck recorded coverage before using a duplicate receipt as current authority."""
+    try:
+        fields = dict(disposition)
+        recorded = fields.pop("duplicate_target")
+        proof = fields.pop("duplicate_proof")
+        proposal = TriageProposal.from_dict(fields)
+        packet = attempt["packet"]
+        observations = tuple(_observed(row, snapshot.repository) for row in packet["observations"])
+        versions = [row.version_id for row in observations]
+        if (
+            attempt.get("state") != "completed"
+            or attempt.get("disposition") != disposition
+            or proposal.disposition != "duplicate"
+            or set(versions) != set(proposal.input_versions)
+            or versions != list(attempt["input_versions"])
+            or packet["intake_coordinates"]["campaign"] != snapshot.id
+            or _digest(packet["inventory"]) != packet["intake_coordinates"]["inventory_digest"]
+        ):
+            return False
+        validate_duplicate_coverage(proof, observations, proposal.acceptance_criteria)
+        return recorded == _duplicate_target(snapshot, attempt, proposal, proof, observations)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return False  # Retained historical or malformed evidence cannot discharge current work.
 
 
 def accept_triage(
@@ -425,6 +582,14 @@ def accept_triage(
         )
         if set(proposal.input_versions) != set(attempt["input_versions"]):
             raise ValueError("triage must disposition its exact assigned input set")
+        disposition = dataclasses.asdict(proposal)
+        if proposal.disposition == "duplicate":
+            proof = raw.get("duplicate_proof")
+            validate_duplicate_coverage(proof, observations, proposal.acceptance_criteria)
+            disposition["duplicate_target"] = _duplicate_target(
+                snapshot, attempt, proposal, proof, observations
+            )
+            disposition["duplicate_proof"] = copy.deepcopy(proof)
     except (TypeError, KeyError, ValueError) as exc:
         raise CampaignError(f"triage artifact refused: {exc}") from exc
     proposal_id = None
@@ -570,7 +735,7 @@ def accept_triage(
             if version not in unit.bindings.get("intake_inputs", [])
         )
     attempt["state"] = "completed"
-    attempt["disposition"] = dataclasses.asdict(proposal)
+    attempt["disposition"] = disposition
     for version in attempt["input_versions"]:
         row = state["records"][version]
         row["state"] = (
@@ -582,7 +747,7 @@ def accept_triage(
                 else "held" if proposal.disposition == "hold" else "resolved"
             )
         )
-        row["disposition"] = dataclasses.asdict(proposal)
+        row["disposition"] = copy.deepcopy(disposition)
         row["proposal_id"] = proposal_id
     snapshot.bindings[INBOX] = state
     add_event(

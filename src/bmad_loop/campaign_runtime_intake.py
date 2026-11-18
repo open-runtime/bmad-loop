@@ -661,7 +661,9 @@ def disposition_intent(
     pr = unit.bindings.get("pr") or {}
     if pr.get("url"):
         text += f"\n\nPlanning/triage draft: {pr['url']}"
-    if disposition.get("related_pr"):
+    if target := disposition.get("duplicate_target"):
+        text += f"\n\nCovered by existing {target['kind']}: {target['url']}"
+    elif disposition.get("related_pr"):
         text += f"\n\nRelated PR: https://github.com/{snapshot.repository}/pull/{disposition['related_pr']}"
     text += "\n\nEvidence:\n" + "\n".join(
         f"- {row['url']} ({row['updated_at']}, `{row['digest']}`)" for row in evidence

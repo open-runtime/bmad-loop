@@ -53,15 +53,14 @@ def test_joined_milestone_close_keeps_prior_disposition_across_restart(snapshot,
     poll(snapshot, service)
     (original,) = flow.untriaged(snapshot)
     attempt = prepare(snapshot, original)
-    flow.accept_triage(
-        snapshot,
-        triage_raw(snapshot, [original], disposition="duplicate", unit_id=unit.id, issue=3),
-        attempt_id=attempt,
-        observed_role=ROLE,
-    )
+    raw = triage_raw(snapshot, [original], disposition="attach", unit_id=unit.id, issue=3)
+    raw["proposal"]["acceptance_criteria"] = list(unit.spec.acceptance)
+    flow.accept_triage(snapshot, raw, attempt_id=attempt, observed_role=ROLE)
     previous = snapshot.bindings[flow.INBOX]["records"][original]
     if legacy:
         previous.pop("disposition_fingerprint")
+        # Historical duplicate receipts predate target/coverage evidence.
+        previous["disposition"]["disposition"] = "duplicate"
     store = CampaignStore(tmp_path / "authority")
     snapshot = store.create(snapshot)
     disposition = copy.deepcopy(store.load(snapshot.id).bindings[flow.INBOX]["records"][original])

@@ -262,14 +262,51 @@ def test_receipt_validation_cannot_release_real_actor_or_mutate_authority(snapsh
         intake.apply_triage(snapshot, unit_id, result(snapshot, unit_id), launch_id="triage-launch")
 
 
-def test_nonwork_control_needs_disposition_comment_and_closed_unmerged_pr(snapshot):
+def apply_existing_duplicate(snapshot):
+    target = snapshot.units["source:project:existing"]
+    target.spec = dataclasses.replace(target.spec, acceptance=("Add scoped incoming behavior",))
+    snapshot.graph_revision += 1
+    url = "https://github.com/a/b/issues/8"
+    target.bindings["issue"] = {"number": 8, "database_id": 1008, "url": url}
+    snapshot.bindings["inventory"]["issues"] = [
+        {"id": 1008, "number": 8, "html_url": url, "state": "open"}
+    ]
     unit_id = start(snapshot)
-    intake.apply_triage(
-        snapshot,
-        unit_id,
-        result(snapshot, unit_id, disposition="duplicate"),
-        launch_id="triage-launch",
+    receipt = result(snapshot, unit_id, disposition="duplicate")
+    proposal = receipt["artifact"]["proposal"]
+    proposal.update(
+        related_issue=8,
+        acceptance_criteria=list(target.spec.acceptance),
+        rationale="Issue 8 already requires the same scoped behavior.",
     )
+    receipt["artifact"]["duplicate_proof"] = {
+        "target_database_id": 1008,
+        "remaining": [],
+        "coverage": [
+            {
+                "input_version": proposal["input_versions"][0],
+                "field": field,
+                "line": 1,
+                "criteria": list(target.spec.acceptance),
+                "reason": reason,
+            }
+            for field, reason in (
+                ("title", "The incoming title introduces the scoped request."),
+                (
+                    "body",
+                    "The entire requested behavior is already an acceptance criterion of issue 8.",
+                ),
+            )
+        ],
+    }
+    intake.apply_triage(snapshot, unit_id, receipt, launch_id="triage-launch")
+    saved = snapshot.bindings[flow.INBOX]["records"][proposal["input_versions"][0]]
+    assert saved["state"] == "resolved" and saved["disposition"]["duplicate_target"]["url"] == url
+    return unit_id
+
+
+def test_nonwork_control_needs_disposition_comment_and_closed_unmerged_pr(snapshot):
+    unit_id = apply_existing_duplicate(snapshot)
     unit = snapshot.units[unit_id]
     assert intake.proposals(snapshot, ROLE)[0].kind == "intake-note"
 
@@ -308,6 +345,7 @@ def test_nonwork_control_needs_disposition_comment_and_closed_unmerged_pr(snapsh
         intake.cancellation_intent(snapshot, unit_id, gateway, action_id="cancel")
     note = intake.disposition_intent(snapshot, unit_id, gateway, action_id="note")
     assert note.path.endswith("/issues/7/comments")
+    assert "Covered by existing issue: https://github.com/a/b/issues/8" in note.payload["body"]
     assert "https://github.com/a/b/pull/20" in note.payload["body"]
     intake.apply_note(snapshot, unit_id, {"state": "confirmed", "receipt": {"id": 1}})
     assert intake.proposals(snapshot, ROLE)[0].kind == "intake-cancel-issue"
@@ -864,7 +902,7 @@ def test_nonwork_intake_closes_only_owned_control_and_keeps_original_issue_open(
         """    if name=="triage":
         contract=context["triage_result_contract"]
         target=next(row for row in context["existing_units"] if row["id"]=="source:project:first")
-        artifact.update(intake_coordinates=contract["intake_coordinates"],proposal={"schema_version":1,"disposition":"duplicate","input_versions":contract["intake_coordinates"]["input_versions"],"unit_id":target["id"],"rationale":"Existing first story already covers the entire incoming request","acceptance_criteria":target["acceptance"],"dependencies":target["after"],"related_issue":1,"related_pr":None,"within_scope":True,"graph_revision":request["coordinates"]["graph_revision"]},units=[])
+        artifact.update(intake_coordinates=contract["intake_coordinates"],proposal={"schema_version":1,"disposition":"attach","input_versions":contract["intake_coordinates"]["input_versions"],"unit_id":target["id"],"rationale":"Existing first story already covers the entire incoming request","acceptance_criteria":target["acceptance"],"dependencies":target["after"],"related_issue":1,"related_pr":None,"within_scope":True,"graph_revision":request["coordinates"]["graph_revision"]},units=[])
     if name in {"requirements","architecture","decomposition"}:""",
     )
     script.write_text(text, encoding="utf-8")
