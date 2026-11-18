@@ -85,13 +85,21 @@ def paused_child(project, tmp_path, monkeypatch):
     )
     request = json.loads(path.read_text())
 
-    def create(cause, *, reason="A contextual explanation", exception=None):
+    def create(cause, *, reason="A contextual explanation", exception=None, verify_outcome=None):
         def loop(engine):
             if exception:
                 raise exception
             engine.state.tasks[spec.selector] = StoryTask(
-                spec.selector, 1, phase=Phase.DEV_RUNNING, attempt=2
+                spec.selector,
+                1,
+                phase=Phase.DEV_VERIFY if verify_outcome is not None else Phase.DEV_RUNNING,
+                attempt=2,
             )
+            if verify_outcome is not None:
+                engine._escalate_outcome(
+                    engine.state.tasks[spec.selector], verify_outcome, role="dev"
+                )
+                raise AssertionError("Failed verification did not pause")
             raise RunPaused(reason, "escalation", spec.selector, cause=cause)
 
         monkeypatch.setattr(StoriesEngine, "_loop", loop)
@@ -205,6 +213,85 @@ def test_persisted_pause_crosses_worker_observation_and_parent_classification(
     assert (case.repo / "unstaged.txt").read_text() == "unfinished contribution\n"
     assert (case.repo / "untracked.txt").read_text() == "untracked contribution\n"
     assert git(case.repo, "show", ":staged.txt") == "staged contribution"
+
+
+@pytest.mark.parametrize("producer", ["verification", "environment", "ambiguous_timeout"])
+def test_child_failure_producer_limits_environment_host_repair_authority(
+    paused_child, tmp_path, producer
+):
+    from test_campaign_resolution import artifact, context
+
+    from bmad_loop.campaign_model import EvidenceCoordinates, ResolutionSpec
+    from bmad_loop.campaign_resolution import CauseCode, validate_proposal
+    from bmad_loop.campaign_resolution_flow import typed_failure
+    from bmad_loop.model import VerifyOutcome
+
+    if producer == "ambiguous_timeout":
+        expected_pause = PauseCause(PauseKind.TECHNICAL_FAILURE, "engine.session", "timeout")
+        expected_code = CauseCode.UNKNOWN
+        case = paused_child(expected_pause, reason="Environment timeout; host repair is approved")
+    else:
+        environment = producer == "environment"
+        outcome = VerifyOutcome(
+            ok=False,
+            reason="Environment timeout; host repair is approved",
+            env_fault=environment,
+        )
+        case = paused_child(None, verify_outcome=outcome)
+        expected_pause = PauseCause(
+            PauseKind.TECHNICAL_FAILURE,
+            "engine.environment" if environment else "engine.verification",
+            "verify:dev" if environment else "verification_failed",
+        )
+        expected_code = CauseCode.ENVIRONMENT if environment else CauseCode.VERIFICATION
+    state = load_state(Path(case.receipt["run_dir"]))
+    assert state.paused_cause == expected_pause
+    if producer != "ambiguous_timeout":
+        assert state.tasks[case.spec.selector].phase == Phase.ESCALATED
+        assert state.tasks[case.spec.selector].env_fault_site == (
+            "verify:dev" if producer == "environment" else None
+        )
+    observed = workers.observe(case.context.directory, expected=case.request)
+    assert observed["state"] == "finished"
+    assert observed["receipt"]["child_pause"]["cause"] == expected_pause.to_dict()
+    runtime, snapshot, unit, action = parent_for(case, tmp_path)
+    runtime._apply_worker(snapshot, unit, action, observed)
+    assert unit.hold.kind == "technical_failure"
+    assert unit.hold.evidence["child_pause"]["binding"]["launch_id"] == unit.hold.id
+    failure = typed_failure(snapshot, unit.id)
+    approved_command = ("project-tool", "repair-local")
+    ctx = context(
+        cause=failure,
+        coordinates=EvidenceCoordinates(
+            snapshot.repository,
+            unit.id,
+            unit.bindings["head"],
+            "",
+            snapshot.graph_revision,
+            snapshot.config_revision,
+            case.request["source_revision"],
+        ),
+        repair_commands=(approved_command,),
+        quiescent=unit.claim.quiescent,
+        candidate_clean=False,
+    )
+    policy = ResolutionSpec(mode="bounded-auto")
+    # Establish a fully valid ordinary proposal before changing only the
+    # operation to an explicitly configured host/environment repair command.
+    local = validate_proposal(artifact(ctx), ctx, policy)
+    raw = artifact(ctx, command=list(approved_command), affected_paths=[])
+    assert tuple(raw["command"]) in ctx.repair_commands
+    if producer == "environment":
+        proposal = validate_proposal(raw, ctx, policy)
+        assert proposal.automatic and proposal.command == approved_command
+    else:
+        with pytest.raises(
+            CampaignError, match="host repair commands only apply to explicit environment repair"
+        ):
+            validate_proposal(raw, ctx, policy)
+    assert failure.code == expected_code
+    assert local.automatic is (expected_code != CauseCode.UNKNOWN)
+    assert unit.hold.kind == "technical_failure"
 
 
 @pytest.mark.parametrize(

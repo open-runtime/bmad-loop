@@ -832,7 +832,12 @@ def _inbox_items(snapshot: CampaignSnapshot, *, now: float):
                 "checkpoint",
             }:
                 operator = "Provide authorized evidence for this exact hold or decision; a response does not itself grant approval"
-            pause = unit.evidence.get("child_pause")
+            hold_evidence = hold.evidence if isinstance(hold.evidence, dict) else {}
+            pause = (
+                hold_evidence["child_pause"]
+                if "child_pause" in hold_evidence
+                else unit.evidence.get("child_pause")
+            )
             parsed_cause = None
             pause_reason = "No supported typed child-pause receipt was recorded"
             if (
@@ -848,8 +853,11 @@ def _inbox_items(snapshot: CampaignSnapshot, *, now: float):
                     if (
                         binding.get("campaign_id") != snapshot.id
                         or binding.get("unit_id") != unit.id
+                        or not isinstance(hold.id, str)
+                        or not hold.id
+                        or binding.get("launch_id") != hold.id
                     ):
-                        raise CampaignError("child pause belongs to another campaign or unit")
+                        raise CampaignError("child pause is not bound to this current hold")
                 except (CampaignError, ValueError, TypeError):
                     parsed_cause = None
                     pause_reason = (

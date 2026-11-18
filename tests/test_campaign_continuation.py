@@ -28,6 +28,7 @@ from bmad_loop.campaign_model import (
     CampaignSnapshot,
     CampaignSpec,
     CampaignUnit,
+    SourceSelector,
     UnitSpec,
     UnitState,
     WorkerClaim,
@@ -340,14 +341,6 @@ def development_handoff(review_handoff, tmp_path, request):
         "model": child.policy.adapter.dev.model,
         "effort": child.policy.adapter.dev.effort,
     }
-    request["continuation_permit"] = prepare_permit(request, child)
-    request["continuation_consumption"] = {
-        "schema_version": 1,
-        "permit_id": request["continuation_permit"]["permit_id"],
-        "successor_launch_id": request["launch_id"],
-        "successor_run_id": request["run_id"],
-        "state": "consumed",
-    }
     claim = WorkerClaim(
         child.unit_id,
         child.attempt,
@@ -363,32 +356,98 @@ def development_handoff(review_handoff, tmp_path, request):
         UnitSpec(**request["unit"]),
         UnitState.RUNNING,
         claim=claim,
-        bindings={"pr": {"number": 7}},
+        bindings={
+            "pr": {"number": 7},
+            "workspace": str(project.project),
+            "branch": request["branch"],
+            "head": handoff["fingerprint"]["head"],
+            "base": task.baseline_commit,
+            "effective_source": request["source"],
+            "source_revision": "source-v1",
+        },
         evidence={
-            "continuation_permits": {
-                request["continuation_permit"]["permit_id"]: {
-                    "permit": request["continuation_permit"],
-                    "consumption": request["continuation_consumption"],
-                }
-            },
             "handoff": {
                 "id": request["handoff_id"],
                 "phase": "continuing",
+                "role": "execution",
+                "native_role": "dev",
+                "candidate": request["candidate"],
+                "capture": {
+                    "capture_digest": handoff["capture_digest"],
+                    "current": {
+                        k: v
+                        for k, v in handoff.items()
+                        if k not in {"capture_digest", "native_role"}
+                    },
+                },
+                "packet": {"sha256": "packet-v1", "read_only": False},
                 "predecessor": request["native_predecessor"],
                 "successor": dataclasses.asdict(claim),
             },
         },
     )
-    CampaignStore(authority, storage=storage).create(
-        CampaignSnapshot(
-            child.campaign_id,
-            "owner/repo",
-            CampaignSpec("continuation", units=(unit.spec,)),
-            {unit.id: unit},
-            generation=child.generation,
-            config_revision=child.config_revision,
-        )
+    snapshot = CampaignSnapshot(
+        child.campaign_id,
+        "owner/repo",
+        CampaignSpec(
+            "continuation", units=(unit.spec,), sources=(SourceSelector(**request["source"]),)
+        ),
+        {unit.id: unit},
+        generation=child.generation,
+        config_revision=child.config_revision,
+        common_dir=request["common_dir"],
+        config_snapshot={"policy": child.policy.to_dict()},
     )
+    template = dataclasses.replace(child, directory=tmp_path / "continuation-template")
+    path, digest = template.save()
+    snapshot.bindings["execution_template"] = {"path": str(path), "digest": digest}
+    from bmad_loop.campaign_acceptance import ensure
+    from bmad_loop.campaign_decisions import DecisionReceipt
+    from bmad_loop.campaign_model import EvidenceCoordinates
+    from bmad_loop.campaign_worker_authority import continuation_context
+
+    ensure(unit)
+    decision = DecisionReceipt(
+        "prior-decision",
+        EvidenceCoordinates(
+            "owner/repo", unit.id, handoff["fingerprint"]["head"], task.baseline_commit, 1, 1
+        ),
+        "prior-question",
+        "human_required",
+        "choose",
+        "Existing approval question",
+        (),
+        (),
+        ("Approval remains required",),
+        (),
+        (),
+        "",
+        False,
+    )
+    snapshot.bindings["decision_receipts"] = {decision.id: dataclasses.asdict(decision)}
+    snapshot.bindings["decision_requests"] = {
+        "prior-question": {
+            "receipt": decision.id,
+            "hold_id": decision.hold_id,
+            "question": decision.answer,
+        }
+    }
+    request["continuation_context"] = continuation_context(snapshot, unit)
+    request["continuation_permit"] = prepare_permit(request, child)
+    request["continuation_consumption"] = {
+        "schema_version": 1,
+        "permit_id": request["continuation_permit"]["permit_id"],
+        "successor_launch_id": request["launch_id"],
+        "successor_run_id": request["run_id"],
+        "state": "consumed",
+    }
+    unit.evidence["continuation_permits"] = {
+        request["continuation_permit"]["permit_id"]: {
+            "permit": request["continuation_permit"],
+            "consumption": request["continuation_consumption"],
+        }
+    }
+    CampaignStore(authority, storage=storage).create(snapshot)
     return project, old, adapter, child, request
 
 
@@ -552,6 +611,155 @@ def test_development_rechecks_campaign_authority_at_entry(development_handoff, m
     assert not validate_resume(composed.engine, task)
     assert not continue_task(composed.engine, task)
     assert not (composed.run_dir / "continuation-consumed.json").exists()
+
+
+def change_current_continuation(snapshot, unit, change):
+    """Change stored authority without changing the successor's request or permit."""
+    if change == "obligation":
+        unit.spec = dataclasses.replace(
+            unit.spec, acceptance=(*unit.spec.acceptance, "New owner obligation")
+        )
+        snapshot.graph_revision += 1
+    elif change == "effective_source":
+        unit.bindings["effective_source"] = {
+            **unit.bindings["effective_source"],
+            "path": "different-source",
+        }
+    elif change == "source_revision":
+        unit.bindings["source_revision"] = "source-v2"
+    elif change == "canonical_source":
+        unit.bindings["canonical_source"] = {"project": "different-canonical-source"}
+    elif change == "workspace":
+        unit.bindings["workspace"] += "-different"
+    elif change in {"head", "base"}:
+        unit.bindings[change] = "c" * 40
+    elif change == "template":
+        snapshot.bindings["execution_template"]["digest"] = "0" * 64
+    elif change == "capture":
+        unit.evidence["handoff"]["capture"]["capture_digest"] = "different-capture"
+    elif change == "candidate":
+        unit.evidence["handoff"]["candidate"]["model"] = "different-model"
+    elif change == "packet":
+        unit.evidence["handoff"]["packet"]["sha256"] = "different-packet"
+    elif change == "acceptance_revision":
+        unit.evidence["acceptance"]["revision"] += 1
+    elif change == "decision":
+        unit.evidence["decision_input_revision"] = "new-owner-answer"
+    elif change == "decision_receipt":
+        snapshot.bindings["decision_receipts"]["prior-decision"][
+            "answer"
+        ] = "Changed authorized answer"
+    elif change == "decision_request":
+        snapshot.bindings["decision_requests"]["prior-question"][
+            "question"
+        ] = "New approval question"
+    elif change == "pending_approval":
+        unit.evidence["pending_failure_hold"] = {"kind": "owner", "reason": "new approval required"}
+    elif change == "contributors":
+        unit.evidence["developer_families"] = ["openai", "anthropic"]
+    elif change == "unknown_contributor":
+        unit.evidence["developer_attribution_incomplete"] = True
+    elif change == "dev_allowance":
+        unit.evidence["dev_attempts_spent"] = unit.evidence.get("dev_attempts_spent", 0) + 1
+    elif change == "review_allowance":
+        unit.evidence["review_cycles_spent"] = unit.evidence.get("review_cycles_spent", 0) + 1
+    elif change == "unknown_allowance":
+        unit.evidence.setdefault("usage", {})["legacy_counters_unknown"] = True
+    else:
+        raise AssertionError(change)
+
+
+@pytest.mark.parametrize("boundary", ["entry", "prelaunch"])
+@pytest.mark.parametrize(
+    "change",
+    [
+        "obligation",
+        "effective_source",
+        "source_revision",
+        "canonical_source",
+        "workspace",
+        "head",
+        "base",
+        "template",
+        "capture",
+        "candidate",
+        "packet",
+        "acceptance_revision",
+        "decision",
+        "decision_receipt",
+        "decision_request",
+        "pending_approval",
+        "contributors",
+        "unknown_contributor",
+        "dev_allowance",
+        "review_allowance",
+        "unknown_allowance",
+    ],
+)
+def test_current_stored_authority_fences_unchanged_successor(
+    development_handoff, monkeypatch, change, boundary
+):
+    _, _, adapter, child, request = development_handoff
+    composed = compose_development(development_handoff)
+    task = composed.state.tasks[request["unit"]["selector"]]
+    assert validate_resume(composed.engine, task)
+    store = CampaignStore(Path(request["continuation_authority"]))
+    original_request = json.dumps(request, sort_keys=True)
+
+    def change_store():
+        snapshot = store.load(child.campaign_id)
+        unit = snapshot.units[child.unit_id]
+        original_permits = json.dumps(unit.evidence["continuation_permits"], sort_keys=True)
+        change_current_continuation(snapshot, unit, change)
+        saved = store.save(snapshot, snapshot.revision)
+        assert (
+            json.dumps(saved.units[child.unit_id].evidence["continuation_permits"], sort_keys=True)
+            == original_permits
+        )
+        assert json.dumps(request, sort_keys=True) == original_request
+
+    if boundary == "entry":
+        change_store()
+        assert not validate_resume(composed.engine, task)
+        assert not continue_task(composed.engine, task)
+        assert not (composed.run_dir / "continuation-consumed.json").exists()
+    else:
+
+        def retained(value, *, prelaunch_validator):
+            value.attempt += 1
+            prelaunch_validator()  # Normal counter reservation remains allowed.
+            change_store()
+            prelaunch_validator()
+
+        monkeypatch.setattr(composed.engine, "_continue_campaign_development", retained)
+        with pytest.raises(CampaignError, match="current constraints|remaining allowance"):
+            continue_task(composed.engine, task)
+        assert (composed.run_dir / "continuation-consumed.json").exists()
+    assert not adapter.sessions
+
+
+def test_live_claim_progress_and_local_attempt_reservation_do_not_rearm_allowance(
+    development_handoff, monkeypatch
+):
+    _, _, _, child, request = development_handoff
+    composed = compose_development(development_handoff)
+    task = composed.state.tasks[request["unit"]["selector"]]
+    store = CampaignStore(Path(request["continuation_authority"]))
+    observed = []
+
+    def retained(value, *, prelaunch_validator):
+        before = value.charged_attempts
+        value.attempt += 1
+        snapshot = store.load(child.campaign_id)
+        snapshot.units[child.unit_id].claim.status = "running"
+        snapshot.units[child.unit_id].claim.pid = os.getpid()
+        store.save(snapshot, snapshot.revision)
+        prelaunch_validator()
+        observed.append((before, value.charged_attempts))
+
+    monkeypatch.setattr(composed.engine, "_continue_campaign_development", retained)
+    assert continue_task(composed.engine, task)
+    assert observed == [(task.charged_attempts - 1, task.charged_attempts)]
 
 
 @pytest.mark.parametrize(

@@ -335,20 +335,10 @@ def test_inbox_never_infers_missing_or_invalid_pause_cause_from_reason(runtime, 
     assert "No automatic continuation" in item["next_automatic_action"]
 
 
-@pytest.fixture
-def inbox_pause(runtime, request):
+def inbox_pause_receipt(snapshot, unit, cause, *, launch_id="launch-1"):
     from bmad_loop.campaign_child_pause import build
-    from bmad_loop.model import PauseCause, PauseKind, Phase, RunState, StoryTask
+    from bmad_loop.model import Phase, RunState, StoryTask
 
-    _, snapshot, _ = runtime
-    unit = snapshot.units["s:e:u"]
-    unit.hold = Hold("paused", "Probe failed", id="pause-hold")
-    kind = getattr(request, "param", "technical_failure")
-    cause = (
-        PauseCause(PauseKind(kind), "engine.environment", "dispatch_probe")
-        if kind is not None
-        else None
-    )
     state = RunState("child-run", "/synthetic/workspace", "2026-11-17T00:00:00Z")
     state.tasks["first"] = StoryTask("first", 1, phase=Phase.DEV_RUNNING, attempt=2)
     state.record_pause("Probe failed", "dispatch", "first", cause=cause)
@@ -360,7 +350,7 @@ def inbox_pause(runtime, request):
     binding = {
         "campaign_id": snapshot.id,
         "unit_id": unit.id,
-        "launch_id": "launch-1",
+        "launch_id": launch_id,
         "attempt": 1,
         "generation": 1,
         "workspace": "/synthetic/workspace",
@@ -370,9 +360,25 @@ def inbox_pause(runtime, request):
         "run_id": state.run_id,
         "run_dir": "/synthetic/run",
     }
-    unit.evidence["child_pause"] = build(
+    return build(
         state, request, types.SimpleNamespace(config_revision=snapshot.config_revision), binding
     )
+
+
+@pytest.fixture
+def inbox_pause(runtime, request):
+    from bmad_loop.model import PauseCause, PauseKind
+
+    _, snapshot, _ = runtime
+    unit = snapshot.units["s:e:u"]
+    unit.hold = Hold("paused", "Probe failed", id="launch-1")
+    kind = getattr(request, "param", "technical_failure")
+    cause = (
+        PauseCause(PauseKind(kind), "engine.environment", "dispatch_probe")
+        if kind is not None
+        else None
+    )
+    unit.evidence["child_pause"] = inbox_pause_receipt(snapshot, unit, cause)
     return snapshot, unit, cause
 
 
@@ -382,7 +388,56 @@ def test_inbox_projects_typed_pause_without_granting_continuation(inbox_pause):
     assert item["pause_evidence_status"] == "typed"
     assert item["pause_cause"] == cause.to_dict()
     assert "No automatic continuation" in item["next_automatic_action"]
-    assert unit.hold.id == "pause-hold"
+    assert unit.hold.id == unit.evidence["child_pause"]["binding"]["launch_id"] == "launch-1"
+
+
+@pytest.mark.parametrize("inbox_pause", ["quota_wait"], indirect=True)
+def test_new_owner_hold_cannot_inherit_an_old_quota_pause(inbox_pause):
+    snapshot, unit, cause = inbox_pause
+    historical = json.loads(json.dumps(unit.evidence["child_pause"]))
+    baseline = next(row for row in inbox_document(snapshot)["items"] if row["kind"] == "hold")
+    assert baseline["pause_evidence_status"] == "typed"
+    assert baseline["pause_cause"] == cause.to_dict()
+    assert baseline["pause_cause"]["kind"] == "quota_wait"
+    unit.hold = Hold(
+        "owner", "New owner decision remains unresolved", id="new-owner-hold", actor="owner"
+    )
+    item = next(row for row in inbox_document(snapshot)["items"] if row["kind"] == "hold")
+    assert item["hold_id"] == "new-owner-hold" and item["hold_kind"] == "owner"
+    assert item["pause_evidence_status"] == "unknown"
+    assert item["pause_cause"] is None
+    assert "No automatic continuation" in item["next_automatic_action"]
+    assert unit.evidence["child_pause"] == historical
+    assert unit.hold.kind == "owner" and unit.hold.id == "new-owner-hold"
+
+
+@pytest.mark.parametrize("inbox_pause", ["quota_wait"], indirect=True)
+def test_inbox_prefers_current_hold_pause_over_unit_history(inbox_pause):
+    from bmad_loop.model import PauseCause, PauseKind
+
+    snapshot, unit, _ = inbox_pause
+    current_cause = PauseCause(PauseKind.AUTHENTICATION_FAILURE, "engine.session", "authentication")
+    current = inbox_pause_receipt(snapshot, unit, current_cause, launch_id="current-launch")
+    unit.hold = Hold(
+        "authentication_required",
+        "Renew access",
+        id="current-launch",
+        evidence={"child_pause": current},
+    )
+    item = next(row for row in inbox_document(snapshot)["items"] if row["kind"] == "hold")
+    assert item["pause_evidence_status"] == "typed"
+    assert item["pause_cause"] == current_cause.to_dict()
+    assert unit.evidence["child_pause"]["cause"]["kind"] == "quota_wait"
+
+
+@pytest.mark.parametrize("current", [None, {"schema_version": 1, "cause": None}])
+def test_inbox_does_not_mask_invalid_current_hold_evidence_with_cached_pause(inbox_pause, current):
+    snapshot, unit, _ = inbox_pause
+    assert unit.hold.id == unit.evidence["child_pause"]["binding"]["launch_id"]
+    unit.hold.evidence["child_pause"] = current
+    item = next(row for row in inbox_document(snapshot)["items"] if row["kind"] == "hold")
+    assert item["pause_evidence_status"] == "unknown"
+    assert item["pause_cause"] is None
 
 
 @pytest.mark.parametrize("inbox_pause", [None, "unknown"], indirect=True)

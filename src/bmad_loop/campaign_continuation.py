@@ -99,6 +99,9 @@ def prepare_permit(request: dict[str, Any], envelope: CampaignExecution) -> dict
         or not request.get("handoff_id")
     ):
         raise CampaignError("development continuation requires an owned PR and successor")
+    context = request.get("continuation_context")
+    if not isinstance(context, dict) or not context:
+        raise CampaignError("development continuation requires frozen current constraints")
     raw_configuration = dataclasses.asdict(envelope)
     configuration = {
         key: raw_configuration[key]
@@ -113,6 +116,7 @@ def prepare_permit(request: dict[str, Any], envelope: CampaignExecution) -> dict
         "unit_id": envelope.unit_id,
         "config_revision": envelope.config_revision,
         "configuration_digest": _hash(configuration),
+        "continuation_context": context,
         "native_role": "dev",
         "handoff_id": request["handoff_id"],
         "capture_digest": handoff["capture_digest"],
@@ -157,6 +161,8 @@ def _consumed_permit(request, envelope) -> dict[str, Any]:
         raise CampaignError("development continuation lacks its consumed exact-successor permit")
     from .campaign_store import CampaignStore
     from .campaign_transfer import retired
+    from .campaign_usage import remaining
+    from .campaign_worker_authority import continuation_context
 
     directory = envelope.directory.resolve()
     authority = request.get("continuation_authority")
@@ -202,6 +208,15 @@ def _consumed_permit(request, envelope) -> dict[str, Any]:
         or (unit.hold and (unit.hold.kind != "handoff" or unit.hold.id != request["handoff_id"]))
     ):
         raise CampaignError("development continuation lost current campaign successor authority")
+    if continuation_context(snapshot, unit) != permit["binding"]["continuation_context"]:
+        raise CampaignError("development continuation current constraints changed")
+    remaining_dev, remaining_review = remaining(snapshot, unit)
+    if (
+        unit.evidence.get("usage", {}).get("legacy_counters_unknown")
+        or remaining_dev != permit["binding"]["remaining_dev_attempts"]
+        or max(0, remaining_review) != permit["binding"]["remaining_review_cycles"]
+    ):
+        raise CampaignError("development continuation remaining allowance changed")
     return permit
 
 

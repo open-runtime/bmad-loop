@@ -7,6 +7,8 @@ This module constructs data only; loading frozen archives remains explicit.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import json
 from pathlib import Path
 from typing import Any
 
@@ -148,6 +150,8 @@ def continuation_request(
             "effective_source", source_to_dict(source_selector(snapshot, unit))
         ),
         "unit": dataclasses.asdict(unit.spec),
+        "source_revision": unit.bindings.get("source_revision", ""),
+        "continuation_context": continuation_context(snapshot, unit),
         "handoff_state": {
             "capture_digest": handoff["capture"]["capture_digest"],
             "fingerprint": current["fingerprint"],
@@ -165,4 +169,103 @@ def continuation_request(
                 )
             },
         },
+    }
+
+
+def continuation_context(snapshot: CampaignSnapshot, unit: CampaignUnit) -> dict[str, Any]:
+    """Bind relevant live authority without duplicating captured histories."""
+
+    def digest(value: Any) -> str:
+        return hashlib.sha256(
+            json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()
+        ).hexdigest()
+
+    handoff = unit.evidence.get("handoff", {})
+    acceptance = unit.evidence.get("acceptance", {})
+    pr = unit.bindings.get("pr", {})
+    decisions = {
+        key: value
+        for key, value in snapshot.bindings.get("decision_receipts", {}).items()
+        if value.get("coordinates", {}).get("unit") == unit.id
+    }
+    return {
+        "schema_version": 1,
+        "unit_spec": digest(dataclasses.asdict(unit.spec)),
+        "repository": digest(
+            {
+                "repository": snapshot.repository,
+                "common_dir": snapshot.common_dir,
+                "root": snapshot.root,
+                "remote_url": snapshot.remote_url,
+            }
+        ),
+        "ownership": digest(
+            {
+                **{
+                    key: unit.bindings.get(key)
+                    for key in ("workspace", "branch", "head", "base", "canonical_source")
+                },
+                "pr": (
+                    {key: pr.get(key) for key in ("number", "id", "node_id")}
+                    if isinstance(pr, dict)
+                    else pr
+                ),
+            }
+        ),
+        "source": digest(
+            unit.bindings.get("effective_source", source_to_dict(source_selector(snapshot, unit)))
+        ),
+        "source_revision": unit.bindings.get("source_revision", ""),
+        "source_paths": digest(
+            {key: unit.bindings.get(key) for key in ("effective_sources", "private_paths")}
+        ),
+        "execution_template": dict(snapshot.bindings.get("execution_template", {})),
+        "handoff": digest(
+            {
+                key: handoff.get(key)
+                for key in (
+                    "id",
+                    "role",
+                    "native_role",
+                    "route_role",
+                    "candidate",
+                    "predecessor",
+                    "capture",
+                    "packet",
+                    "original_payload",
+                )
+            }
+        ),
+        "obligations": digest(
+            {
+                "acceptance": {key: acceptance.get(key) for key in ("revision", "criteria")},
+                "decision_input_revision": unit.evidence.get("decision_input_revision", ""),
+                "decision_receipts": decisions,
+                "decision_requests": {
+                    key: value
+                    for key, value in snapshot.bindings.get("decision_requests", {}).items()
+                    if value.get("receipt") in decisions
+                },
+                **{
+                    key: unit.evidence.get(key)
+                    for key in (
+                        "decisions",
+                        "unresolved_approval_requirements",
+                        "pending_failure_hold",
+                        "pending_failure_holds",
+                        "operator_prior_hold",
+                    )
+                },
+            }
+        ),
+        "contributors": digest(
+            {
+                "primary": unit.evidence.get("developer_family"),
+                "families": sorted(set(unit.evidence.get("developer_families", ()))),
+                "incomplete": unit.evidence.get("developer_attribution_incomplete"),
+            }
+        ),
+        "legacy_counters_unknown": bool(
+            unit.evidence.get("usage", {}).get("legacy_counters_unknown")
+        ),
     }

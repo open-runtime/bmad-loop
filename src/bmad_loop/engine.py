@@ -1180,8 +1180,14 @@ class Engine:
             campaign_recovery=(self._campaign_recovery if campaign_execution is not None else None),
         )
 
-    def _campaign_recovery(self, task: StoryTask, *, cause: str = "retry") -> NoReturn:
-        """Hand off before reset, ledger restoration or lifecycle normalization."""
+    def _campaign_recovery(
+        self, task: StoryTask, *, cause: str = "retry", pause_cause: PauseCause | None = None
+    ) -> NoReturn:
+        """Hand off before reset, ledger restoration or lifecycle normalization.
+
+        A supplied pause cause comes from the current producer, never the
+        recovery reason. Unclassified recovery remains explicitly unknown.
+        """
         assert self.campaign_execution is not None
         self._env_probes_fresh_root = None
         self._invalidate_verify_reuse("campaign-recovery")
@@ -1192,7 +1198,9 @@ class Engine:
         )
         self._save()
         self._escalation_pause(
-            "campaign recovery requested; checkpoint history preserved", task.story_key
+            "campaign recovery requested; checkpoint history preserved",
+            task.story_key,
+            pause_cause=pause_cause,
         )
 
     def _escalation_pause(
@@ -4562,7 +4570,15 @@ class Engine:
                     if not kept_tree:
                         feedback = None
                         rolled_back = True
-                        self._roll_back_rejected_attempt(task, replayed=replayed)
+                        self._roll_back_rejected_attempt(
+                            task,
+                            replayed=replayed,
+                            pause_cause=(
+                                _session_pause_cause(result, decision.usage_limit)
+                                if self.campaign_execution is not None
+                                else None
+                            ),
+                        )
                 if decision.uncharged:
                     # DW-616: the relaunch dispatches below without passing the
                     # top-of-phase gate, and `_env_gate_decision` skipped the
@@ -4599,7 +4615,9 @@ class Engine:
             else:
                 self._escalate_session(task, decision.reason, decision.usage_limit, result=result)
 
-    def _roll_back_rejected_attempt(self, task: StoryTask, *, replayed: bool) -> None:
+    def _roll_back_rejected_attempt(
+        self, task: StoryTask, *, replayed: bool, pause_cause: PauseCause | None = None
+    ) -> None:
         """Roll a rejected dev attempt back to the phase baseline.
 
         The non-fixable RETRY leg of :meth:`_dev_phase`: recover the tree, put the
@@ -4607,9 +4625,12 @@ class Engine:
         chain's pre-harvest snapshot. Also the rollback a kept-tree usage relaunch
         runs before its failed relaunch probe pauses (DW-615). ``replayed`` names
         a crash-replayed attempt: its ledger restore journals a missing snapshot
-        (``ledger-snapshot-missing``) instead of skipping it silently."""
+        (``ledger-snapshot-missing``) instead of skipping it silently. A campaign
+        passes the current session's typed pause cause through its recovery
+        boundary even when the adapter did not set the legacy env_fault flag.
+        """
         if self.campaign_execution is not None:
-            self._campaign_recovery(task, cause="rejected-attempt")
+            self._campaign_recovery(task, cause="rejected-attempt", pause_cause=pause_cause)
         try:
             self._rollback_or_pause(task)
         finally:

@@ -3852,7 +3852,9 @@ class CampaignRuntime:
         decorate_launch(snapshot, unit, request)
         if request.get("handoff_state", {}).get("native_role") == "dev":
             from .campaign_continuation import prepare_permit
+            from .campaign_worker_authority import continuation_context
 
+            request["continuation_context"] = continuation_context(snapshot, unit)
             permit = prepare_permit(request, envelope)
             recorded = unit.evidence.get("continuation_permits", {}).get(permit["permit_id"])
             if (

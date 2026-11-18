@@ -129,6 +129,9 @@ def adoption(development_handoff, tmp_path):
     runtime.project = project.project
     runtime.clock = lambda: 100
     envelope = runtime._launch_envelope(current, action)
+    from bmad_loop.campaign_worker_authority import continuation_context
+
+    request["continuation_context"] = continuation_context(current, unit)
     permit = prepare_permit(request, envelope)
     return SimpleNamespace(
         project=project,
@@ -540,6 +543,9 @@ def test_owned_inprogress_ticket_continues_dirty_work_through_review_and_commit(
         "continuation_permit": record["permit"],
         "continuation_consumption": record["consumption"],
     }
+    from bmad_loop.campaign_worker_authority import continuation_context
+
+    request["continuation_context"] = continuation_context(saved, saved.units[unit.id])
     observed = []
 
     def build(spec):
