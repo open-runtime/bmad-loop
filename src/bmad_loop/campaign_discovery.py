@@ -26,6 +26,9 @@ from .fences import fenced_spans
 from .verify import GitError, git_bytes
 
 
+INVENTORY_REFRESH_SECONDS = 120
+
+
 @dataclass(frozen=True)
 class CoverageReceipt:
     schema_version: int

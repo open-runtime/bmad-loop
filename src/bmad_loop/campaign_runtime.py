@@ -26,10 +26,10 @@ from . import runs, runsetup, verify
 from .adapters.profile import get_profile
 from .campaign_capacity import observe as observe_capacity
 from .campaign_discovery import (
+    INVENTORY_REFRESH_SECONDS,
     CoverageReceipt,
     OverlapDisposition,
     RepositoryDiscovery,
-    validate_overlap,
 )
 from .campaign_execution import CampaignExecution
 from .campaign_github import GhTransport, GithubGateway, MutationIntent
@@ -707,16 +707,19 @@ class CampaignRuntime:
         inventory = snapshot.bindings.get("inventory")
         if not inventory and not self._pending(snapshot, "", "inventory"):
             return (Proposal("inventory", ""),)
-        if (
-            inventory
-            and not inventory.get("complete")
-            and not self._pending(snapshot, "", "inventory")
-        ):
-            if now - inventory.get("observed_at", 0) > 15:
-                return (Proposal("inventory", ""),)
-        if not inventory or not inventory.get("complete"):
+        if not inventory or self._pending(snapshot, "", "inventory"):
             return ()
-        if self._pending(snapshot, "", "inventory"):
+        requested_inventory = any(
+            row.state == "sent_unknown"
+            and row.kind in {"observe-worker", "stage-boundary-after"}
+            and "admission_inventory_wait" in row.receipt
+            and row.receipt["admission_inventory_wait"] == inventory.get("digest", "")
+            for row in snapshot.outbox
+        )
+        if not inventory.get("complete"):
+            age = now - inventory.get("observed_at", 0)
+            if age < 0 or age > 15:
+                return (Proposal("inventory", ""),)
             return ()
         reviewing_inventory = any(
             unit.claim
@@ -724,7 +727,10 @@ class CampaignRuntime:
             and unit.claim.resource in {"planning", "review", "resolution"}
             for unit in snapshot.units.values()
         )
-        if now - inventory.get("observed_at", 0) > 120 and not reviewing_inventory:
+        if requested_inventory or (
+            now - inventory.get("observed_at", 0) > INVENTORY_REFRESH_SECONDS
+            and not reviewing_inventory
+        ):
             return (Proposal("inventory", ""),)
         if (
             any(
@@ -4983,6 +4989,12 @@ class CampaignRuntime:
         ):
             try:
                 self._validate_stage_receipt(snapshot, unit, request, receipt)
+                if receipt.get("validated_admission"):
+                    from .campaign_admission_review import inventory_status, refresh_wait
+
+                    now = self.clock()
+                    if inventory_status(snapshot, receipt, now=now) == "awaiting_inventory":
+                        return refresh_wait(snapshot, now=now)
             except (CampaignError, TypeError, ValueError, KeyError) as exc:
                 # The actor and its coding windows are positively terminal.
                 # Invalid model artifacts hold the unit, not live capacity.
@@ -5114,26 +5126,15 @@ class CampaignRuntime:
                     set(disposition.acceptance_coverage) | set(disposition.remaining)
                 ):
                     raise CampaignError("overlap disposition omits accepted criteria")
-                inventory_data = dict(snapshot.bindings["inventory"])
-                recorded_digest = inventory_data.pop("digest", None)
-                inventory = CoverageReceipt(**inventory_data)
-                current_digest = inventory.digest
-                if recorded_digest != current_digest:
-                    raise CampaignError(
-                        "Current admission inventory does not match its stored digest"
-                    )
-                owned_pr = unit.bindings["pr"]["number"]
+                from .campaign_admission_review import validate_original
+
                 if disposition.inventory_digest != coordinates.inventory_digest:
                     raise CampaignError(
                         "Admission answer does not match its assigned inventory revision"
                     )
-                if current_digest == coordinates.inventory_digest:
-                    validate_overlap(disposition, inventory, owned_pr=owned_pr)
-                else:
-                    from .campaign_admission_review import validate_original
-
-                    validate_original(request, disposition, owned_pr=owned_pr)
+                subject = validate_original(request, disposition, owned_pr=request["pr_number"])
                 receipt["validated_admission"] = raw
+                receipt["admission_reviewed_observation"] = subject
             if coordinates.stage == "native_review_pair":
                 from .campaign_codex_review_pair import stage_evidence
                 from .campaign_headless import capability_for
@@ -6841,6 +6842,19 @@ class CampaignRuntime:
         claim = unit.claim
         if not claim or claim.launch_id != action.payload["launch_id"]:
             raise CampaignError("worker receipt no longer owns its claim")
+        admission_now = None
+        if (data.get("receipt") or {}).get("validated_admission"):
+            from .campaign_admission_review import inventory_status, refresh_wait
+            from .campaign_supervisor import ObservationStale
+
+            admission_now = self.clock()
+            if (
+                inventory_status(snapshot, data["receipt"], now=admission_now)
+                == "awaiting_inventory"
+            ):
+                wait = refresh_wait(snapshot, now=admission_now)
+                data.update(wait.data)
+                raise ObservationStale(wait.reason)
         if data.get("state") in {"finished", "interrupted"}:
             self._validate_git_release(snapshot, unit, data)
         if data.get("object_promotion_error"):
@@ -7123,7 +7137,10 @@ class CampaignRuntime:
                 unit.evidence["verification"] = receipt
                 transition(snapshot, unit.id, UnitState.REVIEWING)
         elif outcome == "stage_complete":
-            self._apply_stage_result(snapshot, unit, receipt)
+            if admission_now is None:
+                self._apply_stage_result(snapshot, unit, receipt)
+            else:
+                self._apply_stage_result(snapshot, unit, receipt, admission_now=admission_now)
         else:
             if outcome == "paused" or (
                 outcome == "recovery_required" and receipt.get("child_pause") is not None
@@ -7185,7 +7202,9 @@ class CampaignRuntime:
                 ),
             )
 
-    def _apply_stage_result(self, snapshot, unit, receipt, *, duplicate_readback=None) -> None:
+    def _apply_stage_result(
+        self, snapshot, unit, receipt, *, duplicate_readback=None, admission_now=None
+    ) -> None:
         claim = unit.claim
         stage = receipt["stage"]
         if receipt.get("landing"):
@@ -7224,15 +7243,30 @@ class CampaignRuntime:
             ).hexdigest()
             transition(snapshot, unit.id, UnitState.LOCALLY_COMPLETE)
         elif stage == "admission_review":
-            if (
-                receipt["validated_admission"]["inventory_digest"]
-                != snapshot.bindings["inventory"]["digest"]
-            ):
+            from .campaign_admission_review import inventory_status, refresh_wait
+            from .campaign_supervisor import ObservationStale
+
+            admission_now = self.clock() if admission_now is None else admission_now
+            state = inventory_status(snapshot, receipt, now=admission_now)
+            if state == "awaiting_inventory":
+                raise ObservationStale(refresh_wait(snapshot, now=admission_now).reason)
+            if state != "current":
                 from .campaign_boundary_sync import invalidate
 
                 invalidate(self, snapshot, unit, {"request": {}, "receipt": receipt})
                 return
-            unit.evidence["admission"] = receipt["validated_admission"]
+            answer = receipt["validated_admission"]
+            current = snapshot.bindings["inventory"]
+            if answer["inventory_digest"] != current["digest"]:
+                unit.evidence["admission_inventory_refresh"] = {
+                    "reviewed_digest": answer["inventory_digest"],
+                    "reviewed_at": receipt["admission_reviewed_observation"]["observed_at"],
+                    "current_digest": current["digest"],
+                    "current_observed_at": current["observed_at"],
+                }
+            else:
+                unit.evidence.pop("admission_inventory_refresh", None)
+            unit.evidence["admission"] = answer
             transition(snapshot, unit.id, UnitState.READY)
         elif receipt.get("result_contract") == "repair-v1":
             unit.evidence["repair_candidate"] = receipt["validated_repair"]

@@ -20,6 +20,7 @@ from pathlib import Path
 from . import verify
 from .campaign_action_history import actions as historical_actions
 from .campaign_action_history import confirmation_revision
+from .campaign_admission_review import inventory_status, refresh_wait
 from .campaign_boundary_receipts import input_reference
 from .campaign_model import CampaignError, Hold, UnitState
 from .campaign_store import add_event, transition
@@ -517,10 +518,14 @@ def after_effect(runtime, snapshot, action):
             raise
         except (CampaignError, ValueError, TypeError, KeyError) as exc:
             receipt.update(outcome="invalid_stage_result", error=str(exc))
-        if admission:
-            changed = receipt["outcome"] != "invalid_stage_result" and (
-                changed or _admission_inventory_changed(snapshot, receipt)
-            )
+        if admission and receipt["outcome"] != "invalid_stage_result":
+            now = runtime.clock()
+            state = inventory_status(snapshot, receipt, now=now)
+            if not changed and state == "awaiting_inventory":
+                return refresh_wait(snapshot, now=now)
+            changed = changed or state == "changed"
+        elif admission:
+            changed = False
         validated = True
     return Observation(
         "confirmed",
@@ -579,6 +584,16 @@ def after_apply(runtime, snapshot, action, data):
     debt = unit.evidence["stage_sync_debt"]
     if data["launch_id"] != debt["receipt"]["launch_id"]:
         raise CampaignError("stage sync receipt belongs to another actor")
+    admission_now = (
+        runtime.clock() if (data.get("receipt") or {}).get("validated_admission") else None
+    )
+    if (
+        admission_now is not None
+        and inventory_status(snapshot, data["receipt"], now=admission_now) == "awaiting_inventory"
+    ):
+        wait = refresh_wait(snapshot, now=admission_now)
+        data.update(wait.data)
+        raise ObservationStale(wait.reason)
     if refresh := data.get("duplicate_replan"):
         from .campaign_runtime_intake import fail_stage
         from .campaign_usage import finalize_stage_usage
@@ -645,7 +660,7 @@ def after_apply(runtime, snapshot, action, data):
         # A forged or malformed answer remains a failure even if its inputs
         # moved. Recheck a valid answer against the actual commit-time receipt.
         changed = data["receipt"].get("outcome") != "invalid_stage_result" and (
-            changed or _admission_inventory_changed(snapshot, data["receipt"])
+            changed or inventory_status(snapshot, data["receipt"], now=admission_now) == "changed"
         )
         unit.evidence["stage_boundary_history"][-1]["changed"] = changed
     if not changed and not data["validated"]:
@@ -690,7 +705,11 @@ def after_apply(runtime, snapshot, action, data):
         from .campaign_usage import finalize_stage_usage
 
         finalize_stage_usage(snapshot, unit, data["receipt"])
-        if data.get("duplicate_readback") is not None:
+        if admission_now is not None:
+            runtime._apply_stage_result(
+                snapshot, unit, data["receipt"], admission_now=admission_now
+            )
+        elif data.get("duplicate_readback") is not None:
             runtime._apply_stage_result(
                 snapshot, unit, data["receipt"], duplicate_readback=data["duplicate_readback"]
             )
@@ -707,20 +726,13 @@ def after_apply(runtime, snapshot, action, data):
     )
 
 
-def _admission_inventory_changed(snapshot, receipt):
-    answer = receipt.get("validated_admission")
-    return (
-        answer is not None
-        and answer["inventory_digest"] != snapshot.bindings["inventory"]["digest"]
-    )
-
-
 def invalidate(runtime, snapshot, unit, debt, *, inputs=None, validated=None):
     receipt = debt["receipt"]
     history = unit.evidence.setdefault("stage_input_invalidations", [])
     entry = {"receipt": receipt, "reason": "GitHub inputs/graph changed during stage"}
-    if receipt["stage"] == "admission_review" and _admission_inventory_changed(
-        snapshot, validated or receipt
+    if (
+        receipt["stage"] == "admission_review"
+        and inventory_status(snapshot, validated or receipt, now=runtime.clock()) == "changed"
     ):
         entry.update(
             reason="Repository inventory changed during admission review",
