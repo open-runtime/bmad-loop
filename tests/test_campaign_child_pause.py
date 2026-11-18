@@ -424,7 +424,7 @@ def test_durable_engine_recovery_request_retains_its_recovery_hold(paused_child,
     assert persisted["task"]["story_key"] == case.spec.selector
     assert observed["receipt"]["outcome"] == "recovery_required"
     runtime, snapshot, unit, action = parent_for(case, tmp_path)
-    runtime._apply_worker(snapshot, unit, action, observed)
+    apply_terminal(runtime, snapshot, unit, action, case, observed)
     assert unit.hold.kind == "recovery_required"
     assert unit.claim.quiescent and unit.claim.launch_id == case.request["launch_id"]
 
@@ -444,7 +444,7 @@ def test_protected_successor_pause_retires_handoff_and_keeps_owner_hold(
         "predecessor": {"launch_id": "old"},
         "successor": {"launch_id": unit.claim.launch_id},
     }
-    runtime._apply_worker(snapshot, unit, action, observed)
+    apply_terminal(runtime, snapshot, unit, action, case, observed)
     assert handoff["phase"] == "stopped"
     assert handoff["successor_receipt"] == observed["receipt"]
     assert unit.hold.kind == ("pause_unknown" if legacy else "owner") and unit.claim.quiescent
@@ -460,7 +460,7 @@ def test_active_handoff_cannot_intercept_untyped_paused_predecessor(paused_child
         "phase": "drain",
         "predecessor": {"launch_id": unit.claim.launch_id},
     }
-    runtime._apply_worker(snapshot, unit, action, observed)
+    apply_terminal(runtime, snapshot, unit, action, case, observed)
     assert handoff["phase"] == "stopped" and handoff["receipt"] == observed["receipt"]
     assert unit.hold.kind == "pause_unknown" and unit.claim.quiescent
 

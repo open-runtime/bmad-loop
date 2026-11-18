@@ -6,9 +6,12 @@ import sys
 import threading
 import time
 from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
+from campaign_runtime_watchdog import ProgressWatchdog
 from conftest import git
 from test_campaign_handoff_flow import campaign as campaign
 from test_campaign_headless import prepared as prepared
@@ -66,6 +69,7 @@ def test_recovery_soak_cycle(campaign, production_case, tmp_path, monkeypatch):
     samples = []
     auth = {}
     lost_ack = {}
+    comments = {}
     marker = "\n\nThe repository owner confirmed the migration date."
     install_scripted_disposition(case.events.parent / "scripted-coding-cli.py", marker)
 
@@ -96,6 +100,26 @@ def test_recovery_soak_cycle(campaign, production_case, tmp_path, monkeypatch):
                     lost_ack["pull"] = int(path.split("/")[-2])
                     mark("merge_acknowledgement_lost")
                 raise
+            parsed = urlsplit(path)
+            if parsed.path.endswith("/comments"):
+                if method == "POST":
+                    stamp = datetime.now(timezone.utc).isoformat()
+                    row = {
+                        **response.data,
+                        "user": {"id": 21, "login": "campaign-bot"},
+                        "author_association": "MEMBER",
+                        "created_at": stamp,
+                        "updated_at": stamp,
+                    }
+                    comments.setdefault(parsed.path, []).append(row)
+                    return service._response(row, status=response.status)
+                if method == "GET":
+                    query = parse_qs(parsed.query)
+                    page = int(query.get("page", ["1"])[0])
+                    count = int(query.get("per_page", ["30"])[0])
+                    return service._response(
+                        comments.get(parsed.path, [])[(page - 1) * count : page * count]
+                    )
             if (
                 lost_ack
                 and path == "graphql"
@@ -118,6 +142,19 @@ def test_recovery_soak_cycle(campaign, production_case, tmp_path, monkeypatch):
             return response
 
     monkeypatch.setattr(service, "request", fault_transport)
+    base_milestones = ProgressWatchdog._milestones
+
+    def soak_milestones(watchdog, snapshot):
+        milestones = base_milestones(watchdog, snapshot)
+        # One persisted 401 and its one actual expiry are distinct milestones.
+        # The ordinary idle watchdog and its absolute ceiling remain in force.
+        if "deadline" in auth:
+            milestones.add(("soak", "tracking-authentication", "wait-persisted"))
+            if time.time() >= auth["deadline"]:
+                milestones.add(("soak", "tracking-authentication", "retry-due"))
+        return milestones
+
+    monkeypatch.setattr(ProgressWatchdog, "_milestones", soak_milestones)
     enqueue = CampaignStore.enqueue
     save = CampaignStore.save
     reconcile = CampaignRuntime._perform_tracking_reconcile
