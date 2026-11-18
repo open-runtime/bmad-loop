@@ -93,6 +93,61 @@ def test_lost_commit_ack_preserves_landed_commit_and_blocks_duplicate(project, m
     assert len(landed) == 1
 
 
+def test_timeout_after_persist_is_uncertain_not_refusal(project, monkeypatch):
+    """GitTimeoutError after active.json must not escape as ordinary GitError."""
+    repo, baseline, original, _index, _preimage = _attempt(project)
+    real = verify._run_git
+
+    def timeout_recovery_ref(cmd, root, **kwargs):
+        if cmd[3] == "update-ref" and any(
+            isinstance(arg, str) and arg.startswith("refs/bmad-finalization/") for arg in cmd
+        ):
+            raise verify.GitTimeoutError("recovery-ref creation timed out")
+        return real(cmd, root, **kwargs)
+
+    monkeypatch.setattr(verify, "_run_git", timeout_recovery_ref)
+    with pytest.raises(verify.GitFinalizationUncertain):
+        verify.finalize_commit(repo, baseline, "finalize")
+    record = finalization_recovery.pending(repo)
+    assert record is not None and record["state"] == "uncertain"
+    assert git(repo, "rev-parse", "HEAD") == original
+    with pytest.raises(verify.GitFinalizationUncertain):
+        verify.finalize_commit(repo, baseline, "do not replay")
+
+
+def test_engine_timeout_after_persist_preserves_bookkeeping(project, monkeypatch):
+    engine, _ = make_engine(project, [])
+    committing_crash_state(project, engine, operator_actions=["owner approval"])
+    real = verify._run_git
+
+    def timeout_recovery_ref(cmd, root, **kwargs):
+        if cmd[3] == "update-ref" and any(
+            isinstance(arg, str) and arg.startswith("refs/bmad-finalization/") for arg in cmd
+        ):
+            raise verify.GitTimeoutError("recovery-ref creation timed out")
+        return real(cmd, root, **kwargs)
+
+    monkeypatch.setattr(verify, "_run_git", timeout_recovery_ref)
+    resumed, adapter = resume_engine(project, engine, [])
+    summary = resumed.run()
+    assert summary.paused and not summary.crashed and summary.done == 0
+    state = load_state(resumed.run_dir)
+    assert state.tasks["1-1-a"].phase == Phase.COMMITTING
+    assert state.paused_cause.kind == PauseKind.UNKNOWN
+    record = finalization_recovery.pending(project.project)
+    assert record is not None and record["context"]["park_record"] is not None
+    assert adapter.sessions == []
+    before = json.dumps(record, sort_keys=True)
+    rerun, adapter2 = resume_engine(project, resumed, [])
+    monkeypatch.setattr(rerun, "_write_park_record", lambda *_: pytest.fail("replayed park"))
+    monkeypatch.setattr(rerun, "_close_declared_deferred", lambda *_: pytest.fail("replayed close"))
+    monkeypatch.setattr(rerun, "_terminal_plan_write", lambda *_: pytest.fail("replayed plan"))
+    summary2 = rerun.run()
+    assert summary2.paused and not summary2.crashed
+    assert adapter2.sessions == []
+    assert json.dumps(finalization_recovery.pending(project.project), sort_keys=True) == before
+
+
 def test_engine_unknown_commit_preserves_bookkeeping_and_resume_does_not_replay(
     project, monkeypatch
 ):
