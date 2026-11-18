@@ -226,6 +226,34 @@ class GhTransport:
             raise error(
                 "GitHub returned invalid JSON", status=status, request_id=request_id
             ) from exc
+        errors = data.get("errors") if path == "graphql" and isinstance(data, dict) else None
+        if (
+            status == 200
+            and isinstance(errors, list)
+            and errors
+            and (
+                headers.get("x-ratelimit-remaining") == "0"
+                or any(
+                    isinstance(row, dict)
+                    and (
+                        row.get("type") == "RATE_LIMITED"
+                        or "secondary rate limit" in str(row.get("message", "")).lower()
+                    )
+                    for row in errors
+                )
+            )
+        ):
+            deadline = retry_at if retry_at is not None else now + 60
+            error = GithubError if read else UncertainMutation
+            raise error(
+                "GitHub GraphQL request was rate limited",
+                category="rate_limit",
+                status=status,
+                request_id=request_id,
+                certainty="observation_failed" if read else "unknown",
+                retry_at=deadline,
+                retry_after_s=max(0, deadline - now),
+            )
         if result.returncode and status < 400:
             error = GithubError if read else UncertainMutation
             raise error(f"gh failed after HTTP {status}", status=status, request_id=request_id)

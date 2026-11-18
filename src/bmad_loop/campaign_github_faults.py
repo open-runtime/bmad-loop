@@ -30,13 +30,26 @@ def mutation_observation(intent, *, now):
     return Observation(state, data, intent.error, deadline)
 
 
+def _actions_with_held_faults(snapshot):
+    from .campaign_action_history import action as recorded_action
+
+    yield from snapshot.outbox
+    hot_ids = {action.id for action in snapshot.outbox}
+    for unit in getattr(snapshot, "units", {}).values():
+        hold = unit.hold
+        if hold and hold.kind == "effect_refused" and hold.id and hold.id not in hot_ids:
+            recorded = recorded_action(snapshot, hold.id)
+            if recorded and recorded.unit == unit.id and recorded.state == "rejected":
+                yield recorded
+
+
 def status_waits(snapshot, *, limit=200):
     """Expose bounded actionable faults without publishing mutation payloads."""
     from .sanitize import scrub_text
 
     rows = []
     total = 0
-    for action in snapshot.outbox:
+    for action in _actions_with_held_faults(snapshot):
         if action.state == "confirmed" or not (action.error or action.next_retry_at):
             continue
         total += 1
@@ -50,7 +63,11 @@ def status_waits(snapshot, *, limit=200):
             "unit": action.unit,
             "kind": action.kind,
             "state": action.state,
-            "reason": scrub_text(action.error),
+            "reason": (
+                "Checkpoint observation unavailable; inspect the private campaign record."
+                if action.kind in {"checkpoint", "checkpoint-progress"} and action.error
+                else scrub_text(action.error)
+            ),
             "next_retry_at": action.next_retry_at or None,
             "next_action": (
                 "operator reconciliation required"

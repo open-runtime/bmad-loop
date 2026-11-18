@@ -69,6 +69,62 @@ def test_graphql_query_transport_failure_is_observation_not_uncertain_mutation(m
     assert len(error.value.request_id) == 64
 
 
+@pytest.mark.parametrize(
+    "operation,certainty", [("query", "observation_failed"), ("mutation", "unknown")]
+)
+def test_http_success_with_graphql_quota_error_retains_deadline_and_request(
+    monkeypatch, operation, certainty
+):
+    response = (
+        "HTTP/2.0 200 OK\nX-RateLimit-Remaining: 0\nX-RateLimit-Reset: 900\n"
+        'Retry-After: 70\nX-Github-Request-Id: limit-1\n\n{"errors":[{"type":"RATE_LIMITED"}]}'
+    )
+    monkeypatch.setattr(
+        subprocess, "run", lambda *a, **kw: subprocess.CompletedProcess(a, 1, response, "")
+    )
+    with pytest.raises(GithubError) as error:
+        GhTransport(clock=lambda: 100).request(
+            "POST", "graphql", {"query": operation + " { synthetic }"}
+        )
+    assert error.value.category == "rate_limit" and error.value.retry_at == 900
+    assert error.value.certainty == certainty and error.value.request_id == "limit-1"
+
+
+def test_live_hold_preserves_archived_fault_in_bounded_waits(tmp_path):
+    from test_campaign_action_history import confirmed
+    from test_campaign_database import state
+
+    from bmad_loop.campaign_github_faults import status_waits
+    from bmad_loop.campaign_model import Hold
+    from bmad_loop.campaign_store import CampaignStore
+
+    store = CampaignStore(tmp_path)
+    snapshot = store.create(state())
+    unit = next(iter(snapshot.units.values()))
+    old = add_action(snapshot, "github", unit.id, {}, action_id="refused")
+    old.state, old.error = "rejected", "GitHub refused an update"
+    old.receipt = {"github_fault": {"category": "permission", "request_id": "req-9"}}
+    unit.hold = Hold("effect_refused", old.error, id=old.id)
+    assert status_waits(snapshot)["total"] == 1
+    confirmed(snapshot, "newer-comment")
+    snapshot = store.save(snapshot, snapshot.revision)
+    assert all(row.id != old.id for row in snapshot.outbox)
+    result = status_waits(snapshot, limit=1)
+    assert result["total"] == 1 and result["items"][0]["github_fault"]["request_id"] == "req-9"
+
+
+def test_checkpoint_fault_does_not_publish_private_path(campaign_store):
+    from bmad_loop.campaign_github_faults import status_waits
+
+    store, campaign_id = campaign_store
+    snapshot = store.load(campaign_id)
+    action = add_action(snapshot, "checkpoint", "s:e:first", {})
+    action.state, action.error = "sent_unknown", "cannot read /private/customer/key-material"
+    item = status_waits(snapshot)["items"][0]
+    assert item["id"] == action.id and "private campaign record" in item["reason"]
+    assert "customer" not in item["reason"]
+
+
 def test_persisted_fault_does_not_charge_expired_retry_duration_again():
     fault = {"category": "rate_limit", "retry_at": 700, "retry_after_s": 600}
     assert retry_at(fault, now=100, wall_clock=lambda: 100) == 700
