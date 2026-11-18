@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import threading
 import time
-from dataclasses import replace
+from dataclasses import asdict, replace
 
 import pytest
+from test_campaign_store import external_landing_case as external_landing_case
 
 from bmad_loop.campaign_model import (
     CampaignSnapshot,
@@ -24,6 +25,110 @@ from bmad_loop.campaign_model import (
 from bmad_loop.campaign_scheduler import admit
 from bmad_loop.campaign_store import CampaignStore, add_action, transition
 from bmad_loop.campaign_supervisor import CampaignSupervisor, Observation, Proposal
+
+
+@pytest.mark.parametrize("order", [("external", "repair"), ("repair", "external")])
+def test_external_landing_harvest_commits_authority_and_reobserves_stale_results(
+    external_landing_case, order
+):
+    from concurrent.futures import Future
+
+    from test_campaign_store import MERGE, UNIT
+
+    from bmad_loop.campaign_model import OutboxAction, ResolutionSpec
+    from bmad_loop.campaign_runtime import CampaignRuntime
+
+    store, snapshot, proof = external_landing_case
+    other = CampaignUnit(
+        replace(snapshot.units[UNIT].spec, id="source:project:other", title="Other"),
+        state=UnitState.MERGED_PENDING_SYNC,
+        evidence={
+            "landing_acceptance": {
+                "merge_commit": MERGE,
+                "failure": {"outcome": "verification_failed"},
+            }
+        },
+    )
+    snapshot.units[other.id] = other
+    snapshot.spec = replace(
+        snapshot.spec,
+        units=tuple(u.spec for u in snapshot.units.values()),
+        resolution=ResolutionSpec(mode="bounded-auto"),
+    )
+    snapshot.graph_revision += 1
+    snapshot.config_revision += 1
+    snapshot.units[UNIT].evidence["review"]["validated"]["coordinates"].update(
+        graph_revision=snapshot.graph_revision,
+        config_revision=snapshot.config_revision,
+    )
+    proof = replace(
+        proof, graph_revision=snapshot.graph_revision, config_revision=snapshot.config_revision
+    )
+    snapshot.outbox.extend(
+        [
+            OutboxAction("external", "prepare-merge", UNIT, {}, 1, state="sent_unknown"),
+            OutboxAction("repair", "landing-repair", other.id, {}, 1, state="sent_unknown"),
+        ]
+    )
+    snapshot = store.save(snapshot, snapshot.revision)
+    before_graph = snapshot.graph_revision
+
+    class Driver:
+        def apply(self, current, action, observation):
+            # Exercise the production application branches, including typed
+            # stale-observation handling; no worker or remote write is needed.
+            CampaignRuntime._apply_effect(self, current, action, observation)
+
+        def _set_hold(self, unit, hold):
+            unit.hold = hold
+
+    def completed(data):
+        future = Future()
+        future.set_result(Observation("confirmed", data))
+        return future
+
+    def landing_data(evidence):
+        return {
+            "external_landing": asdict(evidence),
+            "merge": {
+                "merge_commit": evidence.merge_commit,
+                "canonical_head": evidence.canonical_head,
+            },
+        }
+
+    supervisor = CampaignSupervisor(store, Driver(), clock=lambda: 100, progress=lambda _: None)
+    for identifier in order:
+        supervisor._active[identifier] = completed(
+            landing_data(proof) if identifier == "external" else {"merge_commit": MERGE}
+        )
+    result = supervisor._harvest(snapshot)
+    restored = store.load(snapshot.id)
+    assert restored.graph_revision == before_graph + 1
+    assert sum(u.spec.kind == "landing_repair" for u in restored.units.values()) == 1
+    actions = {a.id: a for a in restored.outbox}
+    assert actions["repair"].state == "confirmed"
+    assert actions["other-unknown-effect"].state == "sent_unknown"
+    if order[0] == "repair":
+        assert restored.units[UNIT].state == UnitState.READY_TO_PUBLISH
+        assert actions["external"].state == "sent_unknown"
+        assert actions["external"].next_retry_at == 105
+        assert "fresh observation required" in actions["external"].error
+        assert "landing_acceptance" not in restored.units[UNIT].evidence
+        assert actions["external"].receipt["merge"]["merge_commit"] == MERGE
+        # Supply a newly bound, independently accepted H receipt after the
+        # revision change, then reconcile the same read action exactly once.
+        review = restored.units[UNIT].evidence["review"]
+        review["launch_id"] = "review-fresh"
+        review["validated"]["coordinates"]["graph_revision"] = restored.graph_revision
+        result = store.save(restored, restored.revision)
+        proof = replace(proof, graph_revision=result.graph_revision, review_launch="review-fresh")
+        supervisor._active["external"] = completed(landing_data(proof))
+        result = supervisor._harvest(result)
+    assert result.units[UNIT].state == UnitState.MERGED_PENDING_SYNC
+    assert result.units[UNIT].evidence["landing_acceptance"]["state"] == "pending"
+    assert result.units[UNIT].evidence["landing_acceptance"]["merge_commit"] == MERGE
+    assert sum(e["kind"] == "external-landing-observed" for e in result.events) == 1
+    assert not any(a.payload.get("purpose") == "merge" for a in result.outbox)
 
 
 @pytest.fixture

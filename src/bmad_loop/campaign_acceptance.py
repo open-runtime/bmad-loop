@@ -135,29 +135,13 @@ def context(unit) -> dict[str, Any]:
     }
 
 
-def evaluate(unit, candidate, *, review=None) -> dict[str, Any]:
-    """Return proof states; missing, failed and stale evidence can never pass."""
-    ledger = ensure(unit)
-    verification = unit.evidence.get("verification", {})
-    review = review if review is not None else unit.evidence.get("review", {})
-    mapping = review.get("artifact", {}).get("acceptance_evidence", [])
-    if not isinstance(mapping, list):
-        raise CampaignError("acceptance_evidence must be a list")
-    by_id = {}
-    known = {row["id"] for row in ledger["criteria"]}
-    for row in mapping:
-        if (
-            not isinstance(row, dict)
-            or row.get("criterion_id") not in known
-            or row["criterion_id"] in by_id
-        ):
-            raise CampaignError("acceptance evidence has unknown or duplicate criterion identity")
-        by_id[row["criterion_id"]] = row
+def receipts_current(verification, review, candidate) -> bool:
+    """Bind verifier provenance and review coordinates even without criteria."""
     proof = verification.get("proof", {})
     commands = verification.get("commands", [])
     recorded_recipe = [row.get("argv", row.get("command")) for row in commands]
     coordinates = review.get("validated", {}).get("coordinates", {})
-    fresh = (
+    return (
         verification.get("head") == candidate.head
         and proof.get("head") == candidate.head
         and proof.get("config_revision") == candidate.config_revision
@@ -177,6 +161,29 @@ def evaluate(unit, candidate, *, review=None) -> dict[str, Any]:
         )
         and str(coordinates.get("config_revision")) == candidate.config_revision
     )
+
+
+def evaluate(unit, candidate, *, review=None) -> dict[str, Any]:
+    """Return proof states; missing, failed and stale evidence can never pass."""
+    ledger = ensure(unit)
+    verification = unit.evidence.get("verification", {})
+    review = review if review is not None else unit.evidence.get("review", {})
+    mapping = review.get("artifact", {}).get("acceptance_evidence", [])
+    if not isinstance(mapping, list):
+        raise CampaignError("acceptance_evidence must be a list")
+    by_id = {}
+    known = {row["id"] for row in ledger["criteria"]}
+    for row in mapping:
+        if (
+            not isinstance(row, dict)
+            or row.get("criterion_id") not in known
+            or row["criterion_id"] in by_id
+        ):
+            raise CampaignError("acceptance evidence has unknown or duplicate criterion identity")
+        by_id[row["criterion_id"]] = row
+    commands = verification.get("commands", [])
+    proof = verification.get("proof", {})
+    fresh = receipts_current(verification, review, candidate)
     rows = []
     for criterion in ledger["criteria"]:
         row = {
