@@ -2016,6 +2016,7 @@ class CampaignRuntime:
             "resolution-accept",
             "resolution-finish",
             "resolution-exhausted",
+            "resolution-refused",
             "terminate-worker",
         }:
             return self.perform(dataclasses.replace(snapshot, generation=action.generation), action)
@@ -3007,6 +3008,9 @@ class CampaignRuntime:
         return finish(self, snapshot, snapshot.units[action.unit], action)
 
     def _perform_resolution_exhausted(self, snapshot, action) -> Observation:
+        return Observation("confirmed", dict(action.payload))
+
+    def _perform_resolution_refused(self, snapshot, action) -> Observation:
         return Observation("confirmed", dict(action.payload))
 
     def _perform_terminate_worker(self, snapshot, action) -> Observation:
@@ -5547,6 +5551,10 @@ class CampaignRuntime:
                 "bounded same-PR repair did not converge",
                 id=data["proposal_id"],
             )
+        elif kind == "resolution-refused":
+            from .campaign_resolution_flow import refuse_persisted_resolution
+
+            refuse_persisted_resolution(snapshot, unit, data)
         elif kind == "resolution-reprobe":
             if data["available"]:
                 unit.hold = None
