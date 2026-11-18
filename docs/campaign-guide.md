@@ -847,6 +847,7 @@ changes. A delegated agent's message does not itself establish owner approval.
 ```bash
 bmad-loop campaign list --project /path/to/project --json
 bmad-loop campaign status CAMPAIGN_ID --project /path/to/project --json
+bmad-loop campaign inbox CAMPAIGN_ID --unit QUALIFIED_UNIT --limit 100 --json
 bmad-loop campaign jobs CAMPAIGN_ID --unit QUALIFIED_UNIT --limit 100 --json
 bmad-loop campaign jobs CAMPAIGN_ID --job JOB_ID --details --json
 bmad-loop campaign endpoints CAMPAIGN_ID --after 0 --limit 100 --json
@@ -883,6 +884,13 @@ discovery wait when no more specific admission reason applies. A partial invento
 does not authorize new work. Optional portfolio reasoning waits for an owned
 workspace when reflection is enabled; refreshing unchanged inventory does not
 create a new analysis merely because its observation time changed.
+
+`inbox` provides a bounded view of holds, uncertain external writes and waiting
+routes. Each item names its exact unit and related decision, effect or job,
+explains the wait, and shows the next automatic action, any recorded retry time
+and required operator action. It observes stopped and retired campaigns without
+resuming them. Historical pauses without typed producer evidence remain unknown;
+their reason text does not establish technical retry or owner approval.
 
 For a capacity wait, inspect `status --json` and the affected job's `--details`.
 Admission needs a fresh valid observation or another eligible candidate already
@@ -963,6 +971,17 @@ capture, then audits the current owner constraints before replacing a worker.
 Changed or corrupt optional cache entries are re-extracted. Complete native-store
 migration is not provided; portable context and source retrieval preserve the
 handoff contract.
+
+Development continuation can retain the campaign's own in-progress ticket after
+a typed quota or transport interruption. The controller consumes a versioned
+permit with the exact successor claim before dispatch. It binds the predecessor,
+saved task and source, worktree, branch, PR, frozen configuration and remaining
+allowances. The child independently checks the durable record and current
+ownership before entering the retained task and again before starting a session.
+Dirty work, baselines, history, contributors and approval obligations remain
+intact; the normal picker still refuses another worker's active ticket.
+Source checkpoints, authentication requirements, owner decisions and unknown
+pauses remain held. Historical review continuations retain their earlier contract.
 
 Controls append durable requests; the coordinator is the single state writer.
 Stop closes admissions and drains current bounded stages by default. Explicit

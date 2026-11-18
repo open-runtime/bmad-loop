@@ -85,6 +85,8 @@ from .model import (
     PAUSE_TICKET_HITL,
     PAUSE_TICKET_REFINE,
     PAUSE_TICKET_TREE,
+    PauseCause,
+    PauseKind,
     Phase,
     RunState,
     TicketBinding,
@@ -146,6 +148,25 @@ HALT_STAGES: Final[Mapping[str, str]] = {
     HALT_BINDING_MOVED: PAUSE_TICKET_TREE,
 }
 """The pause stage each :class:`Halt` cause raises."""
+
+
+def halt_pause_cause(code: str) -> PauseCause:
+    """Preserve the picker's producer code without interpreting its detail prose."""
+    kinds = {
+        HALT_REFINE: PauseKind.SOURCE_CHECKPOINT,
+        HALT_PLAN_CHECKPOINT: PauseKind.SOURCE_CHECKPOINT,
+        HALT_AWAITING_CLOSURE: PauseKind.SOURCE_CHECKPOINT,
+        HALT_EPIC_CLOSURE: PauseKind.SOURCE_CHECKPOINT,
+        HALT_EPIC_REJECTED: PauseKind.SOURCE_CHECKPOINT,
+        HALT_HITL: PauseKind.OWNER_DECISION,
+        HALT_TREE_FAULT: PauseKind.TECHNICAL_FAILURE,
+        HALT_PIN_MISMATCH: PauseKind.TECHNICAL_FAILURE,
+        HALT_DIRTY_INITIATIVE: PauseKind.TECHNICAL_FAILURE,
+        HALT_IGNORED_PLAN: PauseKind.TECHNICAL_FAILURE,
+        HALT_BINDING_MOVED: PauseKind.TECHNICAL_FAILURE,
+    }
+    return PauseCause(kinds.get(code, PauseKind.UNKNOWN), "tickets.pick", code)
+
 
 SKIP_EMPTY: Final = "empty"
 SKIP_PARKED: Final = "parked"

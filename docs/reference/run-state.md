@@ -154,6 +154,14 @@ Claude may omit the model, and Gemini and Copilot send none that bmad-loop reads
 
 A run paused on a usage limit also records `paused_limit_class` (`blocked` for a `usage_limit_patterns` match, `wait` for a `usage_wait_patterns` match, from the visible pane or an opencode provider-error line alike) and `paused_reset_at`, the reset as ISO-8601 when the pane line named one that resolved (null otherwise; an unresolved clause stays in `paused_reason`, and an opencode provider-error line names no reset). Both are null on every other pause, and its `run-paused` journal entry carries them as `usage_limit_class` and `usage_limit_reset_at` when set. `resolve --at-reset` times its wait from these two fields.
 
+When a deterministic producer supplies it, `paused_cause` records a version-1
+`kind`, `producer` and `code`. Kinds distinguish source checkpoints, technical
+failures, authentication failures, quota waits, transport failures, owner
+decisions and explicitly unknown causes. The field is omitted for historical
+untyped pauses; neither stage labels nor reason prose reconstruct it. Clearing
+and restoring a pause includes this evidence. Campaign child receipts additionally
+seal it to the exact task, source, head, configuration and launch identities.
+
 A tickets run's `state.json` also records `initiative` and `initiative_folder`, the BMAD v7 initiative the run is pinned to: every ticket-tree read refuses while the live `[core] active_initiative` names another. Each task carries a `ticket` binding resolved when it was picked (ref, id, epic slug and id, title, plan, risk, and the refined, hitl and checkpoint flags). `ticket_epic_filter`, `ticket_story_approvals`, `ticket_epic_closures`, `ticket_epic_closure_resumed` and `ticket_epic_closure_acked` hold the epic selector, the refs whose story file an operator approved (resuming the pick's `plan-checkpoint` pause records the ref), each finished epic's closure (its retrospective `verdict`, or `unknown`), the epics whose closure pause a resume answered (a closure recorded without one pauses again), and the epics whose one closure pause was resumed past. Tickets pauses add the `paused_stage` values `ticket-hitl`, `ticket-refine` and `ticket-tree` (causes below). `run` resolves a tickets run's selectors before it starts: `ticket_epic_filter` holds the `--epic` epic slug, `story_filter` the `--story` ticket ref, and `epic_filter` stays null.
 
 `parent_initiative` names the parent initiative when a tickets run builds one of its children, and is null otherwise. A child run's `max_stories` is what was left of the chain's `--max-stories` when it launched.

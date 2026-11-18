@@ -138,6 +138,44 @@ def _coordinates(snapshot: CampaignSnapshot, unit_id: str) -> EvidenceCoordinate
 def typed_failure(snapshot: CampaignSnapshot, unit_id: str) -> FailureEvidence:
     """Use machine outcomes only; an arbitrary exception string stays unknown."""
     unit = snapshot.units[unit_id]
+    pause = unit.hold.evidence.get("child_pause") if unit.hold else None
+    if (
+        unit.hold is not None
+        and isinstance(pause, dict)
+        and pause.get("binding", {}).get("launch_id") == unit.hold.id
+    ):
+        from .campaign_child_pause import cause
+        from .model import ENV_FAULT_SITES, PauseKind
+
+        typed = cause({**pause["binding"], "child_pause": pause})
+        code = {
+            PauseKind.SOURCE_CHECKPOINT: CauseCode.APPROVAL,
+            PauseKind.TECHNICAL_FAILURE: CauseCode.UNKNOWN,
+            PauseKind.AUTHENTICATION_FAILURE: CauseCode.CREDENTIALS,
+            PauseKind.QUOTA_WAIT: CauseCode.QUOTA,
+            PauseKind.TRANSPORT_FAILURE: CauseCode.TRANSPORT,
+            PauseKind.OWNER_DECISION: CauseCode.OWNER,
+            PauseKind.UNKNOWN: CauseCode.UNKNOWN,
+        }.get(typed.kind if typed is not None else PauseKind.UNKNOWN, CauseCode.UNKNOWN)
+        if typed is not None and typed.kind == PauseKind.TECHNICAL_FAILURE:
+            if (typed.producer, typed.code) == ("engine.verification", "verification_failed"):
+                code = CauseCode.VERIFICATION
+            elif (typed.producer, typed.code) == ("engine.session", "environment") or (
+                typed.producer == "engine.environment"
+                and typed.code in ENV_FAULT_SITES | {"dispatch_probe"}
+            ):
+                code = CauseCode.ENVIRONMENT
+        return failure_from_receipt(
+            {
+                "code": str(code),
+                "producer": "campaign.child_pause",
+                "id": unit.hold.id,
+                "revision": pause["binding"]["head"],
+                "detail": (
+                    typed.code if typed is not None else "typed producer evidence unavailable"
+                ),
+            }
+        )
     explicit = unit.evidence.get("failure")
     if isinstance(explicit, dict):
         return failure_from_receipt(explicit)
