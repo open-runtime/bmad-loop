@@ -2754,6 +2754,19 @@ def _current_constraints(runtime, snapshot, value):
 
 
 def _assemble(runtime, snapshot, unit, value):
+    from .campaign_handoff_context import MandatoryContextTooLarge, compact_working_state
+
+    current = value["capture"]["current"]
+    try:
+        return _assemble_with_state(runtime, snapshot, unit, value, current)
+    except MandatoryContextTooLarge:
+        compact = compact_working_state(
+            current, _root(runtime, snapshot, value), value["capture"]["capture_digest"]
+        )
+        return _assemble_with_state(runtime, snapshot, unit, value, compact)
+
+
+def _assemble_with_state(runtime, snapshot, unit, value, current):
     from .campaign_handoff_context import (
         AuditedConstraintsTooLarge,
         assemble_packet,
@@ -2781,7 +2794,7 @@ def _assemble(runtime, snapshot, unit, value):
     packet = assemble_packet(
         tuple(HistorySnapshot(**row) for row in value["capture"]["sources"]),
         tuple(value["capture"]["obligations"]),
-        value["capture"]["current"],
+        current,
         summaries,
         _budget(target, cap),
         _root(runtime, snapshot, value) / "packet",
@@ -2931,19 +2944,6 @@ def _assemble(runtime, snapshot, unit, value):
         if field in payload:
             references.append({"path": payload[field]["path"], "sha256": payload[field]["sha256"]})
     bind_authority_evidence(payload, _root(runtime, snapshot, value) / "packet", references)
-    canonical_only = {
-        key: content
-        for key, content in payload.items()
-        if key not in {"resolved_constraints", "recovered_constraints"}
-    }
-    if len(encoded(canonical_only)) > ceiling:
-        raise CampaignError(
-            "Canonical obligations and state exceed successor context; recovery required"
-        )
-    if len(encoded(payload)) > ceiling:
-        raise ConstraintReductionNeeded(
-            "Resolved current constraints exceed successor context; further bounded reduction required"
-        )
     try:
         fit_audited_history(payload, _root(runtime, snapshot, value) / "packet", ceiling=ceiling)
     except AuditedConstraintsTooLarge as exc:
@@ -2958,6 +2958,11 @@ def _assemble(runtime, snapshot, unit, value):
             "read_only": payload["read_only"],
             "history_view_version": 1,
             "mandatory_context_sha256": mandatory_context_digest(payload),
+            **(
+                {"working_state_capture_digest": value["capture"]["capture_digest"]}
+                if "working_state_index" in current
+                else {}
+            ),
         },
         "audits": value["audits"],
     }
@@ -3579,6 +3584,15 @@ def decorate_launch(snapshot, unit, request):
 
     validate_history_view(packet)
     validate_authority_evidence(packet, value["packet"].get("mandatory_context_sha256"))
+    if "working_state_index" in packet["current_state"]:
+        from .campaign_handoff_context import retrieve_working_state_index
+
+        capture_digest = value["capture"]["capture_digest"]
+        if value["packet"].get("working_state_capture_digest") != capture_digest:
+            raise CampaignError("Working-state retrieval reference belongs to another capture")
+        working = retrieve_working_state_index(packet["current_state"], root, capture_digest)
+        if any(value["capture"]["current"].get(key) != raw for key, raw in working.items()):
+            raise CampaignError("Working-state retrieval locators differ from the captured state")
     grants = request.get("headless_grants")
     if grants is not None:
         grants["read_only_paths"] = [

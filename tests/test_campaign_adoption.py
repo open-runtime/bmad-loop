@@ -158,6 +158,7 @@ def case(project, tmp_path):
         service=service,
         provider=provider,
         pr=pr,
+        pulls={"repos/a/b/pulls/7": pr},
     )
     value.resolver = lambda name, **kwargs: (value.provider, lambda *args: value.service)
 
@@ -166,8 +167,8 @@ def case(project, tmp_path):
             assert method == "POST" and "mergeCommit" in payload["query"]
             assert payload["variables"]["number"] == value.pr["number"]
             return merged_graphql(value.pr, merge_commit=head)
-        assert method == "GET" and path == "repos/a/b/pulls/7"
-        return ApiResponse(200, value.pr, {})
+        assert method == "GET" and path in value.pulls
+        return ApiResponse(200, value.pulls[path], {})
 
     value.gateway = GithubGateway(types.SimpleNamespace(request=request), "a/b")
     return value

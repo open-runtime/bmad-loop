@@ -8,6 +8,8 @@ An incomplete packet remains useful for read-only evidence recovery.
 from __future__ import annotations
 
 import hashlib
+import json
+import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -40,6 +42,128 @@ class HistoryContextRecoveryNeeded(CampaignError):
 
 class AuditedConstraintsTooLarge(HistoryContextRecoveryNeeded):
     """Owner constraints fit only after their existing independently audited reduction."""
+
+
+class MandatoryContextTooLarge(HistoryContextRecoveryNeeded):
+    """The fixed packet fields exceed capacity even with empty constraint lists."""
+
+
+_WORKING_STATE_FIELDS = (
+    "artifacts",
+    "original_state_path",
+    "original_state_sha256",
+    "predecessor_receipt_path",
+    "predecessor_receipt_sha256",
+)
+
+
+def _working_state_document(current, root, capture_digest):
+    return {
+        "schema_version": 1,
+        "handoff_id": root.name,
+        "capture_digest": capture_digest,
+        "working_state": {key: current[key] for key in _WORKING_STATE_FIELDS},
+    }
+
+
+def _working_state_reference(root, data):
+    sha = hashlib.sha256(data).hexdigest()
+    return {
+        "path": str(root / "working-state-index" / (sha + ".json")),
+        "sha256": sha,
+        "bytes": len(data),
+        "fields": list(_WORKING_STATE_FIELDS),
+    }
+
+
+def compact_working_state(current, root, capture_digest):
+    """Index only the retrieval locators in an otherwise over-budget capture."""
+    if not all(key in current for key in _WORKING_STATE_FIELDS):
+        raise MandatoryContextTooLarge("Mandatory continuation context exceeds the successor")
+    data = encoded(_working_state_document(current, root, capture_digest))
+    blob(root / "working-state-index", data)
+    return {
+        **{k: v for k, v in current.items() if k not in _WORKING_STATE_FIELDS},
+        "working_state_index": _working_state_reference(root, data),
+    }
+
+
+def retrieve_working_state_index(current, root, capture_digest):
+    """Read the exact locator set and verify every source against the owned capture."""
+    from .campaign_admission_files import fresh_reads
+    from .campaign_headless import MAX_RECORD_BYTES, file_digest, read_json
+    from .platform_util import is_link_like
+
+    ref = current.get("working_state_index")
+    if (
+        not isinstance(ref, dict)
+        or not isinstance(ref.get("sha256"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", ref["sha256"])
+        or type(ref.get("bytes")) is not int
+        or not 0 < ref["bytes"] <= MAX_RECORD_BYTES
+        or not isinstance(capture_digest, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", capture_digest)
+        or set(current).intersection(_WORKING_STATE_FIELDS)
+    ):
+        raise CampaignError("Working-state retrieval reference is malformed")
+    path = root / "working-state-index" / (ref["sha256"] + ".json")
+    if ref.get("path") != str(path) or is_link_like(root) or is_link_like(path.parent):
+        raise CampaignError("Working-state retrieval index escaped its handoff")
+    with fresh_reads():
+        document = read_json(path, limit=ref["bytes"])
+        if file_digest(path) != ref["sha256"]:
+            raise CampaignError("Working-state retrieval index changed before continuation")
+        working = document.get("working_state")
+        if (
+            not isinstance(working, dict)
+            or set(working) != set(_WORKING_STATE_FIELDS)
+            or document != _working_state_document(working, root, capture_digest)
+            or ref != _working_state_reference(root, encoded(document))
+            or not isinstance(working["artifacts"], dict)
+            or set(working["artifacts"])
+            != {"tracked_patch", "index_patch", "status", "untracked_names"}
+        ):
+            raise CampaignError("Working-state retrieval index differs from its capture")
+        leaves = []
+        for raw in working["artifacts"].values():
+            if not isinstance(raw, str):
+                raise CampaignError("Working-state retrieval locator is malformed")
+            leaves.append((raw, "working-state", Path(raw).stem))
+        leaves.extend(
+            (working[key + "_path"], "predecessor", working[key + "_sha256"])
+            for key in ("original_state", "predecessor_receipt")
+        )
+        for raw, directory, sha in leaves:
+            if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{64}", sha):
+                raise CampaignError("Working-state retrieval digest is malformed")
+            leaf = root / directory / (sha + ".json")
+            if raw != str(leaf) or is_link_like(leaf.parent) or file_digest(leaf) != sha:
+                raise CampaignError("Working-state retrieval artifact changed before continuation")
+    return working
+
+
+def verify_working_state_delivery(source, content, read_only_paths):
+    """Require the frozen read-only grant before following compact packet references."""
+    try:
+        packet = json.loads(content)
+    except ValueError:
+        packet = None  # Existing inline sources may carry ordinary text.
+    current = packet.get("current_state") if isinstance(packet, dict) else None
+    if not isinstance(current, dict) or "working_state_index" not in current:
+        if "working_state_capture_digest" in source:
+            raise CampaignError("Compact handoff packet is missing its working-state reference")
+        return
+    path = Path(source["path"])
+    root = path.parent.parent
+    capture_digest = source.get("working_state_capture_digest")
+    grant = {"path": str(root), "capture_digest": capture_digest, "packet_sha256": source["sha256"]}
+    if (
+        grant not in read_only_paths
+        or path != root / "packet" / (source["sha256"] + ".json")
+        or path != path.resolve()
+    ):
+        raise CampaignError("Compact handoff source lacks its exact capture grant")
+    retrieve_working_state_index(current, root, capture_digest)
 
 
 def _indexed_json(reference):
@@ -359,15 +483,14 @@ def fit_audited_history(payload, artifact_root, *, ceiling):
     current_bytes = len(encoded(payload))
     if current_bytes > ceiling:
         canonical_only = {
-            key: value
+            key: [] if key in {"resolved_constraints", "recovered_constraints"} else value
             for key, value in payload.items()
-            if key not in {"resolved_constraints", "recovered_constraints"}
         }
         if len(encoded(canonical_only)) <= ceiling:
             raise AuditedConstraintsTooLarge(
                 "Audited owner constraints exceed the complete packet budget"
             )
-        raise HistoryContextRecoveryNeeded("Mandatory continuation context exceeds the successor")
+        raise MandatoryContextTooLarge("Mandatory continuation context exceeds the successor")
     priorities = {
         kind: rank
         for rank, kind in enumerate(
@@ -555,7 +678,9 @@ def assemble_packet(
     payload["omission_index"] = str(omissions_path)
     reconcile_summary_omissions(payload, artifact_root)
     if count(encoded(payload).decode()) > ceiling:
-        raise CampaignError("canonical state/source manifest exceeds destination packet budget")
+        raise MandatoryContextTooLarge(
+            "canonical state/source manifest exceeds destination packet budget"
+        )
 
     def include(field: str, row: dict[str, Any]) -> bool:
         payload[field].append(row)

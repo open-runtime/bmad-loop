@@ -96,6 +96,41 @@ def complete_history(runtime, snapshot, unit):
         step(runtime, snapshot, unit, "handoff-audit-plan")
 
 
+def complete_constraint_reductions(runtime, snapshot, unit, brief):
+    complete(
+        runtime,
+        snapshot,
+        unit,
+        "constraint_jobs",
+        lambda inputs: {
+            **audit_identity(inputs),
+            "covered_ids": [row["id"] for row in inputs["nodes"]],
+            "groups": [
+                {
+                    "text": brief,
+                    "refs": [row["id"] for row in inputs["nodes"]],
+                }
+            ],
+            "ambiguities": [],
+        },
+    )
+
+
+def complete_constraint_audits(runtime, snapshot, unit):
+    complete(
+        runtime,
+        snapshot,
+        unit,
+        "constraint_audits",
+        lambda inputs: {
+            **audit_identity(inputs),
+            "covered_ids": [row["id"] for row in inputs["nodes"]],
+            "verdict": "faithful",
+            "ambiguities": [],
+        },
+    )
+
+
 def test_oversized_current_constraints_reduce_and_are_independently_audited(campaign):
     runtime, snapshot, unit, receipt = campaign
     source = Path(receipt["sessions"][0]["transcript_path"])
@@ -127,40 +162,18 @@ def test_oversized_current_constraints_reduce_and_are_independently_audited(camp
     while unit.evidence["handoff"]["phase"] == "constraint_reduce":
         rounds += 1
         assert rounds <= 8, unit.evidence["handoff"]["phase"]
-        complete(
+        complete_constraint_reductions(
             runtime,
             snapshot,
             unit,
-            "constraint_jobs",
-            lambda inputs: {
-                **audit_identity(inputs),
-                "covered_ids": [row["id"] for row in inputs["nodes"]],
-                "groups": [
-                    {
-                        "text": "Preserve all accepted invariants and their recorded exceptions.",
-                        "refs": [row["id"] for row in inputs["nodes"]],
-                    }
-                ],
-                "ambiguities": [],
-            },
+            "Preserve all accepted invariants and their recorded exceptions.",
         )
         # Persist/reload before independent review: completed reductions live in SQL.
         snapshot = runtime.store.save(snapshot, snapshot.revision)
         snapshot = runtime.store.load(snapshot.id)
         unit = snapshot.units[unit.id]
         step(runtime, snapshot, unit, "handoff-constraint-audit")
-        complete(
-            runtime,
-            snapshot,
-            unit,
-            "constraint_audits",
-            lambda inputs: {
-                **audit_identity(inputs),
-                "covered_ids": [row["id"] for row in inputs["nodes"]],
-                "verdict": "faithful",
-                "ambiguities": [],
-            },
-        )
+        complete_constraint_audits(runtime, snapshot, unit)
         step(runtime, snapshot, unit, "handoff-assemble")
     step(runtime, snapshot, unit, "handoff-release")
     assert unit.evidence["handoff"]["phase"] == "ready", unit.hold
@@ -208,7 +221,12 @@ def recovery_result(inputs, *, ready):
     }
 
 
-@pytest.mark.parametrize("authority,large", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize(
+    "authority,large,campaign",
+    [(False, False, 0), (True, False, 0), (True, True, 200)],
+    indirect=["campaign"],
+    ids=["False-False", "True-False", "True-True"],
+)
 def test_missing_history_attempts_readonly_recovery_before_escalation(campaign, authority, large):
     runtime, snapshot, unit, receipt = campaign
     runtime.project = Path(unit.bindings["workspace"])
@@ -288,51 +306,93 @@ def test_missing_history_attempts_readonly_recovery_before_escalation(campaign, 
     step(runtime, snapshot, unit, "handoff-assemble")
     if large:
         assert value["phase"] == "constraint_reduce"
-        complete(
-            runtime,
-            snapshot,
-            unit,
-            "constraint_jobs",
-            lambda inputs: {
-                **audit_identity(inputs),
-                "covered_ids": [row["id"] for row in inputs["nodes"]],
-                "groups": [
-                    {
-                        "text": "Retain every accepted feature, published commit and required test. Adopted policy establishes the complete current contract; prior conversation is historical context only.",
-                        "refs": [row["id"] for row in inputs["nodes"]],
-                    }
-                ],
-                "ambiguities": [],
-            },
-        )
-        step(runtime, snapshot, unit, "handoff-constraint-audit")
-        complete(
-            runtime,
-            snapshot,
-            unit,
-            "constraint_audits",
-            lambda inputs: {
-                **audit_identity(inputs),
-                "covered_ids": [row["id"] for row in inputs["nodes"]],
-                "verdict": "faithful",
-                "ambiguities": [],
-            },
-        )
-        step(runtime, snapshot, unit, "handoff-assemble")
+        for level in range(1, 9):
+            assert value["phase"] == "constraint_reduce" and value["constraint_level"] == level
+            brief = (
+                "Retain every accepted feature, commit and required test. The adopted policy "
+                "sets the complete current contract. Prior conversation supplies context only."
+                if level == 1
+                else "Policy alone binds: retain accepted features, commit history and required tests."
+            )
+            complete_constraint_reductions(runtime, snapshot, unit, brief)
+            step(runtime, snapshot, unit, "handoff-constraint-audit")
+            complete_constraint_audits(runtime, snapshot, unit)
+            step(runtime, snapshot, unit, "handoff-assemble")
+            if value["phase"] != "constraint_reduce":
+                break
         assert value["phase"] == "assemble", (value["phase"], unit.hold.reason)
     step(runtime, snapshot, unit, "handoff-release")
     packet = json.loads(Path(value["packet"]["path"]).read_text())
     assert packet["missing_native_history"]
     assert packet["current_contract_recovery"]["missing_history_retained"]
+    assert packet["obligations"] == value["capture"]["obligations"]
     if large:
         index = json.loads(Path(packet["recovered_constraints_index"]["path"]).read_text())
         assert index[0]["source_quote"] == policy.read_text()
         assert packet["resolved_constraints"][0]["authority"] == "context-only"
         assert len(Path(value["packet"]["path"]).read_bytes()) <= packet_limit
         assert packet["current_state"]["controller_controls"]["state"] == controls
+        check_working_state_delivery(snapshot, unit, packet)
     else:
         assert packet["recovered_constraints"]
     assert unit.hold is None and value["phase"] == "ready"
+
+
+def check_working_state_delivery(snapshot, unit, packet):
+    from bmad_loop.campaign_handoff_context import retrieve_working_state_index
+    from bmad_loop.campaign_headless import render_input
+    from bmad_loop.campaign_jobs import JobLimits, JobRequest
+
+    value = unit.evidence["handoff"]
+    launch = flow.resume_proposal(snapshot, unit)
+    assert launch is not None
+    request = {**launch.payload, "role": "execution", "headless_grants": {}}
+    flow.decorate_launch(snapshot, unit, request)
+    source = {**request["handoff_packet"], "source_id": "campaign-handoff"}
+    root = Path(source["path"]).parent.parent
+    current = packet["current_state"]
+    retrieval = retrieve_working_state_index(current, root, value["capture"]["capture_digest"])
+    assert retrieval == {
+        key: value["capture"]["current"][key] for key in current["working_state_index"]["fields"]
+    }
+    candidate = value["candidate"]
+    cap = snapshot.config_snapshot["reasoning_capabilities"][
+        candidate["profile"] + ":" + candidate["model"]
+    ]["execution"]
+    job = JobRequest(
+        "successor",
+        "triage",
+        "execution",
+        {},
+        (source,),
+        "Continue.",
+        {},
+        JobLimits(cap["input_tokens"], 128, 1, 10),
+    )
+    grants = request["headless_grants"]["read_only_paths"]
+    _, delivery = render_input(job, cap, read_only_paths=[str(root), *grants])
+    assert delivery["sources"][0]["sha256"] == source["sha256"]
+    with pytest.raises(CampaignError, match="exact capture grant"):
+        render_input(job, cap, read_only_paths=[])
+    unbound = {key: value for key, value in source.items() if key != "working_state_capture_digest"}
+    with pytest.raises(CampaignError, match="exact capture grant"):
+        render_input(dataclasses.replace(job, inputs=(unbound,)), cap, read_only_paths=grants)
+    with pytest.raises(CampaignError, match="differs from its capture"):
+        retrieve_working_state_index(current, root, "a" * 64)
+    with pytest.raises(CampaignError, match="escaped its handoff"):
+        retrieve_working_state_index(
+            current, root.parent / "other-handoff", source["working_state_capture_digest"]
+        )
+    index_path = Path(current["working_state_index"]["path"])
+    original = index_path.read_bytes()
+    index_path.write_bytes(original.replace(b'"schema_version":1', b'"schema_version":2'))
+    with pytest.raises(CampaignError, match="retrieval index changed"):
+        render_input(job, cap, read_only_paths=grants)
+    index_path.write_bytes(original)
+    leaf = Path(retrieval["artifacts"]["tracked_patch"])
+    leaf.write_bytes(b"changed after successor launch was decorated")
+    with pytest.raises(CampaignError, match="retrieval artifact changed"):
+        render_input(job, cap, read_only_paths=grants)
 
 
 def test_recovery_cannot_claim_canonical_acceptance_is_owner_authority(campaign):

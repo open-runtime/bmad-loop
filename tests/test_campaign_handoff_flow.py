@@ -29,7 +29,7 @@ from bmad_loop.campaign_store import CampaignStore
 
 
 @pytest.fixture
-def campaign(prepared, project, tmp_path):
+def campaign(prepared, project, tmp_path, request):
     _, _, _, first, basecap = prepared
     second = RoleCandidate("claude", "claude-test", "high", "anthropic")
 
@@ -297,8 +297,11 @@ def campaign(prepared, project, tmp_path):
             state="confirmed",
         )
     )
+    # Reproduce long immutable locators independently of the host's temp prefix.
+    minimum = getattr(request, "param", 0)
+    store_name = "store".ljust(minimum - len(str(tmp_path)) - 1, "-")
     runtime = SimpleNamespace(
-        store=CampaignStore(tmp_path / "store"), clock=lambda: 100.0, fixture_cap=cap
+        store=CampaignStore(tmp_path / store_name), clock=lambda: 100.0, fixture_cap=cap
     )
     snapshot = runtime.store.create(snapshot)
     return runtime, snapshot, snapshot.units[unit.id], receipt
