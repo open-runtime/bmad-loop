@@ -6071,17 +6071,7 @@ class CampaignRuntime:
             snapshot, unit, receipt
         ):
             return
-        pause_handoff_allowed = True
-        if receipt.get("child_pause") is not None:
-            from .campaign_child_pause import cause as pause_cause
-            from .model import PauseKind
-
-            typed_pause = pause_cause(receipt)
-            pause_handoff_allowed = typed_pause is not None and typed_pause.kind in {
-                PauseKind.QUOTA_WAIT,
-                PauseKind.TRANSPORT_FAILURE,
-            }
-        if pause_handoff_allowed and intercept_terminal(self, snapshot, unit, receipt):
+        if intercept_terminal(self, snapshot, unit, receipt):
             return
         if outcome == "stage_complete":
             directory = self.store.directory(snapshot.id) / "workers" / claim.launch_id
@@ -6180,9 +6170,7 @@ class CampaignRuntime:
         elif outcome == "stage_complete":
             self._apply_stage_result(snapshot, unit, receipt)
         else:
-            if outcome == "paused" or (
-                outcome == "recovery_required" and receipt.get("child_pause") is not None
-            ):
+            if outcome == "paused":
                 from .campaign_child_pause import hold_kind
 
                 outcome = hold_kind(receipt)

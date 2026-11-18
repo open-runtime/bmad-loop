@@ -437,6 +437,18 @@ def intercept_terminal(runtime, snapshot, unit, receipt) -> bool:
     kind = (receipt.get("interruption") or {}).get("kind")
     if kind not in {"quota", "transport"}:
         return False
+    # Typed pauses still settle active handoffs and record capacity above;
+    # only a fresh quota/transport begin is refused for other sealed causes.
+    if receipt.get("child_pause") is not None:
+        from .campaign_child_pause import cause as pause_cause
+        from .model import PauseKind
+
+        typed_pause = pause_cause(receipt)
+        if typed_pause is None or typed_pause.kind not in {
+            PauseKind.QUOTA_WAIT,
+            PauseKind.TRANSPORT_FAILURE,
+        }:
+            return False
     if not snapshot.spec.reasoning.enabled:
         return False
     if not unit.claim or not unit.claim.quiescent:

@@ -327,8 +327,12 @@ def test_inbox_is_read_only_and_names_exact_hold_and_decision(runtime, monkeypat
 def test_inbox_never_infers_missing_or_invalid_pause_cause_from_reason(runtime, cause):
     _, snapshot, _ = runtime
     unit = snapshot.units["s:e:u"]
-    unit.hold = Hold("paused", "technical failure: safe to retry and approved", id="legacy")
-    unit.evidence["child_pause"] = {"schema_version": 1, "cause": cause}
+    unit.hold = Hold(
+        "paused",
+        "technical failure: safe to retry and approved",
+        id="legacy",
+        evidence={"child_pause": {"schema_version": 1, "cause": cause}},
+    )
     item = next(row for row in inbox_document(snapshot)["items"] if row["kind"] == "hold")
     assert item["pause_evidence_status"] == "unknown"
     assert item["pause_cause"] is None
@@ -342,7 +346,6 @@ def inbox_pause(runtime, request):
 
     _, snapshot, _ = runtime
     unit = snapshot.units["s:e:u"]
-    unit.hold = Hold("paused", "Probe failed", id="pause-hold")
     kind = getattr(request, "param", "technical_failure")
     cause = (
         PauseCause(PauseKind(kind), "engine.environment", "dispatch_probe")
@@ -360,7 +363,7 @@ def inbox_pause(runtime, request):
     binding = {
         "campaign_id": snapshot.id,
         "unit_id": unit.id,
-        "launch_id": "launch-1",
+        "launch_id": "pause-hold",
         "attempt": 1,
         "generation": 1,
         "workspace": "/synthetic/workspace",
@@ -370,9 +373,10 @@ def inbox_pause(runtime, request):
         "run_id": state.run_id,
         "run_dir": "/synthetic/run",
     }
-    unit.evidence["child_pause"] = build(
+    sealed = build(
         state, request, types.SimpleNamespace(config_revision=snapshot.config_revision), binding
     )
+    unit.hold = Hold("paused", "Probe failed", id="pause-hold", evidence={"child_pause": sealed})
     return snapshot, unit, cause
 
 
@@ -415,7 +419,7 @@ def test_inbox_rejects_incomplete_or_rehashed_malformed_pause_receipt(inbox_paus
     snapshot, unit, _ = inbox_pause
     baseline = next(row for row in inbox_document(snapshot)["items"] if row["kind"] == "hold")
     assert baseline["pause_evidence_status"] == "typed"
-    pause = json.loads(json.dumps(unit.evidence["child_pause"]))
+    pause = json.loads(json.dumps(unit.hold.evidence["child_pause"]))
     if change == "cause_only":
         pause = {"schema_version": 1, "cause": pause["cause"]}
     elif change == "missing_binding":
@@ -440,7 +444,9 @@ def test_inbox_rejects_incomplete_or_rehashed_malformed_pause_receipt(inbox_paus
             json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
     )
-    unit.evidence["child_pause"] = pause
+    unit.hold = Hold(
+        unit.hold.kind, unit.hold.reason, id=unit.hold.id, evidence={"child_pause": pause}
+    )
     item = next(row for row in inbox_document(snapshot)["items"] if row["kind"] == "hold")
     assert item["pause_evidence_status"] == "unknown"
     assert item["pause_cause"] is None
