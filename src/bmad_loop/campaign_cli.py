@@ -785,7 +785,7 @@ def _inbox_items(snapshot: CampaignSnapshot, *, now: float):
 
     from .campaign_capacity import selected_fault
     from .campaign_child_pause import cause as pause_cause
-    from .campaign_github_faults import status_waits
+    from .campaign_github_faults import actions_with_held_faults, status_waits
     from .campaign_intake_baseline import admission_waits
     from .campaign_resolution_flow import current_owner_advice, routine_review_pending
     from .campaign_scheduler import CapacityObservation, admit, route_unavailable
@@ -987,7 +987,7 @@ def _inbox_items(snapshot: CampaignSnapshot, *, now: float):
                 "Refresh repository inventory before admitting this unit",
                 "Inspect campaign status discovery details if observation remains unavailable",
             )
-    for action in snapshot.outbox:
+    for action in actions_with_held_faults(snapshot):
         if action.state == "confirmed":
             continue
         external = action.kind.startswith("github") or action.kind in {"push", "checkpoint"}
@@ -1009,7 +1009,7 @@ def _inbox_items(snapshot: CampaignSnapshot, *, now: float):
             "unknown_effect" if external and action.state == "sent_unknown" else "effect_wait",
             action.unit,
             action.id,
-            action.error
+            (projected[0]["reason"] if projected else action.error)
             or (
                 "Effect was refused without a recorded reason"
                 if action.state == "rejected"
