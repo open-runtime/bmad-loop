@@ -6073,7 +6073,7 @@ class CampaignRuntime:
             snapshot, unit, receipt
         ):
             return
-        pause_handoff_allowed = True
+        pause_handoff_allowed = outcome not in {"paused", "operator_held", "recovery_required"}
         if receipt.get("child_pause") is not None:
             from .campaign_child_pause import cause as pause_cause
             from .model import PauseKind
