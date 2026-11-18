@@ -2760,10 +2760,15 @@ def _assemble(runtime, snapshot, unit, value):
     try:
         return _assemble_with_state(runtime, snapshot, unit, value, current)
     except MandatoryContextTooLarge:
-        compact = compact_working_state(
-            current, _root(runtime, snapshot, value), value["capture"]["capture_digest"]
-        )
-        return _assemble_with_state(runtime, snapshot, unit, value, compact)
+        try:
+            compact = compact_working_state(
+                current, _root(runtime, snapshot, value), value["capture"]["capture_digest"]
+            )
+            return _assemble_with_state(runtime, snapshot, unit, value, compact)
+        except MandatoryContextTooLarge as exc:
+            raise CampaignError(
+                "Canonical obligations and state exceed successor context; recovery required"
+            ) from exc
 
 
 def _assemble_with_state(runtime, snapshot, unit, value, current):
