@@ -73,7 +73,7 @@ bmad-loop campaign migrate-state ID [--json]
 bmad-loop campaign requalify ID --capabilities FILE --expected-revision REVISION --reason TEXT [--json]
 bmad-loop campaign reconfigure ID --spec FILE --expected-revision REVISION --reason TEXT [--review-policy-source COMMIT:PATH] [--preview] [--json]
 bmad-loop campaign reflect ID [--unit UNIT] [--expected-revision REVISION] [--preview] [--json]
-bmad-loop campaign resume ID [--json]
+bmad-loop campaign resume ID [--active-only] [--json]
 bmad-loop campaign stop ID [--terminate-workers] [--json]
 bmad-loop campaign hold ID --unit UNIT --reason TEXT [--json]
 bmad-loop campaign release ID --unit UNIT [--json]
@@ -89,6 +89,10 @@ bmad-loop campaign transfer ID --unit UNIT --successor ID --successor-unit UNIT 
 is offline and mutation-free. Preflight reports separate planning, execution,
 publication and reflection verdicts without starting agents or changing rules.
 Run/resume supervise in the foreground; reconcile does not launch workers.
+For a boot or crash supervisor, pass `resume ID --active-only`. It recovers an
+existing coordinator or finishes an outstanding drain, preserves retry budgets
+and exits successfully for a stopped, held, delivered, retired or never-started
+campaign. See [service configuration and restart qualification](../campaign-guide.md#automatic-coordinator-restart).
 Controls enqueue durable requests. Stop drains bounded stages unless explicit
 termination is requested. Release only requests removal of an operator hold.
 It observes current process, source and Git identity before clearing that hold

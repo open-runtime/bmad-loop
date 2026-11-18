@@ -2,10 +2,14 @@
 
 import dataclasses
 import json
+from types import SimpleNamespace
 
 import pytest
+from test_campaign_child_pause import apply_terminal
 from test_campaign_publication import publishable as publishable
+from test_campaign_workers import envelope, worker_request
 
+from bmad_loop import verify
 from bmad_loop.campaign_model import (
     CampaignSnapshot,
     CampaignSpec,
@@ -17,12 +21,42 @@ from bmad_loop.campaign_model import (
 )
 from bmad_loop.campaign_runtime import CampaignRuntime
 from bmad_loop.campaign_store import CampaignStore
+from bmad_loop.campaign_workers import prepare_launch
+
+
+def apply_receipt(runtime, snapshot, unit, receipt, **inputs):
+    claim = unit.claim
+    directory = runtime.store.directory(snapshot.id) / "workers" / claim.launch_id
+    context = dataclasses.replace(
+        envelope(runtime.project, directory),
+        campaign_id=snapshot.id,
+        unit_id=unit.id,
+        attempt=claim.attempt,
+        generation=claim.generation,
+        config_revision=snapshot.config_revision,
+    )
+    if claim.role == "execution":
+        inputs.update(
+            kind="execution",
+            source={"kind": "sprint-status"},
+            source_revision=receipt["head"],
+            unit=dataclasses.asdict(unit.spec),
+        )
+    else:
+        inputs.update(kind="stage", stage=claim.role)
+    path = prepare_launch(
+        context, worker_request(runtime.project, context, launch_id=claim.launch_id, **inputs)
+    )
+    action = OutboxAction(
+        "observe", "observe-worker", unit.id, {"launch_id": claim.launch_id}, claim.generation
+    )
+    case = SimpleNamespace(request=json.loads(path.read_text(encoding="utf-8")))
+    apply_terminal(runtime, snapshot, unit, action, case, {"state": "finished", "receipt": receipt})
 
 
 def publication_receipt(runtime, snapshot, unit, reviewer_family):
     from pathlib import Path
 
-    from bmad_loop import verify
     from bmad_loop.campaign_acceptance import provenance
 
     unit.bindings.setdefault("workspace", str(runtime.project))
@@ -69,25 +103,27 @@ def session(role, models, *, status="completed", label=""):
 
 
 def finished(project, tmp_path, sessions):
-    unit = CampaignUnit(UnitSpec("unit", "source", "epic", "Unit"), UnitState.RUNNING)
-    unit.claim = WorkerClaim(unit.id, 1, 0, "execution", role="execution", writes=True)
+    unit = CampaignUnit(
+        UnitSpec("unit", "source", "epic", "Unit", selector="story"), UnitState.RUNNING
+    )
+    unit.claim = WorkerClaim(unit.id, 1, 1, "execution", role="execution", writes=True)
     snapshot = CampaignSnapshot(
         "attribution",
         "org/repo",
         CampaignSpec("attribution", units=(unit.spec,)),
         {unit.id: unit},
+        generation=unit.claim.generation,
         common_dir=str(project.project / ".git"),
         root=str(project.project),
     )
     runtime = CampaignRuntime(project.project, CampaignStore(tmp_path / "state"))
     receipt = {
         "outcome": "locally_complete",
-        "head": "h" * 40,
+        "head": verify.rev_parse_head(runtime.project),
         "launch_id": "execution",
         "sessions": sessions,
     }
-    action = OutboxAction("observe", "observe-worker", unit.id, {"launch_id": "execution"}, 0)
-    runtime._apply_worker(snapshot, unit, action, {"state": "finished", "receipt": receipt})
+    apply_receipt(runtime, snapshot, unit, receipt)
     return runtime, snapshot, unit
 
 
@@ -165,9 +201,10 @@ def test_resume_recovers_missing_family_and_invalidates_same_family_review(proje
     unit.evidence.pop("developer_attribution", None)
     unit.state = UnitState.READY_TO_PUBLISH
     unit.evidence["review"] = {"provider_family": "openai", "launch_id": "old-review"}
+    runtime = CampaignRuntime(runtime.project, CampaignStore(tmp_path / "restore"))
     snapshot = runtime.store.create(snapshot)
     with ThreadPoolExecutor() as executor:
-        result = CampaignSupervisor(runtime.store, runtime)._reconciled(snapshot.id, executor)
+        result = CampaignSupervisor(runtime.store, runtime)._reconciled(snapshot, executor)
     assert result.units[unit.id].evidence["developer_family"] == "openai"
     assert "review" not in result.units[unit.id].evidence
 
@@ -222,7 +259,9 @@ def test_resumed_live_review_restores_attribution_only_after_accepted_result(
     runtime, snapshot, unit = setup(project, tmp_path)
     unit.spec = dataclasses.replace(unit.spec, kind="epic")
     unit.state = UnitState.REVIEWING
-    unit.claim = WorkerClaim(unit.id, 1, 0, "live-review", role="publication_review")
+    unit.claim = WorkerClaim(
+        unit.id, 1, snapshot.generation, "live-review", role="publication_review"
+    )
     unit.evidence["developer_family"] = ""
     unit.evidence["worker_history"] = [
         {
@@ -237,22 +276,11 @@ def test_resumed_live_review_restores_attribution_only_after_accepted_result(
     assert not runtime.prepare_resume(snapshot)
     assert unit.evidence["developer_family"] == ""
     receipt = publication_receipt(runtime, snapshot, unit, reviewer_family)
+    inputs = {}
     if deferred:
         before = boundary.collect(runtime, snapshot, unit, action_id="before")
-        directory = runtime.store.directory(snapshot.id) / "workers" / unit.claim.launch_id
-        directory.mkdir(parents=True)
-        (directory / "request.json").write_text(
-            json.dumps(
-                {
-                    "stage_boundary": {"inputs": before},
-                    "coordinates": {"head": receipt["head"]},
-                }
-            )
-        )
-    action = OutboxAction(
-        "observe", "observe-worker", unit.id, {"launch_id": unit.claim.launch_id}, 0
-    )
-    runtime._apply_worker(snapshot, unit, action, {"state": "finished", "receipt": receipt})
+        inputs.update(stage_boundary={"inputs": before}, coordinates={"head": receipt["head"]})
+    apply_receipt(runtime, snapshot, unit, receipt, **inputs)
     if deferred:
         assert unit.claim.quiescent and unit.evidence["developer_family"] == ""
         boundary.after_apply(
@@ -291,11 +319,10 @@ def test_completed_live_review_preserves_later_writer_attribution(project, tmp_p
         }
     )
     unit.state = UnitState.REVIEWING
-    unit.claim = WorkerClaim(unit.id, 1, 0, "live-review", role="publication_review")
-    receipt = publication_receipt(runtime, snapshot, unit, "openai")
-    action = OutboxAction(
-        "observe", "observe-worker", unit.id, {"launch_id": unit.claim.launch_id}, 0
+    unit.claim = WorkerClaim(
+        unit.id, 1, snapshot.generation, "live-review", role="publication_review"
     )
-    runtime._apply_worker(snapshot, unit, action, {"state": "finished", "receipt": receipt})
+    receipt = publication_receipt(runtime, snapshot, unit, "openai")
+    apply_receipt(runtime, snapshot, unit, receipt)
     assert unit.evidence["developer_family"] == writer_family
     assert "developer_attribution" not in unit.evidence

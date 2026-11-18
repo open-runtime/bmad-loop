@@ -961,6 +961,80 @@ one-shot process with no receive loop cannot answer it. Peer messages remain
 advisory; use campaign controls for holds, releases and other controller state
 changes. A delegated agent's message does not itself establish owner approval.
 
+## Automatic coordinator restart
+
+After starting a campaign, copy its full ID from `campaign list`. An external
+process supervisor can run the following foreground command on boot and retry
+it after an abnormal exit. Pin the installed executable, project, state root
+and service account to the same values as the original run.
+
+```bash
+bmad-loop campaign resume CAMPAIGN_ID --active-only --project /path/to/project --json
+```
+
+Under the repository coordinator lock, this command reads the exact campaign
+again, applies any queued controls, and reconciles due uncertain effects before
+advancing the generation. An existing drain finishes with admissions closed.
+A never-started, stopped, held, retired or delivered campaign returns its
+current status and exits successfully. An absent ID fails. Development,
+review and checkpoint budgets survive service restarts. Only an explicit
+operator resume can grant another capped checkpoint write budget.
+
+For example, an administrator can configure the following macOS LaunchDaemon
+in `/Library/LaunchDaemons/org.example.bmad-campaign.plist`. Replace the example
+paths, account and ID. Give the service account its normal command search path
+and access to its credentials, state, worktrees and configured transports.
+A user LaunchAgent starts in that user's login session. Qualify a LaunchDaemon
+before relying on operation before login, especially with GUI-backed transports
+or a login keychain.
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>org.example.bmad-campaign</string>
+  <key>UserName</key><string>campaign</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/bmad/venv/bin/bmad-loop</string>
+    <string>campaign</string><string>resume</string><string>CAMPAIGN_ID</string>
+    <string>--active-only</string><string>--project</string><string>/srv/project</string>
+    <string>--json</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>BMAD_LOOP_STATE_DIR</key><string>/srv/bmad-state</string>
+    <key>PATH</key><string>/opt/bmad/venv/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>StandardOutPath</key><string>/srv/bmad-state/service.out</string>
+  <key>StandardErrorPath</key><string>/srv/bmad-state/service.err</string>
+</dict>
+</plist>
+```
+
+Use `campaign stop ID` for a durable stop. A process supervisor may retry a
+killed PID. The durable stop also applies when the coordinator is offline.
+Check the campaign's phase and outstanding claims after the next invocation.
+
+For process-crash qualification, run the sandbox test.
+
+```bash
+uv run pytest -q tests/test_campaign_service_restart.py
+```
+
+Its sandbox kills only a test CLI
+process, starts a fresh CLI against the same store, and checks the campaign ID,
+generation, exhausted budget and offline owner controls. Host reboot qualification
+requires a separately authorized disposable host with the chosen boot service.
+Record the host boot identity and campaign ID, generation, claims, effect IDs,
+budget usage and holds before reboot. After reboot, verify the boot identity
+changed and the service acquired the same campaign automatically. Inspect
+history for reconciled effects, stable attempts and any unresolved worker
+ownership. Repeat with a stopped campaign and verify its revision stays fixed.
+
 ## Operator controls
 
 ```bash

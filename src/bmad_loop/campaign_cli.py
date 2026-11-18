@@ -122,6 +122,12 @@ def register(subparsers: Any) -> None:
                 )
         elif command not in {"list", "provenance"}:
             child.add_argument("campaign_id", metavar="ID")
+        if command == "resume":
+            child.add_argument(
+                "--active-only",
+                action="store_true",
+                help="recover an active coordinator or finish its drain with existing retry budgets",
+            )
         if command == "provenance":
             child.add_argument("--expected-commit", default="", metavar="SHA")
         if command in {
@@ -1356,7 +1362,16 @@ def dispatch(args: argparse.Namespace) -> int:
     snapshot = store.load(campaign_id)
     from .campaign_transfer import require_not_retired
 
-    if command not in {"status", "inbox", "history", "jobs", "messages", "endpoints", "transfer"}:
+    active_only = command == "resume" and args.active_only
+    if not active_only and command not in {
+        "status",
+        "inbox",
+        "history",
+        "jobs",
+        "messages",
+        "endpoints",
+        "transfer",
+    }:
         try:
             require_not_retired(snapshot, operation=command)
         except CampaignError as exc:
@@ -1705,13 +1720,13 @@ def dispatch(args: argparse.Namespace) -> int:
         )
         return _emit(args, _result(command, request=request))
     runtime = _runtime(campaign_runtime, project, store)
-    if command == "resume":
+    if command == "resume" and not active_only:
         runtime.authorize_backup_resume(snapshot)
     if command == "attach":
         return runtime.attach(campaign_id, args.unit, role=args.role)
     supervisor = CampaignSupervisor(store, runtime)
     if command == "resume":
-        result = supervisor.run(campaign_id)
+        result = supervisor.run(campaign_id, active_only=active_only)
     elif command == "reconcile":
         result = supervisor.reconcile(campaign_id)
     else:
