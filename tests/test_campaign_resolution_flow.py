@@ -543,6 +543,7 @@ def test_terminal_failed_diagnosis_preserves_original_hold_and_dirty_work(
         "untracked": (project.project / "untracked.txt").read_bytes(),
         "hold": dataclasses.asdict(unit.hold),
         "attempts": (unit.attempt, unit.resolution_attempts),
+        "cause": typed_failure(snapshot, unit.id),
     }
     runtime = CampaignRuntime(project.project, store)
     receipt = {
@@ -593,3 +594,4 @@ def test_terminal_failed_diagnosis_preserves_original_hold_and_dirty_work(
     assert (project.project / "untracked.txt").read_bytes() == before["untracked"]
     saved = store.save(snapshot, snapshot.revision)
     assert dataclasses.asdict(store.load(saved.id).units[unit.id].hold) == before["hold"]
+    assert typed_failure(store.load(saved.id), unit.id) == before["cause"]

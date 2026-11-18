@@ -54,6 +54,7 @@ def execution_commands(
 def next_step(snapshot: Any, unit: Any) -> Proposal | None:
     accepted = unit.evidence["accepted_resolution"]
     identity = accepted["id"]
+    commands = execution_commands(snapshot, unit, {"resolution_proposal": accepted})
     verified = unit.evidence.get("resolution_verification", {})
     if verified.get("resolution_id") == identity:
         return Proposal("resolution-finish", unit.id, {"proposal_id": identity})
@@ -65,17 +66,13 @@ def next_step(snapshot: Any, unit: Any) -> Proposal | None:
         accepted["action"] in {"reverify", "retry", "reprobe"}
         or repaired.get("resolution_id") == identity
     ):
-        commands = [
-            list(command)
-            for command in execution_commands(snapshot, unit, {"resolution_proposal": accepted})
-        ]
         return Proposal(
             "launch",
             unit.id,
             {
                 "kind": "verify",
                 "stage": "resolution_verify",
-                "commands": commands,
+                "commands": [list(command) for command in commands],
                 "resolution_proposal": accepted,
             },
         )
