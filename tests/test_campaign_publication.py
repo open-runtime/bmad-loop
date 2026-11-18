@@ -7,6 +7,7 @@ import subprocess
 from dataclasses import replace
 
 import pytest
+from test_campaign_github import merged_graphql
 
 from bmad_loop.campaign_github import ApiResponse, GithubError, GithubGateway
 from bmad_loop.campaign_publication import (
@@ -51,6 +52,8 @@ def publishable():
     )
     rules = RemoteRules((RequiredCheck("CI", 7),), True, False, 1, True, True, "rules1")
     pr = {
+        "id": 101,
+        "node_id": "PR_1",
         "number": 1,
         "head": {"sha": candidate.head},
         "base": {"ref": "main", "repo": {"full_name": "a/b"}},
@@ -237,12 +240,12 @@ def test_queued_is_not_merged_and_expired_request_is_unknown(publishable):
     assert (
         controller.merge_status(1, request_id="r1", expected_head=candidate.head).state == "unknown"
     )
-    transport.responses["GET", "repos/a/b/pulls/1"] = ApiResponse(
-        200, {**observation.pr, "merged": True, "merge_commit_sha": "squash"}, {}
-    )
+    pr = {**observation.pr, "merged": True}
+    transport.responses["GET", "repos/a/b/pulls/1"] = ApiResponse(200, pr, {})
+    transport.responses["POST", "graphql"] = merged_graphql(pr, merge_commit="c" * 40)
     receipt = controller.merge_status(1, request_id="r1", expected_head=candidate.head)
     assert receipt.state == "merged_pending_sync"
-    assert receipt.merge_commit == "squash"
+    assert receipt.merge_commit == "c" * 40
 
 
 def test_rules_combine_rulesets_and_classic_without_interpreting_403_as_absence():

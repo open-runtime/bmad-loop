@@ -74,6 +74,7 @@ bmad-loop campaign resume ID [--json]
 bmad-loop campaign stop ID [--terminate-workers] [--json]
 bmad-loop campaign hold ID --unit UNIT --reason TEXT [--json]
 bmad-loop campaign release ID --unit UNIT [--json]
+bmad-loop campaign authorize-scope ID --unit UNIT --expected-revision ACCEPTANCE_REVISION --reason TEXT [--json]
 bmad-loop campaign attach ID --unit UNIT [--role ROLE]
 bmad-loop campaign reconcile ID [--json]
 bmad-loop campaign adoption-proposal ID --unit UNIT --pr NUMBER [--observer NAME] [--json]
@@ -90,6 +91,14 @@ termination is requested. Release only requests removal of an operator hold.
 It observes current process, source and Git identity before clearing that hold
 and invalidates affected acceptance evidence. Hold suppresses automatic input,
 retries and publication while an active actor can finish naturally.
+
+`authorize-scope` authorizes acceptance reductions already present in a delivered
+revised planning PR. Inspect the unit's `acceptance.revision` and criteria in
+`campaign status --json`; `--expected-revision` names that acceptance revision.
+The unit must be unfinished and quiescent, with its pending effects reconciled.
+The coordinator rechecks the exact before/after criteria, planning commit and
+graph revision before applying the request. Stale authorization fails, and
+unrelated holds and required GitHub reviews remain intact.
 
 History uses an integer event sequence cursor; jobs use a string job-ID cursor.
 Both paginate durable records, including completed jobs outside the hot state.
@@ -863,12 +872,6 @@ Every finding's `check` is one of these ids. Severity is `ok`, `warning` or `pro
 | `tickets.capability-not-run`           | ok                     | tickets mode without `--probes`: the capability probe did not run                                                                                       |
 
 The set is closed (`checks.VALIDATE_CHECKS`); plugins cannot add check ids.
-
-`bmad-loop campaign authorize-scope ID --unit UNIT --expected-revision N --reason TEXT`
-queues explicit operator authorization for acceptance reductions already present in a
-delivered revised planning PR. Inspect the current acceptance ledger first. The
-coordinator rechecks the exact scope and graph revision; stale authorization fails.
-This command preserves unrelated holds and required GitHub reviews.
 
 ### Native campaign qualification
 

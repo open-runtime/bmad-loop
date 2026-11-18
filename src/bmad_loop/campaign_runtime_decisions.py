@@ -110,8 +110,12 @@ def _approval(gateway, snapshot, unit) -> tuple[ObservedFact, ...]:
     )
 
 
-def collect(runtime, snapshot, unit, *, max_sources=32, max_bytes=256_000) -> MappedEvidence:
+def collect(
+    runtime, snapshot, unit, *, max_sources=32, max_bytes=256_000, prior_projections=()
+) -> MappedEvidence:
     """Read bounded exact mapped objects; incomplete coverage cannot authorize."""
+    from .campaign_runtime_intake import _owned_projection
+
     if not snapshot.spec.github.enabled:
         return MappedEvidence()
     gateway = runtime.gateway(snapshot)
@@ -170,6 +174,14 @@ def collect(runtime, snapshot, unit, *, max_sources=32, max_bytes=256_000) -> Ma
                     ident = comment.get("id")
                     if type(ident) is not int or ident <= 0:
                         raise CampaignError("mapped discussion comment lacks native identity")
+                    observation = {"kind": "comment", "object_id": str(ident), "payload": comment}
+                    if _owned_projection(snapshot, observation) or any(
+                        prior.repository == snapshot.repository
+                        and prior.common_dir == snapshot.common_dir
+                        and _owned_projection(prior, observation)
+                        for prior in prior_projections
+                    ):
+                        continue
                     add(
                         f"gh:comment:{number}:{ident}",
                         number,

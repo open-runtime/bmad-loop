@@ -63,6 +63,44 @@ def observed(number=7, *, body="Add scoped incoming behavior", kind="issue"):
     )
 
 
+@pytest.mark.parametrize("production_case", [{"intake_mode": "off"}], indirect=True)
+def test_disabled_intake_delivers_with_fresh_mapped_boundaries(production_case, monkeypatch):
+    from bmad_loop.campaign_intake import GithubIntake
+
+    case = production_case
+    polls = []
+    real_poll = GithubIntake.poll
+
+    def poll(self, **kwargs):
+        assert kwargs["mode"] == "off"
+        result = real_poll(self, **kwargs)
+        polls.append((kwargs["cursor"], result))
+        return result
+
+    monkeypatch.setattr(GithubIntake, "poll", poll)
+    result = run_case(case)
+    assert result.phase == "delivered", diagnose(result)
+    assert all(unit.state == UnitState.DELIVERED for unit in result.units.values())
+    assert polls and all(batch.complete and batch.next_cursor == cursor for cursor, batch in polls)
+    assert all(not batch.observations for _, batch in polls)
+    for unit in result.units.values():
+        number = unit.bindings["pr"]["number"]
+        issue = unit.bindings["issue"]["number"]
+        assert unit.evidence["merge"]["canonical_head"]
+        assert case.service.issues[issue]["state"] == "closed"
+        assert sum(path == f"repos/a/b/pulls/{number}" for _, path, _ in case.service.calls) > 1
+        assert any(
+            path.startswith(f"repos/a/b/pulls/{number}/reviews?")
+            for _, path, _ in case.service.calls
+        )
+        assert any(
+            path == "graphql"
+            and "reviewThreads" in payload["query"]
+            and payload["variables"]["number"] == number
+            for _, path, payload in case.service.calls
+        )
+
+
 @pytest.fixture
 def snapshot():
     unit = UnitSpec(

@@ -271,12 +271,6 @@ def execute_special(runtime, snapshot, action, intent, *, reconcile=False):
                 generation=snapshot.generation,
                 independent_families=snapshot.spec.github.require_independent_review,
             )
-    return Observation(
-        (
-            "confirmed"
-            if result.state == "confirmed"
-            else "rejected" if result.state == "rejected" else "unknown"
-        ),
-        {"intent": result.to_dict()},
-        result.error,
-    )
+    from .campaign_github_faults import mutation_observation
+
+    return mutation_observation(result, now=runtime.clock())

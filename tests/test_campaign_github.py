@@ -35,6 +35,91 @@ class FakeTransport:
         return response
 
 
+def merged_graphql(pr, *, merge_commit=None, repository="a/b"):
+    """Current GraphQL payload paired with an independent REST PR observation."""
+    return ApiResponse(
+        200,
+        {
+            "data": {
+                "repository": {
+                    "nameWithOwner": repository,
+                    "pullRequest": {
+                        "id": pr["node_id"],
+                        "fullDatabaseId": pr["id"],
+                        "number": pr["number"],
+                        "merged": pr["merged"],
+                        "headRefOid": pr["head"]["sha"],
+                        "baseRefName": pr["base"]["ref"],
+                        "mergeCommit": {"oid": merge_commit or pr["merge_commit_sha"]},
+                    },
+                }
+            }
+        },
+        {},
+    )
+
+
+@pytest.fixture
+def merged_pull():
+    return {
+        "id": 101,
+        "node_id": "PR_1",
+        "number": 1,
+        "merged": True,
+        "state": "closed",
+        "head": {"sha": "a" * 40},
+        "base": {"ref": "main", "repo": {"full_name": "a/b"}},
+    }
+
+
+def test_current_rest_merge_identity_is_normalized_through_joined_graphql(merged_pull):
+    transport = FakeTransport()
+    transport.responses["GET", "repos/a/b/pulls/1"] = ApiResponse(200, merged_pull, {})
+    transport.responses["POST", "graphql"] = merged_graphql(merged_pull, merge_commit="c" * 40)
+    normalized = GithubGateway(transport, "a/b").pull(1)
+    assert "merge_commit_sha" not in merged_pull
+    assert normalized["merge_commit_sha"] == "c" * 40
+    assert normalized["merge_commit_observation"]["source"] == "graphql.mergeCommit"
+    assert normalized["merge_commit_observation"]["headRefOid"] == merged_pull["head"]["sha"]
+    assert transport.calls[-1][2]["variables"] == {"owner": "a", "name": "b", "number": 1}
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("repository", "other/repo"),
+        ("id", "PR_foreign"),
+        ("fullDatabaseId", 102),
+        ("number", 2),
+        ("headRefOid", "d" * 40),
+        ("baseRefName", "other"),
+        ("merged", False),
+        ("mergeCommit", None),
+        ("mergeCommit", {"oid": ""}),
+    ],
+)
+def test_merged_identity_join_rejects_mismatched_or_missing_graphql(merged_pull, field, value):
+    transport = FakeTransport()
+    transport.responses["GET", "repos/a/b/pulls/1"] = ApiResponse(200, merged_pull, {})
+    graph = merged_graphql(merged_pull, merge_commit="c" * 40)
+    repository = graph.data["data"]["repository"]
+    if field == "repository":
+        repository["nameWithOwner"] = value
+    else:
+        repository["pullRequest"][field] = value
+    transport.responses["POST", "graphql"] = graph
+    with pytest.raises(GithubError, match="identity"):
+        GithubGateway(transport, "a/b").pull(1)
+
+
+def test_merged_identity_uses_graphql_even_when_legacy_rest_field_exists(merged_pull):
+    transport = FakeTransport()
+    legacy = {**merged_pull, "merge_commit_sha": "b" * 40}
+    transport.responses["GET", "repos/a/b/pulls/1"] = ApiResponse(200, legacy, {})
+    transport.responses["POST", "graphql"] = merged_graphql(merged_pull, merge_commit="c" * 40)
+    assert GithubGateway(transport, "a/b").pull(1)["merge_commit_sha"] == "c" * 40
+
+
 @pytest.mark.parametrize("status", [404, 403, 500])
 def test_get_preserves_native_error_status_for_read_observation(status):
     transport = FakeTransport()
@@ -43,6 +128,28 @@ def test_get_preserves_native_error_status_for_read_observation(status):
         GithubGateway(transport, "a/b").issue(7)
     assert error.value.status == status
     assert transport.calls == [("GET", "repos/a/b/issues/7", None)]
+
+
+@pytest.mark.parametrize("representation", [str, int])
+def test_merged_pull_joins_full_64_bit_database_identity(representation):
+    transport = FakeTransport()
+    pr = {
+        "id": 3_000_000_000,
+        "number": 7,
+        "node_id": "PR_large",
+        "merged": True,
+        "head": {"sha": "a" * 40},
+        "base": {"ref": "main", "repo": {"full_name": "a/b"}},
+    }
+    transport.responses["GET", "repos/a/b/pulls/7"] = ApiResponse(200, pr, {})
+    response = merged_graphql(pr, merge_commit="b" * 40)
+    response.data["data"]["repository"]["pullRequest"]["fullDatabaseId"] = representation(pr["id"])
+    transport.responses["POST", "graphql"] = response
+    result = GithubGateway(transport, "a/b").pull(7)
+    assert result["merge_commit_sha"] == "b" * 40
+    query = transport.calls[-1][2]["query"]
+    assert "fullDatabaseId" in query
+    assert " databaseId " not in query
 
 
 def test_optional_intake_issue_cancellation_uses_owned_native_identity_and_not_planned():

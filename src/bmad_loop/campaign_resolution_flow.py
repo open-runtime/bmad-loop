@@ -143,6 +143,25 @@ def typed_failure(snapshot: CampaignSnapshot, unit_id: str) -> FailureEvidence:
         return failure_from_receipt(explicit)
     history = unit.evidence.get("worker_history", [])
     receipt = history[-1] if history else {}
+    if unit.hold and history and unit.evidence.get("resolution_failures"):
+        # Retained legacy snapshots may already end with one or more rejected
+        # diagnosis receipts. Those launches did not produce the held failure.
+        hold = dataclasses.asdict(unit.hold)
+        rejected = [
+            row["receipt"]
+            for row in unit.evidence["resolution_failures"]
+            if row.get("hold") == hold
+        ]
+        rejected_launches = {row["launch_id"] for row in rejected if row.get("launch_id")}
+        receipt = next(
+            (
+                row
+                for row in reversed(history)
+                if row.get("launch_id") not in rejected_launches
+                and (row.get("launch_id") or row not in rejected)
+            ),
+            {},
+        )
     outcome = receipt.get("outcome")
     code = {
         "verification_failed": CauseCode.VERIFICATION,
@@ -169,6 +188,58 @@ def _context_current(snapshot: CampaignSnapshot, unit_id: str, packet: Mapping[s
         == snapshot.units[unit_id].evidence.get("github_input_revision", "")
         and packet.get("decision_input_revision", "")
         == snapshot.units[unit_id].evidence.get("decision_input_revision", "")
+    )
+
+
+def _refusal_subject(snapshot, unit):
+    return _digest(
+        {
+            "coordinates": dataclasses.asdict(_coordinates(snapshot, unit.id)),
+            "hold": dataclasses.asdict(unit.hold) if unit.hold else None,
+            "failure": dataclasses.asdict(typed_failure(snapshot, unit.id)),
+            "github_inputs": unit.evidence.get("github_input_revision", ""),
+            "decision_inputs": unit.evidence.get("decision_input_revision", ""),
+            "verification": snapshot.spec.verify_commands,
+            "repair": unit.evidence.get("active_resolution_packet", {}).get("repair_commands", ()),
+        }
+    )
+
+
+def refuse_persisted_resolution(snapshot, unit, payload):
+    """Retire only the observed invalid proposal and keep its original condition."""
+    accepted = unit.evidence.get("accepted_resolution")
+    history = unit.evidence.get("resolution_history", [])
+    if (
+        not accepted
+        or not history
+        or (unit.claim and not unit.claim.quiescent)
+        or history[-1].get("state") != "proposed"
+        or _digest(accepted) != payload["proposal_digest"]
+        or _refusal_subject(snapshot, unit) != payload["subject"]
+    ):
+        return
+    accepted_id = accepted.get("id") if isinstance(accepted, dict) else None
+    if (
+        unit.hold
+        and unit.hold.kind == "resolution"
+        and accepted_id
+        and unit.hold.evidence.get("proposal") == accepted_id
+    ):
+        original = unit.hold.evidence.get("original_hold")
+        if isinstance(original, dict) and original.get("id") == unit.hold.id:
+            unit.hold = Hold(**original)
+    history[-1].update(
+        state="refused",
+        refusal={
+            "reason": payload["reason"],
+            "proposal": accepted,
+            "subject": _refusal_subject(snapshot, unit),
+        },
+    )
+    unit.evidence.pop("accepted_resolution")
+    unit.evidence.pop("resolution_next_step", None)
+    add_event(
+        snapshot, "resolution-refused", unit=unit.id, proposal=accepted_id, reason=payload["reason"]
     )
 
 
@@ -205,6 +276,14 @@ def proposals(
         if mode == "diagnosis":
             if snapshot.spec.resolution.mode == "off":
                 continue
+            history = unit.evidence.get("resolution_history", [])
+            if (
+                history
+                and history[-1].get("state") == "refused"
+                and history[-1].get("refusal", {}).get("subject")
+                == _refusal_subject(snapshot, unit)
+            ):
+                continue
             cause = typed_failure(snapshot, key)
             if transient_retry(cause, attempt=unit.failure_attempts, now=now) is not None:
                 recorded = unit.evidence.get("transient_retry")
@@ -222,12 +301,31 @@ def proposals(
                     )
                 continue
         if mode == "diagnosis" and unit.evidence.get("accepted_resolution"):
-            accepted = _proposal(unit.evidence["accepted_resolution"])
             history = unit.evidence.get("resolution_history", [])
             if history and history[-1].get("state") == "proposed":
                 from .campaign_resolution_delivery import next_step as delivery_step
 
-                followup = delivery_step(snapshot, unit)
+                raw = unit.evidence["accepted_resolution"]
+                try:
+                    accepted = _proposal(raw)
+                    followup = delivery_step(snapshot, unit)
+                except (CampaignError, KeyError, TypeError, ValueError) as exc:
+                    output.append(
+                        Proposal(
+                            "resolution-refused",
+                            key,
+                            {
+                                "proposal_digest": _digest(raw),
+                                "subject": _refusal_subject(snapshot, unit),
+                                "reason": (
+                                    str(exc)
+                                    if isinstance(exc, CampaignError)
+                                    else "invalid stored resolution proposal"
+                                ),
+                            },
+                        )
+                    )
+                    continue
                 if followup is not None:
                     output.append(followup)
                     continue
@@ -306,6 +404,7 @@ def collect_context(
     mapped_sources: tuple[EvidenceSource, ...] = (),
     facts: tuple[ObservedFact, ...] = (),
     mapped_unavailable: tuple[str, ...] = (),
+    prior_projections=(),
 ) -> dict[str, Any]:
     """Bounded read-only I/O effect. Save its returned packet before dispatch."""
     unit = snapshot.units[unit_id]
@@ -316,7 +415,7 @@ def collect_context(
     if verify.rev_parse_head(workspace) != coordinates.head:
         raise CampaignError("recovery candidate moved before context collection")
     if mode == "decision":
-        from .campaign_decision_sources import configured_locations
+        from .campaign_decision_sources import configured_locations, controller_comment
 
         locations = configured_locations(snapshot.spec.decisions.sources, scope=(unit_id,))
         locations += tuple(
@@ -335,7 +434,11 @@ def collect_context(
             coordinates,
             unit.hold,
             unit.hold.reason,
-            (*collection.sources, *mapped_sources),
+            tuple(
+                source
+                for source in (*collection.sources, *mapped_sources)
+                if not controller_comment(snapshot, source, prior_projections=prior_projections)
+            ),
             facts,
             allowed_paths=unit.spec.scopes,
             unavailable=(
@@ -448,6 +551,29 @@ def apply_context(snapshot: CampaignSnapshot, unit_id: str, result: Mapping[str,
     add_event(snapshot, "recovery-context-collected", unit=unit_id, mode=result["mode"])
 
 
+def preserve_failed_diagnosis(snapshot, unit, request, receipt) -> bool:
+    """Keep the unresolved condition authoritative when its diagnosis is invalid.
+
+    A rejected read-only proposal is evidence about a failed resolution attempt;
+    it does not replace the original approval, acceptance or technical condition.
+    The attempted-context and lifetime counters remain unchanged.
+    """
+    if request.get("result_contract") not in {"decision-v1", "resolution-v1"} or not unit.hold:
+        return False
+    unit.evidence.setdefault("resolution_failures", []).append(
+        {"hold": dataclasses.asdict(unit.hold), "receipt": dict(receipt)}
+    )
+    add_event(
+        snapshot,
+        "recovery-proposal-rejected",
+        unit=unit.id,
+        hold=unit.hold.id,
+        launch=receipt.get("launch_id", ""),
+        reason=receipt.get("error", "Invalid diagnosis result"),
+    )
+    return True
+
+
 def prepare(snapshot: CampaignSnapshot, unit_id: str, payload: Mapping[str, Any]) -> None:
     """Run within prepare-effect, before the launch claim becomes durable."""
     if payload.get("result_contract") not in {"decision-v1", "resolution-v1"}:
@@ -472,6 +598,7 @@ def validate_stage_result(
     mapped_sources: tuple[EvidenceSource, ...] = (),
     facts: tuple[ObservedFact, ...] | None = None,
     mapped_unavailable: tuple[str, ...] = (),
+    prior_projections=(),
 ) -> dict[str, Any]:
     """I/O executor validates fresh source/head bindings after read-only session."""
     unit = snapshot.units[unit_id]
@@ -506,6 +633,7 @@ def validate_stage_result(
             mapped_sources=mapped_sources,
             facts=facts or (),
             mapped_unavailable=mapped_unavailable,
+            prior_projections=prior_projections,
         )
         refreshed = decision_context(fresh["packet"])
         fresh_sources = {source.id: source for source in refreshed.sources}
@@ -589,6 +717,10 @@ def apply_diagnosis(
             created_at=unit.hold.created_at,
             evidence={"original_hold": original_hold, "proposal": proposal.id},
         )
+    if proposal.action == "reverify":
+        from .campaign_resolution_delivery import next_step
+
+        return next_step(snapshot, unit)
     return _next_step(unit_id=unit_id, proposal=proposal, candidate=candidate)
 
 
@@ -615,17 +747,6 @@ def _next_step(
                 "read_only": False,
                 "custom_prompt": prompt,
                 "result_contract": "repair-v1",
-                "resolution_proposal": dataclasses.asdict(proposal),
-            },
-        )
-    if proposal.action == "reverify":
-        return Proposal(
-            "launch",
-            unit_id,
-            {
-                "kind": "verify",
-                "stage": "resolution_verify",
-                "commands": [list(command) for command in proposal.verification],
                 "resolution_proposal": dataclasses.asdict(proposal),
             },
         )

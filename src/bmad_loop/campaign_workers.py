@@ -22,7 +22,12 @@ from typing import Any, Callable, Iterator
 
 from . import bmadconfig, childrun, runs, runsetup, verify
 from .adapters.base import SessionSpec
-from .campaign_execution import CampaignExecution, CampaignExecutionError, worker_policy
+from .campaign_execution import (
+    CampaignExecution,
+    CampaignExecutionError,
+    worker_environment,
+    worker_policy,
+)
 from .campaign_model import CampaignError, SourceSelector, UnitSpec
 from .engine import Engine
 from .journal import TASK_CYCLE_ARTIFACTS, load_state
@@ -256,7 +261,7 @@ def spawn(
                 stdin=subprocess.DEVNULL,
                 stdout=log,
                 stderr=subprocess.STDOUT,
-                env=env,
+                env=worker_environment(os.environ if env is None else env),
                 **process_options,
             )
             with _OWNED_LAUNCHES_LOCK:
@@ -884,6 +889,13 @@ def _verify(request: dict[str, Any], envelope: CampaignExecution) -> dict[str, A
     from .campaign_fingerprint import capture
     from .campaign_resolution import diagnosis_unchanged
 
+    if request.get("legacy_verify") and envelope.verify_commands:
+        raise CampaignError("legacy verifier cannot replace frozen verification authority")
+    if not request.get("legacy_verify"):
+        if envelope.verify_commands is None:
+            raise CampaignError("historical execution envelope has unknown verification authority")
+        if tuple(tuple(command) for command in request["commands"]) != envelope.verify_commands:
+            raise CampaignError("worker commands differ from frozen verification authority")
     workspace = Path(request["workspace"])
     before = verify.rev_parse_head(workspace)
     protected = _protected_sources(workspace, request)
@@ -918,7 +930,11 @@ def _verify(request: dict[str, Any], envelope: CampaignExecution) -> dict[str, A
     records = []
     for command in request["commands"]:
         result = childrun.run_argv(
-            command, cwd=workspace, timeout=request.get("timeout_s", 1800), encoding="utf-8"
+            command,
+            cwd=workspace,
+            timeout=request.get("timeout_s", 1800),
+            encoding="utf-8",
+            env=worker_environment(os.environ),
         )
         records.append(
             {

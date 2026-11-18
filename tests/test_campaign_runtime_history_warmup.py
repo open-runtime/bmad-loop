@@ -59,11 +59,13 @@ class ObservedReasoning(ScriptedReasoning):
             }
             if spec.prompt_version == FINAL_PROMPT_VERSION:
                 result = {
-                    "schema_version": 3,
+                    "schema_version": 4,
                     "job_id": request["id"],
                     "input_sha256": spec.input_sha256,
                     "covered_ids": list(spec.primary_ids),
                     "ranked_fact_ids": list(source["fact_catalog"]),
+                    "required_fact_ids": [],
+                    "excluded_fact_ids": [],
                 }
             return {
                 "state": "finished",
@@ -82,6 +84,82 @@ class ObservedReasoning(ScriptedReasoning):
                 },
             }
         return super()._launch(path)
+
+
+@pytest.mark.parametrize("with_facts", [False, True])
+def test_scripted_warmup_final_reducer_satisfies_current_contract(tmp_path, with_facts):
+    from test_campaign_handoff_context import budget, capture, native_row
+
+    from bmad_loop.campaign_jobs import JobLimits, JobRequest, digest, validate_result
+    from bmad_loop.campaign_summary import (
+        plan_maps,
+        plan_reduction,
+        project_final_input,
+        summary_prompt,
+        summary_schema,
+        validate_summary,
+    )
+    from bmad_loop.campaign_transcripts import load_events
+
+    history = capture(tmp_path, [native_row("codex", "Implementation remains unfinished.")])
+    events = load_events(history)
+    leaf = plan_maps(events, budget(), tmp_path / "leaf")[0]
+    child = validate_summary(
+        leaf,
+        {
+            "schema_version": 1,
+            "job_id": leaf.id,
+            "input_sha256": leaf.input_sha256,
+            "covered_ids": list(leaf.primary_ids),
+            "gaps": [],
+            "facts": (
+                [{"kind": "progress", "text": events[0].record.text, "citations": [events[0].id]}]
+                if with_facts
+                else []
+            ),
+        },
+        events,
+    )
+    reduction = plan_reduction(((leaf, child),), budget(), tmp_path / "reduce")[0]
+    job = project_final_input(reduction, tmp_path / "final")
+    request = JobRequest(
+        job.id,
+        "handoff_reduce",
+        "summarization",
+        {
+            "graph_revision": 1,
+            "config_revision": 1,
+            "head": "",
+            "base": "",
+            "summary_stage": "final",
+            "summary_spec": dataclasses.asdict(job),
+        },
+        (),
+        summary_prompt(job),
+        summary_schema(job),
+        JobLimits(10000, 2500),
+    )
+    path = tmp_path / "request.json"
+    path.write_text(
+        json.dumps(
+            {
+                "request": dataclasses.asdict(request),
+                "request_digest": digest(dataclasses.asdict(request)),
+                "launch_id": "scripted-final",
+                "generation": 1,
+                "selection": {"model": "scripted"},
+            }
+        )
+    )
+    # Exercise the exact model-response helper against a real final request,
+    # independent of runtime timing, route choice or whether compaction fits.
+    reasoner = object.__new__(ObservedReasoning)
+    reasoner.launches = []
+    result = reasoner._launch(path)["receipt"]["result"]
+    validate_result(result, request.output_schema)
+    accepted = validate_summary(job, result, events)
+    assert accepted["structural_coverage"] is True
+    assert len(accepted["facts"]) == int(with_facts)
 
 
 @pytest.mark.parametrize(

@@ -12,7 +12,7 @@ import hashlib
 import json
 import types
 from pathlib import Path
-from typing import Any, Union, get_args, get_origin, get_type_hints
+from typing import Any, Mapping, Union, get_args, get_origin, get_type_hints
 
 from .adapters.profile import CLIProfile
 from .platform_util import atomic_write_text, is_link_like
@@ -22,6 +22,16 @@ from .policy import Policy
 
 class CampaignExecutionError(ValueError):
     """A missing or inconsistent trusted child envelope."""
+
+
+def worker_environment(source: Mapping[str, str]) -> dict[str, str]:
+    """Exclude controller GitHub credentials while retaining provider accounts.
+
+    This only separates inherited environment credentials. File-backed GitHub
+    authentication and system credential helpers require independent filesystem
+    and process confinement; clearing environment keys does not establish it.
+    """
+    return {key: value for key, value in source.items() if not key.startswith(("GH_", "GITHUB_"))}
 
 
 def _restore(annotation: Any, raw: Any) -> Any:
@@ -87,11 +97,16 @@ class CampaignExecution:
     profiles: dict[str, CLIProfile]
     grants: GrantSet = dataclasses.field(default_factory=GrantSet.empty)
     checkpoint_interval_s: float = 600.0
+    # None retains readable historical envelopes without inventing argv authority.
+    # Explicit verification requires a newly frozen controller-owned binding.
+    verify_commands: tuple[tuple[str, ...], ...] | None = None
 
     def save(self) -> tuple[Path, str]:
         self.directory.mkdir(parents=True, exist_ok=True)
         path = self.directory / "execution.json"
         payload = dataclasses.asdict(self)
+        if self.verify_commands is None:
+            payload.pop("verify_commands")
         payload["schema_version"] = 1
         text = _json(payload)
         digest = hashlib.sha256(text.encode()).hexdigest()

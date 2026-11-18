@@ -416,6 +416,14 @@ Configured `github.hold_labels` (default `bmad:hold`) apply to fresh publication
 and merge retries. Read-only reconciliation of an issued merge continues while
 held, without authorizing another merge write.
 
+`campaign status --json` includes bounded `waiting_effects`: the effect identity,
+reason, next reconciliation action and persisted retry time, plus GitHub fault
+category, certainty, HTTP status and request identity when known. The projection
+reports its total and truncation without exposing mutation payloads. Rate-limit
+deadlines survive restart; a refused mutation requires operator reconciliation,
+and an uncertain effect is observed before any authorized resubmission. Historical
+records without typed faults retain their original reason and unknown fault data.
+
 `github.review_users` and `github.review_teams` recruit reviewers on the exact
 candidate. Requests are durable and reconciled after lost acknowledgements.
 An independent model review does not supply an eligible GitHub approval.
@@ -481,10 +489,12 @@ check producer for the combined queue candidate. A client-side fresh-main read
 alone cannot remove the race before a remote merge. Campaigns never enable admin
 bypass in strict or queue mode.
 
-`direct-authorized` is a separate, explicitly repository-bound policy. It uses
-ordinary exact-head GitHub merge first. `allow_admin_merge = true` authorizes an
-administrative retry only after a definitive policy refusal and fresh gate checks;
-an ambiguous response is reconciled before any retry. This mode retains holds,
+`direct-authorized` requires both `github.repository = "OWNER/REPOSITORY"` and
+`github.allow_admin_merge = true`; validation rejects the mode without either
+setting. It uses ordinary exact-head GitHub merge first. The explicit admin
+permission allows an administrative retry only after a definitive policy refusal
+and fresh gate checks; an ambiguous response is reconciled before any retry.
+This mode retains holds,
 configured checks, selected local reviews, verification and history preservation.
 It does not claim server-enforced atomic freshness of the base. The actual landed
 commit must pass acceptance before delivery; failed landing proof creates one
@@ -842,12 +852,21 @@ bmad-loop campaign reconfigure CAMPAIGN_ID --spec campaign.toml --expected-revis
 bmad-loop campaign reflect CAMPAIGN_ID --preview --json
 bmad-loop campaign hold CAMPAIGN_ID --unit QUALIFIED_UNIT --reason "Inspect this change" --json
 bmad-loop campaign release CAMPAIGN_ID --unit QUALIFIED_UNIT --json
+bmad-loop campaign authorize-scope CAMPAIGN_ID --unit QUALIFIED_UNIT --expected-revision ACCEPTANCE_REVISION --reason "Authorize the inspected acceptance reduction" --json
 bmad-loop campaign stop CAMPAIGN_ID --json
 bmad-loop campaign stop CAMPAIGN_ID --terminate-workers --json
 bmad-loop campaign reconcile CAMPAIGN_ID --json
 bmad-loop campaign resume CAMPAIGN_ID --json
 bmad-loop campaign attach CAMPAIGN_ID --unit QUALIFIED_UNIT --role execution
 ```
+
+`authorize-scope` authorizes acceptance reductions already present in a delivered
+revised planning PR. Inspect the unit's `acceptance.revision` and criteria in
+`campaign status --json`; `--expected-revision` names that acceptance revision.
+The unit must be unfinished and quiescent, with its pending effects reconciled.
+The coordinator rechecks the exact before/after criteria, planning commit and
+graph revision before applying the request. Stale authorization fails, and
+unrelated holds and required GitHub reviews remain intact.
 
 `status --json` includes `discovery.state`, the last observation time, whether a
 refresh is pending, and unavailable or truncated sources. Pending units show a

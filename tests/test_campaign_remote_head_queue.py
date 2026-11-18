@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 import test_campaign_remote_head
+from test_campaign_github import merged_graphql
 
 from bmad_loop import campaign_runtime_queue as flow
 from bmad_loop.campaign_github import ApiResponse, GithubError, GithubGateway, MutationIntent
@@ -23,12 +24,19 @@ class Transport:
         self.member_changes = {}
         self.mutations = []
         self.drop = False
+        self.merge_commit = "f" * 40
 
     def request(self, method, path, payload=None):
         pr = self.case.pr
         if method == "GET":
             return ApiResponse(200, copy.deepcopy(pr), {})
         assert payload is not None
+        if "mergeCommit" in payload["query"]:
+            assert method == "POST" and path == "graphql"
+            assert payload["variables"]["number"] == pr["number"]
+            return merged_graphql(
+                pr, merge_commit=self.merge_commit, repository=self.case.snapshot.repository
+            )
         member = {
             "id": pr["node_id"],
             "number": pr["number"],
@@ -54,6 +62,7 @@ class Transport:
 @pytest.fixture
 def case(remote_case):
     c = remote_case
+    c.pr["id"] = 101
     c.snapshot.generation = 1
     c.snapshot.spec = replace(
         c.snapshot.spec, github=replace(c.snapshot.spec.github, merge_mode="queue")

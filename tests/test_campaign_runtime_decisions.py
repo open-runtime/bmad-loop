@@ -424,3 +424,104 @@ def test_held_summary_waits_then_release_reconciles_same_comment_after_lost_repl
     reconciled = driver.reconcile_action(saved, comment)
     assert reconciled.state == "confirmed" and len(service.published) == 1
     assert reconciled.data["intent"]["action_id"] == before["action_id"]
+
+
+def controller_comment(saved, unit, service, *, identifier=400):
+    """Retain a genuine native acknowledgement for one controller projection."""
+    comment = service.add(identifier, body="Campaign decision: SQLite is the recommended answer.")
+    intent = {
+        "action_id": f"projection-{identifier}",
+        "kind": "comment",
+        "method": "POST",
+        "path": "repos/org/repo/issues/7/comments",
+        "payload": {"body": comment["body"]},
+        "state": "confirmed",
+        "receipt": copy.deepcopy(comment),
+    }
+    saved.outbox.append(
+        OutboxAction(
+            intent["action_id"],
+            "github",
+            unit.id,
+            {"intent": intent},
+            saved.generation,
+            state="confirmed",
+            receipt={"intent": intent},
+        )
+    )
+    return comment
+
+
+def test_controller_projection_does_not_change_decision_context_but_owner_reply_does(
+    project, tmp_path
+):
+    driver, saved, unit, service = runtime(project, tmp_path)
+    original = collect(driver, saved, unit)
+    controller_comment(saved, unit, service)
+    # Persist and reload the receipt, as in a restarted coordinator.
+    saved = driver.store.save(saved, saved.revision)
+    saved = driver.store.load(saved.id)
+    unit = saved.units[unit.id]
+    projected = collect(driver, saved, unit)
+    assert projected == original
+    # The same authenticated account's actual reply remains visible, even if
+    # its words happen to repeat a recommendation or quote a managed marker.
+    service.add(401, body=service.comments[0]["body"])
+    answered = collect(driver, saved, unit)
+    assert len(answered.sources) == len(original.sources) + 1
+    assert answered.sources[-1].identity == "gh:comment:7:401"
+    assert answered.sources[-1].authority == "owner"
+    assert answered.sources[-1].origin_verified
+
+
+def test_explicit_controller_comment_cannot_supply_decision_authority(project, tmp_path):
+    driver, saved, unit, service = runtime(project, tmp_path)
+    controller_comment(saved, unit, service)
+    saved.spec = dataclasses.replace(
+        saved.spec, decisions=DecisionSpec(sources=("gh:comment:7:400@5",))
+    )
+    saved.config_revision += 1
+    saved = driver.store.save(saved, saved.revision)
+    action = OutboxAction(
+        "context",
+        "resolution-context",
+        unit.id,
+        {"mode": "decision", "hold_id": unit.hold.id, "head": unit.bindings["head"]},
+        0,
+    )
+    result = driver._perform_resolution_context(saved, action)
+    packet = result.data["packet"]
+    assert all("comment:7:400" not in item["identity"] for item in packet["sources"])
+    assert len(packet["sources"]) == 1  # The original issue remains citable.
+    assert saved.units[unit.id].hold == unit.hold
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_prior_campaign_projection_is_not_an_owner_answer(project, tmp_path, explicit):
+    driver, saved, unit, service = runtime(project, tmp_path)
+    original = collect(driver, saved, unit)
+    prior = saved.clone()
+    prior.id = "previous-campaign"
+    controller_comment(prior, prior.units[unit.id], service)
+    driver.store.create(prior)
+    if explicit:
+        saved.spec = dataclasses.replace(
+            saved.spec, decisions=DecisionSpec(sources=("gh:comment:7:400@5",))
+        )
+        saved.config_revision += 1
+    saved = driver.store.save(saved, saved.revision)
+    action = OutboxAction(
+        "context",
+        "resolution-context",
+        unit.id,
+        {"mode": "decision", "hold_id": unit.hold.id, "head": unit.bindings["head"]},
+        0,
+    )
+    result = driver._perform_resolution_context(saved, action)
+    packet = result.data["packet"]
+    assert packet["sources"] == [dataclasses.asdict(item) for item in original.sources]
+    # Remote text alone still cannot classify the owner's distinct native reply
+    # as a controller projection, even with the identical account and body.
+    service.add(401, body=service.comments[0]["body"])
+    result = driver._perform_resolution_context(saved, action)
+    assert result.data["packet"]["sources"][-1]["identity"] == "gh:comment:7:401"

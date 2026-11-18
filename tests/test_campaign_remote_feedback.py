@@ -95,8 +95,6 @@ def test_required_remote_defect_is_bound_to_exact_head_native_identity_and_rule_
         "pending-check",
         "missing-check",
         "missing-approval",
-        "old-head-review",
-        "outdated-thread",
         "wrong-app",
         "remote-hold",
         "stale",
@@ -112,12 +110,6 @@ def test_waits_and_unbound_findings_do_not_create_repair_authority(publishable, 
         observed = replace(observed, checks=())
     elif case == "missing-approval":
         observed = replace(publishable[3], reviews=())
-    elif case == "old-head-review":
-        candidate, observed = observation(publishable, "changes")
-        observed = replace(observed, reviews=({**observed.reviews[0], "commit_id": "old"},))
-    elif case == "outdated-thread":
-        candidate, observed = observation(publishable, "thread")
-        observed = replace(observed, threads=({**observed.threads[0], "isOutdated": True},))
     elif case == "wrong-app":
         observed = replace(observed, checks=({**observed.checks[0], "app": {"id": 8}},))
     elif case == "remote-hold":
@@ -133,6 +125,60 @@ def test_waits_and_unbound_findings_do_not_create_repair_authority(publishable, 
         )
         is None
     )
+
+
+@pytest.mark.parametrize("later_state", ["COMMENTED", "PENDING"])
+def test_later_comment_preserves_the_latest_binding_review_objection(publishable, later_state):
+    controller, _, evidence, _ = publishable
+    candidate, observed = observation(publishable, "changes")
+    objection = observed.reviews[0]
+    observed = replace(
+        observed,
+        reviews=(
+            objection,
+            {**objection, "id": 3, "state": later_state, "body": "Additional review context"},
+        ),
+    )
+    feedback = collect(candidate, observed, now=100, requirements=PublicationRequirements())
+    assert feedback is not None
+    assert feedback.defects[0]["id"] == str(objection["id"])
+    assert feedback.defects[0]["body"] == objection["body"]
+    assert (
+        "A reviewer requests changes" in controller.evaluate(candidate, evidence, observed).reasons
+    )
+
+
+@pytest.mark.parametrize("kind", ["old-head-review", "outdated-thread", "no-server-rule"])
+def test_repair_context_keeps_every_known_publication_review_veto(publishable, kind):
+    controller, _, evidence, _ = publishable
+    candidate, observed = observation(
+        publishable, "changes" if kind == "old-head-review" else "thread"
+    )
+    if kind == "old-head-review":
+        observed = replace(
+            observed, reviews=({**observed.reviews[0], "commit_id": "previous-head"},)
+        )
+    elif kind == "outdated-thread":
+        observed = replace(observed, threads=({**observed.threads[0], "isOutdated": True},))
+    else:
+        observed = replace(observed, rules=replace(observed.rules, conversation_resolution=False))
+    feedback = collect(candidate, observed, now=100, requirements=PublicationRequirements())
+    assert feedback is not None and len(feedback.defects) == 1
+    defect = feedback.defects[0]
+    assert defect["head"] == candidate.head
+    if kind == "old-head-review":
+        assert defect["review_head"] == "previous-head"
+        assert defect["body"] == observed.reviews[0]["body"]
+    else:
+        assert defect["comments"] == observed.threads[0]["comments"]
+        assert defect["is_outdated"] == observed.threads[0]["isOutdated"]
+    # Collecting a fix proposal does not dismiss or resolve the objection.
+    reason = (
+        "A reviewer requests changes"
+        if kind == "old-head-review"
+        else "Unresolved review threads remain"
+    )
+    assert reason in controller.evaluate(candidate, evidence, observed).reasons
 
 
 def test_remote_repair_preserves_pr_and_attempt_budget_and_must_return_through_full_acceptance(

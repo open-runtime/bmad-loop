@@ -4,6 +4,7 @@ import time
 from dataclasses import asdict, replace
 
 import pytest
+from test_campaign_github import merged_graphql
 from test_campaign_publication import publishable as publishable
 
 from bmad_loop.campaign_github import ApiResponse, GithubError
@@ -57,9 +58,9 @@ def test_lost_ack_replay_uses_frozen_hold_labels_and_retains_readback(
         controller.reconcile_request(intent, candidate, evidence, generation=1, allow_retry=True)
     assert not [call for call in transport.calls if call[0] == "PUT"]
     # A known remote merge is still observed, not resent or fabricated unmerged.
-    transport.responses["GET", "repos/a/b/pulls/1"] = ApiResponse(
-        200, {**observation.pr, "merged": True, "merge_commit_sha": "merge"}, {}
-    )
+    pr = {**observation.pr, "merged": True}
+    transport.responses["GET", "repos/a/b/pulls/1"] = ApiResponse(200, pr, {})
+    transport.responses["POST", "graphql"] = merged_graphql(pr, merge_commit="c" * 40)
     assert (
         controller.reconcile_request(
             intent, candidate, evidence, generation=1, allow_retry=True

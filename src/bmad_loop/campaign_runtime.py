@@ -1891,11 +1891,9 @@ class CampaignRuntime:
                         independent_families=current.spec.github.require_independent_review,
                         queue_evidence_context=current.spec.github.candidate_check_context,
                     )
-                return Observation(
-                    "confirmed" if result.state == "confirmed" else "unknown",
-                    {"intent": result.to_dict()},
-                    result.error,
-                )
+                from .campaign_github_faults import mutation_observation
+
+                return mutation_observation(result, now=self.clock())
             if action.payload.get("purpose") == "parent-tracking":
                 from .campaign_parent_closure import guard
 
@@ -1910,11 +1908,9 @@ class CampaignRuntime:
                     allow_retry=True,
                     generation=snapshot.generation,
                 )
-                return Observation(
-                    "confirmed" if result.state == "confirmed" else "unknown",
-                    {"intent": result.to_dict()},
-                    result.error,
-                )
+                from .campaign_github_faults import mutation_observation
+
+                return mutation_observation(result, now=self.clock())
             result = (
                 gateway.reconcile_create(intent)
                 if intent.kind in {"issue", "milestone", "pr", "comment", "queue_check"}
@@ -1924,11 +1920,9 @@ class CampaignRuntime:
                     generation=snapshot.generation,
                 )
             )
-            return Observation(
-                "confirmed" if result.state == "confirmed" else "unknown",
-                {"intent": result.to_dict()},
-                result.error,
-            )
+            from .campaign_github_faults import mutation_observation
+
+            return mutation_observation(result, now=self.clock())
         if action.kind == "launch":
             refused = self._launch_preparation_refusal(snapshot, action)
             if refused is not None:
@@ -2022,6 +2016,7 @@ class CampaignRuntime:
             "resolution-accept",
             "resolution-finish",
             "resolution-exhausted",
+            "resolution-refused",
             "terminate-worker",
         }:
             return self.perform(dataclasses.replace(snapshot, generation=action.generation), action)
@@ -2939,6 +2934,15 @@ class CampaignRuntime:
     def _perform_planning_complete(self, snapshot, action) -> Observation:
         return Observation("confirmed")
 
+    def _decision_projections(self, snapshot):
+        return tuple(
+            prior
+            for prior in self.store.list()
+            if prior.id != snapshot.id
+            and prior.repository == snapshot.repository
+            and prior.common_dir == snapshot.common_dir
+        )
+
     def _perform_resolution_context(self, snapshot, action) -> Observation:
         from .campaign_decision_sources import github_provider
         from .campaign_resolution_flow import collect_context
@@ -2955,7 +2959,9 @@ class CampaignRuntime:
         ):
             return Observation("confirmed", {"stale_context": True})
         mapped = (
-            collect_mapped(self, current, unit)
+            collect_mapped(
+                self, current, unit, prior_projections=self._decision_projections(current)
+            )
             if action.payload["mode"] == "decision"
             else MappedEvidence()
         )
@@ -2971,6 +2977,7 @@ class CampaignRuntime:
             mapped_sources=mapped.sources,
             facts=mapped.facts,
             mapped_unavailable=mapped.unavailable,
+            prior_projections=self._decision_projections(current),
         )
         result["observed_at"] = self.clock()
         return Observation("confirmed", result)
@@ -3001,6 +3008,9 @@ class CampaignRuntime:
         return finish(self, snapshot, snapshot.units[action.unit], action)
 
     def _perform_resolution_exhausted(self, snapshot, action) -> Observation:
+        return Observation("confirmed", dict(action.payload))
+
+    def _perform_resolution_refused(self, snapshot, action) -> Observation:
         return Observation("confirmed", dict(action.payload))
 
     def _perform_terminate_worker(self, snapshot, action) -> Observation:
@@ -3159,11 +3169,9 @@ class CampaignRuntime:
         result = self.gateway(snapshot).execute(
             dataclasses.replace(intent, state="sent_unknown"), generation=snapshot.generation
         )
-        return Observation(
-            "confirmed" if result.state == "confirmed" else "unknown",
-            {"intent": result.to_dict()},
-            result.error,
-        )
+        from .campaign_github_faults import mutation_observation
+
+        return mutation_observation(result, now=self.clock())
 
     def _perform_push(self, snapshot, action) -> Observation:
         unit = snapshot.units[action.unit]
@@ -3945,11 +3953,16 @@ class CampaignRuntime:
                 allowed_paths=list(product_scopes(unit.spec)),
             )
         elif request["kind"] in {"verify", "verify_existing"}:
+            from .campaign_resolution_delivery import execution_commands
+
             request["config_revision"] = str(snapshot.config_revision)
             request["timeout_s"] = template.policy.verify.command_timeout_min * 60
-            request["commands"] = request.get("commands") or [
-                list(command) for command in snapshot.spec.verify_commands
+            request["commands"] = [
+                list(command) for command in execution_commands(snapshot, unit, request)
             ]
+            envelope = dataclasses.replace(
+                envelope, verify_commands=tuple(tuple(command) for command in request["commands"])
+            )
             if not request["commands"]:
                 # Preserve project verification commands, including its shared
                 # verification locks, through the established verifier seam.
@@ -4349,7 +4362,9 @@ class CampaignRuntime:
             from .campaign_runtime_decisions import collect as collect_mapped
 
             mapped = (
-                collect_mapped(self, snapshot, unit)
+                collect_mapped(
+                    self, snapshot, unit, prior_projections=self._decision_projections(snapshot)
+                )
                 if request.get("result_contract") == "decision-v1"
                 else MappedEvidence()
             )
@@ -4366,6 +4381,7 @@ class CampaignRuntime:
                 mapped_sources=mapped.sources,
                 facts=mapped.facts,
                 mapped_unavailable=mapped.unavailable,
+                prior_projections=self._decision_projections(snapshot),
             )
         elif request.get("result_contract") == "repair-v1":
             from .campaign_resolution_delivery import validate_repair
@@ -5535,6 +5551,10 @@ class CampaignRuntime:
                 "bounded same-PR repair did not converge",
                 id=data["proposal_id"],
             )
+        elif kind == "resolution-refused":
+            from .campaign_resolution_flow import refuse_persisted_resolution
+
+            refuse_persisted_resolution(snapshot, unit, data)
         elif kind == "resolution-reprobe":
             if data["available"]:
                 unit.hold = None
@@ -5899,6 +5919,22 @@ class CampaignRuntime:
         else:
             raise CampaignError(f"unhandled campaign effect result: {kind}")
 
+    def _preserve_diagnosis_failure(self, snapshot, unit, receipt) -> bool:
+        from .campaign_resolution_flow import preserve_failed_diagnosis
+
+        request_path = (
+            self.store.directory(snapshot.id) / "workers" / unit.claim.launch_id / "request.json"
+        )
+        if not request_path.exists():
+            return False
+        request = json.loads(request_path.read_text(encoding="utf-8"))
+        if not preserve_failed_diagnosis(snapshot, unit, request, receipt):
+            return False
+        from .campaign_handoff_flow import record_terminal_capacity
+
+        record_terminal_capacity(self, snapshot, unit, receipt)
+        return True
+
     def _apply_worker(self, snapshot, unit, action, data) -> None:
         claim = unit.claim
         if not claim or claim.launch_id != action.payload["launch_id"]:
@@ -5931,6 +5967,9 @@ class CampaignRuntime:
             from .campaign_usage import apply as apply_usage
 
             apply_usage(snapshot, unit, data, role=claim.role)
+            if self._preserve_diagnosis_failure(snapshot, unit, {**data, "outcome": "interrupted"}):
+                unit.bindings["head"] = data["head"]
+                return
             from .campaign_handoff_flow import intercept_terminal
 
             if intercept_terminal(self, snapshot, unit, data):
@@ -6032,9 +6071,13 @@ class CampaignRuntime:
 
             if any(row.get("role") == "dev" for row in receipt["sessions"]):
                 record_contributors(snapshot, unit, receipt)
+        outcome = receipt["outcome"]
+        if outcome != "stage_complete" and self._preserve_diagnosis_failure(
+            snapshot, unit, receipt
+        ):
+            return
         if intercept_terminal(self, snapshot, unit, receipt):
             return
-        outcome = receipt["outcome"]
         if outcome == "stage_complete":
             directory = self.store.directory(snapshot.id) / "workers" / claim.launch_id
             request_path = directory / "request.json"

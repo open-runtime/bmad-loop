@@ -1,7 +1,7 @@
 """Turn fresh authenticated remote defects into bounded same-PR repair holds.
 
-Pending CI or missing approval waits. Concrete failed required checks, current
-changes-requested reviews and current unresolved threads can request diagnosis;
+Pending CI or missing approval waits. Concrete failed required checks,
+changes-requested reviews and unresolved threads can request diagnosis;
 they cannot approve, resolve threads, waive checks or expand ownership. The
 receipt binds the exact H and rules revision and is revalidated before repair.
 """
@@ -118,42 +118,38 @@ def collect(
     latest: dict[str, dict[str, Any]] = {}
     for review in sorted(observation.reviews, key=lambda row: int(row.get("id", 0))):
         actor = (review.get("user") or {}).get("login")
-        if actor:
+        if actor and review.get("state") not in {"COMMENTED", "PENDING"}:
             latest[actor] = review
     for actor, review in latest.items():
-        if (
-            review.get("id")
-            and review.get("state") == "CHANGES_REQUESTED"
-            and review.get("commit_id") == candidate.head
-        ):
+        if review.get("id") and review.get("state") == "CHANGES_REQUESTED":
             defects.append(
                 {
                     "kind": "changes_requested",
                     "id": str(review["id"]),
                     "author": actor,
                     "head": candidate.head,
+                    "review_head": review.get("commit_id", ""),
                     "revision": review.get("submitted_at") or str(review["id"]),
                     "body": review.get("body", ""),
                     "url": review.get("html_url", ""),
                 }
             )
-    if observation.rules.conversation_resolution:
-        for thread in observation.threads:
-            if (
-                thread.get("id")
-                and thread.get("isResolved") is False
-                and thread.get("isOutdated") is False
-            ):
-                defects.append(
-                    {
-                        "kind": "review_thread",
-                        "id": str(thread["id"]),
-                        "head": candidate.head,
-                        "path": thread.get("path", ""),
-                        "line": thread.get("line"),
-                        "comments": thread.get("comments"),
-                    }
-                )
+    # Publication protects every unresolved thread, including old-head human
+    # objections and repositories without a server resolution rule. Diagnosis
+    # must retain the same vetoes; it does not acquire thread-resolution power.
+    for thread in observation.threads:
+        if thread.get("id") and thread.get("isResolved") is False:
+            defects.append(
+                {
+                    "kind": "review_thread",
+                    "id": str(thread["id"]),
+                    "head": candidate.head,
+                    "is_outdated": thread.get("isOutdated"),
+                    "path": thread.get("path", ""),
+                    "line": thread.get("line"),
+                    "comments": thread.get("comments"),
+                }
+            )
     if not defects:
         return None
     body = {

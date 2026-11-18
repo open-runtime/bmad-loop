@@ -111,6 +111,7 @@ class Transport:
                             "nameWithOwner": group.repository,
                             "pullRequest": {
                                 "id": "PR_1",
+                                "fullDatabaseId": 101,
                                 "number": group.pr_number,
                                 "headRefOid": group.pr_head,
                                 "baseRefName": group.target,
@@ -141,12 +142,16 @@ class Transport:
             return ApiResponse(
                 200,
                 {
+                    "id": 101,
                     "number": self.group.pr_number,
                     "node_id": "PR_1",
                     "merged": False,
                     "state": "open",
                     "head": {"sha": self.group.pr_head},
-                    "base": {"ref": self.group.target},
+                    "base": {
+                        "ref": self.group.target,
+                        "repo": {"full_name": self.group.repository},
+                    },
                 },
                 {},
             )

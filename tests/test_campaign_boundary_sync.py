@@ -731,3 +731,35 @@ def test_production_post_stage_api_failure_releases_actor_and_recovers_without_a
         row.kind == "github" and row.payload.get("purpose") == "transition"
         for row in actions(result)
     )
+
+
+@pytest.mark.parametrize(
+    "contract,kind", [("decision-v1", "owner"), ("resolution-v1", "verification_failed")]
+)
+def test_invalid_diagnosis_preserves_original_hold_after_fresh_boundary(
+    project, tmp_path, contract, kind
+):
+    from bmad_loop.campaign_model import Hold
+
+    runtime, snapshot, unit = setup(project, tmp_path)
+    action = completed(runtime, snapshot, unit)
+    protected = Hold(kind, "Original acceptance or approval remains unresolved", id="original-hold")
+    unit.hold = protected
+    debt = unit.evidence["stage_sync_debt"]
+    debt["request"]["result_contract"] = contract
+    debt["receipt"]["stage"] = "decision_review" if contract == "decision-v1" else "escalation"
+    debt["receipt"]["artifact"] = {"invalid": "model output"}
+
+    def invalid(*args):
+        raise CampaignError("The model cited an unknown or revoked source")
+
+    runtime._validate_stage_receipt = invalid
+    result = boundary.after_effect(runtime, snapshot, action)
+    assert result.data["receipt"]["outcome"] == "invalid_stage_result"
+    boundary.after_apply(runtime, snapshot, action, result.data)
+    assert unit.hold == protected
+    assert unit.claim.quiescent and "stage_sync_debt" not in unit.evidence
+    retained = unit.evidence["resolution_failures"][-1]
+    assert retained["hold"] == dataclasses.asdict(protected)
+    assert retained["receipt"]["error"] == "The model cited an unknown or revoked source"
+    assert retained["receipt"]["artifact"] == {"invalid": "model output"}

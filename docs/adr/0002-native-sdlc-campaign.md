@@ -1,6 +1,6 @@
 # ADR 0002: A deterministic SDLC campaign with GitHub delivery
 
-- **Status:** Implemented; release-specific qualification and target-project delivery remain gated
+- **Status:** Partially implemented; audit repairs, delivery and unattended qualification remain open
 - **Date:** 2026-11-05
 - **Scope:** An opt-in campaign supervisor, isolated workers, planning, GitHub synchronization and native Paradev reflection
 
@@ -39,6 +39,23 @@ extension are separate from the historical release evidence below.
 
 ### Implementation and delivery milestones
 
+Acceptance has two distinct milestones. **Delivery proven** requires two independent
+stories in a disposable repository to complete implementation, independent review,
+current-main integration, a history-preserving hosted merge, canonical landing and
+tracking reconciliation. **Unattended readiness proven** additionally requires
+recovery, writable handoff, messaging, operator controls, repository organization
+and sustained parallel operation. Neither milestone is established by historical
+helper tests, transport canaries or a successful command exit.
+
+Reconcile historical findings against current fork main before declaring a repair.
+Maintain one external acceptance ledger with each finding's requirement, fresh
+reproduction or reason it no longer applies, responsible path, regression, commit
+and environment. Record implementation, review, native qualification and deployment
+separately as passed, failed, stale or unrun. An unexamined finding remains unrun;
+unchanged source and a historical severity are not a current reproduction. Every
+confirmed applicable defect remains in scope, including those avoided by a narrow
+disposable configuration. Keep probe records outside tracked documentation.
+
 The initial campaign and reasoning/handoff implementation has been merged and
 installed. Follow-up repairs retain the implementation contract's
 [G0–G8 traceability matrix](0002-campaign-implementation.md#implementation-goals-and-traceability)
@@ -61,6 +78,7 @@ retained. A narrow Claude/Grok delivery does not establish those capabilities or
 all requested native routes. A green suite, disabled automations or a locally
 completed story cannot substitute for actual delivery and applicable live checks.
 
+Historical qualification applies only to its named subject and dependencies.
 The earlier `276daa62` implementation passed its integrated regression suite,
 packaging and static checks, and two independent reviews found no open findings.
 These results do not qualify the later delivery extension. Normal-runtime

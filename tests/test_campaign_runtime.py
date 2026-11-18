@@ -21,6 +21,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from conftest import git, install_build_auto_skill
+from test_campaign_github import merged_graphql
 
 from bmad_loop import campaign_runtime, campaign_workers, verify
 from bmad_loop.adapters import multiplexer
@@ -97,6 +98,8 @@ class ScriptedGithub:
             if path == "graphql":
                 variables = payload["variables"]
                 operation = payload["query"]
+                if "mergeCommit" in operation:
+                    return merged_graphql(self._pull(variables["number"]))
                 if "reviewThreads" in operation:
                     return self._response(
                         {
@@ -271,7 +274,10 @@ class ScriptedGithub:
                     number = int(parts[1])
                     pr = self._pull(number)
                     if len(parts) == 2:
-                        return self._response(pr)
+                        # The current REST API intentionally omits this field.
+                        return self._response(
+                            {k: v for k, v in pr.items() if k != "merge_commit_sha"}
+                        )
                     if parts[2] == "requested_reviewers":
                         return self._response(
                             {
@@ -680,7 +686,12 @@ def production_case(project, tmp_path, monkeypatch, request):
         ),
         intake=IntakeSpec(
             issues=(
-                "all-open-and-new" if getattr(request, "param", {}).get("intake") else "selected"
+                getattr(request, "param", {}).get("intake_mode")
+                or (
+                    "all-open-and-new"
+                    if getattr(request, "param", {}).get("intake")
+                    else "selected"
+                )
             ),
             allow_new_units=bool(getattr(request, "param", {}).get("intake")),
             allowed_scopes=("src",),

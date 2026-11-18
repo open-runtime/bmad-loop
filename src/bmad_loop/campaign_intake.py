@@ -139,8 +139,12 @@ class GithubIntake:
         own_comment_markers: tuple[str, ...] = (),
         own_comment_author_ids: tuple[int, ...] = (),
     ) -> IntakeBatch:
-        if max_batch < 1 or mode not in {"all-open-and-new", "selected"}:
+        if max_batch < 1 or mode not in {"off", "all-open-and-new", "selected"}:
             raise ValueError("Invalid intake batch size/mode")
+        # Discovery is optional. Mapped issue/PR freshness is independently
+        # observed at the campaign's acceptance and stage boundaries.
+        if mode == "off":
+            return IntakeBatch((), cursor, True, 0)
         since = ""
         if cursor:
             instant = datetime.fromisoformat(cursor.replace("Z", "+00:00"))
