@@ -40,7 +40,7 @@ from conftest import (
     write_sprint,
 )
 
-from bmad_loop import childrun, platform_util, verify
+from bmad_loop import childrun, owned_capture, platform_util, verify
 from bmad_loop.model import StoryTask
 from bmad_loop.policy import EnvironmentPolicy, Policy, VerifyPolicy
 
@@ -351,8 +351,23 @@ def test_attempt_dirty_excludes_tracked_artifact(project):
     assert verify.attempt_dirty(repo, baseline, [], exclude=(artifact_rel,)) is True
 
 
-def _timing_out_run(cmd, **kwargs):
-    raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout", 0))
+def _timing_out_capture(_spawn, **kwargs):
+    ownership = owned_capture.CaptureOwnership(
+        root_pid=None,
+        root_identity=None,
+        root_reaped=False,
+        actors=(),
+        census_count=0,
+        census_complete=False,
+        problems=("scripted timeout without cleanup proof",),
+        stdout_eof=False,
+        stderr_eof=False,
+        io_settled=False,
+        stdout_captured=False,
+        stderr_captured=False,
+        cleanup_required=True,
+    )
+    return owned_capture.CaptureResult(None, b"", b"", True, False, 0, True, ownership)
 
 
 def test_git_timeout_becomes_git_error(project, monkeypatch):
@@ -360,7 +375,7 @@ def test_git_timeout_becomes_git_error(project, monkeypatch):
     every guard already handles — never as a raw TimeoutExpired, which bypassed
     them all and crashed the run from the rollback path."""
     baseline = verify.rev_parse_head(project.project)
-    monkeypatch.setattr(verify.subprocess, "run", _timing_out_run)
+    monkeypatch.setattr(owned_capture, "capture", _timing_out_capture)
     with pytest.raises(verify.GitError, match=r"git diff timed out after \d+s"):
         verify.attempt_dirty(project.project, baseline, [])
 
@@ -369,7 +384,7 @@ def test_capture_diff_timeout_becomes_git_error(project, monkeypatch):
     """capture_diff's inline git spawns (verbatim-stdout diff) share the same
     translation as the `_git` helpers."""
     baseline = verify.rev_parse_head(project.project)
-    monkeypatch.setattr(verify.subprocess, "run", _timing_out_run)
+    monkeypatch.setattr(owned_capture, "capture", _timing_out_capture)
     with pytest.raises(verify.GitError, match="timed out"):
         verify.capture_diff(project.project, baseline)
 
@@ -385,7 +400,7 @@ def test_capture_diff_timeout_becomes_git_error(project, monkeypatch):
 )
 def test_git_spawn_oserror_becomes_git_spawn_error(project, monkeypatch, make_exc):
     """#343: a spawn-level OSError (EMFILE/ENOMEM, git gone from PATH) is raised
-    by `subprocess.run` before any return code exists, so left untranslated it
+    by `subprocess.Popen` before any return code exists, so left untranslated it
     bypassed every `except GitError` guard and crashed the run. It must surface
     as GitSpawnError — a GitError to every existing guard, a distinct type for
     the callers that must tell an environment fault from git refusing.
@@ -397,7 +412,7 @@ def test_git_spawn_oserror_becomes_git_spawn_error(project, monkeypatch, make_ex
     def failing_run(cmd, **kwargs):
         raise exc
 
-    monkeypatch.setattr(verify.subprocess, "run", failing_run)
+    monkeypatch.setattr(verify.subprocess, "Popen", failing_run)
     with pytest.raises(verify.GitError, match="git rev-parse failed to spawn") as excinfo:
         verify.rev_parse_head(project.project)
     assert isinstance(excinfo.value, verify.GitSpawnError)
@@ -406,15 +421,15 @@ def test_git_spawn_oserror_becomes_git_spawn_error(project, monkeypatch, make_ex
 
 def test_configure_git_timeout_overrides_bound(project, monkeypatch):
     """The engine-applied `limits.git_timeout_s` value is what reaches
-    subprocess.run; the module default stays GIT_TIMEOUT_S for standalone users."""
+    owned capture; the module default stays GIT_TIMEOUT_S for standalone users."""
     seen: dict[str, object] = {}
-    real_run = subprocess.run
+    real_capture = owned_capture.capture
 
-    def spying_run(cmd, **kwargs):
-        seen["timeout"] = kwargs.get("timeout")
-        return real_run(cmd, **kwargs)
+    def spying_capture(spawn, **kwargs):
+        seen["timeout"] = kwargs.get("timeout_s")
+        return real_capture(spawn, **kwargs)
 
-    monkeypatch.setattr(verify.subprocess, "run", spying_run)
+    monkeypatch.setattr(owned_capture, "capture", spying_capture)
     verify.configure_git_timeout(7)
     try:
         verify.rev_parse_head(project.project)
@@ -431,13 +446,13 @@ def test_git_bytes_per_call_timeout_overrides_module_state(project, monkeypatch)
     `_run_git` (or drop `git_bytes`' passthrough) and the spied timeout is the
     120s default on the first call."""
     seen: dict[str, object] = {}
-    real_run = subprocess.run
+    real_capture = owned_capture.capture
 
-    def spying_run(cmd, **kwargs):
-        seen["timeout"] = kwargs.get("timeout")
-        return real_run(cmd, **kwargs)
+    def spying_capture(spawn, **kwargs):
+        seen["timeout"] = kwargs.get("timeout_s")
+        return real_capture(spawn, **kwargs)
 
-    monkeypatch.setattr(verify.subprocess, "run", spying_run)
+    monkeypatch.setattr(owned_capture, "capture", spying_capture)
     verify.git_bytes(project.project, "rev-parse", "HEAD", timeout_s=7)
     assert seen["timeout"] == 7
     verify.git_bytes(project.project, "rev-parse", "HEAD")
@@ -452,13 +467,13 @@ def test_run_git_forces_c_locale(project, monkeypatch):
     CI box with no non-English locale catalogs installed (where a plain LANG=it_IT
     test would emit English anyway and pass without the fix)."""
     seen: dict[str, object] = {}
-    real_run = subprocess.run
+    real_spawn = subprocess.Popen
 
     def spying_run(cmd, **kwargs):
         seen["env"] = kwargs.get("env")
-        return real_run(cmd, **kwargs)
+        return real_spawn(cmd, **kwargs)
 
-    monkeypatch.setattr(verify.subprocess, "run", spying_run)
+    monkeypatch.setattr(verify.subprocess, "Popen", spying_run)
     verify.rev_parse_head(project.project)
     assert seen["env"] is not None
     assert seen["env"]["LC_ALL"] == "C"
@@ -468,15 +483,15 @@ def test_run_git_locale_merge_preserves_explicit_env(project, monkeypatch):
     """The LC_ALL=C merge must not clobber a caller-supplied env — the `_git_env`
     callers pass a throwaway GIT_INDEX_FILE / synthetic commit identity that has to
     survive (else snapshot_worktree breaks). Assert both the forced LC_ALL and the
-    caller's own key reach subprocess.run together."""
+    caller's own key reach subprocess.Popen together."""
     seen: dict[str, object] = {}
-    real_run = subprocess.run
+    real_spawn = subprocess.Popen
 
     def spying_run(cmd, **kwargs):
         seen["env"] = kwargs.get("env")
-        return real_run(cmd, **kwargs)
+        return real_spawn(cmd, **kwargs)
 
-    monkeypatch.setattr(verify.subprocess, "run", spying_run)
+    monkeypatch.setattr(verify.subprocess, "Popen", spying_run)
     verify._git_env(project.project, "status", env={**os.environ, "SENTINEL_X": "1"})
     assert seen["env"] is not None
     assert seen["env"]["LC_ALL"] == "C"
@@ -544,22 +559,29 @@ def test_git_bytes_returns_bytes_and_reads_rc_as_an_answer(project):
 def test_git_bytes_inherits_locale_pin_and_timeout(project, monkeypatch):
     """What standing inside the chokepoint buys the bytes callers, asserted rather
     than assumed: the LC_ALL=C pin (#236) and the engine-set `limits.git_timeout_s`
-    bound (#156) reach subprocess.run unchanged, with text mode off."""
+    bound (#156) reach owned capture unchanged, with binary pipes and output."""
     seen: dict[str, object] = {}
-    real_run = subprocess.run
+    real_spawn = subprocess.Popen
+    real_capture = owned_capture.capture
 
     def spying_run(cmd, **kwargs):
         seen.update(kwargs)
-        return real_run(cmd, **kwargs)
+        return real_spawn(cmd, **kwargs)
 
-    monkeypatch.setattr(verify.subprocess, "run", spying_run)
+    def spying_capture(spawn, **kwargs):
+        seen["timeout"] = kwargs["timeout_s"]
+        return real_capture(spawn, **kwargs)
+
+    monkeypatch.setattr(verify.subprocess, "Popen", spying_run)
+    monkeypatch.setattr(owned_capture, "capture", spying_capture)
     verify.configure_git_timeout(9)
     try:
-        verify.git_bytes(project.project, "rev-parse", "HEAD")
+        result = verify.git_bytes(project.project, "rev-parse", "HEAD")
     finally:
         verify.configure_git_timeout(verify.GIT_TIMEOUT_S)
 
-    assert not seen["text"]
+    assert not seen.get("text", False)
+    assert isinstance(result.stdout, bytes)
     assert seen["timeout"] == 9
     assert seen["env"]["LC_ALL"] == "C"
 
@@ -568,9 +590,9 @@ def test_git_bytes_timeout_still_becomes_git_error(project, monkeypatch):
     """Bytes mode skips the decode, not the taxonomy: a timeout has no return code
     to hand back, so it still raises rather than becoming a CompletedProcess.
 
-    Ablation: delete the `except subprocess.TimeoutExpired` arm and this fails with
-    the raw TimeoutExpired."""
-    monkeypatch.setattr(verify.subprocess, "run", _timing_out_run)
+    Ablation: remove the timed_out result guard and this no longer raises the
+    typed timeout expected by its callers."""
+    monkeypatch.setattr(owned_capture, "capture", _timing_out_capture)
     with pytest.raises(verify.GitError, match=r"git config timed out after \d+s"):
         verify.git_bytes(project.project, "config", "--get", "core.excludesFile")
 
@@ -587,9 +609,9 @@ def test_git_timeout_carries_its_own_type(project, monkeypatch):
     taxonomy backward compatible, and losing it would silently break every
     `except GitError` guard in the tree.
 
-    Ablation: raise a bare `GitError` from `_run_git`'s `TimeoutExpired` arm and the
+    Ablation: raise a bare `GitError` from `_run_git`'s timed-out result guard and the
     type assertion fails while the `isinstance(..., GitError)` one stays green."""
-    monkeypatch.setattr(verify.subprocess, "run", _timing_out_run)
+    monkeypatch.setattr(owned_capture, "capture", _timing_out_capture)
     with pytest.raises(verify.GitTimeoutError, match=r"git config timed out after \d+s") as excinfo:
         verify.git_bytes(project.project, "config", "--get", "core.excludesFile")
     assert isinstance(excinfo.value, verify.GitError)
@@ -604,7 +626,7 @@ def test_git_bytes_spawn_oserror_still_becomes_git_spawn_error(project, monkeypa
     def failing_run(cmd, **kwargs):
         raise exc
 
-    monkeypatch.setattr(verify.subprocess, "run", failing_run)
+    monkeypatch.setattr(verify.subprocess, "Popen", failing_run)
     with pytest.raises(verify.GitSpawnError, match="git config failed to spawn") as excinfo:
         verify.git_bytes(project.project, "config", "--get", "core.excludesFile")
     assert excinfo.value.__cause__ is exc
@@ -641,7 +663,7 @@ def test_verify_dev_happy(project):
 
 def test_verify_dev_spawn_fault_escalates(project, monkeypatch):
     """#343 acceptance, escalate class: with the OSError injected at
-    `subprocess.run` itself, the shared change-gate's `except GitError` guard
+    `subprocess.Popen` itself, the shared change-gate's `except GitError` guard
     catches the translated GitSpawnError and escalates (CRITICAL, not
     retryable) instead of crashing. Baseline canonicalization now performs
     fail-closed Git reads first, so the injection targets the proof-of-work diff
@@ -655,14 +677,14 @@ def test_verify_dev_spawn_fault_escalates(project, monkeypatch):
     write_spec(sp, "in-review", task.baseline_commit)
     (project.project / "src.txt").write_text("changed\n")
 
-    real_run = verify.subprocess.run
+    real_run = verify.subprocess.Popen
 
     def cannot_spawn_diff(cmd, **kwargs):
         if cmd[3] == "diff" and "--quiet" in cmd:
             raise OSError(12, "Cannot allocate memory")
         return real_run(cmd, **kwargs)
 
-    monkeypatch.setattr(verify.subprocess, "run", cannot_spawn_diff)
+    monkeypatch.setattr(verify.subprocess, "Popen", cannot_spawn_diff)
     out = verify.verify_dev(task, project, dev_result(sp))
     assert not out.ok and not out.retryable
     assert out.severity == "CRITICAL"
@@ -684,7 +706,7 @@ def test_verify_dev_canonical_baseline_spawn_fault_escalates(project, monkeypatc
     write_spec(sp, "in-review", task.baseline_commit)
     (project.project / "src.txt").write_text("changed\n")
 
-    real_run = verify.subprocess.run
+    real_run = verify.subprocess.Popen
     fault_args = (
         ["rev-parse", f"--disambiguate={task.baseline_commit}"]
         if subcommand == "rev-parse"
@@ -696,7 +718,7 @@ def test_verify_dev_canonical_baseline_spawn_fault_escalates(project, monkeypatc
             raise OSError(12, "Cannot allocate memory")
         return real_run(cmd, **kwargs)
 
-    monkeypatch.setattr(verify.subprocess, "run", cannot_spawn_canonicalization)
+    monkeypatch.setattr(verify.subprocess, "Popen", cannot_spawn_canonicalization)
     out = verify.verify_dev(task, project, dev_result(sp))
 
     assert not out.ok and not out.retryable
@@ -4076,14 +4098,14 @@ def test_verify_dev_bundle_ancestor_probe_git_failure_stays_strict(project, monk
     (project.project / "src.txt").write_text("review fixes\n")
     rj = {"workflow": "auto-dev", "spec_file": str(sp), "dw_ids": ["DW-1"]}
 
-    real_run = verify.subprocess.run
+    real_run = verify._run_git
 
-    def timing_out_merge_base(cmd, **kwargs):
+    def timing_out_merge_base(cmd, repo, **kwargs):
         if cmd[3] == "merge-base":
-            return _timing_out_run(cmd, **kwargs)
-        return real_run(cmd, **kwargs)
+            raise verify.GitTimeoutError("scripted merge-base timeout")
+        return real_run(cmd, repo, **kwargs)
 
-    monkeypatch.setattr(verify.subprocess, "run", timing_out_merge_base)
+    monkeypatch.setattr(verify, "_run_git", timing_out_merge_base)
     assert verify.is_ancestor(project.project, ancestor, task.baseline_commit) is False
     out = verify.verify_dev_bundle(task, project, rj)
     assert not out.ok and "baseline" in out.reason
@@ -7423,24 +7445,22 @@ def test_commits_above_reads_stdout_alone_under_host_noise(project):
 
 def _inject_git_stderr(monkeypatch, line: str) -> None:
     """Prepend `line` to the stderr of every git spawn verify.py makes, leaving the
-    return code and stdout untouched — the house `monkeypatch.setattr(verify.subprocess,
-    "run", …)` seam (see `test_capture_diff_timeout_becomes_git_error`), wrapping the
-    real `subprocess.run` rather than scripting it.
+    return code and stdout untouched, wrapping the real `_run_git` result rather
+    than scripting it. Existing owned-capture evidence remains attached.
 
     A synthetic shape is used only where the real `core.fsyncMethod` warning CANNOT
     redden the row; each caller's docstring says why. Bytes and `None` stderr pass
     through untouched, so a `binary=True` spawn is not corrupted into a type error."""
-    real_run = verify.subprocess.run
+    real_run = verify._run_git
 
-    def noisy_run(cmd, **kwargs):
-        proc = real_run(cmd, **kwargs)
+    def noisy_run(cmd, repo, **kwargs):
+        proc = real_run(cmd, repo, **kwargs)
         if not isinstance(proc.stderr, str):
             return proc
-        return verify.subprocess.CompletedProcess(
-            proc.args, proc.returncode, proc.stdout, line + proc.stderr
-        )
+        proc.stderr = line + proc.stderr
+        return proc
 
-    monkeypatch.setattr(verify.subprocess, "run", noisy_run)
+    monkeypatch.setattr(verify, "_run_git", noisy_run)
 
 
 def test_capture_diff_untracked_leg_reads_stdout_alone(project, monkeypatch):
@@ -7688,7 +7708,7 @@ def test_finalize_commit_staged_rejection_precedes_commit_and_preserves_head(pro
     assert verify.rev_parse_head(project.project) == original_head
 
 
-def test_finalize_commit_restores_original_chain_when_hook_mutates_validated_index(project):
+def test_finalize_commit_preserves_landed_history_when_hook_mutates_validated_index(project):
     baseline = verify.rev_parse_head(project.project)
     path = project.project / "src.txt"
     path.write_text("skill commit bytes\n")
@@ -7716,124 +7736,93 @@ def test_finalize_commit_restores_original_chain_when_hook_mutates_validated_ind
             committed_validator=validate_commit,
         )
 
-    assert verify.rev_parse_head(project.project) == original_head
-    assert git(project.project, "show", "HEAD:src.txt") == "skill commit bytes"
+    from bmad_loop import finalization_recovery
+
+    assert verify.rev_parse_head(project.project) != original_head
+    assert git(project.project, "show", "HEAD:src.txt") == "hook mutation"
+    record = finalization_recovery.pending(project.project)
+    assert record is not None and record["state"] == "uncertain"
+    assert git(project.project, "rev-parse", record["recovery_ref"]) == original_head
 
 
-def test_finalize_commit_restores_original_chain_when_head_probe_fails(project, monkeypatch):
-    """The squash is not accepted until its HEAD identity is known; a failed
-    post-commit probe restores the skill chain and clean index without discarding
-    the accepted working-tree bytes staged by the one allowed add pass.
+def test_finalize_commit_preserves_landed_commit_when_head_probe_fails(project, monkeypatch):
+    """An unobserved commit cannot be reset away or silently replayed."""
+    from bmad_loop import finalization_recovery
 
-    Ablation: move the post-commit ``rev_parse_head`` above the recovery ``try``;
-    the injected fault leaves the squash at HEAD and the accepted bytes staged.
-    """
     repo = project.project
     baseline = verify.rev_parse_head(repo)
     path = repo / "src.txt"
     path.write_text("skill commit bytes\n")
-    git(repo, "add", "--", "src.txt")
-    git(repo, "commit", "-q", "-m", "skill: implementation")
-    original_head = verify.rev_parse_head(repo)
+    git(repo, "add", "src.txt")
+    git(repo, "commit", "-qm", "skill implementation")
+    original = verify.rev_parse_head(repo)
     path.write_text("accepted bytes\n")
-    marker = repo / "commit-hook-ran"
-    hook = repo / ".git" / "hooks" / "pre-commit"
-    hook.write_text("#!/bin/sh\nprintf ran > commit-hook-ran\n")
-    hook.chmod(0o755)
+    real_run = verify._run_git
+    real_head = verify.rev_parse_head
+    armed = False
+    commands = []
 
-    real_rev_parse_head = verify.rev_parse_head
-    rev_parse_calls = 0
+    def observe(cmd, root, **kwargs):
+        nonlocal armed
+        result = real_run(cmd, root, **kwargs)
+        commands.append(cmd[3:])
+        if cmd[3] == "commit" and result.returncode == 0:
+            armed = True
+        return result
 
-    def fail_second_head_probe(probe_repo):
-        nonlocal rev_parse_calls
-        rev_parse_calls += 1
-        if rev_parse_calls == 2:
+    def fail_after_commit(root):
+        nonlocal armed
+        if armed:
+            armed = False
             raise RuntimeError("HEAD identity probe failed")
-        return real_rev_parse_head(probe_repo)
+        return real_head(root)
 
-    real_git = verify._git
-    git_calls = []
-
-    def spy_git(git_repo, *args):
-        git_calls.append(args)
-        return real_git(git_repo, *args)
-
-    monkeypatch.setattr(verify, "rev_parse_head", fail_second_head_probe)
-    monkeypatch.setattr(verify, "_git", spy_git)
-
-    with pytest.raises(RuntimeError, match="HEAD identity probe failed"):
-        verify.finalize_commit(repo, baseline, "story: via bmad-loop")
-
-    assert rev_parse_calls == 2
-    assert verify.rev_parse_head(repo) == original_head
-    assert git(repo, "diff", "--cached", "--quiet") == ""
-    assert git(repo, "show", "HEAD:src.txt") == "skill commit bytes"
+    monkeypatch.setattr(verify, "_run_git", observe)
+    monkeypatch.setattr(verify, "rev_parse_head", fail_after_commit)
+    with pytest.raises(RuntimeError, match="HEAD identity probe failed") as caught:
+        verify.finalize_commit(repo, baseline, "finalized")
+    assert isinstance(caught.value.finalization_uncertain, verify.GitFinalizationUncertain)
+    assert real_head(repo) != original
+    assert git(repo, "show", "HEAD:src.txt") == "accepted bytes"
     assert path.read_text() == "accepted bytes\n"
-    assert marker.read_text() == "ran"
-    assert [args for args in git_calls if args[:1] == ("add",)] == [("add", "-A")]
+    record = finalization_recovery.pending(repo)
+    assert git(repo, "rev-parse", record["recovery_ref"]) == original
+    assert [cmd for cmd in commands if cmd[0] == "add"] == [["add", "-A"]]
+    assert not any(cmd[0] == "reset" for cmd in commands)
 
 
-@pytest.mark.parametrize("raised_restore_fault", [False, True], ids=["nonzero", "raised"])
-def test_finalize_commit_reports_head_probe_and_restore_failures(
-    project, monkeypatch, raised_restore_fault
+@pytest.mark.parametrize("fault", [OSError, verify.GitError])
+def test_finalize_commit_retains_record_when_refusal_compensation_fails(
+    project, monkeypatch, fault
 ):
+    from bmad_loop import finalization_recovery
+
     repo = project.project
     baseline = verify.rev_parse_head(repo)
-    (repo / "src.txt").write_text("skill commit bytes\n")
-    git(repo, "add", "--", "src.txt")
-    git(repo, "commit", "-q", "-m", "skill: implementation")
-    (repo / "src.txt").write_text("accepted bytes\n")
+    (repo / "src.txt").write_text("skill work\n")
+    git(repo, "add", "src.txt")
+    git(repo, "commit", "-qm", "skill work")
+    original = verify.rev_parse_head(repo)
+    hook = repo / ".git/hooks/pre-commit"
+    hook.write_text("#!/bin/sh\nexit 1\n")
+    hook.chmod(0o755)
 
-    real_rev_parse_head = verify.rev_parse_head
-    rev_parse_calls = 0
+    def refuse_index(_transaction):
+        raise fault("index restoration unavailable")
 
-    def fail_second_head_probe(probe_repo):
-        nonlocal rev_parse_calls
-        rev_parse_calls += 1
-        if rev_parse_calls == 2:
-            raise RuntimeError("HEAD identity probe failed")
-        return real_rev_parse_head(probe_repo)
-
-    real_git = verify._git
-
-    def refuse_mixed_restore(git_repo, *args):
-        if args[:2] == ("reset", "--mixed"):
-            if raised_restore_fault:
-                raise verify.GitTimeoutError("restore timed out")
-            return 1, "restore refused"
-        return real_git(git_repo, *args)
-
-    monkeypatch.setattr(verify, "rev_parse_head", fail_second_head_probe)
-    monkeypatch.setattr(verify, "_git", refuse_mixed_restore)
-
-    with pytest.raises(
-        verify.GitError,
-        match=(
-            r"post-commit finalization failed \(RuntimeError: HEAD identity probe failed\); "
-            r"additionally failed to restore HEAD"
-        ),
-    ) as caught:
-        verify.finalize_commit(repo, baseline, "story: via bmad-loop")
-
-    expected_restore_diagnostic = "restore timed out" if raised_restore_fault else "restore refused"
-    assert expected_restore_diagnostic in str(caught.value)
-    assert isinstance(caught.value.__cause__, RuntimeError)
-    assert str(caught.value.__cause__) == "HEAD identity probe failed"
+    monkeypatch.setattr(finalization_recovery.Transaction, "_restore_index", refuse_index)
+    with pytest.raises(verify.GitFinalizationUncertain):
+        verify.finalize_commit(repo, baseline, "finalized")
+    record = finalization_recovery.pending(repo)
+    assert record is not None and record["state"] == "uncertain"
+    assert git(repo, "rev-parse", record["recovery_ref"]) == original
+    assert (repo / "src.txt").read_text() == "skill work\n"
 
 
-def test_finalize_commit_no_op_arm_validates_baseline_and_restores_chain_on_index_reset(project):
-    """The no-op arm sits INSIDE the validated window: "nothing staged" is read
-    off the index after the staged validator returned, so an index reset to
-    baseline in between (a concurrent writer) reads as a clean no-op while the
-    snapshot says a pending-tracked deliverable was staged. Before the fix
-    (#795 review) that returned `None` with HEAD soft-reset to baseline — the
-    accepted skill chain orphaned and the caller free to record baseline as the
-    commit. Now the committed-tree validator runs against baseline itself,
-    refuses, and the original chain AND index are restored; the deliverable is
-    still on disk, untracked, for the replay's `add -A`.
+def test_finalize_commit_preserves_concurrent_index_instead_of_overwriting_it(project, monkeypatch):
+    """Concurrent index changes are retained and prevent the baseline move."""
+    from bmad_loop import finalization_recovery
 
-    Ablation: drop the validator call from the no-op arm and this reds on
-    `pytest.raises` — `finalize_commit` returns None with HEAD at baseline."""
     baseline = verify.rev_parse_head(project.project)
     src = project.project / "src.txt"
     src.write_text("skill commit bytes\n")
@@ -7846,32 +7835,39 @@ def test_finalize_commit_no_op_arm_validates_baseline_and_restores_chain_on_inde
     accepted_oid = verify.git_normalized_blob_oid(project.repo_root, rel, deliverable)
     validated = []
 
-    def snapshot_then_concurrent_reset():
-        snapshot = verify.staged_blob_oids(project.repo_root, (rel,))
-        git(project.project, "read-tree", baseline)  # the concurrent writer
-        return snapshot
+    staging_index = finalization_recovery.Transaction.staging_index
+    peer_updates = []
+
+    def peer_before_lock(transaction):
+        git(project.project, "read-tree", baseline)
+        peer_updates.append(verify._bound_real_index_path(project.project).read_bytes())
+        return staging_index(transaction)
+
+    monkeypatch.setattr(finalization_recovery.Transaction, "staging_index", peer_before_lock)
 
     def validate_commit(revision, staged_snapshot):
         validated.append(revision)
         if verify.revision_blob_oids(project.repo_root, revision, (rel,)) != staged_snapshot:
             raise RuntimeError("committed deliverable drift")
 
-    with pytest.raises(RuntimeError, match="committed deliverable drift"):
+    with pytest.raises(verify.GitFinalizationUncertain):
         verify.finalize_commit(
             project.project,
             baseline,
             "story: via bmad-loop",
-            staged_validator=snapshot_then_concurrent_reset,
+            staged_validator=lambda: verify.staged_blob_oids(project.repo_root, (rel,)),
             committed_validator=validate_commit,
         )
 
-    assert validated == [baseline]  # validated against the tree "nothing" would leave
+    assert validated == []  # The concurrent edit is rejected before moving HEAD.
+    assert len(peer_updates) == 1
+    assert verify._bound_real_index_path(project.project).read_bytes() == peer_updates[0]
     assert verify.rev_parse_head(project.project) == original_head
     assert git(project.project, "show", "HEAD:src.txt") == "skill commit bytes"
     assert deliverable.read_bytes() == b"pending-tracked deliverable"
     assert (
         verify.staged_blob_oids(project.repo_root, (rel,)) == {}
-    )  # index restored: untracked again
+    )  # The concurrent writer's exact index is retained.
     assert accepted_oid not in git(project.project, "ls-files", "-s")
 
 

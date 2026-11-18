@@ -215,11 +215,14 @@ to the campaign's independent stories.
 
 Campaign workers retain their complete resolved configuration on first dispatch,
 retry and resume; inherited story-boundary policy reload is disabled for these
-workers. Ordinary runs retain their existing reload behavior. All campaign retry
-and recovery paths preserve append-only branch history, including internal engine
-rollbacks: a per-unit fence reconciles pending pushes, then a compensating commit
-restores any required attempt state without resetting behind a published head.
-Recovery and re-arm are durable stages with preserved work and lifetime budgets.
+workers. Ordinary runs retain their existing reload behavior. Campaign retry
+and recovery must preserve append-only branch history, including internal engine
+rollbacks: a per-unit fence must reconcile pending pushes before any authorized
+compensation, without resetting behind a published head. Recovery and re-arm must
+remain durable stages with preserved work and lifetime budgets. General technical
+rearm and autonomous reconciliation of unknown local commit outcomes remain open
+implementation requirements; preserving an uncertain operation is not proof that
+it can yet complete unattended.
 
 ### Model roles and escalation resolution
 

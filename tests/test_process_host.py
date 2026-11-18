@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import os
 import shutil
 import signal
@@ -601,3 +602,460 @@ def test_hook_interpreter_routed_through_selected_host(monkeypatch):
     assert get_process_host().hook_interpreter() == WindowsProcessHost().shell_quote(
         str(Path(sys.executable).absolute())
     )
+
+
+@pytest.fixture(params=["darwin", "win32"])
+def strict_process_tree(monkeypatch, request):
+    monkeypatch.setattr(process_host.sys, "platform", request.param)
+    actors = {
+        100: {"birth": 10.0, "parent": 1},
+        200: {"birth": 20.0, "parent": 100},
+        300: {"birth": 30.0, "parent": 200},
+    }
+    calls = []
+    control = {"enumerated": [300, 200], "native": {100: (200,), 200: (300,), 300: ()}}
+
+    class Gone(Exception):
+        pass
+
+    class Process:
+        def __init__(self, pid):
+            if pid not in actors:
+                raise Gone(pid)
+            self.pid = pid
+            self._ident = (pid, actors[pid]["birth"])
+
+        def create_time(self):
+            if self.pid not in actors:
+                raise Gone(self.pid)
+            row = actors[self.pid]
+            if row.get("unreadable"):
+                raise PermissionError("synthetic identity failure")
+            return row["birth"]
+
+        def ppid(self):
+            if self.pid not in actors:
+                raise Gone(self.pid)
+            row = actors[self.pid]
+            if row.get("unreadable"):
+                raise PermissionError("synthetic parent failure")
+            return row["parent"]
+
+        def is_running(self):
+            row = actors.get(self.pid)
+            return (
+                row is not None
+                and not row.get("reused")
+                and self._ident == (self.pid, row["birth"])
+            )
+
+        def children(self, recursive=False):
+            assert request.param == "win32", "macOS must not use a global psutil census"
+            assert recursive is True
+            calls.append(("psutil-tree", self.pid))
+            if control.get("census_error"):
+                raise control["census_error"]
+            selected = [Process(pid) for pid in control["enumerated"]]
+            callback = control.get("after_enumeration")
+            if callback:
+                callback()
+            return selected
+
+    def native(pid, **kwargs):
+        calls.append(("native-children", pid))
+        callback = control.get("after_enumeration")
+        if callback and pid == 100:
+            callback()
+        value = control["native"].get(pid, ())
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    package = SimpleNamespace(
+        Process=Process, NoSuchProcess=Gone, pid_exists=lambda pid: pid in actors
+    )
+    monkeypatch.setattr(process_host, "_psutil", lambda: package)
+    monkeypatch.setattr(process_host, "_macos_child_pids", native)
+    monkeypatch.setattr(
+        process_host.os, "kill", lambda *a: pytest.fail("observation signalled a process")
+    )
+    host = PosixProcessHost() if request.param == "darwin" else WindowsProcessHost()
+    return host, actors, control, calls, (-1 if request.param == "darwin" else 1)
+
+
+def test_strict_descendants_return_authenticated_tree_and_preserve_legacy_map(strict_process_tree):
+    host, actors, control, calls, sign = strict_process_tree
+    observed = host.observe_descendants(100)
+    assert observed.complete and observed.problem == ""
+    assert observed.members == {200: sign * 20.0, 300: sign * 30.0}
+    assert host.descendants(100) == observed.members
+    if sign == 1:
+        assert calls == [("psutil-tree", 100), ("psutil-tree", 100)]
+    else:
+        assert all(kind == "native-children" for kind, _pid in calls)
+
+
+def test_strict_healthy_empty_differs_from_missing_backend(strict_process_tree, monkeypatch):
+    host, actors, control, calls, sign = strict_process_tree
+    control["enumerated"] = []
+    control["native"][100] = ()
+    assert host.observe_descendants(100) == process_host.DescendantObservation({}, True)
+
+    def unavailable():
+        raise ProcessHostError("synthetic backend unavailable")
+
+    monkeypatch.setattr(process_host, "_psutil", unavailable)
+    observation = host.observe_descendants(100)
+    assert observation.members == {} and not observation.complete and observation.problem
+    assert host.descendants(100) == {}  # Existing callers keep their old degrade.
+
+
+@pytest.mark.parametrize(
+    "fault", ["missing_identity", "unreadable", "reused", "foreign_parent", "older_child"]
+)
+def test_strict_bad_member_retains_stamped_sibling_but_never_healthy_coverage(
+    strict_process_tree, fault
+):
+    host, actors, control, calls, sign = strict_process_tree
+    actors[400] = {"birth": 40.0, "parent": 100}
+    control["enumerated"] = [200, 300, 400]
+    control["native"][100] = (200, 400)
+    if fault == "missing_identity":
+        actors[200]["birth"] = None
+    elif fault == "foreign_parent":
+        actors[200]["parent"] = 999
+    elif fault == "older_child":
+        actors[200]["birth"] = 5.0
+    else:
+        actors[200][fault] = True
+    result = host.observe_descendants(100)
+    assert result.members == {400: sign * 40.0}
+    assert not result.complete and result.problem
+
+
+def test_strict_root_generation_change_is_incomplete(strict_process_tree):
+    host, actors, control, calls, sign = strict_process_tree
+    control["enumerated"] = []
+    control["native"][100] = ()
+    control["after_enumeration"] = lambda: actors[100].update(birth=50.0)
+    result = host.observe_descendants(100)
+    assert result.members == {} and not result.complete and result.problem
+
+
+def test_strict_proven_root_disappearance_is_observed_empty_not_historical_proof(
+    strict_process_tree,
+):
+    host, actors, control, calls, sign = strict_process_tree
+    control["enumerated"] = []
+    control["native"][100] = ()
+    control["after_enumeration"] = lambda: actors.pop(100, None)
+    assert host.observe_descendants(100) == process_host.DescendantObservation({}, True)
+    assert host.observe_descendants(100) == process_host.DescendantObservation({}, True)
+
+
+def test_strict_census_bound_keeps_partial_members_and_marks_incomplete(
+    strict_process_tree, monkeypatch
+):
+    host, actors, control, calls, sign = strict_process_tree
+    actors[400] = {"birth": 40.0, "parent": 100}
+    control["enumerated"] = [200, 400, 300]
+    control["native"][100] = (200, 400)
+    monkeypatch.setattr(process_host, "_DESCENDANT_OBSERVATION_LIMIT", 2 if sign == -1 else 1)
+    result = host.observe_descendants(100)
+    assert result.members == {200: sign * 20.0}
+    assert not result.complete and result.problem
+
+
+@pytest.mark.parametrize("platform", ["darwin", "linux", "win32"])
+@pytest.mark.parametrize("pid", [0, -1, True, None])
+def test_strict_invalid_root_does_not_observe_or_signal(monkeypatch, platform, pid):
+    monkeypatch.setattr(process_host.sys, "platform", platform)
+    for seam in ("_psutil", "_linux_descendant_observation", "_macos_descendant_observation"):
+        monkeypatch.setattr(
+            process_host, seam, lambda *a: pytest.fail("invalid pid reached backend")
+        )
+    host = WindowsProcessHost() if platform == "win32" else PosixProcessHost()
+    result = host.observe_descendants(pid)
+    assert not result.complete and result.members == {}
+
+
+def test_strict_unknown_backend_has_no_healthy_fallback(monkeypatch):
+    monkeypatch.setattr(process_host.sys, "platform", "unsupported-platform")
+    monkeypatch.setattr(
+        process_host, "_psutil", lambda: pytest.fail("unsupported backend queried psutil")
+    )
+    result = PosixProcessHost().observe_descendants(100)
+    assert not result.complete and "unsupported" in result.problem
+
+
+def test_strict_linux_uses_scoped_thread_children_and_atomic_stat_fields(monkeypatch):
+    monkeypatch.setattr(process_host.sys, "platform", "linux")
+    actors = {10: (1, 100), 20: (10, 200), 30: (10, 300), 40: (20, 400)}
+    threads = {10: (10, 11), 20: (20,), 30: (30,), 40: (40,)}
+    children = {(10, 10): "20", (10, 11): "30", (20, 20): "40", (30, 30): "", (40, 40): ""}
+    directories = []
+
+    def read_stat(path, **kwargs):
+        assert path.name == "stat"
+        pid = int(path.parent.name)
+        parent, birth = actors[pid]
+        fields = ["S", str(parent)] + ["0"] * 17 + [str(birth)]
+        return f"{pid} (name with ) delimiter) " + " ".join(fields)
+
+    def list_threads(path):
+        assert path.name == "task", "strict Linux observation must not scan /proc globally"
+        directories.append(str(path))
+        return iter(path / str(tid) for tid in threads[int(path.parent.name)])
+
+    def open_children(path, **kwargs):
+        assert path.name == "children"
+        return io.StringIO(children[(int(path.parents[2].name), int(path.parent.name))])
+
+    monkeypatch.setattr(Path, "read_text", read_stat)
+    monkeypatch.setattr(Path, "iterdir", list_threads)
+    monkeypatch.setattr(Path, "open", open_children)
+    monkeypatch.setattr(process_host, "_psutil", lambda: pytest.fail("Linux imported psutil"))
+    result = PosixProcessHost().observe_descendants(10)
+    assert result == process_host.DescendantObservation({20: 200.0, 30: 300.0, 40: 400.0}, True)
+    assert set(directories) == {f"/proc/{pid}/task" for pid in actors}
+
+
+@pytest.mark.parametrize("fault", ["root_identity", "root_read", "child_read", "thread_census"])
+def test_strict_linux_unknown_observation_is_not_empty_success(monkeypatch, fault):
+    monkeypatch.setattr(process_host.sys, "platform", "linux")
+
+    def record(pid):
+        if fault == "root_identity" and pid == 10:
+            return None, 1
+        if (fault == "root_read" and pid == 10) or (fault == "child_read" and pid == 20):
+            raise PermissionError("synthetic /proc refusal")
+        return (100.0, 1) if pid == 10 else (200.0, 10)
+
+    def children(pid, budget):
+        if fault == "thread_census":
+            raise PermissionError("synthetic child-list refusal")
+        return (20,) if pid == 10 else ()
+
+    monkeypatch.setattr(process_host, "_linux_observed_record", record)
+    monkeypatch.setattr(process_host, "_linux_observed_children", children)
+    result = PosixProcessHost().observe_descendants(10)
+    assert not result.complete and result.problem
+    assert result.members == {}
+
+
+def test_strict_linux_zombie_root_and_explicit_disappearance_are_observable(monkeypatch):
+    monkeypatch.setattr(process_host.sys, "platform", "linux")
+    fields = ["Z", "1"] + ["0"] * 17 + ["100"]
+    monkeypatch.setattr(Path, "read_text", lambda *a, **k: "10 (zombie) " + " ".join(fields))
+    monkeypatch.setattr(process_host, "_linux_observed_children", lambda pid, budget: ())
+    assert PosixProcessHost().observe_descendants(10) == process_host.DescendantObservation(
+        {}, True
+    )
+
+    def absent(pid):
+        raise ProcessLookupError(pid)
+
+    monkeypatch.setattr(process_host, "_linux_observed_record", absent)
+    assert PosixProcessHost().observe_descendants(10) == process_host.DescendantObservation(
+        {}, True
+    )
+
+
+@pytest.mark.parametrize("available", [False, True])
+def test_strict_linux_absence_requires_an_available_procfs_backend(monkeypatch, available):
+    monkeypatch.setattr(process_host.sys, "platform", "linux")
+
+    def missing(*a, **kw):
+        raise FileNotFoundError("synthetic missing process")
+
+    monkeypatch.setattr(Path, "read_text", missing)
+    monkeypatch.setattr(
+        process_host, "_proc_identity_state", lambda pid: (123.0, "S") if available else None
+    )
+    observed = PosixProcessHost().observe_descendants(10)
+    assert observed.members == {}
+    assert observed.complete is available
+    assert bool(observed.problem) is not available
+
+
+def test_strict_macos_native_invalid_pid_is_incomplete_without_changing_legacy_behavior(
+    monkeypatch,
+):
+    monkeypatch.setattr(process_host.sys, "platform", "darwin")
+
+    def reader(pid, children, capacity):
+        children[0] = 0
+        return 1
+
+    monkeypatch.setattr(process_host, "_macos_child_reader", lambda: reader)
+    assert process_host._macos_child_pids(100) == ()
+    with pytest.raises(OSError, match="invalid pid"):
+        process_host._macos_child_pids(100, strict=True)
+    parent = SimpleNamespace(pid=100, _ident=(100, 10.0), ppid=lambda: 1, is_running=lambda: True)
+    monkeypatch.setattr(
+        process_host, "_psutil", lambda: SimpleNamespace(Process=lambda pid: parent)
+    )
+    observed = PosixProcessHost().observe_descendants(100)
+    assert not observed.complete and observed.problem
+    assert PosixProcessHost().descendants(100) == {}
+
+
+def test_strict_windows_partial_iterator_fault_keeps_observed_member(monkeypatch):
+    monkeypatch.setattr(process_host.sys, "platform", "win32")
+    child = SimpleNamespace(
+        pid=200, create_time=lambda: 20.0, ppid=lambda: 100, is_running=lambda: True
+    )
+
+    def children(recursive=False):
+        assert recursive
+        yield child
+        raise PermissionError("synthetic interrupted census")
+
+    parent = SimpleNamespace(
+        pid=100,
+        create_time=lambda: 10.0,
+        ppid=lambda: 1,
+        is_running=lambda: True,
+        children=children,
+    )
+    monkeypatch.setattr(
+        process_host, "_psutil", lambda: SimpleNamespace(Process=lambda pid: parent)
+    )
+    result = WindowsProcessHost().observe_descendants(100)
+    assert result.members == {200: 20.0}
+    assert not result.complete and "PermissionError" in result.problem
+
+
+def test_strict_branch_failure_reports_incomplete_census(strict_process_tree):
+    host, actors, control, calls, sign = strict_process_tree
+    if sign == -1:
+        control["native"][200] = PermissionError("synthetic branch failure")
+    else:
+        control["census_error"] = PermissionError("synthetic tree failure")
+    result = host.observe_descendants(100)
+    assert result.members == ({200: -20.0} if sign == -1 else {})
+    assert not result.complete and "PermissionError" in result.problem
+
+
+def test_strict_repeated_pid_generation_change_retains_old_stamp_and_marks_incomplete(monkeypatch):
+    monkeypatch.setattr(process_host.sys, "platform", "linux")
+    calls = []
+
+    def record(pid):
+        if pid == 10:
+            return 10.0, 1
+        calls.append(pid)
+        return (20.0 if len(calls) == 1 else 25.0), 10
+
+    monkeypatch.setattr(process_host, "_linux_observed_record", record)
+    monkeypatch.setattr(
+        process_host, "_linux_observed_children", lambda pid, budget: (20, 20) if pid == 10 else ()
+    )
+    observed = PosixProcessHost().observe_descendants(10)
+    assert observed.members == {20: 20.0}
+    assert not observed.complete and "identity changed" in observed.problem
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_signal_owned_posix_rechecks_birth_and_signals_only_exact_pid(monkeypatch, force):
+    host = PosixProcessHost()
+    actions = []
+    monkeypatch.setattr(host, "liveness_of", lambda pid, identity: "alive")
+    monkeypatch.setattr(host, "identity", lambda pid: 123.0)
+    monkeypatch.setattr(host, "terminate", lambda pid: actions.append(("terminate", pid)))
+    monkeypatch.setattr(host, "force_kill", lambda pid: actions.append(("kill", pid)))
+    assert host.signal_owned(71, 123.0, force=force)
+    assert actions == [("kill" if force else "terminate", 71)]
+    actions.clear()
+    assert not host.signal_owned(71, 122.0, force=force)
+    assert actions == []
+    monkeypatch.setattr(host, "liveness_of", lambda pid, identity: "unknown")
+    with pytest.raises(ProcessHostError, match="unreadable"):
+        host.signal_owned(71, 123.0, force=force)
+    assert actions == []
+
+
+@pytest.mark.parametrize("host_class", [PosixProcessHost, WindowsProcessHost])
+@pytest.mark.parametrize(
+    "pid,identity",
+    [
+        (0, 1.0),
+        (-1, 1.0),
+        (True, 1.0),
+        (71, None),
+        (71, True),
+        (71, float("nan")),
+        (71, float("inf")),
+    ],
+)
+def test_signal_owned_invalid_actor_never_reaches_observation(
+    monkeypatch, host_class, pid, identity
+):
+    host = host_class()
+    monkeypatch.setattr(host, "liveness_of", lambda *a: pytest.fail("invalid actor observed"))
+    monkeypatch.setattr(process_host, "_psutil", lambda: pytest.fail("invalid actor observed"))
+    assert not host.signal_owned(pid, identity, force=True)
+
+
+@pytest.mark.parametrize("force", [False, True])
+@pytest.mark.parametrize("state", ["owned", "wrong_birth", "reused", "unreadable"])
+def test_signal_owned_windows_uses_same_psutil_actor_without_recursive_helper(
+    monkeypatch, force, state
+):
+    events = []
+
+    class Process:
+        def __init__(self, pid):
+            assert pid == 71
+            self.pid = pid
+            events.append("constructed")
+
+        def create_time(self):
+            events.append("birth")
+            if state == "unreadable":
+                raise PermissionError("synthetic birth refusal")
+            return 124.0 if state == "wrong_birth" else 123.0
+
+        def is_running(self):
+            events.append("generation")
+            return state != "reused"
+
+        def terminate(self):
+            events.append(("terminate", self.pid))
+
+        def kill(self):
+            events.append(("kill", self.pid))
+
+        def children(self, **kwargs):
+            pytest.fail("single-actor signal queried or signalled descendants")
+
+    monkeypatch.setattr(process_host, "_psutil", lambda: SimpleNamespace(Process=Process))
+    monkeypatch.setattr(
+        process_host.subprocess, "run", lambda *a, **kw: pytest.fail("taskkill helper started")
+    )
+    monkeypatch.setattr(
+        process_host.os, "kill", lambda *a: pytest.fail("POSIX signal used on Windows seam")
+    )
+    host = WindowsProcessHost()
+    if state == "unreadable":
+        with pytest.raises(ProcessHostError) as caught:
+            host.signal_owned(71, 123.0, force=force)
+        assert isinstance(caught.value.__cause__, PermissionError)
+    else:
+        assert host.signal_owned(71, 123.0, force=force) is (state == "owned")
+    if state == "owned":
+        assert events == [
+            "constructed",
+            "birth",
+            "generation",
+            ("kill" if force else "terminate", 71),
+        ]
+    else:
+        assert not any(isinstance(event, tuple) for event in events)
+
+
+def test_signal_owned_unsupported_backend_does_not_use_legacy_tree_kill(monkeypatch):
+    host = WindowsProcessHost()
+    monkeypatch.setattr(host, "force_kill", lambda pid: pytest.fail("unsafe legacy fallback"))
+    with pytest.raises(ProcessHostError, match="unsupported"):
+        process_host.ProcessHost.signal_owned(host, 71, 123.0, force=True)

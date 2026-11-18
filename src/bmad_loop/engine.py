@@ -8,9 +8,11 @@ verify. All creative work happens inside disposable adapter sessions.
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import contextvars
 import copy
+import dataclasses
 import functools
 import hashlib
 import json
@@ -776,6 +778,27 @@ class _HardStopProbe:
 _hard_stop_probe: contextvars.ContextVar[_HardStopProbe | None] = contextvars.ContextVar(
     "bmad_loop_hard_stop_probe", default=None
 )
+
+
+def _finalization_evidence(value: object) -> object:
+    """Lossless bookkeeping evidence, never executable restoration authority."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Path):
+        return {"path": str(value)}
+    if isinstance(value, bytes):
+        return {"bytes_base64": base64.b64encode(value).decode("ascii")}
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return {
+            "type": type(value).__name__,
+            "fields": {
+                field.name: _finalization_evidence(getattr(value, field.name))
+                for field in dataclasses.fields(value)
+            },
+        }
+    if isinstance(value, (tuple, list)):
+        return [_finalization_evidence(item) for item in value]
+    raise TypeError("unsupported finalization bookkeeping evidence")
 
 
 class _ArmedClose(NamedTuple):
@@ -2966,6 +2989,10 @@ class Engine:
                     self.workspace = unit.workspace
                     try:
                         if task.adopt_pending:
+                            try:
+                                verify.ensure_finalization_settled(self.workspace.root)
+                            except verify.GitFinalizationUncertain as exc:
+                                self._pause_finalization_uncertain(task, exc)
                             self._apply_adoption(task)
                         self._finalize_commit_phase(task)
                     finally:
@@ -5816,14 +5843,16 @@ class Engine:
         budget, and a blocking failure would need an illegal
         COMMITTING→DEFERRED move (#115).
 
-        Re-drive contract: safe to call again after a host death anywhere
-        inside it. ``finalize_commit`` rechecks publication and merge history.
-        Protected chains retain HEAD and append only new bookkeeping; a clean
-        replay records HEAD unchanged. An unpublished linear chain can still
-        be re-squashed to equivalent content. A park record regenerated across
-        midnight can carry a new ``parked_at`` and therefore require a new commit.
-        ``commit_sha`` is stamped only here and is write-only (never routing),
-        so the empty persisted value is harmless."""
+        Re-drive checks durable finalization intent before hooks or bookkeeping.
+        An unresolved operation stays COMMITTING and requires reconciliation;
+        acknowledged completion or refusal permits the ordinary replay path.
+        Historical runs without a recovery record retain their existing replay
+        behavior and recheck publication/merge history before finalization.
+        """
+        try:
+            verify.ensure_finalization_settled(self.workspace.root)
+        except verify.GitFinalizationUncertain as exc:
+            self._pause_finalization_uncertain(task, exc)
         if task.commit_retry is not None:
             from . import bmadconfig, commit_recovery
             from .policy import PolicyError
@@ -5947,6 +5976,17 @@ class Engine:
                     publication_branch=task.branch,
                     on_plan=record_finalization,
                     append_only=self.campaign_execution is not None,
+                    interruption_types=(RunStopped, KeyboardInterrupt, SystemExit),
+                    recovery_context={
+                        "run_id": self.state.run_id,
+                        "story_key": task.story_key,
+                        "deferred_closes": [
+                            {"ledger": str(row.ledger), "ids": row.ids, "exact": row.exact}
+                            for row in snapshot
+                        ],
+                        "park_record": _finalization_evidence(park_record),
+                        "plan_undo": _finalization_evidence(plan_undo),
+                    },
                 )
             task.commit_sha = sha or task.baseline_commit
             # the corrected spec is now durable in HEAD; later attempts need no
@@ -5964,6 +6004,8 @@ class Engine:
             task.dispatched_spec_file = None
             task.dispatched_spec_snapshot = None
             task.dispatched_spec_absent = False
+        except verify.GitFinalizationUncertain as exc:
+            self._pause_finalization_uncertain(task, exc)
         except verify.GitError as e:
             if self.campaign_execution is not None:
                 self._campaign_recovery(task, cause="finalization-failed")
@@ -5971,7 +6013,23 @@ class Engine:
             self._restore_park_record(task, park_record)
             unrestored = self._undo_terminal_plan_write(task, plan_undo)
             self._escalate(task, f"commit failed: {e}" + (f"; {unrestored}" if unrestored else ""))
-        except BaseException:
+        except BaseException as exc:
+            uncertain = getattr(exc, "finalization_uncertain", None)
+            if uncertain is None:
+                try:
+                    verify.ensure_finalization_settled(self.workspace.root)
+                except verify.GitFinalizationUncertain as pending:
+                    uncertain = pending
+            if isinstance(uncertain, verify.GitFinalizationUncertain):
+                if isinstance(exc, (RunStopped, KeyboardInterrupt, SystemExit)):
+                    try:
+                        self._save()
+                    except BaseException as save_error:
+                        exc.add_note(
+                            "Finalization stop-state save failed: " + type(save_error).__name__
+                        )
+                    raise
+                self._pause_finalization_uncertain(task, uncertain)
             # A failed commit is not the only way out of this window: the signal
             # handler `_run` installed raises RunStopped from wherever the main
             # thread is standing, and an OSError raised outside `_run_git` (an
@@ -6019,6 +6077,25 @@ class Engine:
         # the merge-back (`WorktreeFlow.integrate_unit`), which makes this call.
         if not task.worktree_path:
             self._land_post_landing_writes(task)
+
+    def _pause_finalization_uncertain(
+        self, task: StoryTask, error: verify.GitFinalizationUncertain
+    ) -> NoReturn:
+        """Keep COMMITTING and all bookkeeping when a Git effect is unresolved."""
+        self.journal.append(
+            "finalization-uncertain",
+            story_key=task.story_key,
+            operation=error.operation,
+            record=str(error.record_path) if error.record_path else None,
+            reason=str(error),
+        )
+        self._save()
+        self._escalation_pause(
+            str(error),
+            task.story_key,
+            cause=error,
+            pause_cause=PauseCause(PauseKind.UNKNOWN, "engine.finalization", "outcome_unknown"),
+        )
 
     def _latch_post_landing_writes(self, task: StoryTask) -> None:
         """Record on ``task``, before ``_commit``'s COMMITTING save, the work

@@ -1532,6 +1532,7 @@ JOURNAL_KINDS = frozenset(
         # The chosen squash/preserve rule and pinned commit use routed fields;
         # actual fast-forward publication is covered by test_fork_finalize_published.
         "finalization-strategy",
+        "finalization-uncertain",
         # Explicit finalization retry: story/head correlate through existing
         # aliases; a refusal's reason is dropped. test_commit_recovery_journal_fields.
         "commit-retry-armed",
