@@ -2526,6 +2526,7 @@ class CampaignRuntime:
         receipt = RepositoryDiscovery(
             gateway,
             self.project,
+            clock=self.clock,
             cache=self.__dict__.setdefault("_discovery_objects", {}),
             max_metadata_bytes=snapshot.spec.github.inventory_metadata_bytes,
             max_pr_detail_bytes=snapshot.spec.github.inventory_pr_detail_bytes,
