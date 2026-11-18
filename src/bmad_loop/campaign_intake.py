@@ -32,6 +32,38 @@ class IntakeObservation:
     def version_id(self) -> str:
         return f"{self.repository}:{self.kind}:{self.object_id}:{self.updated_at}:{self.digest}"
 
+    @property
+    def issue_disposition_fingerprint(self) -> str | None:
+        """Identify issue work across lifecycle updates to the same hydrated milestone."""
+        milestone = self.payload.get("milestone")
+        if self.kind != "issue" or not isinstance(milestone, dict):
+            return None
+        if any(
+            type(milestone.get(key)) is not int or milestone[key] <= 0 for key in ("id", "number")
+        ):
+            return None
+        node = milestone.get("node_id")
+        if node is not None and (not isinstance(node, str) or not node):
+            return None
+        assignment = {
+            key: value
+            for key, value in milestone.items()
+            if key not in {"state", "closed_at", "updated_at", "open_issues", "closed_issues"}
+        }
+        subject = [
+            "issue-disposition-v1",
+            self.repository,
+            self.object_id,
+            self.number,
+            self.updated_at,
+            self.author,
+            self.url,
+            {**self.payload, "milestone": assignment},
+        ]
+        return hashlib.sha256(
+            json.dumps(subject, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+
     def to_dict(self) -> JsonObject:
         return asdict(self)
 

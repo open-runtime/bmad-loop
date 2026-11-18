@@ -110,7 +110,23 @@ def apply_batch(
             "disposition": None,
             "reason": "",
         }
+        fingerprint = observation.issue_disposition_fingerprint
+        if fingerprint is not None:
+            record["disposition_fingerprint"] = fingerprint
         state["records"][version] = record
+        inserted += 1
+        if (
+            previous
+            and fingerprint is not None
+            and fingerprint
+            == _observed(previous["observation"], snapshot.repository).issue_disposition_fingerprint
+        ):
+            # Keep the independent raw observation and cursor. The existing
+            # issue disposition, outstanding proposal and decision input still
+            # refer to the original issue version. This also reads old records
+            # that predate disposition fingerprints without rewriting them.
+            record.update(state="observation_only", disposition_of=previous_id)
+            continue
         if previous and previous["observation"]["updated_at"] > observation.updated_at:
             record["state"] = "superseded"
         else:
@@ -142,7 +158,6 @@ def apply_batch(
                     # Observation only: this wakes evidence collection, never
                     # treats the comment itself as authority or changes scope.
                     unit.evidence["decision_input_revision"] = version
-        inserted += 1
     prior = snapshot.bindings.get("intake", {})
     snapshot.bindings[INBOX] = state
     snapshot.bindings["intake"] = {
