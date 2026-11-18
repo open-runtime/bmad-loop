@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 from conftest import committing_crash_state, git
@@ -91,6 +92,36 @@ def test_lost_commit_ack_preserves_landed_commit_and_blocks_duplicate(project, m
     with pytest.raises(verify.GitFinalizationUncertain):
         verify.finalize_commit(repo, baseline, "no duplicate")
     assert len(landed) == 1
+
+
+def test_lost_recovery_ref_ack_retains_committing_and_written_bookkeeping(project, monkeypatch):
+    engine, _ = make_engine(project, [])
+    committing_crash_state(project, engine, operator_actions=["owner review"])
+    original = verify.git_bytes
+    attempts = []
+
+    def lose_recovery_ref_ack(repo, *args, **kwargs):
+        result = original(repo, *args, **kwargs)
+        if args[0] == "update-ref" and any(
+            isinstance(arg, str) and arg.startswith("refs/bmad-finalization/") for arg in args
+        ):
+            assert result.returncode == 0
+            attempts.append(args)
+            raise verify.GitTimeoutError(
+                "recovery ref acknowledgement lost", capture=result.owned_capture
+            )
+        return result
+
+    monkeypatch.setattr(verify, "git_bytes", lose_recovery_ref_ack)
+    resumed, _ = resume_engine(project, engine, [])
+    summary = resumed.run()
+    assert len(attempts) == 1 and summary.paused
+    state = load_state(resumed.run_dir)
+    assert state.tasks["1-1-a"].phase == Phase.COMMITTING
+    assert state.paused_cause.kind == PauseKind.UNKNOWN
+    record = finalization_recovery.pending(project.project)
+    park_path, _ = record["context"]["park_record"]
+    assert Path(park_path["path"]).is_file()
 
 
 def test_engine_unknown_commit_preserves_bookkeeping_and_resume_does_not_replay(

@@ -87,7 +87,14 @@ def paused_child(project, tmp_path, monkeypatch):
     )
     request = json.loads(path.read_text())
 
-    def create(cause, *, reason="A contextual explanation", exception=None, verify_outcome=None):
+    def create(
+        cause,
+        *,
+        reason="A contextual explanation",
+        exception=None,
+        verify_outcome=None,
+        request_recovery=False,
+    ):
         def loop(engine):
             if exception:
                 raise exception
@@ -102,6 +109,8 @@ def paused_child(project, tmp_path, monkeypatch):
                     engine.state.tasks[spec.selector], verify_outcome, role="dev"
                 )
                 raise AssertionError("Failed verification did not pause")
+            if request_recovery:
+                engine._campaign_recovery(engine.state.tasks[spec.selector], pause_cause=cause)
             raise RunPaused(reason, "escalation", spec.selector, cause=cause)
 
         monkeypatch.setattr(StoriesEngine, "_loop", loop)
@@ -406,6 +415,54 @@ def test_historical_receipt_without_typed_pause_stays_unknown(paused_child, tmp_
     apply_terminal(runtime, snapshot, unit, action, case, observed)
     assert unit.hold.kind == "pause_unknown"
     assert campaign_child_pause.cause(observed["receipt"]) is None
+
+
+def test_durable_engine_recovery_request_retains_its_recovery_hold(paused_child, tmp_path):
+    case = paused_child(None, request_recovery=True)
+    persisted = json.loads((case.context.directory / "recovery-request.json").read_text())
+    observed = workers.observe(case.context.directory, expected=case.request)
+    assert persisted["task"]["story_key"] == case.spec.selector
+    assert observed["receipt"]["outcome"] == "recovery_required"
+    runtime, snapshot, unit, action = parent_for(case, tmp_path)
+    runtime._apply_worker(snapshot, unit, action, observed)
+    assert unit.hold.kind == "recovery_required"
+    assert unit.claim.quiescent and unit.claim.launch_id == case.request["launch_id"]
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_protected_successor_pause_retires_handoff_and_keeps_owner_hold(
+    paused_child, tmp_path, legacy
+):
+    case = paused_child(PauseCause(PauseKind.OWNER_DECISION, "engine.session", "human_prompt"))
+    observed = workers.observe(case.context.directory, expected=case.request)
+    if legacy:
+        observed["receipt"].pop("child_pause")
+    runtime, snapshot, unit, action = parent_for(case, tmp_path)
+    handoff = unit.evidence["handoff"] = {
+        "id": "h",
+        "phase": "continuing",
+        "predecessor": {"launch_id": "old"},
+        "successor": {"launch_id": unit.claim.launch_id},
+    }
+    runtime._apply_worker(snapshot, unit, action, observed)
+    assert handoff["phase"] == "stopped"
+    assert handoff["successor_receipt"] == observed["receipt"]
+    assert unit.hold.kind == ("pause_unknown" if legacy else "owner") and unit.claim.quiescent
+
+
+def test_active_handoff_cannot_intercept_untyped_paused_predecessor(paused_child, tmp_path):
+    case = paused_child(None)
+    observed = workers.observe(case.context.directory, expected=case.request)
+    observed["receipt"].pop("child_pause")
+    runtime, snapshot, unit, action = parent_for(case, tmp_path)
+    handoff = unit.evidence["handoff"] = {
+        "id": "h",
+        "phase": "drain",
+        "predecessor": {"launch_id": unit.claim.launch_id},
+    }
+    runtime._apply_worker(snapshot, unit, action, observed)
+    assert handoff["phase"] == "stopped" and handoff["receipt"] == observed["receipt"]
+    assert unit.hold.kind == "pause_unknown" and unit.claim.quiescent
 
 
 def test_typed_receipt_cannot_finish_a_live_child(paused_child, monkeypatch):

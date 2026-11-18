@@ -870,7 +870,7 @@ def _inbox_items(snapshot: CampaignSnapshot, *, now: float):
             pause = (
                 hold_evidence["child_pause"]
                 if "child_pause" in hold_evidence
-                else unit.evidence.get("child_pause")
+                else unit.evidence.get("child_pause") if hold.kind == "paused" else None
             )
             parsed_cause = None
             pause_reason = "No supported typed child-pause receipt was recorded"

@@ -423,15 +423,34 @@ def record_terminal_capacity(runtime, snapshot, unit, receipt) -> None:
             )
 
 
-def intercept_terminal(runtime, snapshot, unit, receipt) -> bool:
+def intercept_terminal(runtime, snapshot, unit, receipt, *, permit_new_handoff=True) -> bool:
     """Called only after normal worker observation proves coding descendants stopped."""
     record_terminal_capacity(runtime, snapshot, unit, receipt)
     value = unit.evidence.get("handoff")
-    if value and unit.claim and unit.claim.launch_id != value["predecessor"]["launch_id"]:
-        value["phase"] = "continuing"
+    if (
+        value
+        and unit.claim
+        and unit.claim.launch_id == (value.get("successor") or {}).get("launch_id")
+    ):
+        if not unit.claim.quiescent:
+            raise CampaignError("Handoff successor has not stopped")
+        value["successor_receipt"] = receipt
+        if not permit_new_handoff:
+            # The child ended on a protected pause. The ordinary outcome handler
+            # now owns that hold. Retain both sides of the handoff for history.
+            value["phase"] = "stopped"
+            return False
+    if not permit_new_handoff:
+        if value and value.get("phase") in ACTIVE and unit.claim and unit.claim.quiescent:
+            if unit.claim.launch_id == value["predecessor"]["launch_id"]:
+                value["receipt"] = receipt
+                value["phase"] = "stopped"
+        return False
     if value and value.get("phase") in ACTIVE:
         if not unit.claim or not unit.claim.quiescent:
             raise CampaignError("Handoff cannot consume a live predecessor receipt")
+        if unit.claim.launch_id != value["predecessor"]["launch_id"]:
+            return False
         value["receipt"] = receipt
         return True
     kind = (receipt.get("interruption") or {}).get("kind")

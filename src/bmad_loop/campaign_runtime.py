@@ -6996,7 +6996,7 @@ class CampaignRuntime:
             snapshot, unit, receipt
         ):
             return
-        pause_handoff_allowed = True
+        pause_handoff_allowed = outcome not in {"paused", "operator_held", "recovery_required"}
         if receipt.get("child_pause") is not None:
             from .campaign_child_pause import cause as pause_cause
             from .model import PauseKind
@@ -7006,7 +7006,9 @@ class CampaignRuntime:
                 PauseKind.QUOTA_WAIT,
                 PauseKind.TRANSPORT_FAILURE,
             }
-        if pause_handoff_allowed and intercept_terminal(self, snapshot, unit, receipt):
+        if intercept_terminal(
+            self, snapshot, unit, receipt, permit_new_handoff=pause_handoff_allowed
+        ):
             return
         if outcome == "stage_complete":
             directory = self.store.directory(snapshot.id) / "workers" / claim.launch_id
