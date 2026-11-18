@@ -104,6 +104,55 @@ def test_lost_recruitment_ack_is_read_back_without_another_post(publishable, mon
     assert len(calls) == 1
 
 
+@pytest.mark.parametrize("status", [403, 429])
+def test_throttled_recruitment_keeps_deadline_until_later_readback(
+    publishable, monkeypatch, status
+):
+    import time
+
+    from bmad_loop.campaign_github import MutationIntent
+    from bmad_loop.campaign_github_faults import mutation_observation
+
+    controller, candidate, _, observation = publishable
+    posts = []
+    available = False
+    deadline = time.time() + 600
+
+    def inspect(number):
+        if posts and not available:
+            raise GithubError("review observation unavailable")
+        if available:
+            return replace(observation, requested_reviewers=("new",))
+        return observation
+
+    def request(method, path, payload):
+        posts.append((method, path))
+        raise UncertainMutation(
+            "reviewer request was throttled",
+            status=status,
+            category="rate_limit",
+            retry_at=deadline,
+            request_id="review-rate",
+        )
+
+    monkeypatch.setattr(controller, "inspect", inspect)
+    monkeypatch.setattr(controller.gateway.transport, "request", request)
+    intent = prepare_requests(controller, candidate, users=("new",), action_id="r1", generation=1)
+    sent = execute_requests(controller, replace(intent, state="sent_unknown"), generation=1)
+    before_projection = time.time()
+    wait = mutation_observation(sent, now=100)
+    assert wait.state == "unknown"
+    assert wait.data["github_fault"]["retry_at"] == deadline
+    assert wait.data["github_fault"]["request_id"] == "review-rate"
+    assert max(160, 100 + (deadline - time.time())) <= wait.retry_at
+    assert wait.retry_at <= max(160, 100 + (deadline - before_projection))
+
+    available = True
+    restored = MutationIntent.from_dict(wait.data["intent"])
+    assert reconcile_requests(controller, restored).state == "confirmed"
+    assert posts == [("POST", intent.path)]
+
+
 def test_absent_request_after_lost_ack_stays_unknown(publishable, monkeypatch):
     controller, candidate, _, observation = publishable
     monkeypatch.setattr(controller, "inspect", lambda number: observation)
