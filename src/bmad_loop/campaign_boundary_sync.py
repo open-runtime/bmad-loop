@@ -23,7 +23,7 @@ from .campaign_action_history import confirmation_revision
 from .campaign_boundary_receipts import input_reference
 from .campaign_model import CampaignError, Hold, UnitState
 from .campaign_store import add_event, transition
-from .campaign_supervisor import Observation, Proposal
+from .campaign_supervisor import Observation, ObservationStale, Proposal
 from .campaign_tracking import HierarchyCoordinator
 from .platform_util import atomic_write_text
 
@@ -433,6 +433,8 @@ def before_apply(runtime, snapshot, action, data):
 
 
 def after_effect(runtime, snapshot, action):
+    from .campaign_intake_flow import DuplicateTargetNotObserved
+
     unit = snapshot.units[action.unit]
     debt = unit.evidence["stage_sync_debt"]
     if (
@@ -441,6 +443,9 @@ def after_effect(runtime, snapshot, action):
         or unit.claim.launch_id != debt["receipt"]["launch_id"]
     ):
         raise CampaignError("post-stage sync no longer owns a quiescent completed actor")
+    previous = action.receipt.get("duplicate_target_observation")
+    if previous and previous["launch"] == unit.claim.launch_id:
+        return _duplicate_replan_or_wait(runtime, snapshot, previous)
     inputs = collect(runtime, snapshot, unit, action_id=action.id)
     if not inputs["complete"]:
         return Observation(
@@ -470,12 +475,44 @@ def after_effect(runtime, snapshot, action):
     )
     receipt = dict(debt["receipt"])
     validated = False
+    readback = None
     admission = receipt["stage"] == "admission_review"
     if inputs["complete"] and (not changed or admission):
         from .campaign_github import GithubError
 
         try:
             runtime._validate_stage_receipt(snapshot, unit, debt["request"], receipt)
+        except DuplicateTargetNotObserved as missing:
+            try:
+                native = missing.observe(runtime.gateway(snapshot))
+                if not missing.issued(debt["request"], native):
+                    return _duplicate_replan_or_wait(
+                        runtime,
+                        snapshot,
+                        {
+                            "kind": missing.kind,
+                            "number": native["number"],
+                            "database_id": native["id"],
+                            "binding": missing.binding,
+                            "unit": receipt["artifact"]["proposal"]["unit_id"],
+                            "launch": unit.claim.launch_id,
+                            "observed_at": runtime.clock(),
+                            "boundary_inputs": input_reference(inputs),
+                        },
+                    )
+                runtime._validate_stage_receipt(
+                    snapshot, unit, debt["request"], receipt, duplicate_readback=native
+                )
+                readback = native
+            except GithubError as exc:
+                if exc.status != 404:
+                    raise
+                receipt.update(
+                    outcome="invalid_stage_result",
+                    error="Owned duplicate target unavailable: " + str(exc),
+                )
+            except (CampaignError, KeyError, TypeError) as exc:
+                receipt.update(outcome="invalid_stage_result", error=str(exc))
         except (GithubError, OSError):
             raise
         except (CampaignError, ValueError, TypeError, KeyError) as exc:
@@ -491,10 +528,49 @@ def after_effect(runtime, snapshot, action):
             "inputs": inputs,
             "changed": changed,
             "validated": validated,
+            **({"duplicate_readback": readback} if readback is not None else {}),
             "receipt": receipt,
             "launch_id": unit.claim.launch_id,
             **remote,
         },
+    )
+
+
+def _duplicate_replan_or_wait(runtime, snapshot, observation):
+    inventory = snapshot.bindings.get("inventory", {})
+    subject = snapshot.units.get(observation["unit"])
+    current_binding = subject.bindings.get(observation["kind"]) if subject else None
+    reason = None
+    if not isinstance(current_binding, dict) or current_binding != observation["binding"]:
+        reason = "Duplicate target ownership changed during readback"
+    elif inventory.get("complete") is True:
+        collection = "issues" if observation["kind"] == "issue" else "pulls"
+        rows = [
+            r for r in inventory.get(collection, ()) if r.get("number") == observation["number"]
+        ]
+        if (
+            len(rows) == 1
+            and rows[0].get("id") == observation["database_id"]
+            and rows[0].get("html_url") == current_binding["url"]
+        ):
+            reason = "Original triage did not see the current target; re-triage requires a remaining attempt"
+        elif rows or inventory.get("observed_at", 0) > observation["observed_at"]:
+            reason = "Refreshed catalog does not confirm the owned duplicate target"
+    if reason:
+        return Observation(
+            "confirmed",
+            {
+                "duplicate_replan": observation,
+                "launch_id": observation["launch"],
+                "inputs": observation["boundary_inputs"],
+                "reason": reason,
+            },
+        )
+    return Observation(
+        "waiting",
+        {"duplicate_target_observation": observation},
+        f"Observed owned {observation['kind']} #{observation['number']}; awaiting fresh intake evidence",
+        runtime.clock() + 30,
     )
 
 
@@ -503,6 +579,38 @@ def after_apply(runtime, snapshot, action, data):
     debt = unit.evidence["stage_sync_debt"]
     if data["launch_id"] != debt["receipt"]["launch_id"]:
         raise CampaignError("stage sync receipt belongs to another actor")
+    if refresh := data.get("duplicate_replan"):
+        from .campaign_runtime_intake import fail_stage
+        from .campaign_usage import finalize_stage_usage
+
+        current = _duplicate_replan_or_wait(runtime, snapshot, refresh)
+        if current.state != "confirmed" or current.data["reason"] != data["reason"]:
+            raise ObservationStale("Duplicate target changed before re-triage")
+        receipt = debt["receipt"]
+        finalize_stage_usage(snapshot, unit, receipt, administrative=True)
+        fail_stage(snapshot, unit.id, {"error": data["reason"]}, launch_id=data["launch_id"])
+        unit.evidence.pop("stage_sync_debt", None)
+        add_event(
+            snapshot,
+            "duplicate-target-refresh",
+            unit=unit.id,
+            launch=data["launch_id"],
+            number=refresh["number"],
+        )
+        return
+    if readback := data.get("duplicate_readback"):
+        from .campaign_runtime_intake import validate_receipt
+
+        try:
+            validate_receipt(
+                snapshot,
+                unit.id,
+                data["receipt"],
+                launch_id=data["launch_id"],
+                duplicate_readback=readback,
+            )
+        except CampaignError as exc:
+            raise ObservationStale("Duplicate target changed before applying readback") from exc
     _apply_intake(snapshot, data["inputs"])
     unit.evidence.setdefault("stage_boundary_history", []).append(
         {
@@ -582,7 +690,12 @@ def after_apply(runtime, snapshot, action, data):
         from .campaign_usage import finalize_stage_usage
 
         finalize_stage_usage(snapshot, unit, data["receipt"])
-        runtime._apply_stage_result(snapshot, unit, data["receipt"])
+        if data.get("duplicate_readback") is not None:
+            runtime._apply_stage_result(
+                snapshot, unit, data["receipt"], duplicate_readback=data["duplicate_readback"]
+            )
+        else:
+            runtime._apply_stage_result(snapshot, unit, data["receipt"])
     unit.evidence.pop("stage_sync_debt", None)
     queue_transition(
         runtime,

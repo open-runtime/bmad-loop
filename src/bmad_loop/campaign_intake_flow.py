@@ -386,7 +386,95 @@ def _scope_permitted(scope: str, allowed: tuple[str, ...]) -> bool:
     return False
 
 
-def _duplicate_target(snapshot, attempt, proposal, proof, observations):
+class DuplicateTargetNotObserved(CampaignError):
+    """An owned target was allocated after the triage catalog was captured."""
+
+    def __init__(self, kind, binding, database_id):
+        super().__init__(
+            "triage artifact refused: bound duplicate target is missing from inventory"
+        )
+        self.kind, self.binding, self.database_id = kind, binding, database_id
+
+    def observe(self, gateway):
+        number = self.binding["number"]
+        row = gateway.issue(number) if self.kind == "issue" else gateway.pull(number)
+        if (
+            not isinstance(row, dict)
+            or type(row.get("number")) is not int
+            or type(row.get("id")) is not int
+            or row.get("id") != self.database_id
+            or row.get("number") != number
+            or row.get("html_url") != self.binding["url"]
+            or (self.binding.get("node_id") and row.get("node_id") != self.binding["node_id"])
+        ):
+            raise CampaignError(
+                "Targeted duplicate readback differs from the owned native identity"
+            )
+        return self.project(row)
+
+    def project(self, row):
+        fields = (
+            "id",
+            "node_id",
+            "number",
+            "html_url",
+            "title",
+            "body",
+            "state",
+            "state_reason",
+            "merged",
+            "pull_request",
+        )
+        result = {k: row[k] for k in fields if k in row}
+        if self.kind == "pr":
+            for key in ("head", "base"):
+                ref = row.get(key) or {}
+                result[key] = {
+                    "ref": ref.get("ref"),
+                    "sha": ref.get("sha"),
+                    "repo": {"full_name": (ref.get("repo") or {}).get("full_name")},
+                }
+        return result
+
+    def issued(self, request, native):
+        # Only credit complete content actually present in the worker's issued prompt.
+        try:
+            rendered = json.loads(request["prompt"])["context"]["github_stage_inputs"]
+        except (KeyError, TypeError, ValueError):
+            return False
+        for stage in (request["stage_boundary"]["inputs"], rendered):
+            if not isinstance(stage, dict):
+                return False
+            if self.kind == "issue":
+                repository_inputs = stage.get("repository_inputs")
+                if not isinstance(repository_inputs, dict):
+                    return False
+                item = repository_inputs.get(f"issue:{self.database_id}")
+                if not isinstance(item, dict):
+                    return False
+                rows = [item.get("payload") or {}]
+            else:
+                pulls = stage.get("open_pulls")
+                if not isinstance(pulls, (list, tuple)):
+                    return False
+                rows = [
+                    row
+                    for row in pulls
+                    if isinstance(row, dict) and row.get("number") == self.binding["number"]
+                ]
+            if (
+                len(rows) != 1
+                or not isinstance(rows[0], dict)
+                or not {"title", "body"} <= rows[0].keys()
+                or self.project(rows[0]) != native
+            ):
+                return False
+        return True
+
+
+def _duplicate_target(
+    snapshot, attempt, proposal, proof, observations, *, readback=None, current_read=True
+):
     """Join the model's choice to the same immutable native identity at launch and readback."""
     target = snapshot.units[proposal.unit_id]
     numbers = [("issue", proposal.related_issue), ("pr", proposal.related_pr)]
@@ -428,17 +516,31 @@ def _duplicate_target(snapshot, attempt, proposal, proof, observations):
         or binding.get("number") != number
         or binding.get("url") != url
         or owners != {target.id}
+        or not (binding.get("database_id") or binding.get("node_id"))
+        or type(proof.get("target_database_id")) is not int
+        or proof["target_database_id"] <= 0
+        or (
+            binding.get("database_id") is not None
+            and binding["database_id"] != proof["target_database_id"]
+        )
     ):
         raise ValueError("Duplicate native target is absent, ambiguous or no longer owned")
     observed_intent = []
-    for inventory in (context["inventory"], snapshot.bindings["inventory"]):
+    for original, inventory in (
+        (True, context["inventory"]),
+        (False, snapshot.bindings["inventory"]),
+    ):
         rows = [row for row in inventory.get(collection, ()) if row.get("number") == number]
         if (
             inventory.get("complete") is not True
             or inventory.get("repository", snapshot.repository) != snapshot.repository
-            or len(rows) != 1
+            or len(rows) > 1
         ):
             raise ValueError("Duplicate native target is absent or ambiguous in inventory")
+        if not rows and readback is not None and (original or current_read):
+            rows = [readback]
+        if not rows:
+            raise DuplicateTargetNotObserved(kind, binding, proof["target_database_id"])
         row = rows[0]
         observed_intent.append((row.get("title"), row.get("body")))
         if kind == "pr":
@@ -460,9 +562,7 @@ def _duplicate_target(snapshot, attempt, proposal, proof, observations):
             or type(row.get("number")) is not int
             or type(row.get("id")) is not int
             or row["id"] <= 0
-            or type(proof.get("target_database_id")) is not int
             or proof["target_database_id"] != row["id"]
-            or not (binding.get("database_id") or binding.get("node_id"))
             or (binding.get("database_id") is not None and type(binding["database_id"]) is not int)
             or (binding.get("database_id") is not None and binding["database_id"] != row["id"])
             or (
@@ -506,6 +606,7 @@ def duplicate_current(snapshot, attempt, disposition):
         fields = dict(disposition)
         recorded = fields.pop("duplicate_target")
         proof = fields.pop("duplicate_proof")
+        readback = fields.pop("duplicate_native_readback", None)
         proposal = TriageProposal.from_dict(fields)
         packet = attempt["packet"]
         observations = tuple(_observed(row, snapshot.repository) for row in packet["observations"])
@@ -524,7 +625,9 @@ def duplicate_current(snapshot, attempt, disposition):
         ):
             return False
         validate_duplicate_coverage(proof, observations, proposal.acceptance_criteria)
-        return recorded == _duplicate_target(snapshot, attempt, proposal, proof, observations)
+        return recorded == _duplicate_target(
+            snapshot, attempt, proposal, proof, observations, readback=readback, current_read=False
+        )
     except (AttributeError, KeyError, TypeError, ValueError):
         return False  # Retained historical or malformed evidence cannot discharge current work.
 
@@ -536,6 +639,7 @@ def accept_triage(
     attempt_id: str,
     observed_role: RoleCandidate,
     planning_unit_id: str = "",
+    duplicate_readback=None,
     required_review: bool = False,
     current_pr: int | None = None,
 ) -> str | None:
@@ -561,10 +665,13 @@ def accept_triage(
             "triage actual model/provider attribution does not match its selected role"
         )
     context = packet(snapshot, attempt["input_versions"], candidate=observed_role)
-    if (
-        raw.get("intake_coordinates") != attempt["packet"]["intake_coordinates"]
-        or context["intake_coordinates"] != attempt["packet"]["intake_coordinates"]
-    ):
+    frozen = attempt["packet"]["intake_coordinates"]
+    current = context["intake_coordinates"]
+    if (raw.get("proposal") or {}).get("disposition") == "duplicate":
+        # Duplicate authority is rechecked against the exact target below. An
+        # unrelated inventory clock or portfolio change cannot spend a new turn.
+        current = {**current, "inventory_digest": frozen["inventory_digest"]}
+    if raw.get("intake_coordinates") != frozen or current != frozen:
         raise CampaignError("triage inputs, graph, policy or inventory changed during the session")
     try:
         proposal = TriageProposal.from_dict(dict(raw["proposal"]))
@@ -590,9 +697,13 @@ def accept_triage(
             proof = raw.get("duplicate_proof")
             validate_duplicate_coverage(proof, observations, proposal.acceptance_criteria)
             disposition["duplicate_target"] = _duplicate_target(
-                snapshot, attempt, proposal, proof, observations
+                snapshot, attempt, proposal, proof, observations, readback=duplicate_readback
             )
+            if duplicate_readback is not None:
+                disposition["duplicate_native_readback"] = copy.deepcopy(duplicate_readback)
             disposition["duplicate_proof"] = copy.deepcopy(proof)
+    except DuplicateTargetNotObserved:
+        raise
     except (TypeError, KeyError, ValueError) as exc:
         raise CampaignError(f"triage artifact refused: {exc}") from exc
     proposal_id = None

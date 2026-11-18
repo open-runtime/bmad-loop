@@ -5022,7 +5022,9 @@ class CampaignRuntime:
             raise CampaignError("recovery checkpoint lacks its exact confirmed publication journal")
         return dataclasses.asdict(row)
 
-    def _validate_stage_receipt(self, snapshot, unit, request, receipt) -> None:
+    def _validate_stage_receipt(
+        self, snapshot, unit, request, receipt, *, duplicate_readback=None
+    ) -> None:
         coordinates = StageCoordinates(**request["coordinates"])
         if request.get("result_contract") in {"decision-v1", "resolution-v1"}:
             from .campaign_decision_sources import github_provider
@@ -5092,7 +5094,13 @@ class CampaignRuntime:
             if request.get("result_contract") == "intake-triage-v1":
                 from .campaign_runtime_intake import validate_receipt as validate_intake_receipt
 
-                validate_intake_receipt(snapshot, unit.id, receipt, launch_id=unit.claim.launch_id)
+                validate_intake_receipt(
+                    snapshot,
+                    unit.id,
+                    receipt,
+                    launch_id=unit.claim.launch_id,
+                    duplicate_readback=duplicate_readback,
+                )
             if coordinates.stage == "decomposition":
                 from .campaign_runtime_intake import validate_decomposition
 
@@ -7177,7 +7185,7 @@ class CampaignRuntime:
                 ),
             )
 
-    def _apply_stage_result(self, snapshot, unit, receipt) -> None:
+    def _apply_stage_result(self, snapshot, unit, receipt, *, duplicate_readback=None) -> None:
         claim = unit.claim
         stage = receipt["stage"]
         if receipt.get("landing"):
@@ -7195,7 +7203,13 @@ class CampaignRuntime:
         if receipt.get("result_contract") == "intake-triage-v1":
             from .campaign_runtime_intake import apply_triage
 
-            apply_triage(snapshot, unit.id, receipt, launch_id=claim.launch_id)
+            apply_triage(
+                snapshot,
+                unit.id,
+                receipt,
+                launch_id=claim.launch_id,
+                duplicate_readback=duplicate_readback,
+            )
         elif stage == "closure":
             if not receipt.get("validated_closure"):
                 raise CampaignError("closure lacks exact native artifacts and child reconciliation")

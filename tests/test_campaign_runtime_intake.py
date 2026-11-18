@@ -262,15 +262,15 @@ def test_receipt_validation_cannot_release_real_actor_or_mutate_authority(snapsh
         intake.apply_triage(snapshot, unit_id, result(snapshot, unit_id), launch_id="triage-launch")
 
 
-def apply_existing_duplicate(snapshot):
+def prepare_existing_duplicate(snapshot, *, in_inventory=True):
     target = snapshot.units["source:project:existing"]
     target.spec = dataclasses.replace(target.spec, acceptance=("Add scoped incoming behavior",))
     snapshot.graph_revision += 1
     url = "https://github.com/a/b/issues/8"
     target.bindings["issue"] = {"number": 8, "database_id": 1008, "url": url}
-    snapshot.bindings["inventory"]["issues"] = [
-        {"id": 1008, "number": 8, "html_url": url, "state": "open"}
-    ]
+    native = {"id": 1008, "number": 8, "html_url": url, "state": "open"}
+    if in_inventory:
+        snapshot.bindings["inventory"]["issues"] = [native]
     unit_id = start(snapshot)
     receipt = result(snapshot, unit_id, disposition="duplicate")
     proposal = receipt["artifact"]["proposal"]
@@ -299,10 +299,189 @@ def apply_existing_duplicate(snapshot):
             )
         ],
     }
+    return unit_id, receipt, native
+
+
+def apply_existing_duplicate(snapshot):
+    unit_id, receipt, native = prepare_existing_duplicate(snapshot)
+    proposal = receipt["artifact"]["proposal"]
     intake.apply_triage(snapshot, unit_id, receipt, launch_id="triage-launch")
     saved = snapshot.bindings[flow.INBOX]["records"][proposal["input_versions"][0]]
-    assert saved["state"] == "resolved" and saved["disposition"]["duplicate_target"]["url"] == url
+    assert (
+        saved["state"] == "resolved"
+        and saved["disposition"]["duplicate_target"]["url"] == native["html_url"]
+    )
     return unit_id
+
+
+@pytest.mark.parametrize("issued,budget", [("same", 2), ("changed", 2), ("absent", 1)])
+def test_missing_owned_target_reads_only_its_subject_and_preserves_attempt_budget(
+    snapshot, project, monkeypatch, issued, budget
+):
+    from types import SimpleNamespace
+
+    from conftest import git
+
+    from bmad_loop import campaign_boundary_sync as boundary
+    from bmad_loop.campaign_github import GithubError
+
+    snapshot.spec = dataclasses.replace(
+        snapshot.spec, intake=dataclasses.replace(snapshot.spec.intake, max_triage_attempts=budget)
+    )
+    key, receipt, native = prepare_existing_duplicate(snapshot, in_inventory=False)
+    native.update(title="Existing behavior", body="Add scoped incoming behavior")
+    unit = snapshot.units[key]
+    unit.bindings["workspace"] = str(project.project)
+    receipt.update(
+        stage="triage",
+        outcome="stage_complete",
+        launch_id=unit.claim.launch_id,
+        head=git(project.project, "rev-parse", "HEAD"),
+    )
+    prior = {
+        "complete": True,
+        "graph_revision": snapshot.graph_revision,
+        "config_revision": snapshot.config_revision,
+        "github": {"pulls": {}},
+        "intake": {
+            "batch": {"complete": True, "observations": [], "next_cursor": "", "pending_count": 0},
+            "observed_at": 100,
+        },
+    }
+    request = {
+        "result_contract": intake.CONTRACT,
+        "stage_boundary": {"inputs": prior},
+        "coordinates": {"head": receipt["head"]},
+    }
+    if issued != "absent":
+        prior["repository_inputs"] = {"issue:1008": {"payload": dict(native)}}
+        if issued == "changed":
+            prior["repository_inputs"]["issue:1008"]["payload"][
+                "body"
+            ] = "Original issue instructions"
+    request["prompt"] = json.dumps({"context": {"github_stage_inputs": prior}})
+    unit.evidence["stage_sync_debt"] = {"request": request, "receipt": receipt}
+    calls = []
+
+    def issue(number):
+        calls.append(number)
+        if len(calls) == 1:
+            raise GithubError("rate limited", status=429, retry_after_s=45)
+        return native
+
+    runtime = SimpleNamespace(
+        clock=lambda: 100,
+        gateway=lambda snapshot: SimpleNamespace(issue=issue),
+        template=lambda snapshot: SimpleNamespace(
+            policy=SimpleNamespace(limits=SimpleNamespace(max_review_cycles=3))
+        ),
+        _validate_stage_receipt=lambda snapshot, unit, request, receipt, **kw: intake.validate_receipt(
+            snapshot, unit.id, receipt, launch_id=unit.claim.launch_id, **kw
+        ),
+        _apply_stage_result=lambda snapshot, unit, receipt, **kw: intake.apply_triage(
+            snapshot, unit.id, receipt, launch_id=unit.claim.launch_id, **kw
+        ),
+    )
+    monkeypatch.setattr(boundary, "collect", lambda *a, **kw: prior)
+    monkeypatch.setattr(boundary, "semantic", lambda *a, **kw: {})
+    monkeypatch.setattr(boundary, "_remote_observation", lambda *a, **kw: {})
+    monkeypatch.setattr(boundary, "_apply_remote", lambda *a, **kw: True)
+    monkeypatch.setattr(boundary, "queue_transition", lambda *a, **kw: None)
+    action = OutboxAction("after", "stage-boundary-after", key, {}, snapshot.generation)
+    with pytest.raises(GithubError) as limited:
+        boundary.after_effect(runtime, snapshot, action)
+    assert limited.value.retry_after_s == 45
+    from concurrent.futures import Future
+
+    from bmad_loop.campaign_supervisor import CampaignSupervisor, ObservationStale
+
+    store = CampaignStore(project.project.parent / "duplicate-restart")
+    action.state = "sent_unknown"
+    snapshot.outbox.append(action)
+    snapshot = store.create(snapshot)
+    driver = SimpleNamespace(
+        apply=lambda snap, act, obs: boundary.after_apply(runtime, snap, act, obs.data)
+    )
+    supervisor = CampaignSupervisor(store, driver, clock=runtime.clock)
+
+    def harvest(state, observed):
+        future = Future()
+        future.set_result(observed)
+        supervisor._active[action.id] = future
+        committed = supervisor._harvest(state)
+        return store.load(committed.id)
+
+    unit = snapshot.units[key]
+    action = next(row for row in snapshot.outbox if row.id == "after")
+    waiting = boundary.after_effect(runtime, snapshot, action)
+    (version,) = receipt["artifact"]["proposal"]["input_versions"]
+    if issued == "same":
+        assert (
+            waiting.state == "confirmed"
+            and waiting.data["duplicate_readback"]["id"] == native["id"]
+        )
+        race = snapshot.clone()
+        race.units["source:project:existing"].bindings["issue"]["number"] = 9
+        untouched = race.clone()
+        with pytest.raises(ObservationStale):
+            boundary.after_apply(runtime, race, action, waiting.data)
+        assert race == untouched
+        snapshot = harvest(snapshot, waiting)
+        inbox = snapshot.bindings[flow.INBOX]
+        assert inbox["records"][version]["state"] == "resolved"
+        assert inbox["records"][version]["attempts"] == 1 and len(inbox["attempts"]) == 1
+        assert (
+            inbox["attempts"][receipt["launch_id"]]["disposition"]["duplicate_target"]["number"]
+            == 8
+        )
+        assert not snapshot.bindings["inventory"]["issues"] and calls == [8, 8]
+        return
+    assert waiting.state == "waiting" and waiting.retry_at > runtime.clock()
+    snapshot = harvest(snapshot, waiting)
+    unit = snapshot.units[key]
+    action = next(row for row in snapshot.outbox if row.id == "after")
+    assert action.next_retry_at == waiting.retry_at
+    assert boundary.after_effect(runtime, snapshot, action).state == "waiting"
+    assert calls == [8, 8] and not snapshot.bindings["inventory"]["issues"]
+    assert unit.claim.quiescent and snapshot.units["source:project:existing"].hold is None
+
+    snapshot.bindings["inventory"]["issues"] = [native]
+    snapshot = store.save(snapshot, snapshot.revision)
+    refreshed = boundary.after_effect(runtime, snapshot, action)
+    assert refreshed.state == "confirmed" and refreshed.data["duplicate_replan"]
+    if budget == 1:
+        from bmad_loop.campaign_model import Hold
+
+        snapshot.units[key].hold = Hold("operator", "Owner takeover", id="owner-action")
+        snapshot = store.save(snapshot, snapshot.revision)
+    snapshot = harvest(snapshot, refreshed)
+    unit = snapshot.units[key]
+    stored = next(row for row in snapshot.outbox if row.id == "after")
+    assert stored.state == "confirmed" and stored.receipt["inputs"]["complete"]
+    assert "stage_sync_debt" not in unit.evidence
+    (version,) = receipt["artifact"]["proposal"]["input_versions"]
+    inbox = snapshot.bindings[flow.INBOX]
+    assert inbox["attempts"][receipt["launch_id"]]["state"] == "failed"
+    assert inbox["records"][version]["attempts"] == 1
+    if budget == 1:
+        assert inbox["records"][version]["state"] == "held" and unit.hold.id == "owner-action"
+        assert unit.evidence["pending_failure_hold"]["kind"] == "triage_attempts_exhausted"
+        assert not intake.stage_proposal(snapshot, key, ROLE)
+        return
+    assert unit.bindings["intake_control"]["state"] == "triage_pending" and unit.hold is None
+    assert calls == [8, 8]
+
+    stage = intake.stage_proposal(snapshot, key, ROLE)
+    assert stage and stage.kind == "launch"
+    intake.prepare_stage(snapshot, key, stage.payload, launch_id="fresh-launch")
+    fresh = result(snapshot, key, disposition="duplicate")
+    fresh["artifact"]["proposal"] = {
+        **receipt["artifact"]["proposal"],
+        "graph_revision": snapshot.graph_revision,
+    }
+    fresh["artifact"]["duplicate_proof"] = receipt["artifact"]["duplicate_proof"]
+    intake.apply_triage(snapshot, key, fresh, launch_id="fresh-launch")
+    assert snapshot.bindings[flow.INBOX]["records"][version]["state"] == "resolved"
 
 
 def test_nonwork_control_needs_disposition_comment_and_closed_unmerged_pr(snapshot):
