@@ -12,6 +12,7 @@ from pathlib import Path
 
 from .campaign_jobs import TERMINAL, accept_receipt, current, live, request_from_dict
 from .campaign_model import CampaignError, RoleCandidate
+from .campaign_scheduler import missing_job_claim, session_capacity_wait, session_usage
 from .campaign_store import add_event
 from .campaign_supervisor import Observation, Proposal
 from .platform_util import is_link_like
@@ -187,14 +188,9 @@ def outstanding(snapshot) -> bool:
 def proposals(runtime, snapshot) -> tuple[Proposal, ...]:
     result: list[Proposal] = []
     semantic_fingerprints: dict[str, str] = {}
-    active = sum(live(row) for row in snapshot.jobs.values())
-    sessions = (
-        sum(
-            bool(unit.claim and not unit.claim.quiescent and unit.claim.resource != "verify")
-            for unit in snapshot.units.values()
-        )
-        + active
-    )
+    active = sum(live(row) or missing_job_claim(row) for row in snapshot.jobs.values())
+    usage = session_usage(snapshot)
+    sessions, total_sessions = usage.model, usage.total
     selected: list[tuple[str, RoleCandidate]] = []
     for job_id, row in sorted(
         snapshot.jobs.items(),
@@ -205,6 +201,11 @@ def proposals(runtime, snapshot) -> tuple[Proposal, ...]:
         ),
     ):
         request = request_from_dict(row["request"])
+        if missing_job_claim(row):
+            reason = "Reasoning worker ownership is unknown; reconcile its missing claim"
+            if row.get("reason") != reason and not pending(snapshot, job_id, "reasoning-wait"):
+                result.append(Proposal("reasoning-wait", request.unit, {"job_id": job_id, "reason": reason}))
+            continue
         if live(row):
             kind = (
                 "reasoning-terminate"
@@ -266,10 +267,15 @@ def proposals(runtime, snapshot) -> tuple[Proposal, ...]:
             dependencies.append(known)
         if any(not dependency or dependency["state"] != "applied" for dependency in dependencies):
             continue
-        if (
-            active >= snapshot.spec.reasoning.max_sessions
-            or sessions >= snapshot.spec.resources.max_sessions
-        ):
+        wait = session_capacity_wait(
+            snapshot.spec, "reasoning", model=sessions, total=total_sessions
+        )
+        if active >= snapshot.spec.reasoning.max_sessions:
+            wait = "reasoning session capacity"
+        if wait:
+            reason = "Waiting for " + wait + "; admission resumes when an owned slot is released"
+            if row.get("reason") != reason and not pending(snapshot, job_id, "reasoning-wait"):
+                result.append(Proposal("reasoning-wait", request.unit, {"job_id": job_id, "reason": reason}))
             continue
         from .campaign_summary_routes import validate_request
 
@@ -299,6 +305,7 @@ def proposals(runtime, snapshot) -> tuple[Proposal, ...]:
         )
         selected.append((request.role, candidate))
         sessions += 1
+        total_sessions += 1
         active += 1
     return tuple(result)
 
@@ -311,7 +318,11 @@ def prepare_effect(runtime, snapshot, action) -> None:
     if live(row):
         raise CampaignError("reasoning job already has an unreconciled claim")
     request = request_from_dict(row["request"])
-    reason = admission_reason(snapshot, request.unit)
+    reason = (
+        "Reasoning worker ownership is unknown; reconcile its missing claim"
+        if missing_job_claim(row)
+        else admission_reason(snapshot, request.unit)
+    )
     if reason:
         action.payload["job_binding"] = _binding(row)
         action.state = "confirmed"

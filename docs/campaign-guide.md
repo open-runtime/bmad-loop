@@ -83,6 +83,7 @@ independent = true
 [resources]
 verify_slots = 2
 max_sessions = 6
+max_total_sessions = 6
 
 [github]
 enabled = true
@@ -193,6 +194,20 @@ explicitly; `scm.max_parallel` remains the existing single-run setting. There is
 no implicit one-worker limit per epic. `max_workers_per_epic` is optional and only
 restricts admission when configured. Execution, review, verification, resolver,
 active-epic and total in-flight limits are distinct.
+
+`resources.max_sessions` retains its historical model-worker limit. Set
+`resources.max_total_sessions` to bound execution, planning, review, resolution,
+verification and reasoning reservations together. Each stage's own limit also
+applies. Prepared and uncertain actors keep their reservations until quiescence
+is confirmed; waiting for GitHub without an actor consumes no session slot.
+
+The total limit is a positive integer. Omitting it preserves an old frozen
+configuration and its identity; it does not establish an all-worker ceiling.
+`campaign status --json` reports `active_total_sessions`, `max_total_sessions`,
+`unknown_session_reservations` and `session_limit_basis` alongside the existing
+model and verification counts. `legacy-model-only` means the total limit is
+absent. The 32-session workload must explicitly configure a total limit of 32
+and count verification reservations in its independent measurement.
 
 ## Models and planning
 

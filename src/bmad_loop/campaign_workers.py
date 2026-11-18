@@ -411,7 +411,10 @@ def _tracking(request: dict[str, Any], envelope: CampaignExecution) -> dict[str,
 def _execution(request: dict[str, Any], envelope: CampaignExecution) -> dict[str, Any]:
     from .campaign_intake_amendment import validate_initial_source
 
-    native_handoff = request.get("handoff_state", {}).get("native_role") in {"dev", "review"}
+    native_handoff = (
+        request.get("handoff_state", {}).get("native_role") in {"dev", "review"}
+        or request.get("rearm_state", {}).get("native_role") == "dev"
+    )
     # A continuation binds the exact captured post-development private source,
     # which has legitimately changed since the original ready-for-dev import.
     if not native_handoff:
@@ -476,6 +479,9 @@ def _execution(request: dict[str, Any], envelope: CampaignExecution) -> dict[str
         ),
     )
     composed.journal.append("campaign-config-frozen", config_revision=envelope.config_revision)
+    from .campaign_git_activity import binding as git_activity_binding
+
+    composed.engine._campaign_git_activity = git_activity_binding(request, envelope)
     summary = composed.engine.run()
     state = load_state(composed.run_dir)
     recovery = envelope.directory / "recovery-request.json"
@@ -598,7 +604,8 @@ def _adapters(
         if request.get("kind") == "stage"
         else "review" if request.get("handoff_state", {}).get("native_role") == "review" else "dev"
     )
-    if request.get("handoff_packet") and handoff_role not in selected_caps:
+    continuation_packet = request.get("rearm_packet") or request.get("handoff_packet")
+    if continuation_packet and handoff_role not in selected_caps:
         raise CampaignError(
             "Handoff requires a qualified execution route with inline input delivery"
         )
@@ -623,7 +630,7 @@ def _adapters(
             cap,
             request.get("headless_grants"),
             request.get("headless_coordinates"),
-            request.get("handoff_packet"),
+            continuation_packet,
         )
         if request.get("managed_communication"):
             adapter.set_managed_communication(request["managed_communication"])
@@ -1184,6 +1191,16 @@ def child_main(request_path: Path) -> int:
         receipt["child_pause"] = pause_receipt(
             load_state(Path(result["run_dir"])), request, envelope, receipt
         )
+    from .campaign_git_activity import worker_receipt as git_activity_receipt
+    from .campaign_child_pause import cause as pause_cause
+
+    typed_pause = pause_cause(receipt)
+    required = bool(
+        typed_pause is not None
+        and typed_pause.producer == "engine.finalization"
+        and typed_pause.code == "outcome_unknown"
+    )
+    receipt["git_activity"] = git_activity_receipt(request, envelope, required=required)
     atomic_write_text(envelope.directory / "receipt.json", json.dumps(receipt, default=str))
     return (
         0

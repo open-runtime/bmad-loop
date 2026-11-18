@@ -49,7 +49,9 @@ class GithubError(RuntimeError):
                 else (
                     "rate_limit"
                     if status == 429
-                    else "transient" if status == 0 or status >= 500 else "refused"
+                    else "transient"
+                    if status == 0 or status >= 500
+                    else "refused"
                 )
             )
         )
@@ -203,7 +205,9 @@ class GhTransport:
                     else (
                         "permission"
                         if status == 403
-                        else "transient" if status >= 500 else "refused"
+                        else "transient"
+                        if status >= 500
+                        else "refused"
                     )
                 )
             )
@@ -591,14 +595,45 @@ class GithubGateway:
             raise GithubError("Stale coordinator generation cannot mutate GitHub")
         if intent.state != "sent_unknown":
             raise GithubError("Persist sent_unknown before executing an outbound action")
+        if intent.kind in {"close_issue", "close_milestone"} and (intent.coordinates or {}).get(
+            "tracking_acknowledgement"
+        ):
+            raise GithubError(
+                "An acknowledged close is readback-only and cannot be submitted again",
+                category="precondition",
+                certainty="not_submitted",
+            )
         if intent.coordinates and "updated_at" in intent.coordinates and intent.path != "graphql":
             current = self.get(intent.path)
             if (
                 current.get("id") != intent.coordinates.get("id")
                 or current.get("updated_at") != intent.coordinates["updated_at"]
             ):
-                raise GithubError(
-                    "Remote shared field changed; reconcile human edits before mutation"
+                fault = GithubError(
+                    "Remote shared field changed before submission",
+                    category="precondition",
+                    certainty="not_submitted",
+                )
+                return replace(
+                    intent,
+                    state="rejected",
+                    error=str(fault),
+                    fault=fault.to_dict(),
+                    receipt={
+                        "precondition": {
+                            "schema_version": 1,
+                            "repository": self.repository,
+                            "action_id": intent.action_id,
+                            "generation": intent.generation,
+                            "kind": intent.kind,
+                            "method": intent.method,
+                            "path": intent.path,
+                            "payload": intent.payload,
+                            "expected": intent.coordinates,
+                            "observed": current,
+                            "submitted": False,
+                        }
+                    },
                 )
         try:
             response = self.transport.request(intent.method, intent.path, intent.payload)
@@ -655,9 +690,7 @@ class GithubGateway:
                     "merge_action", intent.payload.get("merge_action")
                 ) != intent.payload.get("merge_action") or details.get(
                     "merge_method", intent.payload.get("merge_method")
-                ) != intent.payload.get(
-                    "merge_method"
-                ):
+                ) != intent.payload.get("merge_method"):
                     return replace(
                         intent, error="Existing merge request options differ", receipt=receipt
                     )
@@ -862,6 +895,29 @@ class GithubGateway:
             raise GithubError("Canonical source publication must precede issue closure")
         issue = self.issue(number)
         if issue.get("state") == "closed":
+            if issue.get("state_reason") != "completed":
+                fault = GithubError(
+                    "Issue was closed with a reason other than completed; human closure is retained",
+                    category="tracking_discrepancy",
+                    certainty="not_submitted",
+                )
+                return MutationIntent(
+                    action_id,
+                    "close_issue",
+                    "PATCH",
+                    f"{self.root}/issues/{number}",
+                    {"state": "closed", "state_reason": "completed"},
+                    state="rejected",
+                    receipt=issue,
+                    error=str(fault),
+                    fault=fault.to_dict(),
+                    generation=generation,
+                    coordinates={
+                        "id": issue["id"],
+                        "updated_at": issue.get("updated_at"),
+                        "source_confirmed": True,
+                    },
+                )
             return MutationIntent(
                 action_id,
                 "close_issue",
@@ -941,7 +997,12 @@ class GithubGateway:
     ) -> MutationIntent:
         """Read desired fields back; unknown outcomes never erase human changes."""
         if intent.state == "confirmed":
-            return intent
+            if intent.kind in {"close_issue", "close_milestone"} and (intent.coordinates or {}).get(
+                "tracking_acknowledgement"
+            ):
+                intent = replace(intent, state="sent_unknown")
+            else:
+                return intent
         if intent.kind == "queue_dequeue":
             from .campaign_queue import reconcile_dequeue
 
@@ -1041,6 +1102,14 @@ class GithubGateway:
 
         if all(field_matches(key, value) for key, value in intent.payload.items()):
             return replace(intent, state="confirmed", receipt=current, error="")
+        if intent.kind in {"close_issue", "close_milestone"} and (intent.coordinates or {}).get(
+            "tracking_acknowledgement"
+        ):
+            return replace(
+                intent,
+                state="sent_unknown",
+                error="Acknowledged close differs from current native state; readback-only",
+            )
         if allow_retry:
             allowed = {
                 "close_issue": {"state", "state_reason"},

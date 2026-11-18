@@ -43,6 +43,68 @@ class Admission:
 
 
 @dataclass(frozen=True)
+class SessionUsage:
+    """Durable reservations, including actors whose launch receipt is missing."""
+
+    model: int
+    verification: int
+    unknown: int
+
+    @property
+    def total(self) -> int:
+        return self.model + self.verification
+
+
+def missing_job_claim(row: Mapping[str, object]) -> bool:
+    return row.get("state") in {"prepared", "running", "uncertain"} and not row.get("claim")
+
+
+def session_usage(snapshot: CampaignSnapshot) -> SessionUsage:
+    model = verification = unknown = 0
+    for unit in snapshot.units.values():
+        if unit.claim and not unit.claim.quiescent:
+            if unit.claim.resource == "verify":
+                verification += 1
+            else:
+                model += 1
+        elif unit.claim is None and unit.state in {UnitState.CLAIMED, UnitState.RUNNING}:
+            model += 1
+            unknown += 1
+    for row in snapshot.jobs.values():
+        if row.get("claim") and not row["claim"]["quiescent"]:
+            model += 1
+        elif missing_job_claim(row):
+            model += 1
+            unknown += 1
+    return SessionUsage(model, verification, unknown)
+
+
+def session_capacity_wait(
+    spec: CampaignSpec, resource: str, *, model: int, total: int
+) -> str:
+    """Apply the explicit all-worker limit and the compatible model limit."""
+    maximum = spec.resources.max_total_sessions
+    if maximum is not None and total >= maximum:
+        return "total session capacity"
+    if resource != "verify" and model >= spec.resources.max_sessions:
+        return "session capacity"
+    return ""
+
+
+def launch_resource(payload: Mapping[str, object]) -> str:
+    """Classify a unit launch identically at admission and claim creation."""
+    if payload.get("kind") in {"verify", "queue_verify"}:
+        return "verify"
+    if payload.get("role") in {"publication_review", "native_review_pair"}:
+        return "review"
+    if payload.get("result_contract") in {"decision-v1", "resolution-v1", "repair-v1"}:
+        return "resolution"
+    if payload.get("kind") == "stage" and payload.get("role") != "execution":
+        return "planning"
+    return "execution"
+
+
+@dataclass(frozen=True)
 class CapacityObservation:
     """An explicit observed route, not a binary-on-PATH inference.
 
@@ -154,12 +216,8 @@ def admit(
     ]
     writers = [unit for unit in active if is_writer(unit)] + uncertain
     execution = len(writers)
-    sessions = sum(unit.claim.resource != "verify" for unit in active if unit.claim) + len(
-        uncertain
-    )
-    sessions += sum(
-        bool(job.get("claim") and not job["claim"]["quiescent"]) for job in snapshot.jobs.values()
-    )
+    usage = session_usage(snapshot)
+    sessions, total_sessions = usage.model, usage.total
     # Code already merged; the real source-repair child inherits its original's
     # slot. Counting both would deadlock a campaign whose configured limit is 1.
     inflight = [
@@ -208,8 +266,10 @@ def admit(
             reason = ""
             if execution >= spec.max_workers:
                 reason = "execution capacity"
-            elif sessions >= spec.resources.max_sessions:
-                reason = "session capacity"
+            elif capacity := session_capacity_wait(
+                spec, "execution", model=sessions, total=total_sessions
+            ):
+                reason = capacity
             elif len(inflight) + len(selected) >= spec.max_in_flight_units:
                 reason = "in-flight capacity"
             elif epic not in active_epics and len(active_epics) >= spec.max_active_epics:
@@ -228,6 +288,7 @@ def admit(
                 writers.append(unit)
                 execution += 1
                 sessions += 1
+                total_sessions += 1
                 epic_workers[epic] += 1
                 active_epics.add(epic)
                 next_epic = epic
@@ -255,14 +316,8 @@ def allocation_order(snapshot: CampaignSnapshot) -> tuple[str, ...]:
 
 
 def active_sessions(snapshot: CampaignSnapshot) -> int:
-    """One global count for unit workers, reasoning jobs and uncertain actors."""
-    return sum(
-        bool(unit.claim and not unit.claim.quiescent and unit.claim.resource != "verify")
-        or (unit.state in {UnitState.CLAIMED, UnitState.RUNNING} and not unit.claim)
-        for unit in snapshot.units.values()
-    ) + sum(
-        bool(row.get("claim") and not row["claim"]["quiescent"]) for row in snapshot.jobs.values()
-    )
+    """The historical model-session count; verification has a separate count."""
+    return session_usage(snapshot).model
 
 
 def resource_available(snapshot: CampaignSnapshot, resource: str) -> bool:
@@ -270,19 +325,32 @@ def resource_available(snapshot: CampaignSnapshot, resource: str) -> bool:
     claims = [
         unit.claim for unit in snapshot.units.values() if unit.claim and not unit.claim.quiescent
     ]
-    if resource in {"execution", "review", "resolution", "planning"}:
-        if active_sessions(snapshot) >= snapshot.spec.resources.max_sessions:
-            return False
-    used = sum(claim.resource == resource for claim in claims)
+    used = (
+        sum(
+            bool(row.get("claim") and not row["claim"]["quiescent"]) or missing_job_claim(row)
+            for row in snapshot.jobs.values()
+        )
+        if resource == "reasoning"
+        else sum(claim.resource == resource for claim in claims)
+    )
+    if resource == "execution":
+        used += sum(
+            unit.claim is None and unit.state in {UnitState.CLAIMED, UnitState.RUNNING}
+            for unit in snapshot.units.values()
+        )
     limit = {
         "execution": snapshot.spec.max_workers,
         "review": snapshot.spec.max_review_sessions,
         "verify": snapshot.spec.resources.verify_slots,
         "resolution": snapshot.spec.resolution.max_sessions,
         "planning": snapshot.spec.resources.max_sessions,
+        "reasoning": snapshot.spec.reasoning.max_sessions,
     }.get(resource)
     if limit is None:
         raise ValueError(f"unknown campaign resource {resource}")
+    usage = session_usage(snapshot)
+    if session_capacity_wait(snapshot.spec, resource, model=usage.model, total=usage.total):
+        return False
     return used < limit
 
 

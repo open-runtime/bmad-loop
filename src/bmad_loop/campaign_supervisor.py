@@ -35,6 +35,10 @@ class Observation:
     retry_at: float | None = None
 
 
+class ObservationStale(CampaignError):
+    """An observation lost current authority; refresh it without replaying a write."""
+
+
 class CampaignDriver(Protocol):
     def proposals(self, snapshot: CampaignSnapshot) -> tuple[Proposal, ...]: ...
     def perform(self, snapshot: CampaignSnapshot, action: OutboxAction) -> Observation: ...
@@ -72,13 +76,18 @@ class CampaignSupervisor:
     def _executors(self):
         # Git/source observations can be slow. They must not occupy the slots
         # needed to observe or stop already-owned native coding processes.
-        with ThreadPoolExecutor(max_workers=2) as controls:
-            with ThreadPoolExecutor(max_workers=self.io_workers) as effects:
-                self._control_executor = controls
-                try:
-                    yield effects
-                finally:
-                    self._control_executor = None
+        try:
+            with ThreadPoolExecutor(max_workers=2) as controls:
+                with ThreadPoolExecutor(max_workers=self.io_workers) as effects:
+                    self._control_executor = controls
+                    try:
+                        yield effects
+                    finally:
+                        self._control_executor = None
+        finally:
+            close = getattr(self.driver, "close_observers", None)
+            if close is not None:
+                close()
 
     def _save(self, snapshot: CampaignSnapshot) -> CampaignSnapshot:
         return self.store.save(snapshot, snapshot.revision, expected_generation=snapshot.generation)
@@ -192,6 +201,10 @@ class CampaignSupervisor:
                         raise
                     observation = Observation(
                         "waiting", observation.data, reason=str(exc), retry_at=self.clock() + 5
+                    )
+                except ObservationStale as exc:
+                    observation = Observation(
+                        "waiting", observation.data, reason=str(exc), retry_at=self.clock() + 1
                     )
             if observation.state == "confirmed":
                 action.state = "confirmed"

@@ -85,6 +85,9 @@ class ResourceSpec:
     verify_slots: int = 1
     max_sessions: int = 4
     budget_usd: float | None = None
+    # Absent in historical frozen configurations: max_sessions retains its
+    # original model-worker meaning. The explicit total also counts verifiers.
+    max_total_sessions: int | None = None
 
 
 @dataclass(frozen=True)
@@ -427,6 +430,7 @@ def _construct(cls: Any, value: Any, name: str) -> Any:
         elif key in {
             "verify_slots",
             "max_sessions",
+            "max_total_sessions",
             "target_interval_s",
             "max_attempts_per_unit",
             "batch_size",
@@ -873,6 +877,9 @@ def source_to_dict(source: SourceSelector) -> dict[str, Any]:
 
 def spec_to_dict(spec: CampaignSpec) -> dict[str, Any]:
     raw = asdict(spec)
+    if spec.resources.max_total_sessions is None:
+        # Keep old frozen configuration/permit fingerprints byte-equivalent.
+        raw["resources"].pop("max_total_sessions")
     raw["sources"] = tuple(source_to_dict(source) for source in spec.sources)
     raw["role_pools"] = {
         name: {"candidates": [asdict(c) for c in candidates]}

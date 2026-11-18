@@ -375,6 +375,9 @@ def resume(
         **extra,
     )
     retained_task = state.tasks[task.story_key]
+    from .campaign_git_activity import binding as git_activity_binding
+
+    engine._campaign_git_activity = git_activity_binding(request, envelope)
     roots = _source_roots(workspace, paths, state)
     if retained_task.phase == Phase.COMMITTING:
         before_verification = capture(workspace, source_roots=roots, exclude_paths=(run_dir,))

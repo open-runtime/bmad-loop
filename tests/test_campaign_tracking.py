@@ -14,6 +14,7 @@ class HierarchyTransport:
         self.milestones = {}
         self.issues = {}
         self.parents = {}
+        self.comments = {}
         self.effects = []
 
     def request(self, method, path, payload=None):
@@ -30,6 +31,8 @@ class HierarchyTransport:
                 number = int(parts[1])
                 if len(parts) == 2:
                     return ApiResponse(200, self.issues[number], {})
+                if parts[-1] == "comments":
+                    return ApiResponse(200, self.comments.get(number, []), {})
                 if parts[-1] == "parent":
                     if number not in self.parents:
                         raise GithubError("No parent", status=404)
@@ -296,7 +299,9 @@ def test_legacy_mirror_fresh_read_must_match_discovery(legacy_mirror, monkeypatc
             row.update(
                 {"body": "Owner removed marker"}
                 if fault == "marker-removed"
-                else {"id": 7777} if fault == "identity-changed" else {"state": "closed"}
+                else {"id": 7777}
+                if fault == "identity-changed"
+                else {"state": "closed"}
             )
         return row
 
@@ -690,7 +695,7 @@ def test_mixed_mirror_order_resolves_shared_parents_before_create(
 ):
     state, mirrored, plain, metadata, transport, gateway, coordinator = mixed_ticket_mirrors
     receipts = {}
-    for unit in ((mirrored, plain) if mirror_first else (plain, mirrored)):
+    for unit in (mirrored, plain) if mirror_first else (plain, mirrored):
         for _ in range(20):
             step = coordinator.step(state, unit.id, source_metadata=metadata, receipts=receipts)
             assert not step.reason

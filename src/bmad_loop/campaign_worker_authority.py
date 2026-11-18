@@ -135,6 +135,14 @@ def execution_envelope(
 def continuation_request(
     snapshot: CampaignSnapshot, unit: CampaignUnit, claim: WorkerClaim
 ) -> dict[str, Any]:
+    rearm = unit.evidence.get("technical_rearm", {})
+    if (
+        rearm.get("phase") == "continuing"
+        and rearm.get("successor", {}).get("launch_id") == claim.launch_id
+    ):
+        from .campaign_rearm import request
+
+        return request(snapshot, unit, claim)
     handoff = unit.evidence["handoff"]
     current = handoff["capture"]["current"]
     return {

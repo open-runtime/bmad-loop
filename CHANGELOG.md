@@ -9,11 +9,16 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- Add an explicit campaign total-session limit covering verification and model workers, with separate status counts and unchanged legacy configuration fingerprints.
 - Expose actionable campaign holds, uncertain effects and route waits through a bounded read-only inbox.
 - Retain typed child-pause evidence and consume exact successor permits for owned development continuation.
 
 ### Fixed
 
+- Retain exact quota-paused tasks across same-route continuation, stale observations, and canceled successor launches.
+- Reconcile proven-unsent issue closes and acknowledged tracking debt without replaying uncertain writes or overriding human closure decisions.
+- Close ready native parent scopes independently while retaining their own member holds and obligations.
+- Keep worker reservations until recorded Git actors are confirmed stopped, independently of uncertain commit effects.
 - Preserve commit history, index preimages and unresolved finalization effects across Git timeouts; block replay until reconciliation.
 - Verify and independently review uncovered external merges before completing tracking; retain pending acceptance across restart.
 - Align ADR index readiness with partial implementation and document campaign `authorize-scope` and required direct-merge settings.

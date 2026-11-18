@@ -49,8 +49,11 @@ linked fixes, independent current-head verification and fresh thread evidence.
 Human objections remain protected even within a bot-created thread.
 
 The accepted shared-session ceiling covers execution, review, reasoning and
-verification. Existing model-session accounting does not bound all four classes;
-that aggregate ceiling and its sustained-load qualification remain unfinished.
+verification. An explicit `resources.max_total_sessions` now bounds their durable
+reservations together; the historical `max_sessions` remains a model-worker limit.
+Omitted total limits retain old frozen identities and are visibly model-only.
+The revised all-worker measurement still requires frozen sustained-load and native
+qualification; earlier model-only measurements cannot satisfy it.
 
 Controller verification derives executable argv from frozen approved configuration.
 Diagnosis results may propose commands but cannot expand that authority; persisted

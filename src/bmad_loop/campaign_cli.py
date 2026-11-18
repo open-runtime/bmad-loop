@@ -552,14 +552,24 @@ def status_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
             }
         )
     counts = dict(Counter(str(unit.state) for unit in snapshot.units.values()))
+    from .campaign_model import UnitState
+    from .campaign_scheduler import missing_job_claim, session_usage
+
+    usage = session_usage(snapshot)
     active_claims = [
         unit.claim for unit in snapshot.units.values() if unit.claim and not unit.claim.quiescent
     ]
     active_jobs = [
-        row for row in snapshot.jobs.values() if row.get("claim") and not row["claim"]["quiescent"]
+        row
+        for row in snapshot.jobs.values()
+        if (row.get("claim") and not row["claim"]["quiescent"]) or missing_job_claim(row)
     ]
     active_roles = Counter(claim.role for claim in active_claims)
     active_roles.update(row["request"]["role"] for row in active_jobs)
+    active_roles["execution"] += sum(
+        unit.claim is None and unit.state in {UnitState.CLAIMED, UnitState.RUNNING}
+        for unit in snapshot.units.values()
+    )
     for unit in snapshot.units.values():
         if (
             unit.claim
@@ -645,10 +655,17 @@ def status_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
             "max_in_flight_units": snapshot.spec.max_in_flight_units,
             "max_workers_per_epic": snapshot.spec.max_workers_per_epic,
             "max_sessions": snapshot.spec.resources.max_sessions,
+            "max_total_sessions": snapshot.spec.resources.max_total_sessions,
             "max_review_sessions": snapshot.spec.max_review_sessions,
-            "active_sessions": sum(claim.resource != "verify" for claim in active_claims)
-            + len(active_jobs),
-            "active_verifications": sum(claim.resource == "verify" for claim in active_claims),
+            "active_sessions": usage.model,
+            "active_verifications": usage.verification,
+            "active_total_sessions": usage.total,
+            "unknown_session_reservations": usage.unknown,
+            "session_limit_basis": (
+                "model-and-total"
+                if snapshot.spec.resources.max_total_sessions is not None
+                else "legacy-model-only"
+            ),
             "role_limits": {
                 role: {
                     "max_sessions": configured.max_sessions,

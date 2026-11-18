@@ -57,7 +57,16 @@ from .campaign_publication import (
     PublicationRequirements,
 )
 from .campaign_recovery import CheckpointPusher
-from .campaign_scheduler import CapacityObservation, admit, select_role
+from .campaign_scheduler import (
+    CapacityObservation,
+    admit,
+    missing_job_claim,
+    launch_resource,
+    resource_available,
+    select_role,
+    session_capacity_wait,
+    session_usage,
+)
 from .campaign_sources import import_sources, prepare_source_view
 from .campaign_store import CampaignStore, add_action, add_event, transition
 from .campaign_supervisor import Observation, Proposal
@@ -252,6 +261,13 @@ class CampaignRuntime:
         self.capacity_observer = capacity_observer
         self.evidence_providers = evidence_providers or {}
         self._publication_lock = threading.RLock()
+        self._git_activity_observer: Any = None
+
+    def close_observers(self) -> None:
+        observer = self._git_activity_observer
+        if observer is not None:
+            observer.close()
+            self._git_activity_observer = None
 
     def gateway(self, snapshot: CampaignSnapshot) -> GithubGateway:
         return self._gateway or GithubGateway(GhTransport(), snapshot.repository)
@@ -444,10 +460,9 @@ class CampaignRuntime:
             claim = job.get("claim")
             candidate = job.get("selection")
             if (
-                claim
-                and not claim["quiescent"]
+                ((claim and not claim["quiescent"]) or missing_job_claim(job))
                 and candidate
-                and claim.get("started_at", 0) >= observed_at
+                and (missing_job_claim(job) or (claim or {}).get("started_at", 0) >= observed_at)
             ):
                 identity = (candidate["profile"], candidate["model"])
                 if identity in capacities:
@@ -472,6 +487,11 @@ class CampaignRuntime:
                     )
         active_role = sum(
             bool(unit.claim and not unit.claim.quiescent and unit.claim.role == role)
+            or (
+                role == "execution"
+                and unit.claim is None
+                and unit.state in {UnitState.CLAIMED, UnitState.RUNNING}
+            )
             for unit in snapshot.units.values()
         )
         if role == "execution_review":
@@ -488,8 +508,7 @@ class CampaignRuntime:
             )
         active_role += sum(
             bool(
-                job.get("claim")
-                and not job["claim"]["quiescent"]
+                ((job.get("claim") and not job["claim"]["quiescent"]) or missing_job_claim(job))
                 and job["request"]["role"] == role
             )
             for job in snapshot.jobs.values()
@@ -546,16 +565,17 @@ class CampaignRuntime:
 
     def completion_ready(self, snapshot) -> bool:
         from .campaign_reasoning_flow import outstanding
+        from .campaign_tracking_recovery import active
 
+        if any(active(unit) for unit in snapshot.units.values()):
+            return False
         if outstanding(snapshot) or not self.communication_settled(snapshot):
             return False
         return snapshot.bindings.get(
             "hierarchy_finalized_graph"
         ) == snapshot.graph_revision and snapshot.bindings.get("intake", {}).get(
             "observed_at", 0
-        ) >= snapshot.bindings.get(
-            "last_delivery_at", 0
-        )
+        ) >= snapshot.bindings.get("last_delivery_at", 0)
 
     def communication_settled(self, snapshot) -> bool:
         if snapshot.spec.communication.mode != "managed":
@@ -730,6 +750,13 @@ class CampaignRuntime:
         from .campaign_intake_baseline import proposals as baseline_proposals
 
         proposals.extend(baseline_proposals(snapshot, now=now))
+        from .campaign_tracking_recovery import proposals as tracking_proposals
+
+        proposals.extend(
+            proposal
+            for proposal in tracking_proposals(snapshot, now=now)
+            if not self._pending(snapshot, proposal.unit, "sync-tracking")
+        )
         baseline_waits = admission_waits(snapshot)
         admission = admit(snapshot, now=now, blocked=baseline_waits)
         selected = set(admission.units)
@@ -739,7 +766,7 @@ class CampaignRuntime:
             if (claim := row.claim) is not None and not claim.quiescent
         )
         reserved["reasoning"] = sum(
-            bool(row.get("claim") and not row["claim"]["quiescent"])
+            bool(row.get("claim") and not row["claim"]["quiescent"]) or missing_job_claim(row)
             for row in snapshot.jobs.values()
         )
         reserved["uncertain"] = sum(
@@ -757,10 +784,11 @@ class CampaignRuntime:
         def reserve(resource: str) -> bool:
             if reserved[resource] >= limits[resource]:
                 return False
-            if (
-                resource != "verify"
-                and sum(count for name, count in reserved.items() if name != "verify")
-                >= snapshot.spec.resources.max_sessions
+            if session_capacity_wait(
+                snapshot.spec,
+                resource,
+                model=sum(count for name, count in reserved.items() if name != "verify"),
+                total=sum(reserved.values()),
             ):
                 return False
             reserved[resource] += 1
@@ -908,6 +936,29 @@ class CampaignRuntime:
                 and (not unit.claim or unit.claim.quiescent)
             ):
                 proposals.append(Proposal("closure-prerequisite", key))
+                continue
+            rearm = unit.evidence.get("technical_rearm", {})
+            if (
+                rearm.get("phase") == "ready"
+                and unit.hold
+                and unit.hold.kind in {"quota", "transport"}
+                and not self._pending(snapshot, key)
+                and (unit.retry_at is None or now >= unit.retry_at)
+            ):
+                from .campaign_rearm import resume_proposal as rearm_proposal
+
+                try:
+                    continuation = rearm_proposal(snapshot, unit, self)
+                except CampaignError:
+                    # Observe the exact old binding to report refusal without
+                    # replacing the hold or inventing fresh authority.
+                    continuation = Proposal(
+                        "resolution-reprobe", key, {"rearm_binding": rearm.get("binding")}
+                    )
+                if continuation is not None and (
+                    continuation.kind != "launch" or reserve("execution")
+                ):
+                    proposals.append(continuation)
                 continue
             if (
                 unit.hold
@@ -1171,8 +1222,10 @@ class CampaignRuntime:
                     proposals.append(Proposal("observe-merge", key))
             elif unit.state == UnitState.MERGED_PENDING_SYNC:
                 from .campaign_landing_acceptance import proposals as landing_proposals
+                from .campaign_tracking_recovery import active
 
-                proposals.extend(landing_proposals(self, snapshot, unit, reserve))
+                if not active(unit):
+                    proposals.extend(landing_proposals(self, snapshot, unit, reserve))
         if snapshot.spec.paradev.reflect:
             for key, unit in snapshot.units.items():
                 if (
@@ -1192,8 +1245,28 @@ class CampaignRuntime:
         for proposal in resolution_proposals(
             snapshot, self.project, resolution_candidates, now=now
         ):
+            if snapshot.units[proposal.unit].evidence.get("technical_rearm", {}).get("phase") in {
+                "ready", "continuing"
+            }:
+                continue
             if self._pending(snapshot, proposal.unit):
                 continue
+            if any(p.unit == proposal.unit and p.kind == "resolution-reprobe" for p in proposals):
+                continue
+            if proposal.kind == "resolution-reprobe":
+                from .campaign_rearm import capture_binding
+
+                unit = snapshot.units[proposal.unit]
+                try:
+                    binding = capture_binding(snapshot, unit)
+                    extra = {"rearm_binding": binding}
+                except CampaignError as exc:
+                    extra = {
+                        "rearm_binding": None,
+                        "rearm_refusal": str(exc),
+                        "rearm_hold": dataclasses.asdict(unit.hold) if unit.hold else None,
+                    }
+                proposal = dataclasses.replace(proposal, payload={**proposal.payload, **extra})
             if proposal.kind == "launch" and not reserve(
                 "verify" if proposal.payload.get("kind") == "verify" else "resolution"
             ):
@@ -1209,8 +1282,7 @@ class CampaignRuntime:
             if not defer_triage or proposal.kind != "triage"
         )
         if (
-            self._units_settled(snapshot)
-            and not self.completion_ready(snapshot)
+            not self.completion_ready(snapshot)
             and not self._pending(snapshot, "", "intake")
             and intake.get("observed_at", 0) >= snapshot.bindings.get("last_delivery_at", 0)
         ):
@@ -1290,7 +1362,7 @@ class CampaignRuntime:
                                 }
                             ),
                         )
-                        if proposal.payload.get("handoff_id")
+                        if proposal.payload.get("handoff_id") or proposal.payload.get("rearm_id")
                         else None
                     ),
                 )
@@ -1308,7 +1380,7 @@ class CampaignRuntime:
             ):
                 fixed_review = (
                     proposal.payload.get("review_candidate")
-                    if proposal.payload.get("handoff_id")
+                    if proposal.payload.get("handoff_id") or proposal.payload.get("rearm_id")
                     else None
                 )
                 allowed_review = (
@@ -1478,7 +1550,6 @@ class CampaignRuntime:
             action = command["action"]
             if action["kind"] in {"launch", "reasoning-launch"}:
                 from .campaign_route_readiness import permissions_for
-                from .campaign_scheduler import active_sessions
 
                 payload = action["payload"]
                 raw = payload.get("candidate")
@@ -1514,13 +1585,29 @@ class CampaignRuntime:
                         )
                         return
 
-                is_session = action["kind"] == "reasoning-launch" or action["payload"].get(
-                    "kind"
-                ) not in {"verify", "queue_verify"}
-                if is_session and active_sessions(snapshot) >= snapshot.spec.resources.max_sessions:
+                resource = (
+                    "reasoning"
+                    if action["kind"] == "reasoning-launch"
+                    else launch_resource(action["payload"])
+                )
+                usage = session_usage(snapshot)
+                wait = session_capacity_wait(
+                    snapshot.spec, resource, model=usage.model, total=usage.total
+                )
+                if not wait and not resource_available(snapshot, resource):
+                    wait = resource + " capacity"
+                if wait:
                     owned = next(row for row in snapshot.outbox if row.id == action["id"])
                     owned.state = "confirmed"
-                    owned.receipt = {"admission_deferred": "global session capacity is reserved"}
+                    owned.receipt = {
+                        "admission_deferred": (
+                            "total session capacity is reserved"
+                            if wait == "total session capacity"
+                            else "global session capacity is reserved"
+                            if wait == "session capacity"
+                            else wait + " is reserved"
+                        )
+                    }
                     add_event(
                         snapshot,
                         "admission-deferred",
@@ -1635,24 +1722,7 @@ class CampaignRuntime:
                     identity = candidate["profile"] + "\0" + candidate.get("model", "")
                     selections = snapshot.bindings.setdefault("role_selections", {})
                     selections[identity] = selections.get(identity, 0) + 1
-                resource = (
-                    "verify"
-                    if payload["kind"] in {"verify", "queue_verify"}
-                    else (
-                        "review"
-                        if payload.get("role") in {"publication_review", "native_review_pair"}
-                        else (
-                            "resolution"
-                            if payload.get("result_contract")
-                            in {"decision-v1", "resolution-v1", "repair-v1"}
-                            else (
-                                "planning"
-                                if payload["kind"] == "stage" and payload.get("role") != "execution"
-                                else "execution"
-                            )
-                        )
-                    )
-                )
+                resource = launch_resource(payload)
                 unit.claim = WorkerClaim(
                     unit.id,
                     unit.attempt,
@@ -1671,8 +1741,13 @@ class CampaignRuntime:
                 from .campaign_handoff_flow import adopt_launch
 
                 adopt_launch(snapshot, unit, payload, unit.claim)
+                if payload.get("rearm_id"):
+                    from .campaign_rearm import adopt_launch as adopt_rearm
+
+                    adopt_rearm(snapshot, unit, payload, unit.claim)
                 if (
-                    payload.get("handoff_id")
+                    payload.get("rearm_id")
+                    or payload.get("handoff_id")
                     and unit.evidence.get("handoff", {}).get("native_role") == "dev"
                 ):
                     owned_action = next(row for row in snapshot.outbox if row.id == action["id"])
@@ -1697,6 +1772,11 @@ class CampaignRuntime:
                     defer_never_submitted(self, snapshot, pending)
                     continue
                 if pending.kind != "launch" or pending.state != "prepared":
+                    continue
+                if pending.payload.get("rearm_id"):
+                    from .campaign_rearm import cancel_unlaunched
+
+                    cancel_unlaunched(snapshot, snapshot.units[pending.unit], pending, mode="prepared-stop")
                     continue
                 pending.state = "rejected"
                 pending.error = "campaign drained before launch submission"
@@ -1779,16 +1859,26 @@ class CampaignRuntime:
             from .campaign_reasoning_flow import perform
 
             return perform(self, snapshot, action)
-        if action.unit in snapshot.units and action.kind not in {
-            "launch",
-            "observe-worker",
-            "checkpoint-progress",
-            "reflection",
-            "release-observation",
-            "stage-boundary-after",
-            "terminate-worker",
-            "decision-project",
-        }:
+        if (
+            action.unit in snapshot.units
+            and action.kind
+            not in {
+                "tracking-reconcile",
+                "sync-tracking",
+                "launch",
+                "observe-worker",
+                "checkpoint-progress",
+                "reflection",
+                "release-observation",
+                "stage-boundary-after",
+                "terminate-worker",
+                "decision-project",
+            }
+            and not (
+                action.kind == "github"
+                and action.payload.get("purpose") in {"tracking", "parent-tracking"}
+            )
+        ):
             from . import campaign_hold
 
             current = self.store.load(snapshot.id)
@@ -1840,6 +1930,10 @@ class CampaignRuntime:
                 action.receipt.get("intent") or action.payload["intent"]
             )
             gateway = self.gateway(snapshot)
+            if self._tracking_close(action, intent):
+                # A previous unknown/acknowledged close is observation-only.
+                # Proven no-send replans receive separate durable action IDs.
+                return self._tracking_observation(snapshot, action, intent, readback=True)
             if intent.kind in {"project_merge", "native_merge", "review_request"}:
                 from .campaign_publication_flow import execute_special
 
@@ -1991,6 +2085,7 @@ class CampaignRuntime:
             "queue-publish",
             "queue-dequeue",
             "sync-tracking",
+            "tracking-reconcile",
             "landing-checkout",
             "landing-repair",
             "landing-repair-confirm",
@@ -2104,6 +2199,11 @@ class CampaignRuntime:
         if not action.kind.startswith("github"):
             return
         intent = action.receipt.get("intent") or action.payload["intent"]
+        if action.payload.get("purpose") in {"tracking", "parent-tracking"} and intent["kind"] in {
+            "close_issue",
+            "close_milestone",
+        }:
+            return  # Only an independently recorded no-send successor may write.
         if intent["kind"] in {"project_merge", "native_merge", "review_request"}:
             # Their reconciliation protocols are observation-only. Never grant
             # generic update retry permission to another outbound submission.
@@ -2850,12 +2950,12 @@ class CampaignRuntime:
         return Observation("confirmed", observation(snapshot, result, action.unit))
 
     def _perform_hierarchy_close(self, snapshot, action) -> Observation:
-        if not self._units_settled(snapshot):
-            return Observation("confirmed", {"stale_scope": True})
         if action.payload.get("parent_key"):
             from .campaign_parent_closure import perform
 
             return perform(self, snapshot, action)
+        if not self._units_settled(snapshot):
+            return Observation("confirmed", {"stale_scope": True})
         from .campaign_action_history import TrackingReceipts
 
         receipts = TrackingReceipts(snapshot)
@@ -2995,10 +3095,12 @@ class CampaignRuntime:
         return Observation("confirmed")
 
     def _perform_resolution_reprobe(self, snapshot, action) -> Observation:
-        unit = snapshot.units[action.unit]
-        role = unit.claim.role if unit.claim else "escalation"
-        available = self._role(snapshot, role)
-        return Observation("confirmed", {"available": available is not None})
+        from .campaign_rearm import observe
+
+        try:
+            return observe(self, snapshot, action)
+        except CampaignError as exc:
+            return Observation("confirmed", {"rearm_rejected": str(exc), "action_id": action.id})
 
     def _perform_resolution_finish(self, snapshot, action) -> Observation:
         from .campaign_resolution_delivery import finish
@@ -3047,6 +3149,419 @@ class CampaignRuntime:
                     follow_symlinks=False,
                 )
         return Observation("confirmed", {"launch_id": claim.launch_id})
+
+    @staticmethod
+    def _tracking_close(action, intent) -> bool:
+        return action.payload.get("purpose") in {"tracking", "parent-tracking"} and intent.kind in {
+            "close_issue",
+            "close_milestone",
+        }
+
+    def _tracking_wait(self, intent, reason="") -> Observation:
+        from .campaign_github_faults import mutation_observation
+        from .campaign_tracking_recovery import RETRY_SECONDS
+
+        now = self.clock()
+        observed = mutation_observation(intent, now=now)
+        return Observation(
+            "waiting",
+            observed.data,
+            reason or observed.reason,
+            max(now + RETRY_SECONDS, observed.retry_at or now),
+        )
+
+    def _tracking_guard_reason(self, snapshot, action, intent) -> str:
+        from . import campaign_hold
+        from .campaign_tracking_recovery import success_guard, target_members
+        from .campaign_transfer import retired
+
+        if retired(snapshot):
+            return "Campaign ownership was transferred; tracking is fenced"
+        reason = success_guard(snapshot, action, intent)
+        if reason:
+            return reason
+        raw_labels = (intent.receipt or {}).get("labels", [])
+        if not isinstance(raw_labels, (list, tuple)) or any(
+            not isinstance(row, dict) or not isinstance(row.get("name"), str) or not row["name"]
+            for row in raw_labels
+        ):
+            return "Native tracking label observation is unavailable"
+        labels = {row["name"].lower() for row in raw_labels}
+        if labels.intersection(name.lower() for name in snapshot.spec.github.hold_labels):
+            return "Configured native issue hold label prevents tracking completion"
+        members = target_members(snapshot, action, intent)
+        if not members:
+            return "Tracking target/member authority is unknown"
+        for member in members:
+            if campaign_hold.active(
+                campaign_hold.channel(self.store.directory(snapshot.id), member),
+                campaign=snapshot.id,
+                unit=member,
+            ):
+                return "Synchronous operator hold prevents tracking completion"
+        return ""
+
+    def _tracking_completion_observation(self, snapshot, action, intent, reason):
+        """Retain an actual receipt without treating it as current delivery proof."""
+        from . import campaign_tracking_recovery as tracking
+
+        coordinates = dict(intent.coordinates or {})
+        if intent.state == "confirmed" and not coordinates.get("tracking_acknowledgement"):
+            coordinates["tracking_acknowledgement"] = {
+                "schema_version": 1,
+                "action_id": intent.action_id,
+                "receipt": intent.receipt,
+                "generation": intent.generation,
+            }
+        retained = dataclasses.replace(intent, coordinates=coordinates)
+        keys = (
+            tracking._target_keys(snapshot, action, retained)
+            if action.payload.get("purpose") == "parent-tracking"
+            else ()
+        )
+        parent_key = action.payload.get("parent_key") or next(iter(keys), "")
+        return Observation(
+            "confirmed",
+            {
+                "uncredited_tracking_intent": retained.to_dict(),
+                "tracking_completion_debt": {
+                    "schema_version": 1,
+                    "mode": "completion",
+                    "predecessor": action.id,
+                    "original": action.payload["intent"],
+                    "acknowledged": retained.to_dict(),
+                    "purpose": action.payload["purpose"],
+                    "tracking_key": action.payload.get("tracking_key", ""),
+                    "parent_key": parent_key,
+                    "state": "waiting",
+                    "reason": reason,
+                    "next_retry_at": max(
+                        self._tracking_wait(retained, reason).retry_at or 0,
+                        action.next_retry_at or 0,
+                    ),
+                },
+            },
+        )
+
+    def _tracking_observation(
+        self, snapshot, action, intent, *, readback=False, preflight=False, preflight_reason=""
+    ) -> Observation:
+        from . import campaign_tracking_recovery as tracking
+        from .campaign_github import GithubError
+        from .campaign_github_faults import mutation_observation
+
+        if not self._tracking_close(action, intent):
+            return (
+                Observation("confirmed", {"tracking_preflight_ready": True})
+                if preflight
+                else mutation_observation(intent, now=self.clock())
+            )
+        current = self.store.load(snapshot.id)
+        # A rejected initial no-send receipt is recorded even while a hold is
+        # active. This records certainty, never clears the hold or credits work.
+        if intent.state == "rejected":
+            observed = tracking.observation(current, action, intent, now=self.clock())
+            return observed or mutation_observation(intent, now=self.clock())
+        if (
+            readback
+            or intent.state == "confirmed"
+            or (intent.coordinates or {}).get("tracking_acknowledgement")
+        ):
+            intent = tracking.readback(self, current, action, intent)
+        reason = self._tracking_guard_reason(current, action, intent) or preflight_reason
+        if preflight and (
+            current.generation != snapshot.generation or intent.generation != current.generation
+        ):
+            reason = "Tracking coordinator generation changed before submission"
+        if (
+            intent.state == "confirmed"
+            and action.payload.get("purpose") == "parent-tracking"
+            and not reason
+        ):
+            from .campaign_parent_closure import guard
+
+            # The acknowledged effect is immutable, but new native children can
+            # prevent credit for the current parent scope.
+            blocked = guard(
+                self, current, action, dataclasses.replace(intent, state="sent_unknown")
+            )
+            if blocked:
+                reason = (
+                    blocked.reason or blocked.data.get("reason") or "Parent tracking scope changed"
+                )
+        if intent.state == "confirmed" or (intent.coordinates or {}).get(
+            "tracking_acknowledgement"
+        ):
+            if reason or intent.state != "confirmed":
+                return self._tracking_completion_observation(
+                    current, action, intent, reason or intent.error
+                )
+            return Observation("confirmed", {"intent": intent.to_dict()})
+        if preflight and reason:
+            if tracking._first_submission(action):
+                fault = GithubError(reason, category="precondition", certainty="not_submitted")
+                refused = dataclasses.replace(
+                    intent,
+                    state="rejected",
+                    error=reason,
+                    fault=fault.to_dict(),
+                    receipt={
+                        "precondition": {
+                            "schema_version": 1,
+                            "repository": current.repository,
+                            "action_id": intent.action_id,
+                            "generation": intent.generation,
+                            "kind": intent.kind,
+                            "method": intent.method,
+                            "path": intent.path,
+                            "payload": intent.payload,
+                            "expected": intent.coordinates,
+                            "submitted": False,
+                            "observed": {
+                                "producer": "campaign-runtime",
+                                "controller_guard": reason,
+                                "revision": current.revision,
+                            },
+                        }
+                    },
+                )
+                observed = tracking.observation(current, action, refused, now=self.clock())
+                if observed is not None:
+                    return observed
+            return Observation(
+                "waiting",
+                {"intent": intent.to_dict()},
+                reason,
+                self.clock() + tracking.RETRY_SECONDS,
+            )
+        if preflight:
+            return Observation("confirmed", {"tracking_preflight_ready": True})
+        return self._tracking_wait(intent, reason)
+
+    def _perform_tracking_reconcile(self, snapshot, action) -> Observation:
+        from . import campaign_hold
+        from . import campaign_tracking_recovery as tracking
+
+        current = self.store.load(snapshot.id)
+        unit = current.units[action.unit]
+        debt = unit.evidence.get(tracking.KEY, {}).get(action.payload["predecessor"])
+        if not debt or debt.get("state") != "waiting":
+            return Observation("confirmed", {"tracking_recovery_stale": True})
+        intent = MutationIntent.from_dict(debt.get("acknowledged") or debt["original"])
+        target = dataclasses.replace(
+            action,
+            payload={
+                "purpose": debt["purpose"],
+                "parent_key": debt.get("parent_key", ""),
+                "scope_revision": current.graph_revision,
+            },
+        )
+        members = tracking.target_members(current, target, intent)
+        if not members or any(
+            campaign_hold.active(
+                campaign_hold.channel(self.store.directory(current.id), member),
+                campaign=current.id,
+                unit=member,
+            )
+            for member in members
+        ):
+            return Observation(
+                "waiting",
+                reason="Tracking target or synchronous hold remains unresolved",
+                retry_at=self.clock() + tracking.RETRY_SECONDS,
+            )
+        if debt.get("mode") == "completion":
+            return self._perform_tracking_completion(current, action, debt, target, intent)
+        return tracking.perform(self, current, action)
+
+    def _perform_tracking_completion(
+        self, snapshot, action, debt, target, intent, *, source_refresh=False
+    ):
+        from . import campaign_tracking_recovery as tracking
+
+        observed = tracking.readback(self, snapshot, target, intent)
+        if observed.state != "confirmed":
+            return self._tracking_wait(observed)
+        unit = snapshot.units[action.unit]
+        parent_key = debt.get("parent_key", "")
+        # This is new local completion authority over an immutable acknowledged
+        # effect, never permission to submit that effect again.
+        prospective = snapshot.clone()
+        context = tracking._digest(
+            tracking._context(prospective, prospective.units[unit.id], parent_key)
+        )
+        fresh = dataclasses.replace(
+            observed,
+            coordinates={**(observed.coordinates or {}), "tracking_recovery_context": context},
+        )
+        reason = self._tracking_guard_reason(prospective, target, fresh)
+        if reason:
+            return self._tracking_wait(observed, reason)
+        source_publication = None
+        if debt["purpose"] == "tracking":
+            if not source_refresh:
+                # Source publication can write canonical metadata. Request its
+                # separate normal durable effect; this reconciliation stays read-only.
+                return Observation(
+                    "confirmed",
+                    {
+                        "tracking_completion_refresh": fresh.to_dict(),
+                        "predecessor": action.payload["predecessor"],
+                    },
+                )
+            published = self._perform_sync_tracking(snapshot, action, _completion=True)
+            if published.state != "confirmed":
+                return dataclasses.replace(
+                    published,
+                    retry_at=max(self.clock() + tracking.RETRY_SECONDS, published.retry_at or 0),
+                )
+            if published.data.get("tracking_control"):
+                return Observation(
+                    "confirmed",
+                    {
+                        "tracking_completion_source": published.data,
+                        "predecessor": action.payload["predecessor"],
+                    },
+                )
+            planned = MutationIntent.from_dict(published.data["intent"])
+            if planned.state != "confirmed":
+                return Observation(
+                    "waiting",
+                    {"intent": observed.to_dict()},
+                    "Acknowledged issue was reopened or changed; fresh observation cannot authorize another close",
+                    self.clock() + tracking.RETRY_SECONDS,
+                )
+            source_publication = published.data.get("source_publication")
+            prospective.units[unit.id].evidence["source_publication"] = source_publication
+            context = tracking._digest(
+                tracking._context(prospective, prospective.units[unit.id], parent_key)
+            )
+            fresh = dataclasses.replace(
+                observed,
+                coordinates={**(observed.coordinates or {}), "tracking_recovery_context": context},
+            )
+        if debt["purpose"] == "parent-tracking":
+            from .campaign_parent_closure import guard
+
+            blocked = guard(
+                self, snapshot, target, dataclasses.replace(fresh, state="sent_unknown")
+            )
+            if blocked is not None:
+                return Observation(
+                    "waiting",
+                    {"intent": observed.to_dict()},
+                    blocked.reason or blocked.data.get("reason") or "Parent tracking scope changed",
+                    self.clock() + tracking.RETRY_SECONDS,
+                )
+        fresh = tracking.readback(self, prospective, target, fresh)
+        reason = self._tracking_guard_reason(prospective, target, fresh)
+        if fresh.state != "confirmed" or reason:
+            return self._tracking_wait(fresh, reason)
+        successor = dataclasses.replace(
+            fresh, action_id=action.id + "-observed", generation=snapshot.generation
+        )
+        return Observation(
+            "confirmed",
+            {
+                "tracking_completion_successor": successor.to_dict(),
+                "predecessor": action.payload["predecessor"],
+                "source_publication": source_publication,
+            },
+        )
+
+    def _apply_tracking_reconcile(self, snapshot, action, data):
+        from . import campaign_tracking_recovery as tracking
+
+        unit = snapshot.units[action.unit]
+        debt = unit.evidence.get(tracking.KEY, {}).get(action.payload["predecessor"])
+        if not debt or debt.get("state") != "waiting" or data.get("tracking_recovery_stale"):
+            return
+        if data.get("tracking_completion_refresh"):
+            target = dataclasses.replace(
+                action,
+                payload={"purpose": debt["purpose"], "parent_key": debt.get("parent_key", "")},
+            )
+            reason = self._tracking_guard_reason(
+                snapshot, target, MutationIntent.from_dict(data["tracking_completion_refresh"])
+            )
+            if reason:
+                debt.update(reason=reason, next_retry_at=self.clock() + tracking.RETRY_SECONDS)
+                return
+            from .campaign_action_history import action as historical_action
+
+            refresh_id = action.id + "-source"
+            if historical_action(snapshot, refresh_id) is None:
+                add_action(
+                    snapshot,
+                    "sync-tracking",
+                    unit.id,
+                    {"completion_predecessor": action.payload["predecessor"]},
+                    action_id=refresh_id,
+                )
+            debt.update(
+                refresh_action=refresh_id, next_retry_at=self.clock() + tracking.RETRY_SECONDS
+            )
+            add_event(
+                snapshot,
+                "tracking-source-refresh-prepared",
+                unit=unit.id,
+                predecessor=action.payload["predecessor"],
+                action=refresh_id,
+            )
+            return
+        if data.get("tracking_completion_source"):
+            self._apply_effect(
+                snapshot,
+                dataclasses.replace(action, kind="sync-tracking"),
+                Observation("confirmed", data["tracking_completion_source"]),
+            )
+            debt["next_retry_at"] = self.clock() + tracking.RETRY_SECONDS
+            return
+        raw = data.get("tracking_completion_successor") or data.get("tracking_recovery_successor")
+        if raw:
+            prospective = snapshot.clone()
+            if data.get("tracking_completion_successor") and debt["purpose"] == "tracking":
+                prospective.units[unit.id].evidence["source_publication"] = data.get(
+                    "source_publication"
+                )
+            target = dataclasses.replace(
+                action,
+                payload={"purpose": debt["purpose"], "parent_key": debt.get("parent_key", "")},
+            )
+            reason = self._tracking_guard_reason(prospective, target, MutationIntent.from_dict(raw))
+            if reason:
+                debt.update(reason=reason, next_retry_at=self.clock() + tracking.RETRY_SECONDS)
+                add_event(
+                    snapshot,
+                    "tracking-reconcile-stale",
+                    unit=unit.id,
+                    action=action.id,
+                    reason=reason,
+                )
+                return
+        if data.get("tracking_completion_successor"):
+            if debt["purpose"] == "tracking":
+                unit.evidence["source_publication"] = data.get("source_publication")
+            self._queue_intent(
+                snapshot,
+                unit,
+                {
+                    "intent": raw,
+                    "purpose": debt["purpose"],
+                    "parent_key": debt.get("parent_key", ""),
+                },
+                tracking_key=debt.get("tracking_key", ""),
+            )
+            debt.update(state="replanned", successor=raw["action_id"])
+            add_event(
+                snapshot,
+                "tracking-completion-renewed",
+                unit=unit.id,
+                predecessor=action.payload["predecessor"],
+                successor=raw["action_id"],
+            )
+            return
+        tracking.apply(self, snapshot, action, data)
 
     def _perform_github(self, snapshot, action) -> Observation:
         intent = MutationIntent.from_dict(action.payload["intent"])
@@ -3138,11 +3653,24 @@ class CampaignRuntime:
                     "rejected", reason="final merge contract changed before submission"
                 )
             intent = dataclasses.replace(refreshed, action_id=intent.action_id)
+        if self._tracking_close(action, intent):
+            if intent.state in {"confirmed", "rejected"} or (intent.coordinates or {}).get(
+                "tracking_acknowledgement"
+            ):
+                return self._tracking_observation(snapshot, action, intent)
+            blocked = self._tracking_observation(snapshot, action, intent, preflight=True)
+            if not blocked.data.get("tracking_preflight_ready"):
+                return blocked
         if action.payload.get("purpose") == "parent-tracking":
             from .campaign_parent_closure import guard
 
             blocked = guard(self, snapshot, action, intent)
             if blocked is not None:
+                if blocked.state == "waiting":
+                    return self._tracking_observation(
+                        snapshot, action, intent, preflight=True,
+                        preflight_reason=blocked.reason or blocked.data.get("reason", "Parent tracking waits"),
+                    )
                 return blocked
         if intent.state == "confirmed":
             return Observation("confirmed", {"intent": intent.to_dict()})
@@ -3166,6 +3694,8 @@ class CampaignRuntime:
         )
         from .campaign_github_faults import mutation_observation
 
+        if self._tracking_close(action, result):
+            return self._tracking_observation(snapshot, action, result)
         return mutation_observation(result, now=self.clock())
 
     def _perform_push(self, snapshot, action) -> Observation:
@@ -3850,7 +4380,13 @@ class CampaignRuntime:
         from .campaign_handoff_flow import decorate_launch
 
         decorate_launch(snapshot, unit, request)
-        if request.get("handoff_state", {}).get("native_role") == "dev":
+        from .campaign_rearm import decorate_launch as decorate_rearm
+
+        decorate_rearm(snapshot, unit, request)
+        if (
+            request.get("handoff_state", {}).get("native_role") == "dev"
+            or request.get("rearm_state", {}).get("native_role") == "dev"
+        ):
             from .campaign_continuation import prepare_permit
             from .campaign_worker_authority import continuation_context
 
@@ -4174,6 +4710,63 @@ class CampaignRuntime:
             )
         return envelope, request, launch_env
 
+    def _git_activity_authority(self, request, result):
+        from .campaign_child_pause import cause as pause_cause
+        from .campaign_git_activity import binding
+
+        receipt = result.get("receipt") or {}
+        pause = pause_cause(receipt)
+        required = bool(pause and pause.producer == "engine.finalization" and pause.code == "outcome_unknown")
+        engine_kind = request.get("kind") in {"execution", "recovery"} and request.get("source", {}).get("kind") in {"stories", "tickets", "sprint-status"}
+        if not required and not engine_kind:
+            return {
+                "mode": "absence-only", "workspace": request["workspace"],
+                "common_dir": request["common_dir"], "branch": request["branch"],
+            }, required
+        envelope = CampaignExecution.load(Path(request["execution"]), request["digest"])
+        return binding(request, envelope), required
+
+    def _observe_git_activity(self, snapshot, request, result) -> Observation | None:
+        from .campaign_git_activity import GitActivityObserver
+
+        try:
+            authority, required = self._git_activity_authority(request, result)
+            if self._git_activity_observer is None:
+                self._git_activity_observer = GitActivityObserver()
+            observer = self._git_activity_observer
+            workspace = Path(request["workspace"])
+            if authority.get("mode") == "absence-only":
+                observed = observer.observe_absence(workspace, common_dir=authority["common_dir"], branch=authority["branch"])
+            else:
+                metadata = (result.get("receipt") or {}).get("git_activity") or {}
+                sealed = metadata.get("activity") if metadata.get("state") == "available" else None
+                observed = observer.observe(workspace, authority, receipt=sealed, required=required)
+            result["git_activity_proof"] = {
+                "schema_version": 1, "authority": authority, "required": required,
+                "observation": dataclasses.asdict(observed),
+            }
+        except (CampaignError, OSError, ValueError, KeyError, TypeError) as exc:
+            return Observation("waiting", result, "Git actor authority unavailable: " + type(exc).__name__, self.clock() + 5)
+        if observed.state != "quiescent":
+            return Observation("waiting", result, observed.reason, self.clock() + 1)
+        return None
+
+    def _validate_git_release(self, snapshot, unit, data) -> None:
+        from .campaign_git_activity import validate_release
+        from .campaign_supervisor import ObservationStale
+
+        directory = self.store.directory(snapshot.id) / "workers" / unit.claim.launch_id
+        try:
+            request = json.loads((directory / "request.json").read_text(encoding="utf-8"))
+            authority, required = self._git_activity_authority(request, data)
+            proof = data.get("git_activity_proof", {})
+            if proof.get("schema_version") != 1 or proof.get("authority") != authority or proof.get("required") is not required:
+                raise CampaignError("Terminal worker has no exact Git actor observation")
+            validate_release(Path(request["workspace"]), authority, proof["observation"], required=required)
+        except (CampaignError, OSError, ValueError, KeyError, TypeError) as exc:
+            raise ObservationStale("Git actor evidence changed before claim release: " + type(exc).__name__) from exc
+        unit.evidence["git_activity"] = proof
+
     def _perform_observe_worker(self, snapshot, action) -> Observation:
         unit = snapshot.units[action.unit]
         claim = unit.claim
@@ -4216,6 +4809,9 @@ class CampaignRuntime:
                 return Observation(
                     "unknown", result, "worker exited while owned coding windows remain"
                 )
+        waiting = self._observe_git_activity(snapshot, request, result)
+        if waiting is not None:
+            return waiting
         if result["state"] == "interrupted":
             result["quiescence_confirmed"] = True
             result["head"] = verify.rev_parse_head(Path(request["workspace"]))
@@ -4802,8 +5398,58 @@ class CampaignRuntime:
 
         return confirm_repair(self, snapshot, action)
 
-    def _perform_sync_tracking(self, snapshot, action) -> Observation:
+    def _perform_sync_tracking(self, snapshot, action, *, _completion=False) -> Observation:
+        from . import campaign_tracking_recovery as tracking
+
+        snapshot = self.store.load(snapshot.id)
         unit = snapshot.units[action.unit]
+        predecessor = action.payload.get("completion_predecessor")
+        if predecessor and not _completion:
+            debt = unit.evidence.get(tracking.KEY, {}).get(predecessor)
+            if not debt or debt.get("mode") != "completion" or debt.get("state") != "waiting":
+                return Observation("confirmed", {"tracking_recovery_stale": True})
+            intent = MutationIntent.from_dict(debt["acknowledged"])
+            target = dataclasses.replace(
+                action,
+                payload={
+                    "purpose": debt["purpose"],
+                    "parent_key": debt.get("parent_key", ""),
+                    "scope_revision": snapshot.graph_revision,
+                },
+            )
+            continuation = dataclasses.replace(
+                action, payload={**action.payload, "predecessor": predecessor}
+            )
+            return self._perform_tracking_completion(
+                snapshot, continuation, debt, target, intent, source_refresh=True
+            )
+        if not _completion and (
+            tracking.active(unit)
+            or any(
+                row.get("mode") == "completion"
+                for row in unit.evidence.get(tracking.KEY, {}).values()
+            )
+        ):
+            return Observation(
+                "waiting",
+                reason="Retained tracking effect requires its normal reconciliation path",
+                retry_at=self.clock() + tracking.RETRY_SECONDS,
+            )
+        issue = unit.bindings["issue"]
+        target = dataclasses.replace(action, payload={"purpose": "tracking"})
+        candidate = MutationIntent(
+            action.id + "-close",
+            "close_issue",
+            "PATCH",
+            f"repos/{snapshot.repository}/issues/{issue['number']}",
+            {"state": "closed", "state_reason": "completed"},
+            coordinates={"id": issue.get("database_id")},
+        )
+        reason = self._tracking_guard_reason(snapshot, target, candidate)
+        if reason:
+            return Observation(
+                "waiting", reason=reason, retry_at=self.clock() + tracking.RETRY_SECONDS
+            )
         from .campaign_landing_acceptance import satisfied
 
         if not satisfied(unit):
@@ -5057,11 +5703,14 @@ class CampaignRuntime:
                     self.clock() + 5,
                 )
         issue = unit.bindings["issue"]
-        intent = self.gateway(snapshot).close_issue_intent(
+        intent = tracking.prepare_close(
+            self.gateway(snapshot),
+            snapshot,
+            unit,
             issue["number"],
             action_id=action.id + "-close",
-            generation=snapshot.generation,
             source_confirmed=True,
+            source_publication=source_receipt,
         )
         return Observation(
             "confirmed",
@@ -5138,6 +5787,42 @@ class CampaignRuntime:
         data = observation.data
         unit = snapshot.units.get(action.unit)
         kind = action.kind
+        if kind == "tracking-reconcile":
+            self._apply_tracking_reconcile(snapshot, action, data)
+            return
+        if kind == "sync-tracking" and action.payload.get("completion_predecessor"):
+            continuation = dataclasses.replace(
+                action,
+                payload={
+                    **{
+                        key: value
+                        for key, value in action.payload.items()
+                        if key != "completion_predecessor"
+                    },
+                    "predecessor": action.payload["completion_predecessor"],
+                },
+            )
+            self._apply_tracking_reconcile(snapshot, continuation, data)
+            return
+        if kind == "github" and data.get("tracking_recovery"):
+            from .campaign_tracking_recovery import apply
+
+            apply(self, snapshot, action, data)
+            return
+        if kind == "github" and data.get("tracking_completion_debt"):
+            from .campaign_tracking_recovery import KEY
+
+            unit.evidence.setdefault(KEY, {}).setdefault(
+                action.id, data["tracking_completion_debt"]
+            )
+            add_event(
+                snapshot,
+                "tracking-completion-retained",
+                unit=unit.id,
+                action=action.id,
+                reason=data["tracking_completion_debt"]["reason"],
+            )
+            return
         if action.unit in snapshot.units and data.get("remote_head_error"):
             if data.get("head"):
                 unit.evidence.setdefault("external_backup_debt", {})[action.id] = data["head"]
@@ -5527,11 +6212,32 @@ class CampaignRuntime:
                 id=data["proposal_id"],
             )
         elif kind == "resolution-reprobe":
-            if data["available"]:
-                unit.hold = None
-                unit.retry_at = None
-                if unit.state != UnitState.READY:
-                    transition(snapshot, unit.id, UnitState.READY)
+            from .campaign_rearm import apply as apply_rearm
+
+            refusal = data.get("rearm_rejected")
+            if not refusal:
+                try:
+                    apply_rearm(self, snapshot, unit, action, data)
+                except CampaignError as exc:
+                    refusal = str(exc)
+            if refusal:
+                bound_hold = (action.payload.get("rearm_binding") or {}).get(
+                    "hold", action.payload.get("rearm_hold")
+                )
+                if unit.hold and dataclasses.asdict(unit.hold) == bound_hold:
+                    unit.retry_at = max(unit.retry_at or 0, self.clock() + 60)
+                    unit.evidence["technical_rearm_wait"] = {
+                        "reason": refusal,
+                        "retry_at": unit.retry_at,
+                        "action_id": action.id,
+                    }
+                add_event(
+                    snapshot,
+                    "technical-rearm-refused",
+                    unit=unit.id,
+                    action=action.id,
+                    reason=refusal,
+                )
         elif kind == "terminate-worker":
             unit.bindings["stop_requested_for"] = data["launch_id"]
         elif kind == "github":
@@ -5568,6 +6274,19 @@ class CampaignRuntime:
             intent = data["intent"]
             if intent["state"] != "confirmed":
                 raise CampaignError("unconfirmed GitHub mutation cannot advance state")
+            typed_intent = MutationIntent.from_dict(intent)
+            if self._tracking_close(action, typed_intent):
+                reason = self._tracking_guard_reason(snapshot, action, typed_intent)
+                if reason:
+                    deferred = self._tracking_completion_observation(
+                        snapshot, action, typed_intent, reason
+                    )
+                    # The supervisor persists this same observation after apply;
+                    # hide no ACK, but never publish a credited parent receipt.
+                    data.clear()
+                    data.update(deferred.data)
+                    self._apply_effect(snapshot, action, Observation("confirmed", data))
+                    return
             receipt = intent["receipt"]
             purpose = action.payload.get("purpose")
             if purpose == "pr":
@@ -5671,6 +6390,13 @@ class CampaignRuntime:
         elif kind == "launch":
             if not unit.claim or unit.claim.launch_id != action.id:
                 raise CampaignError("launch result no longer owns claim")
+            if action.payload.get("rearm_id") and data.get("not_launched"):
+                from .campaign_rearm import cancel_unlaunched
+
+                data["rearm_cancellation"] = cancel_unlaunched(
+                    snapshot, unit, action, mode="not-launched", result=data
+                )
+                return
             if data.get("managed_communication"):
                 unit.bindings["managed_communication"] = data["managed_communication"]
             if data.get("not_launched") and not data.get("remote_feedback_changed"):
@@ -5931,6 +6657,8 @@ class CampaignRuntime:
         claim = unit.claim
         if not claim or claim.launch_id != action.payload["launch_id"]:
             raise CampaignError("worker receipt no longer owns its claim")
+        if data.get("state") in {"finished", "interrupted"}:
+            self._validate_git_release(snapshot, unit, data)
         if data.get("object_promotion_error"):
             if data["state"] not in {"finished", "interrupted"} or not data.get(
                 "quiescence_confirmed"
@@ -5938,6 +6666,12 @@ class CampaignRuntime:
                 raise CampaignError("unsealed object failure lacks terminal worker quiescence")
             claim.quiescent = True
             claim.status = data["state"]
+            from .campaign_rearm import finish, finish_interrupted
+
+            if data["state"] == "interrupted":
+                finish_interrupted(snapshot, unit, action, data)
+            else:
+                finish(snapshot, unit, data["receipt"])
             unit.evidence["failure"] = {
                 "code": "object_promotion_failed",
                 "producer": "campaign.object_promotion",
@@ -5956,9 +6690,20 @@ class CampaignRuntime:
                 )
             claim.quiescent = True
             claim.status = "interrupted"
+            from .campaign_rearm import finish_interrupted
+
+            finish_interrupted(snapshot, unit, action, data)
             from .campaign_usage import apply as apply_usage
 
             apply_usage(snapshot, unit, data, role=claim.role)
+            if data.get("git_activity_proof", {}).get("observation", {}).get("effect") == "unknown":
+                unit.bindings["head"] = data["head"]
+                self._set_hold(
+                    unit,
+                    Hold("pause_unknown", "Interrupted worker retains an uncertain Git effect", id=claim.launch_id,
+                         evidence={"git_activity": data["git_activity_proof"]}),
+                )
+                return
             if self._preserve_diagnosis_failure(snapshot, unit, {**data, "outcome": "interrupted"}):
                 unit.bindings["head"] = data["head"]
                 return
@@ -6006,6 +6751,9 @@ class CampaignRuntime:
         claim.quiescent = True
         claim.status = "finished"
         receipt = data["receipt"]
+        from .campaign_rearm import finish as finish_rearm
+
+        finish_rearm(snapshot, unit, receipt)
         checkpoint = receipt.get("confirmed_owned_checkpoint")
         if checkpoint is not None:
             if checkpoint.get("state") != "confirmed" or checkpoint.get("head") != receipt["head"]:
