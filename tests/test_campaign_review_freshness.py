@@ -77,7 +77,25 @@ def test_actual_intake_after_review_reverifies_rereviews_and_merges(production_c
         """    if name=="triage":
         contract=context["triage_result_contract"]
         target=next(row for row in context["existing_units"] if row["id"]=="source:project:first")
-        binding=context["intake"]["bindings"][target["id"]]["issue"]
+        intake=context["intake"]
+        if "bindings" in intake:
+            binding=intake["bindings"][target["id"]]["issue"]
+        else:
+            from bmad_loop.campaign_stage_prompt import context_artifacts
+            def granted(descriptor):
+                assert descriptor in request["context_artifacts"]
+                assert descriptor in request["headless_grants"]["read_only_paths"]
+                packet,=context_artifacts(Path(sys.argv[1]).parent,[descriptor])
+                return packet.path
+            index=json.loads(granted(context["retrievable_context"]["index"]).read_bytes())
+            pointer=intake["retrievable_fields"]["bindings"]
+            row,=[r for r in index["records"] if r["key"]==pointer and r["collection"]=="" and r["position"]==target["id"]]
+            chunk,=[f for f in index["files"] if f["path"]==row["path"]]
+            with granted(chunk).open("rb") as stream:
+                stream.seek(row["offset"])
+                raw=stream.read(row["size_bytes"])
+            assert len(raw)==row["size_bytes"] and hashlib.sha256(raw).hexdigest()==row["sha256"]
+            binding=json.loads(raw)["issue"]
         versions=contract["intake_coordinates"]["input_versions"]
         rows=[]
         for version,item in zip(versions,context["intake"]["observations"],strict=True):
