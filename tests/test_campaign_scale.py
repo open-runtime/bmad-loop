@@ -22,7 +22,13 @@ from test_campaign_runtime_queue import QueuedServer
 
 from bmad_loop import campaign_runtime
 from bmad_loop.campaign_headless import file_digest
-from bmad_loop.campaign_model import ReasoningSpec, ResourceSpec, RoleSpec, SourceSelector
+from bmad_loop.campaign_model import (
+    ReasoningSpec,
+    ResourceSpec,
+    RoleSpec,
+    SourceSelector,
+    UnitState,
+)
 from bmad_loop.campaign_scheduler import CapacityObservation
 
 

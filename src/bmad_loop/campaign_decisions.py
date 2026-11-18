@@ -607,21 +607,21 @@ def apply_decision(snapshot: CampaignSnapshot, unit_id: str, receipt: DecisionRe
             disposition=receipt.disposition,
         )
     else:
-        requests = snapshot.bindings.setdefault("decision_requests", {})
+        owner_questions = snapshot.bindings.setdefault("decision_requests", {})
         request_key = _digest(
             json.dumps(
                 {"hold": receipt.hold_id, "head": coordinates.head, "sources": receipt.citations},
                 sort_keys=True,
             )
         )
-        existing = requests.get(request_key)
+        existing = owner_questions.get(request_key)
         if (
             existing
             and receipts.get(existing["receipt"], {}).get("coordinates", {}).get("unit") != unit_id
         ):
             request_key = _digest(json.dumps([unit_id, request_key]))
-        if request_key not in requests:
-            requests[request_key] = {
+        if request_key not in owner_questions:
+            owner_questions[request_key] = {
                 "receipt": receipt.id,
                 "hold_id": receipt.hold_id,
                 "question": unit.hold.reason,
@@ -635,8 +635,8 @@ def apply_decision(snapshot: CampaignSnapshot, unit_id: str, receipt: DecisionRe
                 request=request_key,
                 decision=receipt.id,
             )
-        elif requests[request_key]["receipt"] != receipt.id:
-            request = requests[request_key]
+        elif owner_questions[request_key]["receipt"] != receipt.id:
+            request = owner_questions[request_key]
             previous = request["receipt"]
             request.setdefault("original_receipt", previous)
             request.update(
