@@ -416,9 +416,9 @@ def _registration_wait(snapshot, claim):
 
 
 def status_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
-    from .campaign_action_history import counts as action_counts
-
     """Project execution identities; omit private configuration and evidence."""
+    from .campaign_action_history import counts as action_counts
+    from .campaign_completion_scope import terminal_completion_wait
     from .campaign_external_provenance import summary as external_provenance_summary
     from .campaign_github_faults import status_waits
     from .campaign_intake_baseline import admission_waits
@@ -485,6 +485,11 @@ def status_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
                 "parent": unit.spec.parent,
                 "kind": unit.spec.kind,
                 "state": str(unit.state),
+                **(
+                    {"completion_wait": _inbox_text(reason)}
+                    if (reason := terminal_completion_wait(snapshot, unit))
+                    else {}
+                ),
                 "after": list(unit.spec.after),
                 "attempt": unit.attempt,
                 "resolution_attempts": unit.resolution_attempts,
@@ -791,6 +796,7 @@ def _inbox_items(snapshot: CampaignSnapshot, *, now: float):
 
     from .campaign_capacity import selected_fault
     from .campaign_child_pause import cause as pause_cause
+    from .campaign_completion_scope import terminal_completion_wait
     from .campaign_github_faults import actions_with_held_faults, status_waits
     from .campaign_intake_baseline import admission_waits
     from .campaign_resolution_flow import current_owner_advice, routine_review_pending
@@ -957,6 +963,16 @@ def _inbox_items(snapshot: CampaignSnapshot, *, now: float):
                     if parsed_cause
                     else None
                 ),
+            )
+        if reason := terminal_completion_wait(snapshot, unit):
+            yield row(
+                "completion_wait",
+                unit.id,
+                unit.id,
+                reason,
+                "Recheck current member obligations before declaring parent closure",
+                "Inspect this unit's recorded issue, PR and acceptance criteria. Recover missing evidence through a reviewed intake disposition or the normal verification path. A legacy receipt cannot be upgraded by releasing the unit.",
+                operator_required=not (unit.claim and not unit.claim.quiescent),
             )
         handoff = unit.evidence.get("handoff", {})
         if handoff.get("route_wait"):

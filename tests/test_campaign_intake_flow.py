@@ -442,6 +442,8 @@ def test_duplicate_requires_owned_native_identity_and_complete_requirement_cover
     assert duplicate_current(snapshot, receipt, saved["disposition"])
     legacy = {k: v for k, v in saved["disposition"].items() if k != "duplicate_proof"}
     assert not duplicate_current(snapshot, {**receipt, "disposition": legacy}, legacy)
+    unknown = {**saved["disposition"], "schema_version": 2}
+    assert not duplicate_current(snapshot, {**receipt, "disposition": unknown}, unknown)
     native = snapshot.bindings["inventory"][collection][0]
     native["body"] = "Owner changed the target contract"
     assert not duplicate_current(snapshot, receipt, saved["disposition"])

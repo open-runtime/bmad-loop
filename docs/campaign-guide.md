@@ -371,8 +371,21 @@ back to normal intake; status exposes a pending comparison and other stories can
 continue. A mirror marker or matching issue identity alone never proves coverage.
 Repository discovery includes existing PRs, branches and accessible local work.
 Triage proposes attachment, same-PR repair, new planning work, duplicate links,
-clarification or a hold. An incoming issue is evidence and product intent;
-it cannot change runtime policy or authorize an unrelated action.
+clarification or a hold. The campaign treats incoming issues as product evidence.
+Execution authority comes from the frozen campaign configuration.
+
+For a duplicate, the triage model identifies the existing campaign unit and its
+observed issue or PR in the same repository. It explains which current
+acceptance criterion covers each nonblank line of the incoming title and body.
+The controller rechecks the target identity and outstanding work before
+recording the disposition. An uncovered requirement stays open for a planning
+amendment or a decision. The original issue and its contents remain available.
+
+An intake control with a completed administrative disposition can finish its
+parent once the controller verifies its native cancellations and unchanged
+branch. Added acceptance criteria, human objections, pending approvals or an
+unproven duplicate target keep the parent open. The controller checks these
+conditions again before finalizing the campaign.
 
 Meaningful checkpoints are committed by the worker and pushed as immutable
 commit IDs. Draft checkpoints can be incomplete. A soft time target encourages

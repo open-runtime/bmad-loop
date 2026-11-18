@@ -245,8 +245,8 @@ def install_scripted_disposition(script, marker):
         target, = [row for row in context["existing_units"]
                    if "Source: " + row["id"] + "\\n" in item["payload"]["body"]]
         artifact.update(intake_coordinates=contract, units=[], proposal={
-            "schema_version": 1, "disposition": "duplicate", "input_versions": contract["input_versions"],
-            "unit_id": target["id"], "rationale": "The dated maintenance note adds no new work to the existing acceptance.",
+            "schema_version": 1, "disposition": "attach", "input_versions": contract["input_versions"],
+            "unit_id": target["id"], "rationale": "Attach the repository owner's dated note to this same mapped issue without changing its accepted work.",
             "acceptance_criteria": target["acceptance"], "dependencies": target["after"],
             "related_issue": item["number"], "related_pr": None, "within_scope": True,
             "graph_revision": request["coordinates"]["graph_revision"],
@@ -510,7 +510,7 @@ def test_recovery_soak_cycle(campaign, production_case, tmp_path, monkeypatch):
         assert any(
             row["observation"]["number"] == auth["number"]
             and row["observation"]["payload"]["body"].endswith(marker)
-            and (row.get("disposition") or {}).get("disposition") == "duplicate"
+            and (row.get("disposition") or {}).get("disposition") == "attach"
             for row in settled.bindings[INBOX]["records"].values()
         )
         story_prs = {unit.bindings["pr"]["number"] for unit in stories}

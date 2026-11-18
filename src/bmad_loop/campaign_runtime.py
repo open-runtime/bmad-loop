@@ -556,22 +556,18 @@ class CampaignRuntime:
         return selected
 
     def _units_settled(self, snapshot) -> bool:
-        from .campaign_runtime_intake import optional_canceled, settled
+        from .campaign_completion_scope import all_members_settled
+        from .campaign_runtime_intake import settled
 
-        return (
-            bool(snapshot.units)
-            and all(
-                unit.state == UnitState.DELIVERED or optional_canceled(unit)
-                for unit in snapshot.units.values()
-            )
-            and settled(snapshot)
-        )
+        return all_members_settled(snapshot) and settled(snapshot)
 
     def completion_ready(self, snapshot) -> bool:
         from .campaign_reasoning_flow import outstanding
         from .campaign_tracking_recovery import active
 
-        if any(active(unit) for unit in snapshot.units.values()):
+        if not self._units_settled(snapshot) or any(
+            active(unit) for unit in snapshot.units.values()
+        ):
             return False
         if outstanding(snapshot) or not self.communication_settled(snapshot):
             return False
@@ -2982,6 +2978,9 @@ class CampaignRuntime:
 
             return perform(self, snapshot, action)
         if not self._units_settled(snapshot):
+            return Observation("confirmed", {"stale_scope": True})
+        current = self.store.load(snapshot.id)
+        if current.graph_revision != snapshot.graph_revision or not self._units_settled(current):
             return Observation("confirmed", {"stale_scope": True})
         from .campaign_action_history import TrackingReceipts
 
@@ -6264,6 +6263,8 @@ class CampaignRuntime:
                     tracking_key=data["action_key"],
                 )
             elif data.get("complete") or data.get("reason"):
+                if not self._units_settled(snapshot):
+                    return
                 snapshot.bindings["hierarchy_finalized_graph"] = snapshot.graph_revision
                 snapshot.bindings["hierarchy_remaining_scope"] = data.get("reason", "")
         elif kind in {

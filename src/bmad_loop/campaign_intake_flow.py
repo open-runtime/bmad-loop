@@ -514,6 +514,9 @@ def duplicate_current(snapshot, attempt, disposition):
             attempt.get("state") != "completed"
             or attempt.get("disposition") != disposition
             or proposal.disposition != "duplicate"
+            or type(proposal.schema_version) is not int
+            or proposal.schema_version != 1
+            or proposal.graph_revision != packet["intake_coordinates"]["graph_revision"]
             or set(versions) != set(proposal.input_versions)
             or versions != list(attempt["input_versions"])
             or packet["intake_coordinates"]["campaign"] != snapshot.id

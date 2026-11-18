@@ -28,6 +28,28 @@ def git(*args: str) -> str:
     return subprocess.check_output(["git", *args], cwd=ROOT, text=True, timeout=20).strip()
 
 
+def source_subject() -> dict:
+    """Hash exact Git-reported changes; preserve deletions and symlink identities."""
+    paths = set()
+    for args in (
+        ("diff", "--name-only", "-z", "HEAD"),
+        ("ls-files", "--others", "--exclude-standard", "-z"),
+    ):
+        names = subprocess.check_output(["git", *args], cwd=ROOT, timeout=20)
+        paths.update(os.fsdecode(name) for name in names.split(b"\0") if name)
+    files = {}
+    for name in sorted(paths):
+        path = ROOT / name
+        if path.is_symlink():
+            files[name] = {"symlink": os.readlink(path)}
+        elif path.is_file():
+            with path.open("rb") as stream:
+                files[name] = {"sha256": hashlib.file_digest(stream, "sha256").hexdigest()}
+        else:
+            files[name] = {"kind": "directory" if path.is_dir() else "absent"}
+    return {"commit": git("rev-parse", "HEAD"), "dirty_paths": files}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group(required=True)
@@ -72,6 +94,7 @@ def main() -> int:
         "python": sys.executable,
         "python_version": sys.version,
         "runtime": subject,
+        "checkout_at_start": source_subject(),
         "archived_stage_inputs": histories,
         "started_at": time.time(),
         "status": "running",
@@ -143,6 +166,7 @@ def main() -> int:
                     process.wait(timeout=60)
                     raise
             entry.update(seconds=time.monotonic() - before, exit=code)
+            entry["checkout_at_exit"] = source_subject()
             save("running")
             if (
                 code

@@ -558,8 +558,10 @@ def success_guard(snapshot, action, intent) -> str:
     ).get("context")
     if expected and expected != _digest(_context(snapshot, unit, parent_key)):
         return "Tracking completion source, ownership or acceptance obligations changed"
-    if reason := next(
-        (reason for name in members if (reason := acceptance_wait(snapshot.units[name]))), ""
+    if action.payload.get("purpose") != "parent-tracking" and (
+        reason := next(
+            (reason for name in members if (reason := acceptance_wait(snapshot.units[name]))), ""
+        )
     ):
         return reason
     if any(
@@ -646,13 +648,15 @@ def perform(runtime, snapshot, action):
         return waiting("Tracking recovery waits for member quiescence")
     if debt.get("context") != _digest(_context(snapshot, unit, parent_key)):
         return waiting("Tracking source, ownership or acceptance obligations changed; retain debt")
-    if reason := next(
-        (
-            reason
-            for name in _members(snapshot, unit, parent_key)
-            if (reason := acceptance_wait(snapshot.units[name]))
-        ),
-        "",
+    if not parent_key and (
+        reason := next(
+            (
+                reason
+                for name in _members(snapshot, unit, parent_key)
+                if (reason := acceptance_wait(snapshot.units[name]))
+            ),
+            "",
+        )
     ):
         return waiting(reason)
     if any(

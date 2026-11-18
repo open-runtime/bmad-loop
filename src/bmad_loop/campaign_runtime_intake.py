@@ -40,6 +40,10 @@ from .campaign_supervisor import Proposal
 
 CONTRACT = "intake-triage-v1"
 _NONWORK = frozenset({"attach", "repair_current_pr", "duplicate", "needs_information", "hold"})
+CONTROL_ACCEPTANCE = (
+    "Disposition the exact incoming GitHub evidence within approved scope.",
+    "Review and deliver any proposed BMAD source graph before implementation.",
+)
 
 
 def _digest(value: Any) -> str:
@@ -397,10 +401,7 @@ def create_control(snapshot: CampaignSnapshot, payload: Mapping[str, Any]) -> st
         "intake",
         f"Triage GitHub issue #{number}",
         kind="planning",
-        acceptance=(
-            "Disposition the exact incoming GitHub evidence within approved scope.",
-            "Review and deliver any proposed BMAD source graph before implementation.",
-        ),
+        acceptance=CONTROL_ACCEPTANCE,
         scopes=("resource:campaign-plan",),
         order=-1,
     )

@@ -33,7 +33,8 @@ def dependencies(snapshot, key):
 
 
 def proposals(snapshot):
-    from .campaign_runtime_intake import optional_canceled, settled
+    from .campaign_completion_scope import all_members_settled
+    from .campaign_runtime_intake import settled
     from .campaign_tracking_recovery import pending_parents
 
     if not settled(snapshot):
@@ -70,14 +71,7 @@ def proposals(snapshot):
         selected.append(Proposal("hierarchy-close", unit, {"parent_key": key}))
         if len(selected) >= max(0, LIMIT - len(pending)):
             break
-    if (
-        not remaining
-        and not pending
-        and snapshot.units
-        and all(
-            unit.state == "delivered" or optional_canceled(unit) for unit in snapshot.units.values()
-        )
-    ):
+    if not remaining and not pending and all_members_settled(snapshot):
         selected.append(Proposal("hierarchy-close", next(iter(snapshot.units))))
     return tuple(selected)
 

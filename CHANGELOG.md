@@ -18,6 +18,7 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Bind intake duplicates to an observed issue or PR and check outstanding obligations before closing administrative parents.
 - Retain exact quota-paused tasks across same-route continuation, stale observations, and canceled successor launches.
 - Reconcile proven-unsent issue closes and acknowledged tracking debt without replaying uncertain writes or overriding human closure decisions.
 - Close ready native parent scopes independently while retaining their own member holds and obligations.
