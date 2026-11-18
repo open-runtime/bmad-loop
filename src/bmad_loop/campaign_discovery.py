@@ -25,7 +25,6 @@ from .campaign_github import GithubError, GithubGateway, JsonObject
 from .fences import fenced_spans
 from .verify import GitError, git_bytes
 
-
 INVENTORY_REFRESH_SECONDS = 120
 
 
