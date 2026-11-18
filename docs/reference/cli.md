@@ -60,6 +60,7 @@ bmad-loop campaign migration-qualify SPEC MANIFEST [--json]
 bmad-loop campaign run SPEC [--prepare-only] [--paradev-reflect] [--paradev-project ID] [--json]
 bmad-loop campaign list [--json]
 bmad-loop campaign status ID [--json]
+bmad-loop campaign inbox ID [--unit UNIT] [--after ITEM_ID] [--limit N] [--json]
 bmad-loop campaign history ID [--unit UNIT] [--role ROLE] [--after SEQUENCE] [--limit N] [--json]
 bmad-loop campaign jobs ID [--unit UNIT] [--job JOB] [--after JOB_ID] [--limit N] [--details] [--json]
 bmad-loop campaign endpoints ID [--after SEQUENCE] [--limit N] [--state STATE] [--json]
@@ -102,6 +103,15 @@ unrelated holds and required GitHub reviews remain intact.
 
 History uses an integer event sequence cursor; jobs use a string job-ID cursor.
 Both paginate durable records, including completed jobs outside the hot state.
+
+Inbox reads actionable holds, uncertain external effects and route waits from one
+stored revision. Its JSON `inbox` object includes `items`, `total`, `has_more`
+and `next_after`; limits are 1–200, with a default of 100. Items carry exact unit,
+hold, decision, effect or job identities, their reason, next automatic action,
+retry time when recorded, and required operator action. Missing or invalid typed
+pause evidence is explicitly unknown. Inbox changes no state and starts no worker.
+Restart pagination when the returned campaign revision changes.
+
 `--details` exposes sanitized lifecycle fields, not raw prompts or model results.
 Attach selects the requested role and returns retained file history when its
 terminal has finished. Handoff requests continuation through a frozen approved

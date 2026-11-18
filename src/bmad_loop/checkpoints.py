@@ -43,6 +43,8 @@ from .model import (
     PAUSE_ESCALATION,
     PAUSE_PLAN_CHECKPOINT,
     PAUSE_STORY_CHECKPOINT,
+    PauseCause,
+    PauseKind,
     Phase,
     StoryTask,
 )
@@ -174,7 +176,12 @@ class CheckpointFlowMixin(_MixinBase):
             f"{detail} — resolve, then `bmad-loop resume {self.state.run_id}`",
         )
         self._save()
-        raise RunPaused(reason, PAUSE_ESCALATION, key)
+        raise RunPaused(
+            reason,
+            PAUSE_ESCALATION,
+            key,
+            cause=PauseCause(PauseKind.UNKNOWN, "source.checkpoint", "source_wedged"),
+        )
 
     # -------------------------------------------------------- plan checkpoint
 
@@ -221,6 +228,7 @@ class CheckpointFlowMixin(_MixinBase):
             f"plan checkpoint for {task.story_key}: review the spec, then resume",
             PAUSE_PLAN_CHECKPOINT,
             task.story_key,
+            cause=PauseCause(PauseKind.SOURCE_CHECKPOINT, "source.checkpoint", "plan_checkpoint"),
         )
 
     def _pause_plan_review_owed(self, task: StoryTask) -> None:
@@ -256,6 +264,7 @@ class CheckpointFlowMixin(_MixinBase):
             f"plan checkpoint — review the spec, then resume",
             PAUSE_PLAN_CHECKPOINT,
             task.story_key,
+            cause=PauseCause(PauseKind.SOURCE_CHECKPOINT, "source.checkpoint", "plan_review_owed"),
         )
 
     def _resume_after_dev_verify(self, task: StoryTask) -> None:
@@ -319,6 +328,7 @@ class CheckpointFlowMixin(_MixinBase):
             f"story checkpoint for {task.story_key}: review, then resume",
             PAUSE_STORY_CHECKPOINT,
             task.story_key,
+            cause=PauseCause(PauseKind.SOURCE_CHECKPOINT, "source.checkpoint", "story_checkpoint"),
         )
 
     def _max_stories_reached(self) -> bool:

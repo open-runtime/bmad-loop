@@ -88,6 +88,13 @@ def campaign_review_continuation(task: StoryTask) -> None:
     task.phase = Phase.REVIEW_VERIFY
 
 
+def campaign_development_continuation(task: StoryTask) -> None:
+    """Re-enter exact retained development without widening ordinary resume."""
+    if task.phase not in {Phase.DEV_RUNNING, Phase.DEV_VERIFY, Phase.ESCALATED}:
+        raise IllegalTransition("campaign continuation does not own interrupted development")
+    task.phase = Phase.DEV_VERIFY
+
+
 # The sprint-board regressions `sprintstatus.advance` may perform on explicit
 # opt-in (`allow_regression=True`); every other backward move stays illegal.
 # ("done", "awaiting-operator"): a review pass that finds a `done` story owes

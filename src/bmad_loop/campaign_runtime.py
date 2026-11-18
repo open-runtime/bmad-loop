@@ -308,16 +308,9 @@ class CampaignRuntime:
             }
 
     def source(self, snapshot: CampaignSnapshot, unit: CampaignUnit) -> SourceSelector:
-        if unit.spec.kind in {"tracking", "landing_repair"}:
-            return SourceSelector("explicit", id=unit.spec.source)
-        found = next(
-            (source for source in snapshot.spec.sources if source.id == unit.spec.source), None
-        )
-        if found is not None:
-            return found
-        if unit.spec.kind == "planning":
-            return SourceSelector("explicit", id=unit.spec.source)
-        raise CampaignError(f"unit {unit.id} has no configured BMAD source selector")
+        from .campaign_worker_authority import source_selector
+
+        return source_selector(snapshot, unit)
 
     def _pending(self, snapshot: CampaignSnapshot, unit: str, kind: str | None = None) -> bool:
         return any(
@@ -1678,6 +1671,12 @@ class CampaignRuntime:
                 from .campaign_handoff_flow import adopt_launch
 
                 adopt_launch(snapshot, unit, payload, unit.claim)
+                if (
+                    payload.get("handoff_id")
+                    and unit.evidence.get("handoff", {}).get("native_role") == "dev"
+                ):
+                    owned_action = next(row for row in snapshot.outbox if row.id == action["id"])
+                    self._consume_development_continuation(snapshot, unit, owned_action)
                 from .campaign_scheduler import epic_key
 
                 snapshot.last_epic = epic_key(
@@ -3693,6 +3692,41 @@ class CampaignRuntime:
             },
         )
 
+    def _consume_development_continuation(self, snapshot, unit, action):
+        from .campaign_continuation import prepare_permit
+        from .campaign_store import consume_continuation_permit
+
+        claim = unit.claim
+        envelope = self._launch_envelope(snapshot, action)
+        if isinstance(envelope, Observation):
+            raise CampaignError(envelope.reason or "continuation allowance unavailable")
+        from .campaign_worker_authority import continuation_request
+
+        request = continuation_request(snapshot, unit, claim)
+        permit = prepare_permit(request, envelope)
+        consume_continuation_permit(snapshot, unit.id, permit)
+        action.payload["continuation_permit_id"] = permit["permit_id"]
+
+    def _launch_envelope(self, snapshot, action):
+        """Derive one frozen child policy for claim adoption and dispatch."""
+        from .campaign_worker_authority import ChildAllowanceExhausted, execution_envelope
+
+        unit = snapshot.units[action.unit]
+        claim = unit.claim
+        if claim is None or claim.launch_id != action.id:
+            raise CampaignError("worker envelope requires its exact adopted claim")
+        try:
+            return execution_envelope(
+                self.template(snapshot),
+                snapshot,
+                unit,
+                claim,
+                action.payload,
+                self.store.directory(snapshot.id) / "workers" / action.id,
+            )
+        except ChildAllowanceExhausted as exc:
+            return Observation("rejected", reason=str(exc))
+
     def _prepare_launch(self, snapshot, action):
         """Prepare immutable inputs without persisting a request or spawning a child."""
         unit = snapshot.units[action.unit]
@@ -3741,90 +3775,13 @@ class CampaignRuntime:
                 return Observation(
                     "confirmed", {"not_launched": True, "remote_feedback_changed": True}
                 )
-        template = self.template(snapshot)
+        envelope = self._launch_envelope(snapshot, action)
+        if isinstance(envelope, Observation):
+            return envelope
+        directory = envelope.directory
         from .adapters.multiplexer import configure_multiplexer
 
-        configure_multiplexer(template.policy.mux.backend or None, origin=self.project)
-        directory = self.store.directory(snapshot.id) / "workers" / action.id
-        envelope = dataclasses.replace(
-            template,
-            unit_id=unit.id,
-            attempt=claim.attempt,
-            generation=claim.generation,
-            directory=directory,
-            checkpoint_interval_s=float(snapshot.spec.checkpoints.target_interval_s),
-        )
-        if action.payload["kind"] == "execution":
-            from .campaign_usage import remaining
-
-            remaining_dev, remaining_review = remaining(snapshot, unit)
-            handoff = unit.evidence.get("handoff", {})
-            resuming_review = (
-                action.payload.get("handoff_id") == handoff.get("id")
-                and bool(handoff.get("id"))
-                and handoff.get("native_role") == "review"
-            )
-            if (not resuming_review and remaining_dev <= 0) or (
-                resuming_review and remaining_review <= 0
-            ):
-                return Observation(
-                    "rejected", reason="campaign lifetime child attempt budget exhausted"
-                )
-            envelope = dataclasses.replace(
-                envelope,
-                policy=dataclasses.replace(
-                    template.policy,
-                    limits=dataclasses.replace(
-                        template.policy.limits,
-                        max_dev_attempts=remaining_dev,
-                        max_review_cycles=max(0, remaining_review),
-                    ),
-                ),
-            )
-            if action.payload.get("candidate"):
-                candidate = action.payload["candidate"]
-                selection = dataclasses.replace(
-                    envelope.policy.adapter.dev,
-                    name=candidate["profile"],
-                    model=candidate.get("model", ""),
-                    effort=candidate.get("effort", ""),
-                )
-                profiles = dict(envelope.profiles)
-                profiles["dev"] = profiles.get("campaign:" + candidate["profile"], profiles["dev"])
-                if profiles["dev"].name != candidate["profile"]:
-                    raise CampaignError("execution candidate is absent from the frozen profiles")
-                envelope = dataclasses.replace(
-                    envelope,
-                    profiles=profiles,
-                    policy=dataclasses.replace(
-                        envelope.policy,
-                        adapter=dataclasses.replace(
-                            envelope.policy.adapter,
-                            dev=selection,
-                        ),
-                    ),
-                )
-            if action.payload.get("review_candidate"):
-                candidate = action.payload["review_candidate"]
-                selection = dataclasses.replace(
-                    envelope.policy.adapter.review,
-                    name=candidate["profile"],
-                    model=candidate.get("model", ""),
-                    effort=candidate.get("effort", ""),
-                )
-                profiles = dict(envelope.profiles)
-                profiles["review"] = profiles["campaign:" + candidate["profile"]]
-                envelope = dataclasses.replace(
-                    envelope,
-                    profiles=profiles,
-                    policy=dataclasses.replace(
-                        envelope.policy,
-                        adapter=dataclasses.replace(
-                            envelope.policy.adapter,
-                            review=selection,
-                        ),
-                    ),
-                )
+        configure_multiplexer(envelope.policy.mux.backend or None, origin=self.project)
         workspace = Path(action.payload.get("verification_workspace", unit.bindings["workspace"]))
         request = {
             **action.payload,
@@ -3833,9 +3790,11 @@ class CampaignRuntime:
             "common_dir": snapshot.common_dir,
             "launch_id": action.id,
             "run_id": claim.run_id,
+            "pr_number": (unit.bindings.get("pr") or {}).get("number"),
             "source": unit.bindings.get(
                 "effective_source", source_to_dict(self.source(snapshot, unit))
             ),
+            "source_revision": unit.bindings.get("source_revision", ""),
             "unit": dataclasses.asdict(unit.spec),
             "remote": snapshot.spec.remote,
             "target": snapshot.spec.target,
@@ -3891,6 +3850,24 @@ class CampaignRuntime:
         from .campaign_handoff_flow import decorate_launch
 
         decorate_launch(snapshot, unit, request)
+        if request.get("handoff_state", {}).get("native_role") == "dev":
+            from .campaign_continuation import prepare_permit
+
+            permit = prepare_permit(request, envelope)
+            recorded = unit.evidence.get("continuation_permits", {}).get(permit["permit_id"])
+            if (
+                not recorded
+                or recorded.get("permit") != permit
+                or action.payload.get("continuation_permit_id") != permit["permit_id"]
+            ):
+                raise CampaignError(
+                    "development continuation permit is absent or changed after claim adoption"
+                )
+            request.update(
+                continuation_permit=permit,
+                continuation_consumption=recorded["consumption"],
+                continuation_authority=str(self.store.root.resolve()),
+            )
         from .campaign_hold import channel
 
         request["hold_channel"] = str(channel(self.store.directory(snapshot.id), unit.id))
@@ -3934,7 +3911,7 @@ class CampaignRuntime:
             )
         if request["kind"] == "queue_verify":
             request["candidate"] = request.pop("queue_candidate")
-            request["timeout_s"] = template.policy.verify.command_timeout_min * 60
+            request["timeout_s"] = envelope.policy.verify.command_timeout_min * 60
         elif request["kind"] == "tracking":
             request["tracking"] = unit.bindings["tracking"]
         elif request["kind"] == "recovery":
@@ -3952,7 +3929,7 @@ class CampaignRuntime:
             from .campaign_resolution_delivery import execution_commands
 
             request["config_revision"] = str(snapshot.config_revision)
-            request["timeout_s"] = template.policy.verify.command_timeout_min * 60
+            request["timeout_s"] = envelope.policy.verify.command_timeout_min * 60
             request["commands"] = [
                 list(command) for command in execution_commands(snapshot, unit, request)
             ]
@@ -6077,6 +6054,11 @@ class CampaignRuntime:
         from .campaign_usage import apply as apply_usage
 
         apply_usage(snapshot, unit, receipt, role=claim.role)
+        if receipt.get("child_pause") is not None:
+            from .campaign_child_pause import cause as pause_cause
+
+            pause_cause(receipt)
+            unit.evidence["child_pause"] = receipt["child_pause"]
         from .campaign_handoff_flow import intercept_terminal
 
         if receipt.get("sessions"):
@@ -6089,7 +6071,17 @@ class CampaignRuntime:
             snapshot, unit, receipt
         ):
             return
-        if intercept_terminal(self, snapshot, unit, receipt):
+        pause_handoff_allowed = True
+        if receipt.get("child_pause") is not None:
+            from .campaign_child_pause import cause as pause_cause
+            from .model import PauseKind
+
+            typed_pause = pause_cause(receipt)
+            pause_handoff_allowed = typed_pause is not None and typed_pause.kind in {
+                PauseKind.QUOTA_WAIT,
+                PauseKind.TRANSPORT_FAILURE,
+            }
+        if pause_handoff_allowed and intercept_terminal(self, snapshot, unit, receipt):
             return
         if outcome == "stage_complete":
             directory = self.store.directory(snapshot.id) / "workers" / claim.launch_id
@@ -6188,6 +6180,12 @@ class CampaignRuntime:
         elif outcome == "stage_complete":
             self._apply_stage_result(snapshot, unit, receipt)
         else:
+            if outcome == "paused" or (
+                outcome == "recovery_required" and receipt.get("child_pause") is not None
+            ):
+                from .campaign_child_pause import hold_kind
+
+                outcome = hold_kind(receipt)
             if outcome == "ownership_uncertain":
                 unit.evidence["failure"] = {
                     "code": "ownership_uncertain",
@@ -6229,8 +6227,16 @@ class CampaignRuntime:
                 unit,
                 Hold(
                     outcome,
-                    receipt.get("error", receipt.get("reason", outcome)),
+                    receipt.get("error")
+                    or receipt.get("reason")
+                    or (receipt.get("child_pause") or {}).get("reason")
+                    or outcome,
                     id=claim.launch_id,
+                    evidence=(
+                        {"child_pause": receipt["child_pause"]}
+                        if receipt.get("child_pause") is not None
+                        else {}
+                    ),
                 ),
             )
 

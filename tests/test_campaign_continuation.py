@@ -4,6 +4,7 @@ import dataclasses
 import hashlib
 import json
 import os
+from pathlib import Path
 
 import pytest
 from conftest import git, install_bmad_config, review_effect, write_spec, write_sprint
@@ -11,16 +12,31 @@ from test_engine import make_engine
 
 from bmad_loop import policy as policy_mod
 from bmad_loop import runs, runsetup, verify
-from bmad_loop.campaign_continuation import compose_review, validate_resume
+from bmad_loop.campaign_continuation import (
+    compose_continuation,
+    compose_review,
+    continue_task,
+    prepare_permit,
+    validate_resume,
+)
 from bmad_loop.campaign_execution import CampaignExecution, bind_run
 from bmad_loop.campaign_finalization import _source_roots
 from bmad_loop.campaign_fingerprint import capture
 from bmad_loop.campaign_interruptions import execution_interruption
-from bmad_loop.campaign_model import CampaignError
+from bmad_loop.campaign_model import (
+    CampaignError,
+    CampaignSnapshot,
+    CampaignSpec,
+    CampaignUnit,
+    UnitSpec,
+    UnitState,
+    WorkerClaim,
+)
+from bmad_loop.campaign_store import CampaignStore
 from bmad_loop.campaign_workers import _execution, common_directory, prepare_launch
 from bmad_loop.engine import RunPaused
 from bmad_loop.journal import load_state, save_state
-from bmad_loop.model import Phase, SessionRecord, StoryTask, TokenUsage
+from bmad_loop.model import PauseCause, PauseKind, Phase, SessionRecord, StoryTask, TokenUsage
 
 
 def archive(root, value):
@@ -278,4 +294,300 @@ def test_permit_cannot_survive_candidate_mutation_or_be_replaced_by_boolean(revi
     assert not validate_resume(composed.engine, task)
     with pytest.raises(RunPaused, match="campaign recovery"):
         composed.engine._finish_inflight()
+    assert not adapter.sessions
+
+
+@pytest.fixture(params=["json", "sqlite"])
+def development_handoff(review_handoff, tmp_path, request):
+    storage = request.param
+    project, old, adapter, child, request = review_handoff
+    authority = tmp_path / "authority"
+    child = dataclasses.replace(
+        child, directory=authority / child.campaign_id / "workers" / request["launch_id"]
+    )
+    task = old.state.tasks[request["unit"]["selector"]]
+    task.sessions[-1] = SessionRecord("interrupted-dev", "dev", "crashed", ended="pool")
+    task.baseline_untracked = ["preexisting-untracked.txt"]
+    old.state.record_pause(
+        "native pool unavailable",
+        "escalation",
+        task.story_key,
+        cause=PauseCause(PauseKind.QUOTA_WAIT, "native-session", "pool"),
+    )
+    (project.project / "owned.py").write_text("retained staged work\n")
+    git(project.project, "add", "owned.py")
+    (project.project / "owned.py").write_text("retained unstaged work\n")
+    (project.project / "preexisting-untracked.txt").write_text("retained untracked work\n")
+    save_state(old.run_dir, old.state)
+    handoff = request["handoff_state"]
+    handoff["native_role"] = "dev"
+    handoff["original_state_path"], handoff["original_state_sha256"] = archive(
+        tmp_path / "dev-archive", old.state.to_dict()
+    )
+    sessions = [row.to_dict() for row in task.sessions]
+    receipt = json.loads(Path(handoff["predecessor_receipt_path"]).read_text())
+    receipt.update(sessions=sessions, interruption=execution_interruption(sessions))
+    handoff["predecessor_receipt_path"], handoff["predecessor_receipt_sha256"] = archive(
+        tmp_path / "dev-archive", receipt
+    )
+    roots = _source_roots(project.project, project, old.state)
+    handoff["fingerprint"] = capture(project.project, source_roots=roots).to_dict()
+    request["run_id"] = "dev-successor"
+    request["pr_number"] = 7
+    request["continuation_authority"] = str(authority)
+    request["candidate"] = {
+        "profile": child.policy.adapter.dev.name,
+        "model": child.policy.adapter.dev.model,
+        "effort": child.policy.adapter.dev.effort,
+    }
+    request["continuation_permit"] = prepare_permit(request, child)
+    request["continuation_consumption"] = {
+        "schema_version": 1,
+        "permit_id": request["continuation_permit"]["permit_id"],
+        "successor_launch_id": request["launch_id"],
+        "successor_run_id": request["run_id"],
+        "state": "consumed",
+    }
+    claim = WorkerClaim(
+        child.unit_id,
+        child.attempt,
+        child.generation,
+        request["launch_id"],
+        run_id=request["run_id"],
+        run_dir=str(child.directory),
+        workspace=str(project.project),
+        branch=request["branch"],
+        writes=True,
+    )
+    unit = CampaignUnit(
+        UnitSpec(**request["unit"]),
+        UnitState.RUNNING,
+        claim=claim,
+        bindings={"pr": {"number": 7}},
+        evidence={
+            "continuation_permits": {
+                request["continuation_permit"]["permit_id"]: {
+                    "permit": request["continuation_permit"],
+                    "consumption": request["continuation_consumption"],
+                }
+            },
+            "handoff": {
+                "id": request["handoff_id"],
+                "phase": "continuing",
+                "predecessor": request["native_predecessor"],
+                "successor": dataclasses.asdict(claim),
+            },
+        },
+    )
+    CampaignStore(authority, storage=storage).create(
+        CampaignSnapshot(
+            child.campaign_id,
+            "owner/repo",
+            CampaignSpec("continuation", units=(unit.spec,)),
+            {unit.id: unit},
+            generation=child.generation,
+            config_revision=child.config_revision,
+        )
+    )
+    return project, old, adapter, child, request
+
+
+def compose_development(case):
+    _, _, adapter, envelope, request = case
+    return compose_continuation(
+        request,
+        envelope,
+        make_adapters=lambda *a, **k: {"dev": adapter, "review": adapter, "retro": adapter},
+    )
+
+
+def test_development_composition_retains_exact_dirty_tree_and_task_history(development_handoff):
+    project, old, _, child, request = development_handoff
+    before = old.state.tasks[request["unit"]["selector"]].to_dict()
+    state_bytes = (old.run_dir / "state.json").read_bytes()
+    composed = compose_development(development_handoff)
+    task = composed.state.tasks[request["unit"]["selector"]]
+    expected = dict(
+        before,
+        phase=Phase.DEV_VERIFY.value,
+        generation=before["generation"] + 1,
+        resume_blocked=True,
+    )
+    assert task.to_dict() == expected
+    assert validate_resume(composed.engine, task)
+    assert (
+        capture(
+            project.project, source_roots=_source_roots(project.project, project, old.state)
+        ).to_dict()
+        == request["handoff_state"]["fingerprint"]
+    )
+    assert (old.run_dir / "state.json").read_bytes() == state_bytes
+    assert (
+        composed.engine.policy.limits.max_dev_attempts
+        == task.charged_attempts + child.policy.limits.max_dev_attempts
+    )
+    with pytest.raises(FileExistsError):
+        compose_development(development_handoff)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "missing",
+        "receipt",
+        "successor",
+        "pr",
+        "source",
+        "head",
+        "remaining",
+        "candidate",
+        "grant",
+        "argv_empty",
+        "argv_changed",
+        "checkpoint",
+    ],
+)
+def test_development_permit_binds_exact_consumed_successor(development_handoff, change):
+    project, old, adapter, child, request = development_handoff
+    assert request["continuation_permit"] == prepare_permit(request, child)
+    if change == "missing":
+        request.pop("continuation_permit")
+    elif change == "receipt":
+        request["continuation_consumption"]["state"] = "prepared"
+    elif change == "successor":
+        request["launch_id"] = "another-launch"
+    elif change == "pr":
+        request["pr_number"] = 8
+    elif change == "source":
+        request["source"]["id"] = "other-source"
+    elif change == "head":
+        (project.project / "owned.py").write_text("unexpected work\n")
+    elif change == "remaining":
+        child = dataclasses.replace(
+            child,
+            policy=dataclasses.replace(
+                child.policy, limits=dataclasses.replace(child.policy.limits, max_dev_attempts=0)
+            ),
+        )
+    elif change == "grant":
+        from bmad_loop.plugins.grants import GrantSet
+
+        child = dataclasses.replace(
+            child, grants=GrantSet(snapshot_root=project.project / "grants")
+        )
+    elif change == "argv_empty":
+        child = dataclasses.replace(child, verify_commands=())
+    elif change == "argv_changed":
+        child = dataclasses.replace(child, verify_commands=(("unexpected-verifier",),))
+    elif change == "checkpoint":
+        child = dataclasses.replace(child, checkpoint_interval_s=child.checkpoint_interval_s + 1)
+    else:
+        request["candidate"]["model"] = "unapproved-model"
+    with pytest.raises(CampaignError):
+        compose_development((project, old, adapter, child, request))
+    assert not adapter.sessions
+
+
+def test_development_entry_is_consumed_before_dispatch_and_cannot_replay(
+    development_handoff, monkeypatch
+):
+    _, _, _, _, request = development_handoff
+    composed = compose_development(development_handoff)
+    task = composed.state.tasks[request["unit"]["selector"]]
+    calls = []
+
+    def retained(value, *, prelaunch_validator):
+        assert not validate_resume(composed.engine, value)
+        assert (composed.run_dir / "continuation-consumed.json").is_file()
+        prelaunch_validator()
+        calls.append(value.story_key)
+
+    monkeypatch.setattr(composed.engine, "_continue_campaign_development", retained, raising=False)
+    assert continue_task(composed.engine, task)
+    assert calls == [task.story_key]
+    assert not continue_task(composed.engine, task)
+
+
+def test_development_prelaunch_rechecks_work_changed_by_hooks(development_handoff, monkeypatch):
+    project, _, adapter, _, request = development_handoff
+    composed = compose_development(development_handoff)
+    task = composed.state.tasks[request["unit"]["selector"]]
+
+    def retained(value, *, prelaunch_validator):
+        value.attempt += 1  # Normal counter advancement does not invalidate the grant.
+        prelaunch_validator()
+        (project.project / "owned.py").write_text("changed by a pre-session hook\n")
+        prelaunch_validator()
+
+    monkeypatch.setattr(composed.engine, "_continue_campaign_development", retained)
+    with pytest.raises(CampaignError, match="changed before native launch"):
+        continue_task(composed.engine, task)
+    assert not adapter.sessions
+    assert not validate_resume(composed.engine, task)
+    assert (composed.run_dir / "continuation-consumed.json").exists()
+
+
+@pytest.mark.parametrize("change", ["stopped", "generation", "hold", "claim", "missing_permit"])
+def test_development_rechecks_campaign_authority_at_entry(development_handoff, monkeypatch, change):
+    _, _, _, child, request = development_handoff
+    composed = compose_development(development_handoff)
+    task = composed.state.tasks[request["unit"]["selector"]]
+    assert validate_resume(composed.engine, task)
+    store = CampaignStore(Path(request["continuation_authority"]))
+    snapshot = store.load(child.campaign_id)
+    unit = snapshot.units[child.unit_id]
+    if change == "stopped":
+        snapshot.phase = "stopped"
+    elif change == "generation":
+        snapshot.generation += 1
+    elif change == "hold":
+        from bmad_loop.campaign_model import Hold
+
+        unit.hold = Hold("owner", "preserved owner hold")
+    elif change == "claim":
+        unit.claim.launch_id = "another-successor"
+    else:
+        unit.evidence.pop("continuation_permits")
+    monkeypatch.setattr(CampaignStore, "load", lambda *_: snapshot)
+    assert not validate_resume(composed.engine, task)
+    assert not continue_task(composed.engine, task)
+    assert not (composed.run_dir / "continuation-consumed.json").exists()
+
+
+@pytest.mark.parametrize(
+    "cause",
+    [
+        None,
+        PauseKind.SOURCE_CHECKPOINT,
+        PauseKind.OWNER_DECISION,
+        PauseKind.AUTHENTICATION_FAILURE,
+        PauseKind.UNKNOWN,
+    ],
+)
+def test_development_does_not_reconstruct_pause_authority(
+    development_handoff, tmp_path, monkeypatch, cause
+):
+    project, old, adapter, child, request = development_handoff
+    old.state.paused_cause = PauseCause(cause, "fixture", "typed") if cause else None
+    save_state(old.run_dir, old.state)
+    handoff = request["handoff_state"]
+    handoff["original_state_path"], handoff["original_state_sha256"] = archive(
+        tmp_path / "ineligible-archive", old.state.to_dict()
+    )
+    # Even an otherwise matching proposed permit cannot turn an unknown or
+    # protected pause into an interrupted-development entry.
+    request["continuation_permit"] = prepare_permit(request, child)
+    request["continuation_consumption"]["permit_id"] = request["continuation_permit"]["permit_id"]
+    # Isolate the child-side typed-pause gate from the independent controller
+    # minting gate. Even a matching stored record cannot manufacture this entry.
+    snapshot = CampaignStore(Path(request["continuation_authority"])).load(child.campaign_id)
+    snapshot.units[child.unit_id].evidence["continuation_permits"] = {
+        request["continuation_permit"]["permit_id"]: {
+            "permit": request["continuation_permit"],
+            "consumption": request["continuation_consumption"],
+        }
+    }
+    monkeypatch.setattr(CampaignStore, "load", lambda *_: snapshot)
+    with pytest.raises(CampaignError, match="typed eligible child pause"):
+        compose_development((project, old, adapter, child, request))
     assert not adapter.sessions

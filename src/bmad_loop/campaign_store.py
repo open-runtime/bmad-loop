@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import hashlib
 import json
 import os
 import re
@@ -266,6 +267,107 @@ class CampaignStore:
                     raise CampaignError("configuration change requires quiescent reasoning jobs")
             for key, unit in previous.units.items():
                 replacement = snapshot.units.get(key)
+                prior_permits = unit.evidence.get("continuation_permits", {})
+                next_permits = (
+                    replacement.evidence.get("continuation_permits", {}) if replacement else {}
+                )
+                if any(
+                    next_permits.get(ident) != record for ident, record in prior_permits.items()
+                ):
+                    raise CampaignError("consumed continuation authority is immutable")
+                if len(next_permits.keys() - prior_permits.keys()) > 1:
+                    raise CampaignError("one successor may consume only one continuation permit")
+                for ident in next_permits.keys() - prior_permits.keys():
+                    if replacement is None:
+                        raise CampaignError("continuation requires its retained unit")
+                    record = next_permits[ident]
+                    expected = _continuation_record(snapshot, replacement, record.get("permit"))
+                    from .campaign_usage import remaining as remaining_allowance
+
+                    prior_dev, prior_review = remaining_allowance(previous, unit)
+                    prior_handoff = unit.evidence.get("handoff", {})
+                    if (
+                        record != expected
+                        or ident != expected["permit"]["permit_id"]
+                        or prior_handoff.get("phase") != "ready"
+                        or prior_handoff.get("id") != expected["permit"]["binding"]["handoff_id"]
+                        or not unit.claim
+                        or not unit.claim.quiescent
+                        or unit.claim.launch_id
+                        != expected["permit"]["binding"]["predecessor"]["launch_id"]
+                        or (
+                            unit.hold
+                            and (
+                                unit.hold.kind != "handoff"
+                                or unit.hold.id != prior_handoff.get("id")
+                            )
+                        )
+                        or replacement.hold != unit.hold
+                        or replacement.attempt != unit.attempt + 1
+                        or any(
+                            getattr(replacement, field) != getattr(unit, field)
+                            for field in (
+                                "failure_attempts",
+                                "resolution_attempts",
+                                "review_attempts",
+                            )
+                        )
+                        or any(
+                            replacement.evidence.get(field) != unit.evidence.get(field)
+                            for field in (
+                                "developer_family",
+                                "developer_families",
+                                "developer_attribution_incomplete",
+                                "acceptance",
+                                "usage",
+                                "decisions",
+                                "worker_history",
+                                "unresolved_approval_requirements",
+                            )
+                        )
+                        or snapshot.config_revision != previous.config_revision
+                        or snapshot.bindings.get("execution_template")
+                        != previous.bindings.get("execution_template")
+                        or replacement.spec != unit.spec
+                        or any(
+                            replacement.bindings.get(field) != unit.bindings.get(field)
+                            for field in (
+                                "workspace",
+                                "branch",
+                                "pr",
+                                "effective_source",
+                                "effective_sources",
+                                "private_paths",
+                                "source_revision",
+                            )
+                        )
+                        or any(
+                            replacement.evidence.get("handoff", {}).get(field)
+                            != prior_handoff.get(field)
+                            for field in (
+                                "id",
+                                "role",
+                                "native_role",
+                                "route_role",
+                                "candidate",
+                                "predecessor",
+                                "capture",
+                                "packet",
+                            )
+                        )
+                        or expected["permit"]["binding"]["remaining_dev_attempts"] != prior_dev
+                        or expected["permit"]["binding"]["remaining_review_cycles"]
+                        != max(0, prior_review)
+                        or expected["permit"]["binding"]["successor"]["directory"]
+                        != str(
+                            directory
+                            / "workers"
+                            / expected["permit"]["binding"]["successor"]["launch_id"]
+                        )
+                    ):
+                        raise CampaignError(
+                            "continuation consumption lacks exact prior ownership and successor claim"
+                        )
                 if unit.evidence.get("external_landing"):
                     if (
                         replacement is None
@@ -752,6 +854,166 @@ def add_action(
         raise CampaignError("outbox action ID already exists")
     snapshot.outbox.append(action)
     return action
+
+
+def _continuation_record(snapshot, unit, permit) -> dict[str, Any]:
+    """Bind a development permit to pinned configuration and captured task bytes."""
+    from .campaign_usage import remaining
+
+    if (
+        not isinstance(permit, dict)
+        or set(permit) != {"schema_version", "permit_id", "binding"}
+        or type(permit.get("schema_version")) is not int
+        or permit["schema_version"] != 2
+    ):
+        raise CampaignError("unsupported continuation permit")
+    binding = permit["binding"]
+    if (
+        not isinstance(binding, dict)
+        or permit["permit_id"]
+        != hashlib.sha256(
+            json.dumps(binding, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    ):
+        raise CampaignError("continuation permit identity changed")
+    claim = unit.claim
+    handoff = unit.evidence.get("handoff", {})
+    predecessor = handoff.get("predecessor", {})
+    successor = binding.get("successor", {})
+    dev, review = remaining(snapshot, unit)
+    if (
+        snapshot.phase != "active"
+        or not claim
+        or claim.quiescent
+        or binding.get("campaign_id") != snapshot.id
+        or binding.get("unit_id") != unit.id
+        or binding.get("native_role") != "dev"
+        or handoff.get("native_role") != "dev"
+        or binding.get("config_revision") != snapshot.config_revision
+        or binding.get("handoff_id") != handoff.get("id")
+        or handoff.get("phase") != "continuing"
+        or binding.get("capture_digest") != handoff.get("capture", {}).get("capture_digest")
+        or binding.get("fingerprint")
+        != handoff.get("capture", {}).get("current", {}).get("fingerprint")
+        or any(
+            binding.get(key) != handoff.get("capture", {}).get("current", {}).get(key)
+            for key in ("source_roots", "original_state_sha256", "predecessor_receipt_sha256")
+        )
+        or binding.get("workspace") != unit.bindings.get("workspace")
+        or binding.get("common_dir") != snapshot.common_dir
+        or binding.get("branch") != unit.bindings.get("branch")
+        or type(binding.get("pr_number")) is not int
+        or binding["pr_number"] <= 0
+        or binding["pr_number"] != unit.bindings.get("pr", {}).get("number")
+        or predecessor.get("quiescent") is not True
+        or any(
+            binding.get("predecessor", {}).get(key) != predecessor.get(key)
+            for key in (
+                "launch_id",
+                "run_id",
+                "run_dir",
+                "attempt",
+                "generation",
+            )
+        )
+        or any(
+            successor.get(key) != value
+            for key, value in {
+                "launch_id": claim.launch_id,
+                "run_id": claim.run_id,
+                "directory": claim.run_dir,
+                "attempt": claim.attempt,
+                "generation": snapshot.generation,
+            }.items()
+        )
+        or successor.get("launch_id") == predecessor.get("launch_id")
+        or successor.get("run_id") == predecessor.get("run_id")
+        or type(binding.get("remaining_dev_attempts")) is not int
+        or binding.get("remaining_dev_attempts") != dev
+        or dev <= 0
+        or type(binding.get("remaining_review_cycles")) is not int
+        or binding.get("remaining_review_cycles") != max(0, review)
+        or not any(
+            action.id == claim.launch_id
+            and action.unit == unit.id
+            and action.kind == "launch"
+            and action.generation == claim.generation
+            and action.state in {"prepared", "sent_unknown"}
+            and action.payload.get("kind") == "execution"
+            and action.payload.get("handoff_id") == handoff.get("id")
+            for action in snapshot.outbox
+        )
+        or (unit.hold and (unit.hold.kind != "handoff" or unit.hold.id != handoff.get("id")))
+    ):
+        raise CampaignError(
+            "continuation permit is stale, exhausted or not owned by its exact successor"
+        )
+    from .campaign_continuation import prepare_permit
+    from .campaign_execution import CampaignExecution
+    from .campaign_worker_authority import continuation_request, execution_envelope
+
+    template_binding = snapshot.bindings.get("execution_template")
+    if not isinstance(template_binding, dict):
+        raise CampaignError("continuation has no pinned execution configuration")
+    template = CampaignExecution.load(Path(template_binding["path"]), template_binding["digest"])
+    if template.campaign_id != snapshot.id or template.config_revision != snapshot.config_revision:
+        raise CampaignError("continuation execution configuration belongs to another authority")
+    action = next(row for row in snapshot.outbox if row.id == claim.launch_id)
+    from .campaign_model import RoleCandidate
+
+    try:
+        selected_raw = action.payload["candidate"]
+        approved_raw = handoff["candidate"]
+        selected_route = RoleCandidate(
+            **{**selected_raw, "capacity_command": tuple(selected_raw.get("capacity_command", ()))}
+        )
+        approved_route = RoleCandidate(
+            **{**approved_raw, "capacity_command": tuple(approved_raw.get("capacity_command", ()))}
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise CampaignError("continuation requires its approved frozen route") from exc
+    if selected_route != approved_route:
+        raise CampaignError("continuation route differs from its approved handoff")
+    envelope = execution_envelope(
+        template, snapshot, unit, claim, action.payload, Path(claim.run_dir)
+    )
+    request = continuation_request(snapshot, unit, claim)
+    if prepare_permit(request, envelope) != permit:
+        raise CampaignError(
+            "continuation permit differs from its pinned source, task or configuration"
+        )
+    receipt = {
+        "schema_version": 1,
+        "permit_id": permit["permit_id"],
+        "successor_launch_id": claim.launch_id,
+        "successor_run_id": claim.run_id,
+        "state": "consumed",
+    }
+    return {"permit": permit, "consumption": receipt}
+
+
+def consume_continuation_permit(snapshot, unit_id, permit) -> dict[str, Any]:
+    """Consume once in the same authority transaction as successor adoption."""
+    unit = snapshot.units[unit_id]
+    record = _continuation_record(snapshot, unit, permit)
+    permits = unit.evidence.setdefault("continuation_permits", {})
+    if permit["permit_id"] in permits:
+        raise CampaignError("continuation permit has already been consumed")
+    if any(
+        existing.get("consumption", {}).get("successor_launch_id") == unit.claim.launch_id
+        for existing in permits.values()
+    ):
+        raise CampaignError("successor already consumed continuation authority")
+    permits[permit["permit_id"]] = record
+    add_event(
+        snapshot,
+        "continuation-consumed",
+        unit=unit_id,
+        permit_id=permit["permit_id"],
+        successor=unit.claim.launch_id,
+        predecessor=permit["binding"]["predecessor"]["launch_id"],
+    )
+    return record
 
 
 def transition(snapshot: CampaignSnapshot, unit: str, target: UnitState, **details: Any) -> None:

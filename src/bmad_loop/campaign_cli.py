@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
+import heapq
+import json
 import time
 from collections import Counter
 from pathlib import Path
@@ -41,6 +44,7 @@ def register(subparsers: Any) -> None:
         ("resume", "reconcile and supervise an existing campaign"),
         ("list", "list repository campaigns"),
         ("status", "show campaign units, holds and links"),
+        ("inbox", "read actionable holds, uncertain effects and route waits"),
         ("history", "read bounded campaign events and retained role history"),
         ("jobs", "read bounded reasoning job state and lifecycle receipts"),
         ("messages", "read durable message delivery and application status"),
@@ -205,6 +209,10 @@ def register(subparsers: Any) -> None:
             child.add_argument("--after", default="")
             child.add_argument("--limit", type=int, default=100)
             child.add_argument("--details", action="store_true")
+        if command == "inbox":
+            child.add_argument("--unit", default="", metavar="UNIT")
+            child.add_argument("--after", default="", metavar="ITEM_ID")
+            child.add_argument("--limit", type=int, default=100)
         if command == "messages":
             child.add_argument("--unit", default="", metavar="UNIT")
             child.add_argument("--job", default="", metavar="JOB")
@@ -718,6 +726,366 @@ def status_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
     }
 
 
+def _inbox_text(value, *, limit=2048):
+    """Retain useful wait prose while failing closed on credential-shaped text."""
+    import re
+
+    from .sanitize import assert_no_leak, scrub_text
+
+    text = scrub_text(str(value))
+    # Wait prose can come from remote comments or provider diagnostics. Strip
+    # terminal controls before rendering it as an operator-facing line.
+    text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)", "", text)
+    text = "".join(
+        " " if char in "\r\n\t" else char
+        for char in text
+        if char in "\r\n\t" or (ord(char) >= 32 and not 127 <= ord(char) < 160)
+    )
+    if assert_no_leak(text):
+        text = re.sub(
+            r"\S+",
+            lambda match: "<redacted:secret>" if assert_no_leak(match[0]) else match[0],
+            text,
+        )
+    if assert_no_leak(text):
+        return "Sensitive details withheld; inspect the private receipt"
+    return text[:limit]
+
+
+def _inbox_items(snapshot: CampaignSnapshot, *, now: float):
+    """Read recorded waits only; prose never establishes cause or retry authority."""
+    from types import SimpleNamespace
+
+    from .campaign_capacity import selected_fault
+    from .campaign_child_pause import cause as pause_cause
+    from .campaign_github_faults import status_waits
+    from .campaign_intake_baseline import admission_waits
+    from .campaign_scheduler import CapacityObservation, admit, route_unavailable
+    from .model import PauseKind
+
+    def row(
+        kind,
+        unit,
+        reference,
+        reason,
+        automatic,
+        operator,
+        retry=None,
+        *,
+        operator_required=False,
+        **fields,
+    ):
+        identity = hashlib.sha256(json.dumps([kind, unit, reference]).encode()).hexdigest()
+        retired = bool(snapshot.bindings.get("ownership_retirement"))
+        return {
+            "id": kind + ":" + identity,
+            "kind": kind,
+            "unit_id": unit,
+            "reason": _inbox_text(reason),
+            "next_automatic_action": (
+                "None; campaign ownership is retired"
+                if retired
+                else (
+                    automatic
+                    if snapshot.phase == "active"
+                    else "None while campaign is " + snapshot.phase
+                )
+            ),
+            "retry_at": retry,
+            "operator_action": (
+                "Inspect preserved history and the recorded successor; this campaign is retired"
+                if retired
+                else operator
+            ),
+            "operator_action_required": operator_required,
+            **fields,
+        }
+
+    decisions = {}
+    for identity, receipt in snapshot.bindings.get("decision_receipts", {}).items():
+        coordinate = receipt.get("coordinates", {})
+        unit = snapshot.units.get(coordinate.get("unit"))
+        if unit and unit.hold and unit.hold.id == receipt.get("hold_id"):
+            key = (unit.id, unit.hold.id)
+            refs = decisions.setdefault(key, {"ids": [], "total": 0})
+            refs["total"] += 1
+            if len(refs["ids"]) < 32:
+                refs["ids"].append(identity)
+    waits = admit(snapshot, blocked=admission_waits(snapshot)).waits
+    inventory = snapshot.bindings.get("inventory", {})
+    for unit in snapshot.units.values():
+        if unit.hold:
+            hold = unit.hold
+            automatic = "No automatic continuation is established by current evidence"
+            operator = "Inspect this hold and resolve its actual condition; it remains protected"
+            if hold.kind == "operator":
+                operator = "Use campaign release for this unit only when this explicit operator hold may be released"
+            elif hold.kind in {"remote_wait", "external_wait"} and hold.actor == "github":
+                automatic = "Reobserve bound GitHub conditions before repeating acceptance"
+                operator = "Resolve the recorded remote condition if intervention is required"
+            elif hold.kind in {
+                "product_choice",
+                "planning_decision",
+                "design_choice",
+                "decision",
+                "approval",
+                "checkpoint",
+            }:
+                operator = "Provide authorized evidence for this exact hold or decision; a response does not itself grant approval"
+            pause = unit.evidence.get("child_pause")
+            parsed_cause = None
+            pause_reason = "No supported typed child-pause receipt was recorded"
+            if (
+                isinstance(pause, dict)
+                and type(pause.get("schema_version")) is int
+                and pause["schema_version"] == 1
+            ):
+                try:
+                    binding = pause.get("binding")
+                    if not isinstance(binding, dict):
+                        raise CampaignError("child pause lacks terminal bindings")
+                    parsed_cause = pause_cause({**binding, "child_pause": pause})
+                    if (
+                        binding.get("campaign_id") != snapshot.id
+                        or binding.get("unit_id") != unit.id
+                    ):
+                        raise CampaignError("child pause belongs to another campaign or unit")
+                except (CampaignError, ValueError, TypeError):
+                    parsed_cause = None
+                    pause_reason = (
+                        "Recorded child-pause receipt is missing, invalid or bound elsewhere"
+                    )
+                else:
+                    pause_reason = (
+                        "Producer did not record a typed pause cause"
+                        if parsed_cause is None
+                        else (
+                            "Producer recorded an unknown pause cause"
+                            if parsed_cause.kind == PauseKind.UNKNOWN
+                            else ""
+                        )
+                    )
+            typed = parsed_cause is not None and parsed_cause.kind != PauseKind.UNKNOWN
+            refs = decisions.get((unit.id, hold.id), {"ids": [], "total": 0})
+            yield row(
+                "hold",
+                unit.id,
+                hold.id,
+                hold.reason,
+                automatic,
+                operator,
+                unit.retry_at,
+                operator_required=(
+                    False
+                    if hold.kind in {"remote_wait", "external_wait"} and hold.actor == "github"
+                    else True
+                ),
+                hold_id=hold.id,
+                hold_kind=hold.kind,
+                actor=hold.actor,
+                decision_ids=refs["ids"],
+                decision_ids_total=refs["total"],
+                decision_ids_truncated=refs["total"] > len(refs["ids"]),
+                pause_evidence_status="typed" if typed else "unknown",
+                pause_evidence_reason=pause_reason,
+                pause_cause=(
+                    {
+                        **parsed_cause.to_dict(),
+                        "producer": _inbox_text(parsed_cause.producer, limit=128),
+                        "code": _inbox_text(parsed_cause.code, limit=128),
+                    }
+                    if parsed_cause
+                    else None
+                ),
+            )
+        handoff = unit.evidence.get("handoff", {})
+        if handoff.get("route_wait"):
+            yield row(
+                "route_wait",
+                unit.id,
+                handoff.get("id", ""),
+                handoff["route_wait"],
+                "Refresh route capacity and reconsider qualified continuation",
+                "Inspect route availability; no unqualified fallback or new allowance is authorized",
+                unit.retry_at,
+                handoff_id=handoff.get("id", ""),
+            )
+        if not unit.hold and unit.id in waits:
+            yield row(
+                "admission_wait",
+                unit.id,
+                unit.id,
+                waits[unit.id],
+                "Reconsider admission after its recorded constraint clears",
+                "Inspect dependencies or capacity when intervention is required",
+                unit.retry_at,
+            )
+        elif not unit.hold and unit.state in {"pending", "ready"} and not inventory.get("complete"):
+            yield row(
+                "discovery_wait",
+                unit.id,
+                unit.id,
+                (
+                    "Repository discovery is incomplete"
+                    if inventory
+                    else "Repository discovery has not completed"
+                ),
+                "Refresh repository inventory before admitting this unit",
+                "Inspect campaign status discovery details if observation remains unavailable",
+            )
+    for action in snapshot.outbox:
+        if action.state == "confirmed":
+            continue
+        external = action.kind.startswith("github") or action.kind in {"push", "checkpoint"}
+        if not (
+            action.error
+            or action.next_retry_at
+            or action.state == "rejected"
+            or (external and action.state == "sent_unknown")
+        ):
+            continue
+        projected = status_waits(SimpleNamespace(outbox=(action,)), limit=1)["items"]
+        fault = projected[0].get("github_fault") if projected else None
+        if fault:
+            fault = {
+                key: _inbox_text(value, limit=256) if isinstance(value, str) else value
+                for key, value in fault.items()
+            }
+        yield row(
+            "unknown_effect" if external and action.state == "sent_unknown" else "effect_wait",
+            action.unit,
+            action.id,
+            action.error
+            or (
+                "Effect was refused without a recorded reason"
+                if action.state == "rejected"
+                else (
+                    "External effect acknowledgement is not yet established"
+                    if external
+                    else "Effect wait reason was not recorded"
+                )
+            ),
+            (
+                "No automatic resubmission for a rejected effect"
+                if action.state == "rejected"
+                else "Reconcile the existing effect after its retry deadline; never blindly repeat a mutation"
+            ),
+            (
+                "Inspect the exact effect receipt and resolve its refusal"
+                if action.state == "rejected"
+                else "Preserve uncertain effects; inspect their receipts before any intervention"
+            ),
+            action.next_retry_at or None,
+            operator_required=action.state == "rejected",
+            effect_id=action.id,
+            effect_kind=action.kind,
+            effect_state=action.state,
+            github_fault=fault,
+        )
+    for job in snapshot.jobs.values():
+        if job.get("state") not in {"capacity_wait", "failed", "exhausted"}:
+            continue
+        request = job.get("request") or {}
+        yield row(
+            "job_wait",
+            request.get("unit", ""),
+            job["id"],
+            job.get("reason") or "No typed reason was recorded for this job wait",
+            (
+                "Refresh capacity before reconsidering this job"
+                if job["state"] == "capacity_wait"
+                else "No automatic retry is established by this terminal job record"
+            ),
+            "Inspect the job receipt; retained attempts and approval requirements still apply",
+            job.get("retry_at"),
+            operator_required=job["state"] != "capacity_wait",
+            job_id=job["id"],
+            job_state=job["state"],
+        )
+    batch = snapshot.bindings.get("capacity", {})
+    for index, route in enumerate(batch.get("observations", [])):
+        capacity = route.get("capacity", {})
+        if not isinstance(capacity, dict):
+            capacity = {}
+        try:
+            observed = CapacityObservation(**capacity)
+            observed = dataclasses.replace(
+                observed,
+                observed_at=(
+                    observed.observed_at
+                    if observed.observed_at is not None
+                    else batch.get("observed_at", 0)
+                ),
+                expires_at=(
+                    observed.expires_at
+                    if observed.expires_at is not None
+                    else batch.get("observed_at", 0) + 120
+                ),
+            )
+            reason = selected_fault(
+                snapshot, route.get("profile", ""), route.get("model", ""), now=now
+            ) or route_unavailable(observed, now=now)
+        except (AttributeError, KeyError, TypeError, ValueError, CampaignError):
+            reason = "Stored provider capacity evidence is invalid or incomplete"
+        launcher_reasons = [
+            entry.get("reason") or "Qualified launcher unavailable"
+            for entry in route.get("launchers", [])
+            if entry.get("ready") is False
+        ]
+        if not reason and not launcher_reasons:
+            continue
+        reason = "; ".join([value for value in [reason, *launcher_reasons] if value])
+        if capacity.get("reason") and capacity["reason"] not in reason:
+            reason += "; " + str(capacity["reason"])
+        yield row(
+            "provider_wait",
+            "",
+            [route.get("profile"), route.get("model"), index],
+            reason,
+            "Refresh provider capacity before selecting this route",
+            "Restore provider access if required; unknown capacity cannot qualify a route",
+            None,
+            profile=route.get("profile", ""),
+            model=route.get("model", ""),
+            capacity_known=capacity.get("known") is True,
+            capacity_observed_at=capacity.get("observed_at", batch.get("observed_at")),
+            capacity_expires_at=capacity.get("expires_at"),
+        )
+
+
+def inbox_document(snapshot: CampaignSnapshot, *, unit="", after="", limit=100, now=None):
+    """A bounded page from a single stored revision, without advancing authority."""
+    if not 1 <= limit <= 200:
+        raise CampaignError("inbox page limit must be between 1 and 200")
+    if unit and unit not in snapshot.units:
+        raise CampaignError(f"unknown campaign unit {unit}")
+    total = 0
+
+    def candidates():
+        nonlocal total
+        for item in _inbox_items(snapshot, now=time.time() if now is None else now):
+            if unit and item["unit_id"] != unit:
+                continue
+            total += 1
+            if item["id"] > after:
+                yield item
+
+    page = heapq.nsmallest(limit + 1, candidates(), key=lambda item: item["id"])
+    more = len(page) > limit
+    items = page[:limit]
+    return {
+        "campaign_id": snapshot.id,
+        "revision": snapshot.revision,
+        "generation": snapshot.generation,
+        "phase": snapshot.phase,
+        "items": items,
+        "total": total,
+        "has_more": more,
+        "next_after": items[-1]["id"] if more else None,
+        "unit_filter": unit,
+    }
+
+
 def _emit(args: argparse.Namespace, result: dict[str, Any]) -> int:
     if args.json:
         machine.emit(result)
@@ -741,6 +1109,29 @@ def _emit(args: argparse.Namespace, result: dict[str, Any]) -> int:
                 print(f"{campaign['id']}: {campaign['phase']} ({campaign['name']})")
         elif "request" in result:
             print(f"{result['command']}: request {result['request']['id']} queued")
+        elif "inbox" in result:
+            inbox = result["inbox"]
+            print(f"{inbox['campaign_id']}: {inbox['total']} inbox items ({inbox['phase']})")
+            for item in inbox["items"]:
+                print(f"  {item['unit_id'] or 'campaign'}: {item['kind']} — {item['reason']}")
+                identities = [
+                    f"{key}={item[key]}"
+                    for key in ("hold_id", "effect_id", "job_id", "handoff_id")
+                    if item.get(key)
+                ]
+                identities.extend("decision_id=" + value for value in item.get("decision_ids", []))
+                if identities:
+                    print("    " + ", ".join(identities))
+                if item.get("pause_evidence_status") == "unknown":
+                    print("    Pause evidence: unknown — " + item["pause_evidence_reason"])
+                print(f"    Next: {item['next_automatic_action']}")
+                if item["retry_at"] is not None:
+                    print(f"    Retry at: {item['retry_at']}")
+                else:
+                    print("    Retry deadline: not recorded")
+                print(f"    Operator: {item['operator_action']}")
+            if inbox["has_more"]:
+                print(f"  More items: --after {inbox['next_after']}")
         elif "jobs" in result:
             for job in result["jobs"]:
                 print(f"{job['id']}: {job['state']} ({job['purpose']}) {job.get('reason', '')}")
@@ -898,7 +1289,7 @@ def dispatch(args: argparse.Namespace) -> int:
     snapshot = store.load(campaign_id)
     from .campaign_transfer import require_not_retired
 
-    if command not in {"status", "history", "jobs", "messages", "endpoints", "transfer"}:
+    if command not in {"status", "inbox", "history", "jobs", "messages", "endpoints", "transfer"}:
         try:
             require_not_retired(snapshot, operation=command)
         except CampaignError as exc:
@@ -934,6 +1325,15 @@ def dispatch(args: argparse.Namespace) -> int:
         return _emit(args, _result(command, **report))
     if command == "status":
         return _emit(args, _result(command, campaign=status_document(snapshot)))
+    if command == "inbox":
+        try:
+            inbox = inbox_document(snapshot, unit=args.unit, after=args.after, limit=args.limit)
+        except CampaignError as exc:
+            return _emit(args, _result(command, ok=False, problems=[str(exc)]))
+        return _emit(
+            args,
+            _result(command, inbox=inbox),
+        )
     if command == "endpoints":
         from .campaign_managed_communication import ManagedCommunication
 

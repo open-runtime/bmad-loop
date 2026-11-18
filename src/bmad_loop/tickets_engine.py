@@ -125,6 +125,8 @@ from .model import (
     PAUSE_SPEC_APPROVAL,
     PAUSE_STORY_GATE,
     PAUSE_TICKET_TREE,
+    PauseCause,
+    PauseKind,
     Phase,
     RunState,
     StoryTask,
@@ -170,6 +172,7 @@ from .tickets_source import (
     committed_epics,
     dispatch_invocation,
     epic_boundary,
+    halt_pause_cause,
     path_overlaps,
     plan_planned,
     ticket_binding,
@@ -951,14 +954,14 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
             f"{self._resume_hint()}"
         )
         gates.notify(self.policy, self.run_dir, f"hitl ticket: {halt.key}", reason)
-        raise RunPaused(reason, halt.stage, halt.key)
+        raise RunPaused(reason, halt.stage, halt.key, cause=halt_pause_cause(halt.cause))
 
     def _pause_ticket_refine(self, halt: Halt) -> NoReturn:
         """The next ticket needs refining (bmad-agent-po) before a build can start."""
         self.journal.append("ticket-refine-pause", ref=halt.key)
         reason = f"{halt.detail} — refine it with bmad-agent-po, then {self._resume_hint()}"
         gates.notify(self.policy, self.run_dir, f"ticket needs refining: {halt.key}", reason)
-        raise RunPaused(reason, halt.stage, halt.key)
+        raise RunPaused(reason, halt.stage, halt.key, cause=halt_pause_cause(halt.cause))
 
     def _pause_ticket_pick(self, halt: Halt) -> NoReturn:
         """Every other pick halt: a refined plan checkpoint (named story file), an
@@ -987,7 +990,7 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
             detail=halt.detail,
         )
         gates.notify(self.policy, self.run_dir, f"tickets run paused: {halt.cause}", reason)
-        raise RunPaused(reason, halt.stage, halt.key or None)
+        raise RunPaused(reason, halt.stage, halt.key or None, cause=halt_pause_cause(halt.cause))
 
     def _pause_blocked_plan(self, halt: Halt) -> NoReturn:
         """A blocked plan this run did not park: record the ESCALATED wedge task
@@ -1121,6 +1124,7 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
                 f"awaiting spec approval for {task.story_key}",
                 PAUSE_SPEC_APPROVAL,
                 task.story_key,
+                cause=PauseCause(PauseKind.SOURCE_CHECKPOINT, "tickets.gates", "spec_approval"),
             )
         self._review_and_commit(task)
 
@@ -2010,7 +2014,12 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
             f"but not committed; fix the ticket tree, then {self._resume_hint()}"
         )
         gates.notify(self.policy, self.run_dir, f"mark {target} failed: {task.story_key}", reason)
-        raise RunPaused(reason, PAUSE_TICKET_TREE, task.story_key)
+        raise RunPaused(
+            reason,
+            PAUSE_TICKET_TREE,
+            task.story_key,
+            cause=PauseCause(PauseKind.TECHNICAL_FAILURE, "tickets.mark", "terminal_mark_failed"),
+        )
 
     # ------------------------------------------- shared store: after landing
 
@@ -2304,7 +2313,12 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
             f"the mark is still owed; fix the ticket tree, then {self._resume_hint()}"
         )
         gates.notify(self.policy, self.run_dir, f"mark {target} failed: {task.story_key}", reason)
-        raise RunPaused(reason, PAUSE_TICKET_TREE, task.story_key)
+        raise RunPaused(
+            reason,
+            PAUSE_TICKET_TREE,
+            task.story_key,
+            cause=PauseCause(PauseKind.TECHNICAL_FAILURE, "tickets.mark", "landed_mark_failed"),
+        )
 
     def _apply_adoption(self, task: StoryTask) -> None:
         """An adopted kept branch (``resolve --adopt-branch``) is the orchestrator's
@@ -2468,4 +2482,9 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
             f"ticket tree, then {self._resume_hint()}"
         )
         gates.notify(self.policy, self.run_dir, f"plan re-arm failed: {task.story_key}", reason)
-        raise RunPaused(reason, PAUSE_TICKET_TREE, task.story_key)
+        raise RunPaused(
+            reason,
+            PAUSE_TICKET_TREE,
+            task.story_key,
+            cause=PauseCause(PauseKind.TECHNICAL_FAILURE, "tickets.mark", "rearm_failed"),
+        )

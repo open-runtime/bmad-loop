@@ -77,6 +77,8 @@ from .model import (
     SWEEP_REFUSED_DIRTY,
     SWEEP_REFUSED_FAILED,
     SWEEP_REFUSED_NOT_STARTED,
+    PauseCause,
+    PauseKind,
     Phase,
     RunState,
     SessionRecord,
@@ -325,17 +327,58 @@ USAGE_RELAUNCH_RESUME = (
     "work is still in the working tree, so continue that work rather than "
     "starting over."
 )
+CAMPAIGN_DEVELOPMENT_RESUME = (
+    "The previous campaign session ended before this work finished. Its partial "
+    "work remains in the working tree; continue that work and retain every "
+    "unfinished acceptance and approval requirement."
+)
 
 
 class RunPaused(Exception):
-    def __init__(self, reason: str, stage: str, story_key: str | None = None):
+    def __init__(
+        self,
+        reason: str,
+        stage: str,
+        story_key: str | None = None,
+        *,
+        cause: PauseCause | None = None,
+    ):
         super().__init__(reason)
         self.reason = reason
         self.stage = stage
         self.story_key = story_key
+        self.cause = cause
         # The usage-limit facts of a pause whose reason is the usage-limit reason
         # (DW-591), attached by `Engine._escalate_session`; None on every other.
         self.usage_limit: UsageLimitPause | None = None
+
+
+def _session_pause_cause(
+    result: SessionResult | None, usage_limit: UsageLimitPause | None
+) -> PauseCause | None:
+    """Classify adapter fields only; session prose never supplies retry authority."""
+    native = (result.native_binding or {}).get("outcome") if result is not None else None
+    if result is not None and result.status != "completed" and native == "authentication":
+        return PauseCause(PauseKind.AUTHENTICATION_FAILURE, "engine.session", "authentication")
+    if usage_limit is not None or (
+        result is not None
+        and result.status != "completed"
+        and (
+            native == "quota" or result.usage_limited or result.transport_fault in {"usage", "pool"}
+        )
+    ):
+        return PauseCause(PauseKind.QUOTA_WAIT, "engine.session", "usage_limit")
+    if result is None or result.status == "completed":
+        return None
+    if native == "transport" or result.transport_fault == "transport":
+        return PauseCause(PauseKind.TRANSPORT_FAILURE, "engine.session", "transport")
+    if result.parked:
+        return PauseCause(PauseKind.OWNER_DECISION, "engine.session", "human_prompt")
+    if result.env_fault or result.transport_fault == "environment":
+        return PauseCause(PauseKind.TECHNICAL_FAILURE, "engine.session", "environment")
+    if result.status in {"crashed", "timeout", "over_budget"}:
+        return PauseCause(PauseKind.TECHNICAL_FAILURE, "engine.session", result.status)
+    return None
 
 
 SpecWriteReason = Literal["salvage", "reconcile", "adoption", "repair", "implemented-review"]
@@ -947,6 +990,8 @@ class Engine:
             raise ValueError("campaign child requires its frozen campaign execution envelope")
         self.campaign_execution = campaign_execution
         self._campaign_retained_permit: Any = None
+        self._campaign_development_entry: StoryTask | None = None
+        self._campaign_development_prelaunch: Callable[[], None] | None = None
         self.paths = paths
         # where code+git work + artifact reads happen. isolation="none" (today's
         # only mode) → the repo root in place; Phase 3 swaps in per-unit worktrees.
@@ -1151,12 +1196,17 @@ class Engine:
         )
 
     def _escalation_pause(
-        self, reason: str, story_key: str = "", *, cause: BaseException | None = None
+        self,
+        reason: str,
+        story_key: str = "",
+        *,
+        cause: BaseException | None = None,
+        pause_cause: PauseCause | None = None,
     ) -> NoReturn:
         """Raise the engine's ``RunPaused`` (PAUSE_ESCALATION) on behalf of the
         worktree collaborator. Injected as a callable so ``worktree_flow`` need not
         import ``RunPaused`` — that would reintroduce a runtime<->engine cycle."""
-        raise RunPaused(reason, PAUSE_ESCALATION, story_key) from cause
+        raise RunPaused(reason, PAUSE_ESCALATION, story_key, cause=pause_cause) from cause
 
     # ------------------------------------------------------------- top level
 
@@ -1339,6 +1389,7 @@ class Engine:
                     pause.story_key,
                     reset_at=usage.reset_at if usage is not None else None,
                     limit_class=usage.limit_class if usage is not None else None,
+                    cause=pause.cause,
                 )
                 # Present-only, like `session-end`'s usage-limit fields.
                 pause_extras: dict = {}
@@ -2724,9 +2775,9 @@ class Engine:
                     self._campaign_recovery(task, cause="resume")
         for task in list(self.state.tasks.values()):
             if self.campaign_execution is not None:
-                from .campaign_continuation import continue_review
+                from .campaign_continuation import continue_task
 
-                if continue_review(self, task):
+                if continue_task(self, task):
                     self._post_story_after_replay(task)
                     self._after_story(task)
                     continue
@@ -3687,6 +3738,7 @@ class Engine:
                             f"blocking workflow {wf.name!r} ({lp.name})", result
                         ),
                         usage_limit_pause(result),
+                        result=result,
                     )
                 if result.parked:
                     # Parked on a human prompt (DW-348/DW-350): the adapter withheld
@@ -3696,6 +3748,7 @@ class Engine:
                         task,
                         parked_pause_reason(f"blocking workflow {wf.name!r} ({lp.name})", result),
                         usage_limit_pause(result),
+                        result=result,
                     )
                 if not result.produced_work:
                     # Never did anything (#727): a deferral would charge the story
@@ -3793,6 +3846,7 @@ class Engine:
                 f"awaiting spec approval for {task.story_key}",
                 PAUSE_SPEC_APPROVAL,
                 task.story_key,
+                cause=PauseCause(PauseKind.SOURCE_CHECKPOINT, "engine.gates", "spec_approval"),
             )
         self._review_and_commit(task)
 
@@ -4022,24 +4076,92 @@ class Engine:
         del task
         return None
 
+    def _continue_campaign_development(
+        self, task: StoryTask, *, prelaunch_validator: Callable[[], None] | None = None
+    ) -> None:
+        """Enter only the retained task selected by the consumed campaign permit.
+
+        Keep the source engine's normal checkpoint and final review behavior.
+        The one-shot entry changes development initialization, never completion
+        authority, source selection, lifetime allowances or native history.
+        """
+        if (
+            self.campaign_execution is None
+            or self.state.tasks.get(task.story_key) is not task
+            or task.phase != Phase.DEV_VERIFY
+            or self._campaign_development_entry is not None
+        ):
+            raise RuntimeError("campaign development continuation lacks its exact retained task")
+
+        def validate_retained_entry() -> None:
+            try:
+                assert prelaunch_validator is not None
+                prelaunch_validator()
+            except (OSError, ValueError) as exc:
+                # The consumed permit remains spent. An observation failure or
+                # changed authority preserves the candidate for reconciliation;
+                # it is never permission for legacy rollback or a fresh pick.
+                raise RunPaused(
+                    f"campaign continuation authority changed before launch: {exc}",
+                    PAUSE_ESCALATION,
+                    task.story_key,
+                    cause=PauseCause(
+                        PauseKind.UNKNOWN, "engine.continuation", "continuation_authority_changed"
+                    ),
+                ) from exc
+
+        self._campaign_development_entry = task
+        self._campaign_development_prelaunch = (
+            validate_retained_entry if prelaunch_validator is not None else None
+        )
+        try:
+            self._drive_story(task)
+        finally:
+            self._campaign_development_entry = None
+            self._campaign_development_prelaunch = None
+
     def _dev_phase(self, task: StoryTask, resume_result: SessionResult | None = None) -> bool:
+        retained = self._campaign_development_entry is task
+        retained_validator = self._campaign_development_prelaunch if retained else None
+        retained_prompt = None
+        if retained:
+            self._campaign_development_entry = None
+            self._campaign_development_prelaunch = None
+            if resume_result is not None:
+                raise RuntimeError("retained development cannot fabricate a completed result")
+            retained_prompt = self._usage_relaunch_prompt(task)
+            if retained_prompt is None:
+                raise RunPaused(
+                    "campaign continuation cannot bind its retained source; preserve the working tree",
+                    PAUSE_ESCALATION,
+                    task.story_key,
+                    cause=PauseCause(
+                        PauseKind.UNKNOWN, "engine.continuation", "retained_source_unavailable"
+                    ),
+                )
+            # Reuse the source-specific explicit-spec prompt and its checkpoint
+            # clauses; only the engine-authored explanation changes.
+            retained_prompt = retained_prompt.replace(
+                USAGE_RELAUNCH_RESUME, CAMPAIGN_DEVELOPMENT_RESUME, 1
+            )
         if resume_result is None:
             # DW-523: probe before anything below mutates the task, so an
             # `environment` pause leaves nothing to roll back on resume.
             self._gate_dispatch(task, "dev")
             # A fresh invocation cannot consume a snapshot armed by an earlier,
             # non-replayable invocation. Keep crash replay's snapshot intact.
-            self._disarm_ledger_snapshot(task)
+            if not retained:
+                self._disarm_ledger_snapshot(task)
         # F2 (open-runtime fork): HEAD before the hook, so a move the hook makes
         # (a sync merge) is told apart from one made while the run was paused.
         head_before_hook = (
             self._head_or_none()
-            if resume_result is None and self.policy.recovery.restamp_plan_baseline
+            if resume_result is None and not retained and self.policy.recovery.restamp_plan_baseline
             else None
         )
         if self._vetoed(self._emit("pre_dev_phase", task), task):
             return False
-        if resume_result is None:
+        if resume_result is None and not retained:
             previous_baseline = task.baseline_commit
             task.baseline_commit = verify.rev_parse_head(self.workspace.root)
             if head_before_hook and task.baseline_commit != head_before_hook:
@@ -4078,8 +4200,8 @@ class Engine:
         # harvest/ledger/snapshot state as a fixable retry does, and dispatches
         # `relaunch_prompt` when no repair `feedback` is held. Loop-local for the
         # same reason as `feedback`: a crash replay re-decides from its record.
-        kept_tree = False
-        relaunch_prompt: str | None = None
+        kept_tree = retained
+        relaunch_prompt: str | None = retained_prompt
         while True:
             replayed = resume_result is not None
             # This attempt starts on the previous attempt's tree, not a rolled-back
@@ -4192,6 +4314,7 @@ class Engine:
                     prompt=prompt,
                     seq=task.attempt,
                     preserve_dispatched_spec_snapshot=preserve_chain_snapshot,
+                    prelaunch_validator=retained_validator,
                     resume=resume_record,
                     # #772: a repair keeps the harvested ledger, and a retry
                     # after rollback starts on the restored one — both dirty, both
@@ -4205,6 +4328,7 @@ class Engine:
                     # rollback's preserve step would drop.
                     commit_engine_ledger=(inherits_tree or rolled_back) and not kept_tree,
                 )
+                retained_validator = None
                 # Consume the rollback's bookkeeping before another attempt can
                 # keep this session's edits for an in-place resume. Those edits
                 # are session-authored, not the earlier rollback's restored ledger.
@@ -4473,7 +4597,7 @@ class Engine:
             ):
                 self._escalate_env(task, decision.reason, site="verify:dev")
             else:
-                self._escalate_session(task, decision.reason, decision.usage_limit)
+                self._escalate_session(task, decision.reason, decision.usage_limit, result=result)
 
     def _roll_back_rejected_attempt(self, task: StoryTask, *, replayed: bool) -> None:
         """Roll a rejected dev attempt back to the phase baseline.
@@ -4884,7 +5008,7 @@ class Engine:
                 task.salvage_refile_pending = False
                 self._save()
             if decision.action == Action.PAUSE:
-                self._escalate_decision(task, decision)
+                self._escalate_decision(task, decision, result=result)
             if decision.action == Action.DEFER:
                 self._defer(task, decision.reason)
                 return
@@ -8042,7 +8166,12 @@ class Engine:
         task.env_fault_site = site
         gates.notify(self.policy, self.run_dir, f"environment fault: {task.story_key}", reason)
         self._save()
-        raise RunPaused(reason, PAUSE_ENVIRONMENT, task.story_key)
+        raise RunPaused(
+            reason,
+            PAUSE_ENVIRONMENT,
+            task.story_key,
+            cause=PauseCause(PauseKind.TECHNICAL_FAILURE, "engine.environment", "dispatch_probe"),
+        )
 
     def _take_env_dispatch_pause(self, task: StoryTask) -> str | None:
         """Consume a dispatch-site environment pause on resume (DW-523).
@@ -8640,6 +8769,7 @@ class Engine:
                     f"awaiting spec approval for {task.story_key}",
                     PAUSE_SPEC_APPROVAL,
                     task.story_key,
+                    cause=PauseCause(PauseKind.SOURCE_CHECKPOINT, "engine.gates", "spec_approval"),
                 )
             self._review_and_commit(task)
         elif decision.action == Action.DEFER:
@@ -10033,7 +10163,13 @@ class Engine:
                 self.journal.append(
                     "campaign-session-withheld", story_key=task.story_key, role=role
                 )
-                self._escalation_pause("campaign operator hold; no automatic retry", task.story_key)
+                self._escalation_pause(
+                    "campaign operator hold; no automatic retry",
+                    task.story_key,
+                    pause_cause=PauseCause(
+                        PauseKind.OWNER_DECISION, "engine.campaign", "campaign_operator_hold"
+                    ),
+                )
         # A session may change the environment a probe pass vouched for, so no
         # pass survives a launch (DW-523) — nor a green verify pass (#1002).
         if self.campaign_execution is not None:
@@ -11283,13 +11419,17 @@ class Engine:
                     task,
                     env_fault_pause_reason("fix", result),
                     usage_limit_pause(result),
+                    result=result,
                 )
             if result.status != "completed" and result.parked:
                 # Parked on a human prompt (DW-348/DW-350): the adapter withheld the
                 # stall nudge, so the repair never ran — another attempt would
                 # relaunch into the same prompt. Pause (re-arm restores the budget).
                 self._escalate_session(
-                    task, parked_pause_reason("fix", result), usage_limit_pause(result)
+                    task,
+                    parked_pause_reason("fix", result),
+                    usage_limit_pause(result),
+                    result=result,
                 )
             if result.status != "completed" and not result.produced_work:
                 # Never did anything (#727): another attempt would launch into the
@@ -12940,7 +13080,12 @@ class Engine:
         and saves it. The site is set on the task rather than threaded through
         ``_escalate`` so the sweep engine's override keeps its signature."""
         task.env_fault_site = site
-        self._escalate(task, reason)
+        try:
+            self._escalate(task, reason)
+        except RunPaused as pause:
+            if pause.cause is None:
+                pause.cause = PauseCause(PauseKind.TECHNICAL_FAILURE, "engine.environment", site)
+            raise
 
     def _escalate_outcome(self, task: StoryTask, outcome: VerifyOutcome, *, role: str) -> None:
         """Escalate a failed verify outcome: an environment fault records site
@@ -12948,19 +13093,33 @@ class Engine:
         if outcome.env_fault:
             self._escalate_env(task, outcome.reason, site=f"verify:{role}")
         else:
-            self._escalate(task, outcome.reason)
+            try:
+                self._escalate(task, outcome.reason)
+            except RunPaused as pause:
+                if pause.cause is None:
+                    pause.cause = PauseCause(
+                        PauseKind.TECHNICAL_FAILURE, "engine.verification", "verification_failed"
+                    )
+                raise
 
-    def _escalate_decision(self, task: StoryTask, decision: Decision) -> None:
+    def _escalate_decision(
+        self, task: StoryTask, decision: Decision, *, result: SessionResult | None = None
+    ) -> None:
         """Escalate a PAUSE decision, recording its ``env_site`` when the
         environment seam (:meth:`_env_gate_decision`) produced it, else its
         usage-limit facts (:meth:`_escalate_session`)."""
         if decision.env_site is not None:
             self._escalate_env(task, decision.reason, site=decision.env_site)
         else:
-            self._escalate_session(task, decision.reason, decision.usage_limit)
+            self._escalate_session(task, decision.reason, decision.usage_limit, result=result)
 
     def _escalate_session(
-        self, task: StoryTask, reason: str, usage_limit: UsageLimitPause | None
+        self,
+        task: StoryTask,
+        reason: str,
+        usage_limit: UsageLimitPause | None,
+        *,
+        result: SessionResult | None = None,
     ) -> None:
         """Escalate a pause whose reason came from a session result, attaching
         that result's usage-limit facts (``escalation.usage_limit_pause``, None
@@ -12972,6 +13131,8 @@ class Engine:
             self._escalate(task, reason)
         except RunPaused as pause:
             pause.usage_limit = usage_limit
+            if pause.cause is None:
+                pause.cause = _session_pause_cause(result, usage_limit)
             raise
 
     def _record_sweep_refusal(self, trigger: str, reason: str) -> None:

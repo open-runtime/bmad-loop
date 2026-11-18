@@ -7,6 +7,11 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Added
+
+- Expose actionable campaign holds, uncertain effects and route waits through a bounded read-only inbox.
+- Retain typed child-pause evidence and consume exact successor permits for owned development continuation.
+
 ### Fixed
 
 - Verify and independently review uncovered external merges before completing tracking; retain pending acceptance across restart.

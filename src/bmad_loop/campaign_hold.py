@@ -17,7 +17,12 @@ from pathlib import Path
 from typing import Callable
 
 from . import platform_util as fs
+from .adapters.multiplexer import MultiplexerError
 from .platform_util import file_lock, safe_segment
+
+
+class OperatorHoldError(MultiplexerError):
+    """A controller-observed operator hold refused automatic session admission."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -47,6 +52,8 @@ PROTECTED_HOLDS = frozenset(
         "checkpoint",
         "github_review",
         "required_review",
+        "authentication_required",
+        "pause_unknown",
         "intake_plan_change",
         "intake_plan_changed",
     }
@@ -189,14 +196,13 @@ def held() -> bool:
 @contextmanager
 def admission():
     """Serialize final child session admission with committed operator controls."""
-    from .adapters.multiplexer import MultiplexerError
     from .childrun import hard_stop_pending
 
     probe = _probe.get()
     lock = probe.admission_lock if probe is not None else None
     with file_lock(lock) if lock is not None else nullcontext():
         if held() or (probe and probe.admission_held and probe.admission_held()):
-            raise MultiplexerError("campaign operator hold suppresses automatic session launch")
+            raise OperatorHoldError("campaign operator hold suppresses automatic session launch")
         if hard_stop_pending():
             raise MultiplexerError("campaign hard stop suppresses automatic session launch")
         yield

@@ -342,6 +342,11 @@ def observe(directory: Path, *, expected: dict[str, Any]) -> dict[str, Any]:
         state = load_state(Path(receipt["run_dir"]))
         if state.run_id != receipt.get("run_id"):
             raise CampaignError("legacy run identity does not match worker receipt")
+        if receipt.get("child_pause") is not None:
+            from .campaign_child_pause import validate as validate_pause
+
+            envelope = CampaignExecution.load(Path(request["execution"]), request["digest"])
+            validate_pause(state, request, envelope, receipt)
         if receipt.get("outcome") == "locally_complete" and (
             not state.finished
             or state.paused
@@ -406,10 +411,10 @@ def _tracking(request: dict[str, Any], envelope: CampaignExecution) -> dict[str,
 def _execution(request: dict[str, Any], envelope: CampaignExecution) -> dict[str, Any]:
     from .campaign_intake_amendment import validate_initial_source
 
-    review_handoff = request.get("handoff_state", {}).get("native_role") == "review"
+    native_handoff = request.get("handoff_state", {}).get("native_role") in {"dev", "review"}
     # A continuation binds the exact captured post-development private source,
     # which has legitimately changed since the original ready-for-dev import.
-    if not review_handoff:
+    if not native_handoff:
         validate_initial_source(request)
     workspace = Path(request["workspace"])
     source = SourceSelector(**request["source"])
@@ -422,10 +427,10 @@ def _execution(request: dict[str, Any], envelope: CampaignExecution) -> dict[str
     ):
         raise CampaignError("worker would write a non-private ticket store")
     run_id = request["run_id"]
-    if review_handoff:
-        from .campaign_continuation import compose_review
+    if native_handoff:
+        from .campaign_continuation import compose_continuation
 
-        composed = compose_review(
+        composed = compose_continuation(
             request,
             envelope,
             make_adapters=lambda project, run_dir, policy, **kwargs: _adapters(
@@ -538,7 +543,9 @@ def _execution(request: dict[str, Any], envelope: CampaignExecution) -> dict[str
                 if done
                 else (
                     "operator_held"
-                    if state.paused and "campaign operator hold" in (state.paused_reason or "")
+                    if state.paused_cause is not None
+                    and state.paused_cause.code == "campaign_operator_hold"
+                    and state.paused_cause.kind.value == "owner_decision"
                     else "paused"
                 )
             )
@@ -1140,7 +1147,9 @@ def child_main(request_path: Path) -> int:
         from .campaign_interruptions import CampaignStageInterrupted
 
         result = {
-            "outcome": "operator_held" if "campaign operator hold" in str(exc) else "failed",
+            "outcome": (
+                "operator_held" if isinstance(exc, campaign_hold.OperatorHoldError) else "failed"
+            ),
             "error": f"{type(exc).__name__}: {exc}",
         }
         if isinstance(exc, CampaignStageInterrupted):
@@ -1167,6 +1176,14 @@ def child_main(request_path: Path) -> int:
         "result_contract": request.get("result_contract", ""),
         "landing": bool(request.get("landing")),
     }
+    if result["outcome"] in {"paused", "operator_held", "recovery_required"} and result.get(
+        "run_dir"
+    ):
+        from .campaign_child_pause import build as pause_receipt
+
+        receipt["child_pause"] = pause_receipt(
+            load_state(Path(result["run_dir"])), request, envelope, receipt
+        )
     atomic_write_text(envelope.directory / "receipt.json", json.dumps(receipt, default=str))
     return (
         0

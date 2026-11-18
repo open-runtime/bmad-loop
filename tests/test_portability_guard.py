@@ -259,7 +259,7 @@ REARM_ESCALATION_CALLERS = {
 # relying on a reviewer to find it by grep.
 SAVE_STATE_CALLERS = {
     # Fresh run publication under state_lock; predecessor remains immutable.
-    ("campaign_continuation.py", "compose_review"),
+    ("campaign_continuation.py", "_compose"),
     # Owned accepted-finalization continuation: both publications hold state_lock.
     ("campaign_finalization.py", "resume"),
     ("accepted_review.py", "rearm_for_implemented_review"),
@@ -281,7 +281,7 @@ SAVE_STATE_CALLERS = {
     ("unitreplay.py", "abandon_replay_run"),
 }
 RUN_STATE_TRANSACTIONS = {
-    ("campaign_continuation.py", "compose_review"),
+    ("campaign_continuation.py", "_compose"),
     ("campaign_finalization.py", "resume"),
     ("accepted_review.py", "rearm_for_implemented_review"),
     ("commit_recovery.py", "arm"),
@@ -1522,6 +1522,10 @@ JOURNAL_KINDS = frozenset(
         # kind-aliased. Actual records covered in test_campaign_continuation.
         "campaign-review-continuation",
         "campaign-review-handoff",
+        # Retained development uses the same bounded correlation fields;
+        # exact permit/entry and ticket lifecycle are covered by continuation tests.
+        "campaign-development-continuation",
+        "campaign-development-handoff",
         # Finalization's publication boundary; SHA/branch fields use existing
         # diagnostic aliases. Native replay coverage: test_fork_finalize_target.
         "baseline-adopted-from-target",
@@ -8253,8 +8257,7 @@ TASK_ARTIFACT_SCOPE_CASES = [
         (
             f"journal-bare-literal-beside-it:{name}",
             "journal.py",
-            f"TASK_CYCLE_ARTIFACTS: tuple[str, ...] = ({_ARTIFACT_TUPLE_SRC})\n"
-            f'STALE = "{name}"\n',
+            f'TASK_CYCLE_ARTIFACTS: tuple[str, ...] = ({_ARTIFACT_TUPLE_SRC})\nSTALE = "{name}"\n',
             True,
         )
         for name in TASK_CYCLE_ARTIFACTS
@@ -9079,10 +9082,9 @@ def test_journal_kind_declaration_is_scoped_by_position(label, rel, fn, is_offen
     a site the scan cannot read must not read as clean because a same-named function
     elsewhere is allowed to be unreadable."""
     offenders = _journal_kind_offenders([("journalkind", rel, 1, "journal.append(kind)", fn)])
-    assert bool(offenders) is is_offender, (
-        f"a non-literal kind in {rel}::{fn} should "
-        f"{'be refused' if is_offender else 'be allowed'}"
-    )
+    assert (
+        bool(offenders) is is_offender
+    ), f"a non-literal kind in {rel}::{fn} should {'be refused' if is_offender else 'be allowed'}"
 
 
 # The count axis of the same declaration, as rows. Each case is a MUTATION of the

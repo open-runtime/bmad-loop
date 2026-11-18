@@ -18,6 +18,8 @@ from bmad_loop.model import (
     SWEEP_REFUSED_DIRTY,
     SWEEP_REFUSED_NOT_STARTED,
     UNATTRIBUTED_MODEL,
+    PauseCause,
+    PauseKind,
     Phase,
     RunState,
     SessionRecord,
@@ -29,6 +31,54 @@ from bmad_loop.model import (
     result_mapping,
     settle_by_model,
 )
+
+
+def test_typed_pause_cause_round_trip_clear_and_restore():
+    state = RunState("typed", "/project", "start")
+    cause = PauseCause(PauseKind.SOURCE_CHECKPOINT, "tickets", "epic_boundary")
+    state.record_pause("Await source approval", "epic-boundary", "ticket", cause=cause)
+    original = state.to_dict()
+    assert RunState.from_dict(original).paused_cause == cause
+    saved = state.pause_snapshot()
+    state.clear_pause()
+    assert state.paused_cause is None and not state.paused
+    state.restore_pause(saved)
+    assert state.to_dict() == original
+    state.record_pause("New legacy pause", "unknown", "ticket")
+    assert state.paused_cause is None
+
+
+def test_legacy_pause_remains_unknown_without_reason_or_stage_inference():
+    original = RunState("legacy", "/project", "start").to_dict()
+    original.update(paused_reason="quota cleared; owner approved", paused_stage="epic-boundary")
+    state = RunState.from_dict(original)
+    assert state.paused_cause is None
+    assert "paused_cause" not in state.to_dict()
+    assert state.to_dict() == original
+
+
+@pytest.mark.parametrize("version", [True, 0, 2, "1"])
+def test_typed_pause_cause_rejects_unknown_or_noninteger_version(version):
+    valid = PauseCause(PauseKind.TECHNICAL_FAILURE, "engine", "verification_failed").to_dict()
+    assert PauseCause.from_dict(valid).kind == PauseKind.TECHNICAL_FAILURE
+    with pytest.raises(ValueError, match="pause cause schema"):
+        PauseCause.from_dict({**valid, "schema_version": version})
+
+
+@pytest.mark.parametrize("damage", ["missing", "extra", "kind", "producer", "code"])
+def test_typed_pause_cause_refuses_malformed_producer_evidence(damage):
+    valid = PauseCause(PauseKind.QUOTA_WAIT, "engine", "provider_quota").to_dict()
+    assert PauseCause.from_dict(valid).kind == PauseKind.QUOTA_WAIT
+    if damage == "missing":
+        del valid["producer"]
+    elif damage == "extra":
+        valid["approved"] = True
+    elif damage == "kind":
+        valid["kind"] = "owner_approved"
+    else:
+        valid[damage] = ""
+    with pytest.raises(ValueError):
+        PauseCause.from_dict(valid)
 
 
 def _state(**kw) -> RunState:

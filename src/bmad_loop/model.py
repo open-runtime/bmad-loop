@@ -1535,9 +1535,62 @@ def env_fault_site_reverifiable(task: StoryTask) -> bool:
     return latest is not None and latest.status == "completed"
 
 
+class PauseKind(StrEnum):
+    SOURCE_CHECKPOINT = "source_checkpoint"
+    TECHNICAL_FAILURE = "technical_failure"
+    AUTHENTICATION_FAILURE = "authentication_failure"
+    QUOTA_WAIT = "quota_wait"
+    TRANSPORT_FAILURE = "transport_failure"
+    OWNER_DECISION = "owner_decision"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class PauseCause:
+    """Producer-declared pause category; reason prose cannot confer this authority."""
+
+    kind: PauseKind
+    producer: str
+    code: str
+    schema_version: int = 1
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            raise ValueError("Unsupported pause cause schema")
+        if not isinstance(cast(object, self.kind), PauseKind):
+            raise ValueError("Pause cause requires a typed kind")
+        for value in (cast(object, self.producer), cast(object, self.code)):
+            if not isinstance(value, str) or not value.strip() or len(value) > 128:
+                raise ValueError("Pause cause requires bounded producer and code identities")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "kind": str(self.kind),
+            "producer": self.producer,
+            "code": self.code,
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> PauseCause:
+        if not isinstance(value, dict) or set(value) != {
+            "schema_version",
+            "kind",
+            "producer",
+            "code",
+        }:
+            raise ValueError("Pause cause requires its exact versioned fields")
+        return cls(
+            kind=PauseKind(value["kind"]),
+            producer=value["producer"],
+            code=value["code"],
+            schema_version=value["schema_version"],
+        )
+
+
 @dataclass(frozen=True)
 class PauseSnapshot:
-    """The eight fields :meth:`RunState.clear_pause` clears, captured just before a
+    """The fields :meth:`RunState.clear_pause` clears, captured just before a
     resume clears them so a resume that fails before its engine starts can put
     them back (:meth:`RunState.restore_pause`). Without it that failure left an
     escalated story behind a run with no pause stage, which ``resolve`` refused."""
@@ -1550,6 +1603,7 @@ class PauseSnapshot:
     stopped: bool
     crashed: bool
     crash_error: str | None
+    paused_cause: PauseCause | None = None
 
 
 @dataclass
@@ -1653,6 +1707,9 @@ class RunState:
     # other pause and on state written before they existed.
     paused_reset_at: str | None = None
     paused_limit_class: str | None = None
+    # Optional for compatibility: absent producer evidence remains unknown.
+    # It is never reconstructed from a stage label or human-readable reason.
+    paused_cause: PauseCause | None = None
     finished: bool = False
     # deliberately stopped (bmad-loop stop / engine SIGTERM); distinct from a
     # crash. Resume clears it via clear_pause(), so a stopped run is resumable.
@@ -1858,6 +1915,7 @@ class RunState:
         *,
         reset_at: str | None = None,
         limit_class: str | None = None,
+        cause: PauseCause | None = None,
     ) -> None:
         """Record a pause. The usage-limit facts are written on every pause, so a
         pause that is not a usage limit stores None rather than inheriting a
@@ -1867,6 +1925,7 @@ class RunState:
         self.paused_story_key = story_key
         self.paused_reset_at = reset_at
         self.paused_limit_class = limit_class
+        self.paused_cause = cause
 
     def clear_pause(self) -> None:
         self.paused_reason = None
@@ -1874,6 +1933,7 @@ class RunState:
         self.paused_story_key = None
         self.paused_reset_at = None
         self.paused_limit_class = None
+        self.paused_cause = None
         self.stopped = False
         self.crashed = False
         self.crash_error = None
@@ -1889,6 +1949,7 @@ class RunState:
             stopped=self.stopped,
             crashed=self.crashed,
             crash_error=self.crash_error,
+            paused_cause=self.paused_cause,
         )
 
     def restore_pause(self, snapshot: PauseSnapshot) -> None:
@@ -1901,6 +1962,7 @@ class RunState:
         self.stopped = snapshot.stopped
         self.crashed = snapshot.crashed
         self.crash_error = snapshot.crash_error
+        self.paused_cause = snapshot.paused_cause
 
     def cache_read_weight(self) -> float:
         """The run's cache-read weight from its persisted policy snapshot; the
@@ -1942,6 +2004,11 @@ class RunState:
             "paused_story_key": self.paused_story_key,
             "paused_reset_at": self.paused_reset_at,
             "paused_limit_class": self.paused_limit_class,
+            **(
+                {"paused_cause": self.paused_cause.to_dict()}
+                if self.paused_cause is not None
+                else {}
+            ),
             "finished": self.finished,
             "stopped": self.stopped,
             "crashed": self.crashed,
@@ -1996,6 +2063,11 @@ class RunState:
             paused_story_key=d.get("paused_story_key"),
             paused_reset_at=d.get("paused_reset_at"),
             paused_limit_class=d.get("paused_limit_class"),
+            paused_cause=(
+                PauseCause.from_dict(d["paused_cause"])
+                if d.get("paused_cause") is not None
+                else None
+            ),
             finished=bool(d.get("finished", False)),
             stopped=bool(d.get("stopped", False)),
             crashed=bool(d.get("crashed", False)),
