@@ -410,9 +410,14 @@ def test_durable_engine_recovery_request_retains_its_recovery_hold(paused_child,
     assert unit.claim.quiescent and unit.claim.launch_id == case.request["launch_id"]
 
 
-def test_protected_successor_pause_retires_handoff_and_keeps_owner_hold(paused_child, tmp_path):
+@pytest.mark.parametrize("legacy", [False, True])
+def test_protected_successor_pause_retires_handoff_and_keeps_owner_hold(
+    paused_child, tmp_path, legacy
+):
     case = paused_child(PauseCause(PauseKind.OWNER_DECISION, "engine.session", "human_prompt"))
     observed = workers.observe(case.context.directory, expected=case.request)
+    if legacy:
+        observed["receipt"].pop("child_pause")
     runtime, snapshot, unit, action = parent_for(case, tmp_path)
     handoff = unit.evidence["handoff"] = {
         "id": "h",
@@ -423,7 +428,22 @@ def test_protected_successor_pause_retires_handoff_and_keeps_owner_hold(paused_c
     runtime._apply_worker(snapshot, unit, action, observed)
     assert handoff["phase"] == "stopped"
     assert handoff["successor_receipt"] == observed["receipt"]
-    assert unit.hold.kind == "owner" and unit.claim.quiescent
+    assert unit.hold.kind == ("pause_unknown" if legacy else "owner") and unit.claim.quiescent
+
+
+def test_active_handoff_cannot_intercept_untyped_paused_predecessor(paused_child, tmp_path):
+    case = paused_child(None)
+    observed = workers.observe(case.context.directory, expected=case.request)
+    observed["receipt"].pop("child_pause")
+    runtime, snapshot, unit, action = parent_for(case, tmp_path)
+    handoff = unit.evidence["handoff"] = {
+        "id": "h",
+        "phase": "drain",
+        "predecessor": {"launch_id": unit.claim.launch_id},
+    }
+    runtime._apply_worker(snapshot, unit, action, observed)
+    assert handoff["phase"] == "stopped" and handoff["receipt"] == observed["receipt"]
+    assert unit.hold.kind == "pause_unknown" and unit.claim.quiescent
 
 
 def test_typed_receipt_cannot_finish_a_live_child(paused_child, monkeypatch):

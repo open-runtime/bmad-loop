@@ -430,6 +430,14 @@ def test_inbox_prefers_current_hold_pause_over_unit_history(inbox_pause):
     assert unit.evidence["child_pause"]["cause"]["kind"] == "quota_wait"
 
 
+@pytest.mark.parametrize("inbox_pause", ["quota_wait"], indirect=True)
+def test_owner_hold_cannot_inherit_quota_even_with_same_launch_id(inbox_pause):
+    snapshot, unit, _ = inbox_pause
+    unit.hold = Hold("owner", "Ask the owner", id="launch-1")
+    item = next(row for row in inbox_document(snapshot)["items"] if row["kind"] == "hold")
+    assert item["pause_evidence_status"] == "unknown" and item["pause_cause"] is None
+
+
 @pytest.mark.parametrize("current", [None, {"schema_version": 1, "cause": None}])
 def test_inbox_does_not_mask_invalid_current_hold_evidence_with_cached_pause(inbox_pause, current):
     snapshot, unit, _ = inbox_pause
