@@ -1,5 +1,6 @@
 """Accepted diagnosis cannot substitute for observed same-PR repair and verification."""
 
+import dataclasses
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +12,7 @@ from bmad_loop import verify
 from bmad_loop.campaign_model import CampaignError, UnitState, WorkerClaim
 from bmad_loop.campaign_resolution_delivery import (
     apply,
+    execution_commands,
     finish,
     next_step,
     prepare,
@@ -189,3 +191,78 @@ def test_pending_verify_payload_does_not_supply_execution_authority(project):
     assert execution_commands(snapshot, unit, {}) == (("approved-test",),)
     with pytest.raises(CampaignError, match="frozen verification"):
         execution_commands(snapshot, unit, {"commands": [["controller-secret-reader"]]})
+
+
+def test_initial_and_resumed_reverify_use_the_same_frozen_sequence(project):
+    snapshot = state(project)
+    frozen = (("first",), ("second",))
+    snapshot.spec = dataclasses.replace(snapshot.spec, verify_commands=frozen)
+    unit = snapshot.units["s:project:u"]
+    saved = collect_context(project.project, snapshot, unit.id, "diagnosis")
+    apply_context(snapshot, unit.id, saved)
+    launch = proposals(snapshot, project.project, candidate(), now=10)[0]
+    begin(snapshot, unit.id, launch.payload)
+    receipt = {
+        "outcome": "stage_complete",
+        "head": unit.bindings["head"],
+        "artifact": diagnosis(
+            saved["packet"], action="reverify", verification=[["second"], ["second"], ["first"]]
+        ),
+    }
+    receipt["validated_resolution"] = validate_stage_result(
+        project.project, snapshot, unit.id, receipt
+    )
+    initial = apply_diagnosis(snapshot, unit.id, receipt)
+    (resumed,) = proposals(snapshot, project.project, candidate(), now=11)
+    assert initial == resumed
+    assert execution_commands(snapshot, unit, initial.payload) == frozen
+    assert initial.payload["commands"] == [["first"], ["second"]]
+
+
+def test_invalid_stored_reverify_refuses_only_its_unit_across_restart(project, tmp_path):
+    from bmad_loop.campaign_model import Hold, OutboxAction
+
+    snapshot, unit = accepted(project)
+    peer = state(project).units[unit.id]
+    peer.spec = dataclasses.replace(peer.spec, id="s:project:peer")
+    snapshot.units[peer.id] = peer
+    snapshot.spec = dataclasses.replace(snapshot.spec, units=(unit.spec, peer.spec))
+    store = CampaignStore(tmp_path / "store")
+    proposal = unit.evidence["accepted_resolution"]
+    proposal.update(action="reverify", verification=[["outside-frozen-authority"]])
+    original_hold = unit.hold.evidence["original_hold"]
+    original_attempts = unit.resolution_attempts
+    snapshot = store.create(snapshot)
+    runtime = CampaignRuntime(project.project, store)
+    pending = {row.unit: row for row in proposals(snapshot, project.project, candidate(), now=20)}
+    refused, other = pending[unit.id], pending[peer.id]
+    assert (refused.kind, refused.unit) == ("resolution-refused", unit.id)
+    assert (other.kind, other.unit) == ("resolution-context", peer.id)
+    snapshot.bindings["inventory"] = {"complete": True, "observed_at": runtime.clock()}
+    assert {row.kind for row in runtime.proposals(snapshot)} >= {
+        "resolution-refused",
+        "resolution-context",
+    }
+    action = OutboxAction(
+        "refusal", refused.kind, refused.unit, refused.payload, snapshot.generation
+    )
+    result = runtime.perform(snapshot, action)
+    assert result.state == "confirmed"
+    changed = snapshot.clone()
+    takeover = Hold("operator", "owner took over", id="takeover")
+    changed.units[unit.id].hold = takeover
+    runtime.apply(changed, action, result)
+    assert changed.units[unit.id].hold == takeover
+    assert (
+        changed.units[unit.id].evidence["accepted_resolution"]
+        == snapshot.units[unit.id].evidence["accepted_resolution"]
+    )
+    runtime.apply(snapshot, action, result)
+    store.save(snapshot, snapshot.revision)
+    loaded = store.load(snapshot.id)
+    retained = loaded.units[unit.id]
+    assert dataclasses.asdict(retained.hold) == original_hold
+    assert retained.resolution_attempts == original_attempts
+    assert retained.evidence["resolution_history"][-1]["state"] == "refused"
+    assert "frozen verification" in retained.evidence["resolution_history"][-1]["refusal"]["reason"]
+    assert proposals(loaded, project.project, candidate(), now=86400) == (other,)
