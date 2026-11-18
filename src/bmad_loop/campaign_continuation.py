@@ -260,6 +260,7 @@ def _consumed_permit(request, envelope) -> dict[str, Any]:
         raise CampaignError("development continuation lost current campaign successor authority")
     if rearm:
         import time
+
         from .campaign_rearm import _validate_condition, validate_current
 
         validate_current(snapshot, unit, handoff, continuing=True)
@@ -663,15 +664,18 @@ def _compose(
             predecessor=original.run_id,
             handoff_id=request["handoff_id"],
         )
-    else:
+    elif rearm is not None:
         journal.append(
-            "campaign-development-rearm" if rearm is not None else "campaign-development-handoff",
+            "campaign-development-rearm",
             story_key=selector,
             predecessor=original.run_id,
-            **(
-                {"rearm_id": request["rearm_id"]}
-                if rearm is not None
-                else {"handoff_id": request["handoff_id"]}
-            ),
+            rearm_id=request["rearm_id"],
+        )
+    else:
+        journal.append(
+            "campaign-development-handoff",
+            story_key=selector,
+            predecessor=original.run_id,
+            handoff_id=request["handoff_id"],
         )
     return runsetup.ComposedRun(engine, state.run_id, run_dir, state, journal)

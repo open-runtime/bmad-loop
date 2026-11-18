@@ -592,6 +592,65 @@ owner authority. Imported arbitrary JSON and unqualified harness stores are
 refused; unavailable or oversized evidence remains visible.
 
 Existing decisions and delegated choices can settle routine product questions.
+For example, an owner can approve post-planning decisions by Muse Wonderful
+or Codex Astra 6.2 and permit coding to continue on either Claude model or
+Codex. The following role settings belong in the campaign specification.
+Use the effort and profile for which the installation has current proof.
+
+```toml
+[role_pools.post_planning]
+candidates = [
+  { profile = "muse", model = "muse-wonder-full-1.0", effort = "xhigh" },
+  { profile = "codex", model = "gpt-6.2-astra", effort = "high" },
+]
+
+[roles.decision_review]
+pool = "post_planning"
+
+[roles.escalation]
+pool = "post_planning"
+
+[roles.triage]
+pool = "post_planning"
+
+[role_pools.development]
+candidates = [
+  { profile = "claude", model = "claude-opus-5-5", effort = "high" },
+  { profile = "claude", model = "claude-fable-5-2", effort = "high" },
+  { profile = "codex", model = "gpt-6.2-astra", effort = "high" },
+]
+
+[roles.execution]
+pool = "development"
+```
+
+Handoff requires enabled reasoning, qualified summary and audit routes, and
+fresh destination capacity. A shared Claude quota can block both Claude
+models. An eligible Codex route can then continue, or the campaign can wait
+for quota to recover. Publication review must be independent of every family
+that contributed to the work. When both Claude and Codex have written to one
+PR, configure a qualified independent reviewer under the repository's policy.
+
+A campaign owner can delegate implementation choices after planning by setting
+`[decisions] delegation_documents` to an array of `SHA256:relative/path`
+references. Each digest pins the exact UTF-8 bytes of a committed repository
+document describing which choices the model may make. The decision reviewer
+receives the accepted story scope and criteria together with that document.
+Configure its qualified model and fallback pool through `[roles.decision_review]`.
+Omitting the field grants no routine-choice delegation. A missing, changed, or
+uncommitted document leaves the hold in place.
+Before development starts, the controller checks the decision inputs again.
+The assigned development session receives the validated action, answer,
+constraints and observed decision model. The source documents and quotations
+stay in the decision ledger. A change to the story, policy, or observed decision
+evidence reopens the original hold for review.
+
+When a decision reviewer needs the owner's judgment, it ranks the viable options
+and gives a reason and evidence references for each. `campaign inbox` shows the
+current recommendation and alternatives. If the stage used private sources, the
+inbox gives the receipt ID for the full options in the local
+`decision-ledger.json`. Older decisions retain their original evidence.
+
 A specific owner stop needs a later authorized release or its verified release
 condition. Required GitHub approval needs actual current eligible approval;
 fresh-signoff checkpoints and human-only attestations keep their own requirements.

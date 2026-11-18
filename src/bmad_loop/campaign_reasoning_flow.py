@@ -204,7 +204,9 @@ def proposals(runtime, snapshot) -> tuple[Proposal, ...]:
         if missing_job_claim(row):
             reason = "Reasoning worker ownership is unknown; reconcile its missing claim"
             if row.get("reason") != reason and not pending(snapshot, job_id, "reasoning-wait"):
-                result.append(Proposal("reasoning-wait", request.unit, {"job_id": job_id, "reason": reason}))
+                result.append(
+                    Proposal("reasoning-wait", request.unit, {"job_id": job_id, "reason": reason})
+                )
             continue
         if live(row):
             kind = (
@@ -275,7 +277,9 @@ def proposals(runtime, snapshot) -> tuple[Proposal, ...]:
         if wait:
             reason = "Waiting for " + wait + "; admission resumes when an owned slot is released"
             if row.get("reason") != reason and not pending(snapshot, job_id, "reasoning-wait"):
-                result.append(Proposal("reasoning-wait", request.unit, {"job_id": job_id, "reason": reason}))
+                result.append(
+                    Proposal("reasoning-wait", request.unit, {"job_id": job_id, "reason": reason})
+                )
             continue
         from .campaign_summary_routes import validate_request
 

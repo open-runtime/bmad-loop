@@ -14,7 +14,8 @@ from test_campaign_workers import envelope, worker_request
 from test_stories_engine import SPEC_FOLDER, setup_stories
 
 from bmad_loop import campaign_git_activity as activity
-from bmad_loop import campaign_object_promotion, campaign_workers as workers
+from bmad_loop import campaign_object_promotion
+from bmad_loop import campaign_workers as workers
 from bmad_loop import finalization_recovery, policy, runs, runsetup, verify
 from bmad_loop.adapters import multiplexer
 from bmad_loop.adapters.mock import MockAdapter
@@ -88,59 +89,143 @@ def paused_git_worker(project, tmp_path, monkeypatch):
     def build(*, stopped=False, complete=True, missing_receipt=False):
         repo = project.project
         install_bmad_config(project)
-        setup_stories(project, [{"id": "first", "title": "First", "description": "Keep acceptance"}])
+        setup_stories(
+            project, [{"id": "first", "title": "First", "description": "Keep acceptance"}]
+        )
         baseline = git(repo, "rev-parse", "HEAD")
         (repo / "src.txt").write_text("unfinished source contribution\n")
         (repo / "untracked.txt").write_text("preserve untracked contribution\n")
         store = CampaignStore(tmp_path / "parent")
         directory = store.directory("campaign-1") / "workers" / "launch-1"
-        context = envelope(repo, directory, policy.loads('[gates]\nmode="none"\n[notify]\ndesktop=false\n'))
+        context = envelope(
+            repo, directory, policy.loads('[gates]\nmode="none"\n[notify]\ndesktop=false\n')
+        )
         source = SourceSelector("stories", id="s", path=SPEC_FOLDER)
-        spec = UnitSpec(context.unit_id, "s", "epic", "Selected", selector="first",
-                        scopes=("src/**",), acceptance=("Keep acceptance",))
-        sibling = UnitSpec("s:project:other", "s", "epic", "Overlapping", selector="other",
-                           scopes=("src/**",), acceptance=("Keep sibling acceptance",))
-        claim = WorkerClaim(spec.id, context.attempt, context.generation, "launch-1",
-                            run_id="paused-finalization-run", run_dir=str(directory),
-                            workspace=str(repo), branch="main", writes=True)
-        unit = CampaignUnit(spec, UnitState.RUNNING, attempt=context.attempt, claim=claim,
-                            bindings={"workspace": str(repo), "branch": "main", "head": baseline, "base": baseline},
-                            evidence={"developer_families": ["anthropic", "openai"]})
-        observed_action = OutboxAction("observe-pause", "observe-worker", spec.id,
-                                      {"launch_id": claim.launch_id}, context.generation,
-                                      state="sent_unknown")
-        snapshot = store.create(CampaignSnapshot(context.campaign_id, "a/b",
-            CampaignSpec("Git ownership", sources=(source,), units=(spec, sibling)),
-            {unit.id: unit, sibling.id: CampaignUnit(sibling, UnitState.READY)},
-            config_revision=context.config_revision, generation=context.generation,
-            common_dir=str(repo / ".git"), outbox=[observed_action]))
+        spec = UnitSpec(
+            context.unit_id,
+            "s",
+            "epic",
+            "Selected",
+            selector="first",
+            scopes=("src/**",),
+            acceptance=("Keep acceptance",),
+        )
+        sibling = UnitSpec(
+            "s:project:other",
+            "s",
+            "epic",
+            "Overlapping",
+            selector="other",
+            scopes=("src/**",),
+            acceptance=("Keep sibling acceptance",),
+        )
+        claim = WorkerClaim(
+            spec.id,
+            context.attempt,
+            context.generation,
+            "launch-1",
+            run_id="paused-finalization-run",
+            run_dir=str(directory),
+            workspace=str(repo),
+            branch="main",
+            writes=True,
+        )
+        unit = CampaignUnit(
+            spec,
+            UnitState.RUNNING,
+            attempt=context.attempt,
+            claim=claim,
+            bindings={"workspace": str(repo), "branch": "main", "head": baseline, "base": baseline},
+            evidence={"developer_families": ["anthropic", "openai"]},
+        )
+        observed_action = OutboxAction(
+            "observe-pause",
+            "observe-worker",
+            spec.id,
+            {"launch_id": claim.launch_id},
+            context.generation,
+            state="sent_unknown",
+        )
+        snapshot = store.create(
+            CampaignSnapshot(
+                context.campaign_id,
+                "a/b",
+                CampaignSpec("Git ownership", sources=(source,), units=(spec, sibling)),
+                {unit.id: unit, sibling.id: CampaignUnit(sibling, UnitState.READY)},
+                config_revision=context.config_revision,
+                generation=context.generation,
+                common_dir=str(repo / ".git"),
+                outbox=[observed_action],
+            )
+        )
         adapter = MockAdapter([])
-        monkeypatch.setattr(runsetup, "make_adapters", lambda *a, **kw: {role: adapter for role in ("dev", "review", "retro", "triage")})
+        monkeypatch.setattr(
+            runsetup,
+            "make_adapters",
+            lambda *a, **kw: {role: adapter for role in ("dev", "review", "retro", "triage")},
+        )
         monkeypatch.setattr(multiplexer, "configure_multiplexer", lambda *a, **kw: None)
-        path = workers.prepare_launch(context, worker_request(repo, context,
-            kind="execution", source=dataclasses.asdict(source), source_revision="",
-            unit=dataclasses.asdict(spec), run_id=claim.run_id))
+        path = workers.prepare_launch(
+            context,
+            worker_request(
+                repo,
+                context,
+                kind="execution",
+                source=dataclasses.asdict(source),
+                source_revision="",
+                unit=dataclasses.asdict(spec),
+                run_id=claim.run_id,
+            ),
+        )
         request = json.loads(path.read_text())
-        capture = CaptureResult(None, b"", b"", True, False, 0, True,
-            CaptureOwnership(900001, 123.0, True,
-                (ActorEvidence(900001, 123.0, "dead"), ActorEvidence(900002, 124.0, "dead" if stopped else "unknown")),
-                1, complete, (), True, True, True, True, True, True))
+        capture = CaptureResult(
+            None,
+            b"",
+            b"",
+            True,
+            False,
+            0,
+            True,
+            CaptureOwnership(
+                900001,
+                123.0,
+                True,
+                (
+                    ActorEvidence(900001, 123.0, "dead"),
+                    ActorEvidence(900002, 124.0, "dead" if stopped else "unknown"),
+                ),
+                1,
+                complete,
+                (),
+                True,
+                True,
+                True,
+                True,
+                True,
+                True,
+            ),
+        )
         real_git = verify._run_git
         commits = []
+
         def interrupted_commit(cmd, root, **kwargs):
             if len(cmd) > 3 and cmd[3] == "commit":
                 commits.append(tuple(cmd))
                 raise verify.GitTimeoutError("scripted lost acknowledgement", capture=capture)
             return real_git(cmd, root, **kwargs)
+
         monkeypatch.setattr(verify, "_run_git", interrupted_commit)
+
         def committing_loop(engine):
-            task = StoryTask(spec.selector, 1, phase=Phase.COMMITTING,
-                             baseline_commit=baseline, attempt=2)
+            task = StoryTask(
+                spec.selector, 1, phase=Phase.COMMITTING, baseline_commit=baseline, attempt=2
+            )
             engine.state.tasks[spec.selector] = task
             engine._save()
             # Actual Engine finalization supplies its private bound context.
             engine._finalize_commit_phase(task)
             pytest.fail("uncertain finalization did not pause")
+
         monkeypatch.setattr(StoriesEngine, "_loop", committing_loop)
         assert workers.child_main(path) == 1
         receipt = json.loads((directory / "receipt.json").read_text())
@@ -152,7 +237,9 @@ def paused_git_worker(project, tmp_path, monkeypatch):
         assert state.tasks[spec.selector].phase == Phase.COMMITTING
         record = finalization_recovery.pending(repo)
         assert record is not None and record["state"] == "uncertain"
-        assert record["context"]["campaign_git_activity"]["binding"] == activity.binding(request, context)
+        assert record["context"]["campaign_git_activity"]["binding"] == activity.binding(
+            request, context
+        )
         record_path = finalization_recovery._root(repo) / record["id"] / "record.json"
         original_record = record_path.read_bytes()
         if missing_receipt:
@@ -160,21 +247,36 @@ def paused_git_worker(project, tmp_path, monkeypatch):
         monkeypatch.setattr(runs, "read_named_pid_identity", lambda _: (800001, 200.0))
         monkeypatch.setattr(runs, "probe_liveness", lambda *a: "dead")
         mux_calls = []
+
         class EmptyMux:
             def list_window_ids(self, session):
                 mux_calls.append(session)
                 return []
+
         monkeypatch.setattr(multiplexer, "get_multiplexer", lambda: EmptyMux())
         runtime = CampaignRuntime(repo, store, clock=lambda: 100.0)
         monkeypatch.setattr(runtime, "template", lambda _: context)
         host = FakeHost()
         runtime._git_activity_observer = activity.GitActivityObserver(host=host, wait_s=1)
         runtimes.append(runtime)
-        return SimpleNamespace(repo=repo, store=store, context=context, request=request,
-            receipt=receipt, snapshot=snapshot, unit_id=unit.id, sibling_id=sibling.id,
-            action_id=observed_action.id, runtime=runtime, host=host, commits=commits,
-            record_path=record_path, original_record=original_record, mux_calls=mux_calls,
-            supervisor=CampaignSupervisor(store, runtime, clock=lambda: 100.0))
+        return SimpleNamespace(
+            repo=repo,
+            store=store,
+            context=context,
+            request=request,
+            receipt=receipt,
+            snapshot=snapshot,
+            unit_id=unit.id,
+            sibling_id=sibling.id,
+            action_id=observed_action.id,
+            runtime=runtime,
+            host=host,
+            commits=commits,
+            record_path=record_path,
+            original_record=original_record,
+            mux_calls=mux_calls,
+            supervisor=CampaignSupervisor(store, runtime, clock=lambda: 100.0),
+        )
 
     yield build
     for runtime in runtimes:
@@ -195,7 +297,9 @@ def test_unknown_git_actor_retains_reservation_then_fresh_death_releases_once(pa
     harvest(case, finished)
     unit = selected(case)
     assert unit.claim.quiescent and unit.hold.kind == "pause_unknown"
-    assert session_usage(case.snapshot).model == 0 and writer_available(case.snapshot, case.sibling_id)
+    assert session_usage(case.snapshot).model == 0 and writer_available(
+        case.snapshot, case.sibling_id
+    )
     assert unit.evidence["dev_attempts_spent"] == 2
     assert len(unit.evidence["worker_history"]) == 1
     assert unit.evidence["child_pause"] == case.receipt["child_pause"]
@@ -247,12 +351,16 @@ def test_interrupted_worker_without_receipt_retains_unknown_effect_hold(paused_g
 
 
 @pytest.mark.parametrize("missing_receipt", [False, True])
-def test_promotion_failure_cannot_skip_unsettled_git_gate(paused_git_worker, monkeypatch, missing_receipt):
+def test_promotion_failure_cannot_skip_unsettled_git_gate(
+    paused_git_worker, monkeypatch, missing_receipt
+):
     case = paused_git_worker(missing_receipt=missing_receipt)
     promoted = []
+
     def refuse(*args, **kwargs):
         promoted.append(True)
         raise CampaignError("scripted promotion unavailable")
+
     monkeypatch.setattr(campaign_object_promotion, "promote", refuse)
     waiting = observe(case)
     assert waiting.state == "waiting" and promoted == []
@@ -269,7 +377,9 @@ def test_promotion_failure_cannot_skip_unsettled_git_gate(paused_git_worker, mon
 
 
 @pytest.mark.parametrize("missing_receipt", [False, True])
-def test_record_change_between_observe_and_apply_keeps_claim_and_retries_observation(paused_git_worker, missing_receipt):
+def test_record_change_between_observe_and_apply_keeps_claim_and_retries_observation(
+    paused_git_worker, missing_receipt
+):
     case = paused_git_worker(stopped=True, missing_receipt=missing_receipt)
     finished = observe(case)
     assert finished.state == "confirmed", finished

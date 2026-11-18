@@ -17,7 +17,9 @@ from bmad_loop.campaign_store import CampaignStore, add_action
 def limit(snapshot, total, *, model=8):
     snapshot.spec = replace(
         snapshot.spec,
-        resources=replace(snapshot.spec.resources, max_sessions=model, max_total_sessions=total, verify_slots=8),
+        resources=replace(
+            snapshot.spec.resources, max_sessions=model, max_total_sessions=total, verify_slots=8
+        ),
     )
 
 
@@ -40,7 +42,9 @@ def test_invalid_total_session_limit_is_rejected(value):
         spec_from_dict(raw)
 
 
-@pytest.mark.parametrize("occupied", ["execution", "review", "verify", "reasoning", "unknown-unit", "unknown-job"])
+@pytest.mark.parametrize(
+    "occupied", ["execution", "review", "verify", "reasoning", "unknown-unit", "unknown-job"]
+)
 def test_every_reserved_actor_blocks_all_classes_until_quiescent(occupied):
     snapshot = make_snapshot()
     limit(snapshot, 1)
@@ -67,12 +71,16 @@ def test_every_reserved_actor_blocks_all_classes_until_quiescent(occupied):
         unit.state = UnitState.READY
     assert session_usage(snapshot).total == 0
     assert len(admit(snapshot).units) == 1
-    assert all(resource_available(snapshot, resource) for resource in ("execution", "review", "verify"))
+    assert all(
+        resource_available(snapshot, resource) for resource in ("execution", "review", "verify")
+    )
 
 
 def test_legacy_model_ceiling_keeps_verification_separate():
     snapshot = make_snapshot()
-    snapshot.spec = replace(snapshot.spec, resources=replace(snapshot.spec.resources, max_sessions=1))
+    snapshot.spec = replace(
+        snapshot.spec, resources=replace(snapshot.spec.resources, max_sessions=1)
+    )
     unit = next(iter(snapshot.units.values()))
     unit.state = UnitState.VERIFYING
     unit.claim = claim(unit, resource="verify")
@@ -93,7 +101,10 @@ def test_final_prepare_guard_defers_verifier_then_admits_released_slot(tmp_path,
     runtime = CampaignRuntime(tmp_path, CampaignStore(tmp_path / "state"), clock=lambda: 100)
     action = add_action(snapshot, "launch", target.id, {"kind": kind})
     runtime.control(snapshot, {"kind": "prepare-effect", "action": asdict(action)})
-    assert action.state == "confirmed" and action.receipt["admission_deferred"] == "total session capacity is reserved"
+    assert (
+        action.state == "confirmed"
+        and action.receipt["admission_deferred"] == "total session capacity is reserved"
+    )
     assert target.claim is None and target.attempt == 0 and target.hold is None
     occupied.claim.quiescent = True
     successor = add_action(snapshot, "launch", target.id, {"kind": kind})
@@ -106,7 +117,9 @@ def test_final_prepare_guard_defers_verifier_then_admits_released_slot(tmp_path,
 def test_final_prepare_guard_also_honors_independent_verification_limit(tmp_path):
     snapshot = make_snapshot()
     limit(snapshot, 8)
-    snapshot.spec = replace(snapshot.spec, resources=replace(snapshot.spec.resources, verify_slots=1))
+    snapshot.spec = replace(
+        snapshot.spec, resources=replace(snapshot.spec.resources, verify_slots=1)
+    )
     occupied, target, *_ = snapshot.units.values()
     occupied.state = UnitState.VERIFYING
     occupied.claim = claim(occupied, resource="verify")
@@ -115,7 +128,10 @@ def test_final_prepare_guard_also_honors_independent_verification_limit(tmp_path
     runtime = CampaignRuntime(tmp_path, CampaignStore(tmp_path / "state"), clock=lambda: 100)
     action = add_action(snapshot, "launch", target.id, {"kind": "verify"})
     runtime.control(snapshot, {"kind": "prepare-effect", "action": asdict(action)})
-    assert action.state == "confirmed" and action.receipt["admission_deferred"] == "verify capacity is reserved"
+    assert (
+        action.state == "confirmed"
+        and action.receipt["admission_deferred"] == "verify capacity is reserved"
+    )
     assert target.claim is None and target.attempt == 0
     assert session_usage(snapshot).total == 1 < 8
 
@@ -130,7 +146,10 @@ def test_verifier_reservation_blocks_reasoning_and_releases_normal_prepare(tmp_p
     snapshot, runtime, supervisor, _ = case(tmp_path, prepared, count=1, configure=configure)
     proposals = runtime.observe_workers(snapshot)
     assert not any(p.kind == "reasoning-launch" for p in proposals)
-    assert any(p.kind == "reasoning-wait" and "total session capacity" in p.payload["reason"] for p in proposals)
+    assert any(
+        p.kind == "reasoning-wait" and "total session capacity" in p.payload["reason"]
+        for p in proposals
+    )
     snapshot.units[next(iter(snapshot.units))].claim.quiescent = True
     proposals = runtime.observe_workers(snapshot)
     assert any(p.kind == "reasoning-launch" for p in proposals)

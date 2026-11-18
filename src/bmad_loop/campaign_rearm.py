@@ -44,8 +44,8 @@ def _digest(value: Any) -> str:
 
 def capture_binding(snapshot: CampaignSnapshot, unit: CampaignUnit) -> dict[str, Any]:
     """Describe a retryable terminal child without clearing or changing anything."""
-    from .campaign_transfer import require_not_retired
     from .campaign_action_history import action as historical_action
+    from .campaign_transfer import require_not_retired
 
     require_not_retired(snapshot, operation="technical continuation")
     claim, hold = unit.claim, unit.hold
@@ -70,14 +70,15 @@ def capture_binding(snapshot: CampaignSnapshot, unit: CampaignUnit) -> dict[str,
     receipt = history[-1]
     pause = receipt.get("child_pause")
     typed = pause_cause(receipt)
+    if typed is None:
+        raise CampaignError("technical rearm lacks matching typed child and session evidence")
     interruption = execution_interruption(receipt.get("sessions", []))
     expected = {
         PauseKind.QUOTA_WAIT: ("quota", "quota"),
         PauseKind.TRANSPORT_FAILURE: ("transport", "transport"),
-    }.get(typed.kind if typed is not None else None)
+    }.get(typed.kind)
     if (
-        typed is None
-        or expected is None
+        expected is None
         or (typed.producer, typed.code)
         != ("engine.session", "usage_limit" if expected[0] == "quota" else "transport")
         or hold.kind != expected[0]
@@ -149,9 +150,10 @@ def capture_binding(snapshot: CampaignSnapshot, unit: CampaignUnit) -> dict[str,
     ) or unit.evidence.get("pending_failure_holds") not in (None, []):
         raise CampaignError("technical rearm cannot bypass an independently retained hold")
     if any(
-        row.unit == unit.id
-        and row.state == "sent_unknown"
-        and row.kind not in {"resolution-reprobe", "observe-worker"}
+        row.unit == unit.id and row.state == "sent_unknown"
+        # These polls read the retained worker and its progress. The separate
+        # checkpoint action can push a ref and must settle before continuation.
+        and row.kind not in {"resolution-reprobe", "observe-worker", "checkpoint-progress"}
         for row in snapshot.outbox
     ):
         raise CampaignError("technical rearm waits for uncertain predecessor effects")
@@ -200,10 +202,10 @@ def _candidate(binding):
 
 def _capture(runtime, snapshot, unit, binding):
     """Reuse immutable history capture, without inventing any summary or audit."""
+    from .campaign_action_history import action as historical_action
     from .campaign_handoff_flow import _capture as capture_handoff
     from .campaign_handoff_flow import _target_cap
     from .campaign_transcripts import blob, digest, encoded
-    from .campaign_action_history import action as historical_action
 
     launch = historical_action(snapshot, unit.claim.launch_id)
     if launch is None:
@@ -226,13 +228,18 @@ def _capture(runtime, snapshot, unit, binding):
     # native context or an outstanding external effect.
     pending = capture["current"].get("pending_actions", [])
     own_observations = [
-        row["id"] for row in pending
+        row["id"]
+        for row in pending
         if row.get("kind") == "resolution-reprobe"
         and _plain(row.get("payload", {}).get("rearm_binding")) == binding
     ]
-    capture["current"]["pending_actions"] = [row for row in pending if row["id"] not in own_observations]
+    capture["current"]["pending_actions"] = [
+        row for row in pending if row["id"] not in own_observations
+    ]
     capture["current"]["excluded_rearm_observations"] = own_observations
-    capture["capture_digest"] = digest([capture["current"], capture["sources"], capture["obligations"]])
+    capture["capture_digest"] = digest(
+        [capture["current"], capture["sources"], capture["obligations"]]
+    )
     if capture["gaps"] or capture["native_role"] != "dev":
         raise CampaignError("technical rearm requires complete original development history")
     limit = min(snapshot.spec.reasoning.packet_token_limit, capability["input_tokens"] // 2)
@@ -265,7 +272,9 @@ def _capture(runtime, snapshot, unit, binding):
         }
     )
     if len(packet) > limit:
-        raise CampaignError(f"technical rearm exact context is {len(packet)} bytes; input allowance is {limit}")
+        raise CampaignError(
+            f"technical rearm exact context is {len(packet)} bytes; input allowance is {limit}"
+        )
     path = blob(runtime.store.directory(snapshot.id) / "handoffs" / value["id"] / "packet", packet)
     return {
         "id": value["id"],
@@ -401,6 +410,7 @@ def observe(runtime, snapshot, action):
 
 def _validate_condition(binding, condition, *, now):
     import math
+
     from .campaign_capacity import quota_retry_at
 
     retained_deadline = quota_retry_at({"outcome": "quota", **binding.get("capacity_fault", {})})
@@ -436,8 +446,8 @@ def _validate_condition(binding, condition, *, now):
 
 def validate_capture(snapshot, unit, value, *, directory=None) -> None:
     """Check the sealed task, complete native input and exact candidate metadata."""
-    from .campaign_continuation import _archive
     from .campaign_acceptance import criteria
+    from .campaign_continuation import _archive
     from .campaign_transcripts import digest
     from .model import RunState
     from .platform_util import is_link_like
@@ -625,7 +635,9 @@ def validate_current(snapshot, unit, value, *, continuing=False) -> None:
         ):
             raise CampaignError("technical rearm lost its exact successor claim or hold")
         projected = dataclasses.replace(
-            unit, claim=WorkerClaim(**value["predecessor"]), hold=Hold(**value["binding"]["hold"]),
+            unit,
+            claim=WorkerClaim(**value["predecessor"]),
+            hold=Hold(**value["binding"]["hold"]),
             attempt=value["binding"]["campaign_attempt"],
         )
         # The successor's own unknown launch is reconciled, never mistaken for
@@ -782,7 +794,11 @@ def adopt_launch(snapshot, unit, payload, claim) -> None:
         raise CampaignError("technical rearm launch differs from its exact retained authority")
     # Runtime has installed the successor claim. Check every prior binding with
     # that one expected change projected back to the terminal predecessor.
-    projected = dataclasses.replace(unit, claim=WorkerClaim(**value["predecessor"]), attempt=value["binding"]["campaign_attempt"])
+    projected = dataclasses.replace(
+        unit,
+        claim=WorkerClaim(**value["predecessor"]),
+        attempt=value["binding"]["campaign_attempt"],
+    )
     validate_current(snapshot, projected, value)
     value["phase"] = "continuing"
     value["successor"] = dataclasses.asdict(claim)
@@ -857,7 +873,11 @@ def _retire_terminal_gate(unit, value) -> None:
     if unit.hold and unit.hold.kind == "technical_rearm" and unit.hold.id == value["id"]:
         unit.hold = None
     prior = unit.evidence.get("operator_prior_hold")
-    if isinstance(prior, dict) and prior.get("kind") == "technical_rearm" and prior.get("id") == value["id"]:
+    if (
+        isinstance(prior, dict)
+        and prior.get("kind") == "technical_rearm"
+        and prior.get("id") == value["id"]
+    ):
         value["retired_operator_prior_hold"] = dict(prior)
         unit.evidence.pop("operator_prior_hold")
 
@@ -873,14 +893,17 @@ def finish(snapshot, unit, receipt) -> None:
         or not unit.claim.quiescent
         or unit.claim.launch_id != successor.get("launch_id")
         or any(
-            receipt.get(key) != successor.get(key)
-            for key in ("launch_id", "attempt", "generation")
+            receipt.get(key) != successor.get(key) for key in ("launch_id", "attempt", "generation")
         )
         or receipt.get("campaign_id") != snapshot.id
         or receipt.get("unit_id") != unit.id
         or (
             receipt.get("run_id") != successor.get("run_id")
-            and not (receipt.get("run_id") is None and receipt.get("outcome") == "failed" and receipt.get("error"))
+            and not (
+                receipt.get("run_id") is None
+                and receipt.get("outcome") == "failed"
+                and receipt.get("error")
+            )
         )
     ):
         raise CampaignError("technical rearm terminal result does not own its successor")
@@ -912,13 +935,24 @@ def finish_interrupted(snapshot, unit, action, data) -> None:
         or action.payload.get("launch_id") != claim.launch_id
         or any(
             getattr(claim, key) != successor.get(key)
-            for key in ("unit", "launch_id", "run_id", "run_dir", "attempt", "generation", "workspace", "branch")
+            for key in (
+                "unit",
+                "launch_id",
+                "run_id",
+                "run_dir",
+                "attempt",
+                "generation",
+                "workspace",
+                "branch",
+            )
         )
         or any(
             startup.get(key) != expected
             for key, expected in {
-                "campaign_id": snapshot.id, "unit_id": unit.id,
-                "launch_id": claim.launch_id, "attempt": claim.attempt,
+                "campaign_id": snapshot.id,
+                "unit_id": unit.id,
+                "launch_id": claim.launch_id,
+                "attempt": claim.attempt,
                 "generation": claim.generation,
             }.items()
         )
@@ -970,29 +1004,56 @@ def cancel_unlaunched(snapshot, unit, action, *, mode, result=None):
         or action.payload.get("rearm_id") != value.get("id")
         or not claim
         or claim.launch_id != action.id
-        or any(getattr(claim, key) != value.get("successor", {}).get(key) for key in ("unit", "launch_id", "run_id", "run_dir", "attempt", "generation", "workspace", "branch"))
+        or any(
+            getattr(claim, key) != value.get("successor", {}).get(key)
+            for key in (
+                "unit",
+                "launch_id",
+                "run_id",
+                "run_dir",
+                "attempt",
+                "generation",
+                "workspace",
+                "branch",
+            )
+        )
         or permit.get("schema_version") != 3
         or permit.get("permit_id") != permit_id
         or permit_id != _digest(permit.get("binding"))
         or permit.get("binding", {}).get("purpose") != "technical_rearm"
         or permit.get("binding", {}).get("rearm_id") != value.get("id")
         or permit.get("binding", {}).get("pause_binding") != value.get("binding")
-        or consumption != {"schema_version": 1, "permit_id": permit_id, "successor_launch_id": claim.launch_id, "successor_run_id": claim.run_id, "state": "consumed"}
+        or consumption
+        != {
+            "schema_version": 1,
+            "permit_id": permit_id,
+            "successor_launch_id": claim.launch_id,
+            "successor_run_id": claim.run_id,
+            "state": "consumed",
+        }
         or value.get("predecessor", {}).get("quiescent") is not True
         or value.get("predecessor") != value.get("binding", {}).get("predecessor")
     ):
-        raise CampaignError("technical rearm cancellation lacks exact never-launched successor evidence")
+        raise CampaignError(
+            "technical rearm cancellation lacks exact never-launched successor evidence"
+        )
     proof = {
-        "schema_version": 1, "mode": mode,
-        "campaign_id": snapshot.id, "unit_id": unit.id,
-        "action_id": action.id, "generation": action.generation,
-        "permit_id": permit_id, "successor": dataclasses.asdict(claim),
+        "schema_version": 1,
+        "mode": mode,
+        "campaign_id": snapshot.id,
+        "unit_id": unit.id,
+        "action_id": action.id,
+        "generation": action.generation,
+        "permit_id": permit_id,
+        "successor": dataclasses.asdict(claim),
         "certainty": "not-submitted" if mode == "prepared-stop" else "not-launched",
         "predecessor_launch_id": value["predecessor"]["launch_id"],
     }
     proof["id"] = _digest(proof)
     original_hold = Hold(**value["binding"]["hold"])
-    internal = Hold("technical_rearm", "Exact retained development continuation is in progress", id=value["id"])
+    internal = Hold(
+        "technical_rearm", "Exact retained development continuation is in progress", id=value["id"]
+    )
     if unit.hold is None or unit.hold == internal:
         unit.hold = original_hold
     if unit.evidence.get("operator_prior_hold") == dataclasses.asdict(internal):
@@ -1005,5 +1066,12 @@ def cancel_unlaunched(snapshot, unit, action, *, mode, result=None):
         action.state = "rejected"
         action.error = "campaign drained before retained launch submission"
         action.receipt = {"not_launched": True, "rearm_cancellation": proof}
-    add_event(snapshot, "technical-rearm-canceled", unit=unit.id, action=action.id, permit_id=permit_id, mode=mode)
+    add_event(
+        snapshot,
+        "technical-rearm-canceled",
+        unit=unit.id,
+        action=action.id,
+        permit_id=permit_id,
+        mode=mode,
+    )
     return proof

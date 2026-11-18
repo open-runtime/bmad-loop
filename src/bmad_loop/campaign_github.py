@@ -49,9 +49,7 @@ class GithubError(RuntimeError):
                 else (
                     "rate_limit"
                     if status == 429
-                    else "transient"
-                    if status == 0 or status >= 500
-                    else "refused"
+                    else "transient" if status == 0 or status >= 500 else "refused"
                 )
             )
         )
@@ -205,9 +203,7 @@ class GhTransport:
                     else (
                         "permission"
                         if status == 403
-                        else "transient"
-                        if status >= 500
-                        else "refused"
+                        else "transient" if status >= 500 else "refused"
                     )
                 )
             )
@@ -690,7 +686,9 @@ class GithubGateway:
                     "merge_action", intent.payload.get("merge_action")
                 ) != intent.payload.get("merge_action") or details.get(
                     "merge_method", intent.payload.get("merge_method")
-                ) != intent.payload.get("merge_method"):
+                ) != intent.payload.get(
+                    "merge_method"
+                ):
                     return replace(
                         intent, error="Existing merge request options differ", receipt=receipt
                     )

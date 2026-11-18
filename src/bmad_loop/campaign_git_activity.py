@@ -261,7 +261,7 @@ def _inode(path: Path) -> list[int]:
     return [value.st_dev, value.st_ino]
 
 
-def _subject(workspace: Path, *, common_dir, branch) -> dict[str, Any]:
+def _subject(workspace: Path, *, common_dir, branch, detached_head=None) -> dict[str, Any]:
     """Actual checkout authority, independent of any Engine source/task binding."""
     if (
         not workspace.is_absolute()
@@ -277,12 +277,22 @@ def _subject(workspace: Path, *, common_dir, branch) -> dict[str, Any]:
     if git_dir != common and git_dir.parent != common / "worktrees":
         raise CampaignError("Git activity Git directory escaped the launch repository")
     git_identity = _inode(git_dir)
-    if _bytes(git_dir / "HEAD", 1024).decode("utf-8").strip() != "ref: refs/heads/" + branch:
+    expected = "ref: refs/heads/" + branch
+    if detached_head is not None:
+        if (
+            not isinstance(detached_head, str)
+            or len(detached_head) not in {40, 64}
+            or any(char not in "0123456789abcdef" for char in detached_head)
+        ):
+            raise CampaignError("Git activity detached candidate has an invalid object ID")
+        expected = detached_head
+    if _bytes(git_dir / "HEAD", 1024).decode("utf-8").strip() != expected:
         raise CampaignError("Git activity current branch differs from its launch")
     return {
         "workspace": str(workspace.resolve()),
         "common_dir": str(common),
         "branch": branch,
+        **({"detached_head": detached_head} if detached_head is not None else {}),
         "repo_identity": repo_identity,
         "git_dir": str(git_dir),
         "git_dir_identity": git_identity,
@@ -294,7 +304,10 @@ def _current(
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     if str(workspace.resolve()) != bound["workspace"]:
         raise CampaignError("Git activity workspace differs from launch")
-    _subject(workspace, common_dir=bound["common_dir"], branch=bound["branch"])
+    detached = bound.get("detached_head") if absence_only else None
+    _subject(
+        workspace, common_dir=bound["common_dir"], branch=bound["branch"], detached_head=detached
+    )
     root = finalization_recovery._root(workspace)
     try:
         (root / "active.json").lstat()
@@ -316,7 +329,7 @@ def _current(
         or record.get("repo_identity") != _inode(workspace)
         or not isinstance(record.get("git_dir"), str)
         or record.get("git_dir_identity") != _inode(Path(record["git_dir"]))
-        or record.get("branch_ref") != "refs/heads/" + bound["branch"]
+        or record.get("branch_ref") != ("HEAD" if detached else "refs/heads/" + bound["branch"])
     ):
         raise CampaignError("Git activity record belongs to another subject")
     # The Git directory may be the common directory or one exact linked-worktree
@@ -327,9 +340,8 @@ def _current(
         raise CampaignError("Git activity Git directory escaped the launch repository")
     if git_dir != _workspace_git_dir(workspace):
         raise CampaignError("Git activity record names another worktree Git directory")
-    if (
-        _bytes(git_dir / "HEAD", 1024).decode("utf-8").strip()
-        != "ref: refs/heads/" + bound["branch"]
+    if _bytes(git_dir / "HEAD", 1024).decode("utf-8").strip() != (
+        detached or "ref: refs/heads/" + bound["branch"]
     ):
         raise CampaignError("Git activity current branch differs from its launch")
     witness = {
@@ -377,9 +389,12 @@ def _current(
 
 
 def _absence(workspace, subject) -> dict[str, Any]:
-    before = _subject(workspace, common_dir=subject["common_dir"], branch=subject["branch"])
+    coordinates = {
+        key: subject[key] for key in ("common_dir", "branch", "detached_head") if key in subject
+    }
+    before = _subject(workspace, **coordinates)
     _record, witness = _current(workspace, subject, absence_only=True)
-    after = _subject(workspace, common_dir=subject["common_dir"], branch=subject["branch"])
+    after = _subject(workspace, **coordinates)
     if before != after:
         raise CampaignError("Git activity checkout changed during absence observation")
     return {"schema_version": 1, "mode": "absence-only", "subject": after, "record": witness}
@@ -407,7 +422,9 @@ def seal(workspace: Path, bound, *, required: bool = False) -> dict[str, Any]:
     return {**body, "id": _digest(body)}
 
 
-def validate_release(workspace: Path, authority: dict, observation: dict, *, required=False) -> None:
+def validate_release(
+    workspace: Path, authority: dict, observation: dict, *, required=False
+) -> None:
     """Recheck a controller-created observation before committing claim release.
 
     Recorded process death is monotonic for its birth identity. This validates
@@ -594,9 +611,11 @@ class GitActivityObserver:
             return GitActivityObservation(
                 state,
                 effect,
-                "Recorded Git actors stopped"
-                if state == "quiescent"
-                else "Recorded Git actors remain alive or unknown",
+                (
+                    "Recorded Git actors stopped"
+                    if state == "quiescent"
+                    else "Recorded Git actors remain alive or unknown"
+                ),
                 {
                     "receipt": current,
                     "actors": states,
@@ -619,7 +638,7 @@ class GitActivityObserver:
         return self._observe(workspace, bound, receipt, required=required)
 
     def observe_absence(
-        self, workspace: Path, *, common_dir, branch: str
+        self, workspace: Path, *, common_dir, branch: str, detached_head: str | None = None
     ) -> GitActivityObservation:
         """Prove only absence of pending finalization, never general quiescence.
 
@@ -632,6 +651,7 @@ class GitActivityObserver:
             "workspace": str(workspace.resolve()),
             "common_dir": str(common_dir),
             "branch": branch,
+            **({"detached_head": detached_head} if detached_head is not None else {}),
         }
         return self._observe(workspace, subject, None, required=False, absence=True)
 

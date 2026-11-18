@@ -22,9 +22,14 @@ def consumed_case(quota_child, monkeypatch, tmp_path):
 
     snapshot, unit, runtime = ready_case(quota_child, monkeypatch, tmp_path)
     claim = replace(
-        unit.claim, launch_id="canceled-successor", run_id="canceled-run",
+        unit.claim,
+        launch_id="canceled-successor",
+        run_id="canceled-run",
         run_dir=str(tmp_path / "workers" / "canceled-successor"),
-        attempt=unit.attempt + 1, quiescent=False, status="prepared", writes=True,
+        attempt=unit.attempt + 1,
+        quiescent=False,
+        status="prepared",
+        writes=True,
     )
     payload = {**snapshot.outbox[0].payload, "rearm_id": unit.evidence["technical_rearm"]["id"]}
     action = OutboxAction(claim.launch_id, "launch", unit.id, payload, snapshot.generation)
@@ -32,9 +37,21 @@ def consumed_case(quota_child, monkeypatch, tmp_path):
     unit.claim, unit.attempt = claim, claim.attempt
     rearm.adopt_launch(snapshot, unit, payload, claim)
     policy = Policy()
-    policy = replace(policy, adapter=replace(policy.adapter, dev=StageAdapterPolicy(name="codex", model="gpt-scripted")))
+    policy = replace(
+        policy,
+        adapter=replace(policy.adapter, dev=StageAdapterPolicy(name="codex", model="gpt-scripted")),
+    )
     profile = CLIProfile("codex", "scripted-unused", HookSpec("none", "", {}))
-    template = CampaignExecution(snapshot.id, unit.id, 0, 0, snapshot.config_revision, tmp_path / "frozen", policy, {"dev": profile})
+    template = CampaignExecution(
+        snapshot.id,
+        unit.id,
+        0,
+        0,
+        snapshot.config_revision,
+        tmp_path / "frozen",
+        policy,
+        {"dev": profile},
+    )
     envelope = execution_envelope(template, snapshot, unit, claim, payload, Path(claim.run_dir))
     permit = prepare_permit(continuation_request(snapshot, unit, claim), envelope)
     action.payload["continuation_permit_id"] = permit["permit_id"]
@@ -42,8 +59,10 @@ def consumed_case(quota_child, monkeypatch, tmp_path):
         permit["permit_id"]: {
             "permit": permit,
             "consumption": {
-                "schema_version": 1, "permit_id": permit["permit_id"],
-                "successor_launch_id": claim.launch_id, "successor_run_id": claim.run_id,
+                "schema_version": 1,
+                "permit_id": permit["permit_id"],
+                "successor_launch_id": claim.launch_id,
+                "successor_run_id": claim.run_id,
                 "state": "consumed",
             },
         },
@@ -52,13 +71,19 @@ def consumed_case(quota_child, monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("mode", ["prepared-stop", "not-launched"])
-def test_cancellation_preserves_spent_permit_and_restores_only_terminal_predecessor(quota_child, monkeypatch, tmp_path, mode):
+def test_cancellation_preserves_spent_permit_and_restores_only_terminal_predecessor(
+    quota_child, monkeypatch, tmp_path, mode
+):
     from bmad_loop import campaign_rearm as rearm
 
     snapshot, unit, _, action = consumed_case(quota_child, monkeypatch, tmp_path)
     previous = copy.deepcopy(unit.evidence["technical_rearm"])
     permits = copy.deepcopy(unit.evidence["continuation_permits"])
-    attempts = (unit.attempt, unit.evidence["dev_attempts_spent"], unit.evidence["review_cycles_spent"])
+    attempts = (
+        unit.attempt,
+        unit.evidence["dev_attempts_spent"],
+        unit.evidence["review_cycles_spent"],
+    )
     if mode == "prepared-stop":
         snapshot.phase = "draining"
         result = None
@@ -70,7 +95,11 @@ def test_cancellation_preserves_spent_permit_and_restores_only_terminal_predeces
     assert asdict(unit.claim) == previous["predecessor"]
     assert asdict(unit.hold) == previous["binding"]["hold"]
     assert unit.evidence["continuation_permits"] == permits
-    assert (unit.attempt, unit.evidence["dev_attempts_spent"], unit.evidence["review_cycles_spent"]) == attempts
+    assert (
+        unit.attempt,
+        unit.evidence["dev_attempts_spent"],
+        unit.evidence["review_cycles_spent"],
+    ) == attempts
     assert proof["permit_id"] in permits
     assert rearm.cancel_unlaunched(snapshot, unit, action, mode=mode, result=result) == proof
     if mode == "not-launched":
@@ -81,7 +110,9 @@ def test_cancellation_preserves_spent_permit_and_restores_only_terminal_predeces
     assert next_binding["campaign_attempt"] == attempts[0]
 
 
-def test_cancel_preserves_new_owner_and_its_original_quota_obligation(quota_child, monkeypatch, tmp_path):
+def test_cancel_preserves_new_owner_and_its_original_quota_obligation(
+    quota_child, monkeypatch, tmp_path
+):
     from bmad_loop import campaign_rearm as rearm
 
     snapshot, unit, _, action = consumed_case(quota_child, monkeypatch, tmp_path)
@@ -96,14 +127,21 @@ def test_cancel_preserves_new_owner_and_its_original_quota_obligation(quota_chil
     assert unit.evidence["unresolved_approval_requirements"] == ["fresh-human-signoff"]
 
 
-@pytest.mark.parametrize("change", ["sent_unknown", "launched", "no_receipt", "foreign_claim", "missing_permit", "other_permit"])
-def test_cancel_requires_definitive_never_launched_exact_successor(quota_child, monkeypatch, tmp_path, change):
+@pytest.mark.parametrize(
+    "change",
+    ["sent_unknown", "launched", "no_receipt", "foreign_claim", "missing_permit", "other_permit"],
+)
+def test_cancel_requires_definitive_never_launched_exact_successor(
+    quota_child, monkeypatch, tmp_path, change
+):
     from bmad_loop import campaign_rearm as rearm
 
     snapshot, unit, _, action = consumed_case(quota_child, monkeypatch, tmp_path)
     snapshot.phase = "draining"
     baseline = snapshot.clone()
-    rearm.cancel_unlaunched(baseline, baseline.units[unit.id], baseline.outbox[-1], mode="prepared-stop")
+    rearm.cancel_unlaunched(
+        baseline, baseline.units[unit.id], baseline.outbox[-1], mode="prepared-stop"
+    )
     assert baseline.units[unit.id].evidence["technical_rearm"]["phase"] == "canceled"
     mode, result = "prepared-stop", None
     if change == "sent_unknown":
@@ -135,7 +173,13 @@ def test_first_never_launched_quota_stays_fresh_admission_not_retained_work(paus
     unit.claim.quiescent = False
     action = snapshot.outbox[0]
     runtime = CampaignRuntime.__new__(CampaignRuntime)
-    runtime._apply_effect(snapshot, action, Observation("confirmed", {"not_launched": True, "quota_wait": "Admission closed before first spawn"}))
+    runtime._apply_effect(
+        snapshot,
+        action,
+        Observation(
+            "confirmed", {"not_launched": True, "quota_wait": "Admission closed before first spawn"}
+        ),
+    )
     assert unit.state == UnitState.READY and unit.hold is None
     assert unit.claim.status == "not_launched" and unit.claim.quiescent
     assert "worker_history" not in unit.evidence and "technical_rearm" not in unit.evidence
@@ -144,12 +188,22 @@ def test_first_never_launched_quota_stays_fresh_admission_not_retained_work(paus
 
 
 @pytest.mark.parametrize("wrong_run", [False, True])
-def test_bound_bootstrap_failure_is_terminal_without_inventing_native_run_identity(quota_child, monkeypatch, tmp_path, wrong_run):
+def test_bound_bootstrap_failure_is_terminal_without_inventing_native_run_identity(
+    quota_child, monkeypatch, tmp_path, wrong_run
+):
     from bmad_loop import campaign_rearm as rearm
 
     snapshot, unit, _, _ = consumed_case(quota_child, monkeypatch, tmp_path)
     unit.claim.quiescent = True
-    receipt = {"campaign_id": snapshot.id, "unit_id": unit.id, "launch_id": unit.claim.launch_id, "attempt": unit.claim.attempt, "generation": unit.claim.generation, "outcome": "failed", "error": "Controller rejected changed startup authority"}
+    receipt = {
+        "campaign_id": snapshot.id,
+        "unit_id": unit.id,
+        "launch_id": unit.claim.launch_id,
+        "attempt": unit.claim.attempt,
+        "generation": unit.claim.generation,
+        "outcome": "failed",
+        "error": "Controller rejected changed startup authority",
+    }
     if wrong_run:
         receipt["run_id"] = "foreign-native-run"
         with pytest.raises(CampaignError, match="does not own"):

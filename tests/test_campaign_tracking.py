@@ -299,9 +299,7 @@ def test_legacy_mirror_fresh_read_must_match_discovery(legacy_mirror, monkeypatc
             row.update(
                 {"body": "Owner removed marker"}
                 if fault == "marker-removed"
-                else {"id": 7777}
-                if fault == "identity-changed"
-                else {"state": "closed"}
+                else {"id": 7777} if fault == "identity-changed" else {"state": "closed"}
             )
         return row
 

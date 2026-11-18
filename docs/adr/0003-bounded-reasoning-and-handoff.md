@@ -56,6 +56,16 @@ Writable handoff, managed messaging, live controls and current load qualificatio
 remain unfulfilled rollout gates. A narrow Claude/Grok delivery does not establish
 these gates or qualify every requested native route.
 
+The unattended rollout requires quota-triggered writable continuation both
+between Claude and Codex and between Claude Opus 5.5 and Claude Fable 5.2.
+Exercise each direction intended for automatic selection. Record the selected
+and served model, effort, route and provider family. Preserve the same ticket,
+worktree, branch, PR, dirty files, outstanding acceptance and remaining allowances.
+Carry immutable history through hierarchical summarization and independent audit.
+Verify the successor uses the packet to finish unfinished work. Two Claude models
+count as one family when selecting independent publication review. Exact installed
+routes, current capacity and successful native trials are qualification prerequisites.
+
 Before any coding or reasoning launch, a stopped campaign may renew equivalent
 route proofs after its deterministic workspace preparation has been reconciled.
 The preparation receipt, clean bootstrap commit and native workspace identity must

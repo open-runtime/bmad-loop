@@ -226,8 +226,16 @@ def test_scripted_observation_replays_only_recorded_completion(scripted_reasonin
     assert admissions == ["enter", "exit"]
 
 
+@pytest.mark.parametrize(
+    "claude_models",
+    [
+        pytest.param(None, id="cross-harness"),
+        pytest.param(("claude-opus-5-5", "claude-fable-5-2"), id="opus-to-fable"),
+        pytest.param(("claude-fable-5-2", "claude-opus-5-5"), id="fable-to-opus"),
+    ],
+)
 def test_real_worker_quota_continues_same_pr_through_normal_supervisor(
-    campaign, production_case, tmp_path
+    campaign, production_case, tmp_path, claude_models
 ):
     configured_runtime, configured, _, _ = campaign
     case = production_case
@@ -239,9 +247,15 @@ def test_real_worker_quota_continues_same_pr_through_normal_supervisor(
     roles = dict(snapshot.spec.roles)
     roles.update(fixture_roles)
     first, last = configured.spec.candidates("execution")
-    unavailable = dataclasses.replace(first, model="gpt-capacity-unavailable")
     routes = copy.deepcopy(configured.config_snapshot["reasoning_capabilities"])
-    routes["codex:" + unavailable.model] = {
+    if claude_models:
+        first, last = (dataclasses.replace(last, model=model) for model in claude_models)
+        for candidate in (first, last):
+            routes[f"{candidate.profile}:{candidate.model}"] = {
+                "execution": configured_runtime.fixture_cap(candidate, True)
+            }
+    unavailable = dataclasses.replace(first, model=first.model + "-quota-unknown")
+    routes[f"{unavailable.profile}:{unavailable.model}"] = {
         "execution": configured_runtime.fixture_cap(unavailable, True)
     }
     capabilities = tmp_path / "capabilities.json"
@@ -270,9 +284,20 @@ def test_real_worker_quota_continues_same_pr_through_normal_supervisor(
     snapshot = case.store.save(snapshot, snapshot.revision)
     from bmad_loop.campaign_scheduler import CapacityObservation
 
-    case.runtime.capacity_observer = lambda candidate, project: CapacityObservation(
-        candidate.model != unavailable.model, slots=8, model_access=True
-    )
+    def observe_capacity(candidate, project):
+        if candidate == unavailable:
+            return CapacityObservation(False, known=False, reason="quota unknown for this model")
+        if (
+            claude_models
+            and candidate == last
+            and not (tmp_path / "parallel-markers/first").exists()
+        ):
+            return CapacityObservation(
+                False, known=False, reason="awaiting model quota observation"
+            )
+        return CapacityObservation(True, slots=8, model_access=True)
+
+    case.runtime.capacity_observer = observe_capacity
     case.runtime.reasoning_runner = ScriptedReasoning()
     script = tmp_path / "scripted-coding-cli.py"
     body = script.read_text()
@@ -296,7 +321,8 @@ def test_real_worker_quota_continues_same_pr_through_normal_supervisor(
         assert json.loads(packet.read_text())["resolved_constraints"]
         assert partial.read_text()=="preserved partial work"
         predecessor=json.loads((Path(request["native_predecessor"]["run_dir"])/"request.json").read_text())
-        assert request["candidate"]["profile"]!=predecessor["candidate"]["profile"]
+        assert request["candidate"]["model"]!=predecessor["candidate"]["model"]
+        assert (request["workspace"],request["branch"])==(predecessor["workspace"],predecessor["branch"])
         assert request["native_predecessor"]["launch_id"]!=request["launch_id"]
         event("successor-context-delivered",request)
 """
@@ -352,11 +378,18 @@ def test_real_worker_quota_continues_same_pr_through_normal_supervisor(
         row.get("outcome") == "locally_complete" and row.get("head")
         for row in first.evidence["worker_history"]
     )
-    assert first.evidence["developer_families"] == ["anthropic", "openai"]
+    assert first.evidence["developer_families"] == (
+        ["anthropic"] if claude_models else ["anthropic", "openai"]
+    )
     assert first.evidence["handoff"]["phase"] == "continuing"
     continuation = first.evidence["handoff"]["candidate"]
-    assert continuation["model"] in {"gpt-test", "claude-test"}
-    assert continuation["profile"] != first.evidence["handoff"]["previous_route"][0]
+    previous = first.evidence["handoff"]["previous_route"]
+    if claude_models:
+        assert previous == ["claude", claude_models[0]]
+        assert (continuation["profile"], continuation["model"]) == ("claude", claude_models[1])
+    else:
+        assert continuation["model"] in {"gpt-test", "claude-test"}
+        assert continuation["profile"] != previous[0]
     assert first.evidence["session_lineage"][0]["native_session_imported"] is False
     assert (
         len(

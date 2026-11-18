@@ -24,6 +24,7 @@ from .campaign_decisions import (
     apply_decision,
     collect_evidence,
     decision_packet,
+    development_choice,
     validate_decision,
 )
 from .campaign_model import (
@@ -32,6 +33,7 @@ from .campaign_model import (
     EvidenceCoordinates,
     Hold,
     RoleCandidate,
+    UnitState,
 )
 from .campaign_recovery import CampaignRecovery, PushObservation, Quiescence
 from .campaign_resolution import (
@@ -207,6 +209,61 @@ def _context_current(snapshot: CampaignSnapshot, unit_id: str, packet: Mapping[s
         == snapshot.units[unit_id].evidence.get("github_input_revision", "")
         and packet.get("decision_input_revision", "")
         == snapshot.units[unit_id].evidence.get("decision_input_revision", "")
+        and (
+            "question" not in packet
+            or packet.get("delegation_recheck_revision", "")
+            == snapshot.units[unit_id].evidence.get("delegation_recheck_revision", "")
+        )
+    )
+
+
+def current_owner_advice(snapshot, unit):
+    """Only expose recommendations bound to the current hold and decision inputs."""
+    binding = unit.evidence.get("decision_advice", {})
+    receipt = snapshot.bindings.get("decision_receipts", {}).get(binding.get("receipt"), {})
+    if (
+        not receipt.get("options")
+        or not unit.hold
+        or binding.get("hold") != _digest(dataclasses.asdict(unit.hold))
+        or not _context_current(
+            snapshot,
+            unit.id,
+            {**binding, "coordinates": receipt["coordinates"], "hold": {"id": receipt["hold_id"]}},
+        )
+    ):
+        return None
+    return {
+        "decision_id": receipt["id"],
+        "private": bool(receipt.get("private_sources")),
+        "options": () if receipt.get("private_sources") else receipt["options"],
+    }
+
+
+def _routine_choice(unit):
+    return (
+        unit.hold
+        and unit.hold.kind in {"product_choice", "decision"}
+        and unit.spec.kind != "planning"
+        and unit.state not in {UnitState.PENDING, UnitState.PLANNING, UnitState.DRAFT}
+    )
+
+
+def routine_review_pending(snapshot, unit):
+    """Whether a routine choice is awaiting its first review of the current inputs."""
+    if (
+        not _routine_choice(unit)
+        or snapshot.spec.decisions.mode == "off"
+        or not unit.bindings.get("workspace")
+    ):
+        return False
+    if unit.claim and not unit.claim.quiescent:
+        return unit.claim.role == "decision_review"
+    saved = unit.evidence.get("resolution_context", {})
+    packet = saved.get("packet", {})
+    return (
+        saved.get("mode") != "decision"
+        or not _context_current(snapshot, unit.id, packet)
+        or _digest(packet) not in unit.evidence.get("resolution_contexts_attempted", ())
     )
 
 
@@ -358,6 +415,17 @@ def collect_context(
         from .campaign_decision_sources import configured_locations, controller_comment
 
         locations = configured_locations(snapshot.spec.decisions.sources, scope=(unit_id,))
+        if _routine_choice(unit):
+            locations += tuple(
+                EvidenceLocation(
+                    "delegation:" + ref,
+                    "delegation_document",
+                    ref,
+                    authority="delegation",
+                    scope=(unit_id,),
+                )
+                for ref in snapshot.spec.decisions.delegation_documents
+            )
         locations += tuple(
             EvidenceLocation(
                 f"transcript:{identity}",
@@ -386,8 +454,16 @@ def collect_context(
                 *(f"{source}: truncated" for source in collection.truncated),
                 *mapped_unavailable,
             ),
+            require_owner_options=True,
         )
         packet = decision_packet(context)
+        packet["accepted_work"] = {
+            "title": unit.spec.title,
+            "scopes": list(unit.spec.scopes),
+            "acceptance": list(unit.spec.acceptance),
+        }
+        if revision := unit.evidence.get("delegation_recheck_revision"):
+            packet["delegation_recheck_revision"] = revision
     elif mode == "diagnosis":
         if unit.hold.kind in _DECISION_HOLDS:
             raise CampaignError("owner and approval holds require decision evidence review first")
@@ -458,6 +534,7 @@ def decision_context(packet: Mapping[str, Any]) -> DecisionContext:
         tuple(packet["allowed_actions"]),
         tuple(packet["allowed_paths"]),
         tuple(packet.get("unavailable", [])),
+        bool(packet.get("require_owner_options")),
     )
 
 
@@ -487,7 +564,12 @@ def resolution_context(packet: Mapping[str, Any]) -> ResolutionContext:
 def apply_context(snapshot: CampaignSnapshot, unit_id: str, result: Mapping[str, Any]) -> None:
     if not _context_current(snapshot, unit_id, result["packet"]):
         raise CampaignError("recovery context is stale")
-    snapshot.units[unit_id].evidence["resolution_context"] = dict(result)
+    evidence = snapshot.units[unit_id].evidence
+    if evidence.get("decision_advice") and _digest(
+        evidence.get("resolution_context", {}).get("packet")
+    ) != _digest(result["packet"]):
+        evidence.pop("decision_advice")
+    evidence["resolution_context"] = dict(result)
     add_event(snapshot, "recovery-context-collected", unit=unit_id, mode=result["mode"])
 
 
@@ -582,6 +664,50 @@ def validate_stage_result(
         if refreshed.unavailable:
             context = dataclasses.replace(context, unavailable=refreshed.unavailable)
         accepted = validate_decision(receipt["artifact"], context, current_sources=fresh_sources)
+        if accepted.disposition == "delegated_choice":
+            if _digest(fresh["packet"]) != _digest(packet):
+                raise CampaignError("delegated decision inputs changed during review")
+            actor = receipt.get("observed_model")
+            source = receipt.get("observed_model_source")
+            observed_models = receipt.get("observed_models", [])
+            if (
+                not isinstance(actor, str)
+                or not actor.strip()
+                or len(actor) > 256
+                or source not in {"transcript_primary", "native_session_hook"}
+                or not isinstance(observed_models, (list, tuple))
+                or len(observed_models) > 32
+                or any(
+                    not isinstance(model, str) or not model or len(model) > 256
+                    for model in observed_models
+                )
+            ):
+                raise CampaignError("delegated choice requires an observed native decision model")
+            accepted = dataclasses.replace(
+                accepted,
+                id=_digest(
+                    [
+                        accepted.id,
+                        accepted.constraints,
+                        accepted.invalidation_triggers,
+                        actor,
+                        source,
+                        observed_models,
+                        _digest(packet),
+                    ]
+                ),
+                actual_actor=actor,
+                observed_model_source=source,
+                observed_models=tuple(dict.fromkeys([actor, *observed_models])),
+            )
+            pending = [
+                development_choice(snapshot.bindings["decision_receipts"][binding["receipt"]])
+                for key, binding in unit.evidence.get("pending_delegated_choices", {}).items()
+                if key != accepted.hold_id
+            ]
+            choices = json.dumps([*pending, development_choice(dataclasses.asdict(accepted))])
+            if len(choices.encode()) > 32_000 or _redact(choices) != choices:
+                raise CampaignError("delegated choices exceed the safe bounded development input")
         return {"kind": "decision", "accepted": dataclasses.asdict(accepted)}
     context = resolution_context(packet)
     accepted = validate_proposal(receipt["artifact"], context, snapshot.spec.resolution)
@@ -591,6 +717,9 @@ def validate_stage_result(
 def _decision(raw: Mapping[str, Any]) -> DecisionReceipt:
     values = dict(raw)
     values["coordinates"] = EvidenceCoordinates(**values["coordinates"])
+    values["options"] = tuple(
+        (answer, reason, tuple(sources)) for answer, reason, sources in values.get("options", ())
+    )
     for key in (
         "citations",
         "contrary",
@@ -598,6 +727,7 @@ def _decision(raw: Mapping[str, Any]) -> DecisionReceipt:
         "invalidation_triggers",
         "fact_ids",
         "private_sources",
+        "observed_models",
     ):
         values[key] = tuple(
             tuple(item) if isinstance(item, list) else item for item in values.get(key, [])
@@ -637,7 +767,28 @@ def apply_diagnosis(
     if not isinstance(validated, dict):
         raise CampaignError("resolution receipt lacks fresh independent artifact validation")
     if validated["kind"] == "decision":
-        apply_decision(snapshot, unit_id, _decision(validated["accepted"]))
+        decision = _decision(validated["accepted"])
+        original = dataclasses.asdict(unit.hold) if unit.hold else None
+        apply_decision(snapshot, unit_id, decision)
+        if (
+            decision.disposition == "delegated_choice"
+            and decision.observed_model_source
+            and original
+        ):
+            from .campaign_attribution import record_stage_writer
+
+            record_stage_writer(
+                unit,
+                {
+                    "observed_model": decision.actual_actor,
+                    "observed_models": decision.observed_models,
+                },
+            )
+            unit.evidence.setdefault("pending_delegated_choices", {})[decision.hold_id] = {
+                "receipt": decision.id,
+                "hold": original,
+                "packet_digest": _digest(unit.evidence["active_resolution_packet"]),
+            }
         return None
     proposal = _proposal(validated["accepted"])
     if proposal.automatic and unit.hold and unit.hold.kind not in _TECHNICAL_HOLDS:

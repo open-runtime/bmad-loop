@@ -315,7 +315,8 @@ class CampaignStore:
                         or unit.claim.launch_id
                         != expected["permit"]["binding"]["predecessor"]["launch_id"]
                         or (
-                            not technical and unit.hold
+                            not technical
+                            and unit.hold
                             and (
                                 unit.hold.kind != "handoff"
                                 or unit.hold.id != prior_handoff.get("id")
@@ -372,7 +373,11 @@ class CampaignStore:
                                 "predecessor",
                                 "capture",
                                 "packet",
-                                *(('binding', 'condition', 'capacity', 'original_payload') if technical else ()),
+                                *(
+                                    ("binding", "condition", "capacity", "original_payload")
+                                    if technical
+                                    else ()
+                                ),
                             )
                         )
                         or expected["permit"]["binding"]["remaining_dev_attempts"] != prior_dev
@@ -649,6 +654,8 @@ class CampaignStore:
             "adopt",
             "handoff",
             "authorize-scope",
+            "rearm",
+            "answer",
         }:
             raise CampaignError(f"unknown campaign control {kind}")
         self.load(campaign_id)
@@ -897,23 +904,51 @@ def _audit_rearm_cancellation(previous, snapshot, key) -> None:
     from .campaign_rearm import cancel_unlaunched
 
     expected = cancel_unlaunched(
-        projected, projected.units[key], action,
+        projected,
+        projected.units[key],
+        action,
         mode=proof.get("mode"),
         result=result.receipt if proof.get("mode") == "not-launched" else None,
     )
     restored = projected.units[key]
     if (
-        proof != expected or new.claim != restored.claim or new.attempt != old.attempt
+        proof != expected
+        or new.claim != restored.claim
+        or new.attempt != old.attempt
         or new.spec != old.spec
-        or any(new.bindings.get(field) != old.bindings.get(field) for field in (
-            "workspace", "branch", "pr", "issue", "head", "base", "canonical_source",
-            "effective_source", "effective_sources", "private_paths", "source_revision",
-        ))
-        or any(getattr(new, field) != getattr(old, field) for field in ("failure_attempts", "resolution_attempts", "review_attempts"))
-        or any(new.evidence.get(field) != old.evidence.get(field) for field in (
-            "continuation_permits", "worker_history", "acceptance", "usage", "developer_family",
-            "developer_families", "developer_attribution_incomplete", "unresolved_approval_requirements",
-        ))
+        or any(
+            new.bindings.get(field) != old.bindings.get(field)
+            for field in (
+                "workspace",
+                "branch",
+                "pr",
+                "issue",
+                "head",
+                "base",
+                "canonical_source",
+                "effective_source",
+                "effective_sources",
+                "private_paths",
+                "source_revision",
+            )
+        )
+        or any(
+            getattr(new, field) != getattr(old, field)
+            for field in ("failure_attempts", "resolution_attempts", "review_attempts")
+        )
+        or any(
+            new.evidence.get(field) != old.evidence.get(field)
+            for field in (
+                "continuation_permits",
+                "worker_history",
+                "acceptance",
+                "usage",
+                "developer_family",
+                "developer_families",
+                "developer_attribution_incomplete",
+                "unresolved_approval_requirements",
+            )
+        )
         or {k: v for k, v in after.items() if k not in {"phase", "cancellation"}}
         != {k: v for k, v in before.items() if k not in {"phase", "cancellation"}}
     ):

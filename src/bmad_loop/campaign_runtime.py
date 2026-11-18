@@ -60,8 +60,8 @@ from .campaign_recovery import CheckpointPusher
 from .campaign_scheduler import (
     CapacityObservation,
     admit,
-    missing_job_claim,
     launch_resource,
+    missing_job_claim,
     resource_available,
     select_role,
     session_capacity_wait,
@@ -575,7 +575,9 @@ class CampaignRuntime:
             "hierarchy_finalized_graph"
         ) == snapshot.graph_revision and snapshot.bindings.get("intake", {}).get(
             "observed_at", 0
-        ) >= snapshot.bindings.get("last_delivery_at", 0)
+        ) >= snapshot.bindings.get(
+            "last_delivery_at", 0
+        )
 
     def communication_settled(self, snapshot) -> bool:
         if snapshot.spec.communication.mode != "managed":
@@ -1246,7 +1248,8 @@ class CampaignRuntime:
             snapshot, self.project, resolution_candidates, now=now
         ):
             if snapshot.units[proposal.unit].evidence.get("technical_rearm", {}).get("phase") in {
-                "ready", "continuing"
+                "ready",
+                "continuing",
             }:
                 continue
             if self._pending(snapshot, proposal.unit):
@@ -1536,6 +1539,17 @@ class CampaignRuntime:
 
         require_not_retired(snapshot, operation="campaign control")
         kind, key = command["kind"], command.get("unit", "")
+        if kind == "answer":
+            from .campaign_answer import question
+
+            question(snapshot, key, command["payload"].get("decision_id"))
+            add_action(snapshot, "decision-answer-observe", key, command["payload"])
+            return
+        if kind == "rearm":
+            from .campaign_rearm_control import apply as request_rearm
+
+            request_rearm(snapshot, command, now=self.clock())
+            return
         if kind == "authorize-scope":
             from .campaign_scope_authority import apply
 
@@ -1603,9 +1617,11 @@ class CampaignRuntime:
                         "admission_deferred": (
                             "total session capacity is reserved"
                             if wait == "total session capacity"
-                            else "global session capacity is reserved"
-                            if wait == "session capacity"
-                            else wait + " is reserved"
+                            else (
+                                "global session capacity is reserved"
+                                if wait == "session capacity"
+                                else wait + " is reserved"
+                            )
                         )
                     }
                     add_event(
@@ -1776,7 +1792,9 @@ class CampaignRuntime:
                 if pending.payload.get("rearm_id"):
                     from .campaign_rearm import cancel_unlaunched
 
-                    cancel_unlaunched(snapshot, snapshot.units[pending.unit], pending, mode="prepared-stop")
+                    cancel_unlaunched(
+                        snapshot, snapshot.units[pending.unit], pending, mode="prepared-stop"
+                    )
                     continue
                 pending.state = "rejected"
                 pending.error = "campaign drained before launch submission"
@@ -1873,6 +1891,7 @@ class CampaignRuntime:
                 "stage-boundary-after",
                 "terminate-worker",
                 "decision-project",
+                "decision-answer-observe",
             }
             and not (
                 action.kind == "github"
@@ -2105,6 +2124,7 @@ class CampaignRuntime:
             "resolution-context",
             "remote-wait",
             "decision-project",
+            "decision-answer-observe",
             "resolution-backoff",
             "resolution-reprobe",
             "resolution-accept",
@@ -3085,6 +3105,25 @@ class CampaignRuntime:
 
         return Observation("confirmed", project(self, snapshot, action))
 
+    def _perform_decision_answer_observe(self, snapshot, action) -> Observation:
+        from .campaign_answer import observe
+        from .campaign_github import GithubError
+
+        try:
+            evidence = observe(self, self.store.load(snapshot.id), action.unit, **action.payload)
+        except CampaignError as exc:
+            if isinstance(exc.__cause__, GithubError) and exc.__cause__.category in {
+                "transient",
+                "rate_limit",
+                "authentication",
+                "permission",
+            }:
+                # Let the supervisor persist the service's retry deadline.
+                raise exc.__cause__ from None
+            # A refused reply cannot replace the original owner decision.
+            return Observation("confirmed", {"answer_refused": str(exc)})
+        return Observation("confirmed", {"owner_answer": evidence})
+
     def _perform_remote_wait(self, snapshot, action) -> Observation:
         from .campaign_remote_waits import observe
 
@@ -3668,8 +3707,12 @@ class CampaignRuntime:
             if blocked is not None:
                 if blocked.state == "waiting":
                     return self._tracking_observation(
-                        snapshot, action, intent, preflight=True,
-                        preflight_reason=blocked.reason or blocked.data.get("reason", "Parent tracking waits"),
+                        snapshot,
+                        action,
+                        intent,
+                        preflight=True,
+                        preflight_reason=blocked.reason
+                        or blocked.data.get("reason", "Parent tracking waits"),
                     )
                 return blocked
         if intent.state == "confirmed":
@@ -4428,6 +4471,16 @@ class CampaignRuntime:
 
         request["claim"] = dataclasses.asdict(claim)
         request["sibling_context"] = compose_context(snapshot, unit)
+        request.pop("delegated_choices", None)
+        if request["kind"] == "execution" and unit.evidence.get("pending_delegated_choices"):
+            from .campaign_runtime_decisions import execution_choices
+
+            choices, stale = execution_choices(self, snapshot, unit)
+            if stale:
+                return Observation(
+                    "confirmed", {"not_launched": True, "stale_delegated_choice": stale}
+                )
+            request["delegated_choices"] = choices
         if request["kind"] in {"execution", "stage"}:
             from .campaign_messages import MessageLedger
             from .campaign_messages import context as message_context
@@ -4716,12 +4769,23 @@ class CampaignRuntime:
 
         receipt = result.get("receipt") or {}
         pause = pause_cause(receipt)
-        required = bool(pause and pause.producer == "engine.finalization" and pause.code == "outcome_unknown")
-        engine_kind = request.get("kind") in {"execution", "recovery"} and request.get("source", {}).get("kind") in {"stories", "tickets", "sprint-status"}
+        required = bool(
+            pause and pause.producer == "engine.finalization" and pause.code == "outcome_unknown"
+        )
+        engine_kind = request.get("kind") in {"execution", "recovery"} and request.get(
+            "source", {}
+        ).get("kind") in {"stories", "tickets", "sprint-status"}
         if not required and not engine_kind:
+            checkout = {}
+            if request.get("kind") == "queue_verify" or request.get("landing_group"):
+                group = request.get("landing_group") or request["queue_group"]
+                checkout["detached_head"] = group["head"]
             return {
-                "mode": "absence-only", "workspace": request["workspace"],
-                "common_dir": request["common_dir"], "branch": request["branch"],
+                "mode": "absence-only",
+                "workspace": request["workspace"],
+                "common_dir": request["common_dir"],
+                "branch": request["branch"],
+                **checkout,
             }, required
         envelope = CampaignExecution.load(Path(request["execution"]), request["digest"])
         return binding(request, envelope), required
@@ -4736,17 +4800,29 @@ class CampaignRuntime:
             observer = self._git_activity_observer
             workspace = Path(request["workspace"])
             if authority.get("mode") == "absence-only":
-                observed = observer.observe_absence(workspace, common_dir=authority["common_dir"], branch=authority["branch"])
+                observed = observer.observe_absence(
+                    workspace,
+                    common_dir=authority["common_dir"],
+                    branch=authority["branch"],
+                    detached_head=authority.get("detached_head"),
+                )
             else:
                 metadata = (result.get("receipt") or {}).get("git_activity") or {}
                 sealed = metadata.get("activity") if metadata.get("state") == "available" else None
                 observed = observer.observe(workspace, authority, receipt=sealed, required=required)
             result["git_activity_proof"] = {
-                "schema_version": 1, "authority": authority, "required": required,
+                "schema_version": 1,
+                "authority": authority,
+                "required": required,
                 "observation": dataclasses.asdict(observed),
             }
         except (CampaignError, OSError, ValueError, KeyError, TypeError) as exc:
-            return Observation("waiting", result, "Git actor authority unavailable: " + type(exc).__name__, self.clock() + 5)
+            return Observation(
+                "waiting",
+                result,
+                "Git actor authority unavailable: " + type(exc).__name__,
+                self.clock() + 5,
+            )
         if observed.state != "quiescent":
             return Observation("waiting", result, observed.reason, self.clock() + 1)
         return None
@@ -4760,11 +4836,19 @@ class CampaignRuntime:
             request = json.loads((directory / "request.json").read_text(encoding="utf-8"))
             authority, required = self._git_activity_authority(request, data)
             proof = data.get("git_activity_proof", {})
-            if proof.get("schema_version") != 1 or proof.get("authority") != authority or proof.get("required") is not required:
+            if (
+                proof.get("schema_version") != 1
+                or proof.get("authority") != authority
+                or proof.get("required") is not required
+            ):
                 raise CampaignError("Terminal worker has no exact Git actor observation")
-            validate_release(Path(request["workspace"]), authority, proof["observation"], required=required)
+            validate_release(
+                Path(request["workspace"]), authority, proof["observation"], required=required
+            )
         except (CampaignError, OSError, ValueError, KeyError, TypeError) as exc:
-            raise ObservationStale("Git actor evidence changed before claim release: " + type(exc).__name__) from exc
+            raise ObservationStale(
+                "Git actor evidence changed before claim release: " + type(exc).__name__
+            ) from exc
         unit.evidence["git_activity"] = proof
 
     def _perform_observe_worker(self, snapshot, action) -> Observation:
@@ -5787,6 +5871,24 @@ class CampaignRuntime:
         data = observation.data
         unit = snapshot.units.get(action.unit)
         kind = action.kind
+        if kind == "decision-answer-observe":
+            from .campaign_answer import apply as apply_answer
+
+            reason = data.get("answer_refused")
+            if not reason:
+                try:
+                    apply_answer(snapshot, action.unit, data["owner_answer"])
+                except CampaignError as exc:
+                    reason = str(exc)
+            if reason:
+                add_event(
+                    snapshot,
+                    "owner-answer-refused",
+                    unit=action.unit,
+                    action=action.id,
+                    reason=reason,
+                )
+            return
         if kind == "tracking-reconcile":
             self._apply_tracking_reconcile(snapshot, action, data)
             return
@@ -6396,6 +6498,10 @@ class CampaignRuntime:
                 data["rearm_cancellation"] = cancel_unlaunched(
                     snapshot, unit, action, mode="not-launched", result=data
                 )
+                if data.get("stale_delegated_choice"):
+                    from .campaign_runtime_decisions import reopen_choice
+
+                    reopen_choice(snapshot, unit, data["stale_delegated_choice"])
                 return
             if data.get("managed_communication"):
                 unit.bindings["managed_communication"] = data["managed_communication"]
@@ -6423,6 +6529,11 @@ class CampaignRuntime:
                     transition(snapshot, unit.id, UnitState.READY)
                 elif unit.state == UnitState.VERIFYING:
                     transition(snapshot, unit.id, UnitState.SYNCING)
+                if data.get("stale_delegated_choice"):
+                    from .campaign_runtime_decisions import reopen_choice
+
+                    reopen_choice(snapshot, unit, data["stale_delegated_choice"])
+                    return
                 if data.get("preparation_refused"):
                     refusal = data["preparation_refused"]
                     unit.evidence["launch_preparation_refusal"] = refusal
@@ -6700,8 +6811,12 @@ class CampaignRuntime:
                 unit.bindings["head"] = data["head"]
                 self._set_hold(
                     unit,
-                    Hold("pause_unknown", "Interrupted worker retains an uncertain Git effect", id=claim.launch_id,
-                         evidence={"git_activity": data["git_activity_proof"]}),
+                    Hold(
+                        "pause_unknown",
+                        "Interrupted worker retains an uncertain Git effect",
+                        id=claim.launch_id,
+                        evidence={"git_activity": data["git_activity_proof"]},
+                    ),
                 )
                 return
             if self._preserve_diagnosis_failure(snapshot, unit, {**data, "outcome": "interrupted"}):
@@ -6795,6 +6910,11 @@ class CampaignRuntime:
             apply_worker(self, snapshot, unit, receipt)
             return
         unit.bindings["head"] = receipt["head"]
+        if receipt.get("outcome") == "locally_complete" and receipt.get("delegated_choice_ids"):
+            pending = unit.evidence.get("pending_delegated_choices", {})
+            for key, choice in list(pending.items()):
+                if choice["receipt"] in receipt["delegated_choice_ids"]:
+                    del pending[key]
         if receipt.get("usage") is not None or receipt.get("sessions"):
             # CLI token telemetry is not dollar-cost telemetry. Keep spend
             # unknown until a qualified account receipt supplies actual cost.

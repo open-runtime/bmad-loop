@@ -346,6 +346,7 @@ def test_normal_runtime_first_execution_request_reaches_engine_with_empty_revisi
     from conftest import install_bmad_config
     from test_campaign_workers import envelope as execution_envelope
     from test_stories_engine import SPEC_FOLDER, setup_stories
+
     from bmad_loop import campaign_adoption, campaign_hold, campaign_workers, runsetup
     from bmad_loop.adapters import multiplexer
     from bmad_loop.adapters.mock import MockAdapter

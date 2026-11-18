@@ -3,8 +3,8 @@
 import copy
 import hashlib
 import json
-from pathlib import Path
 from dataclasses import asdict, replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -168,6 +168,19 @@ def test_read_only_predecessor_cannot_mint_writable_rearm_authority(paused_child
     unit.claim.writes = False
     with pytest.raises(CampaignError, match="quiescent development pause"):
         capture_binding(snapshot, unit)
+
+
+def test_rearm_survives_checkpoint_observation_but_waits_for_uncertain_push(paused_child):
+    snapshot, unit = paused_child
+    binding = capture_binding(snapshot, unit)
+    job = OutboxAction(
+        "progress", "checkpoint-progress", unit.id, {}, snapshot.generation, "sent_unknown"
+    )
+    snapshot.outbox.append(job)
+    validate_binding(snapshot, unit, binding)
+    job.kind = "checkpoint"
+    with pytest.raises(CampaignError, match="uncertain predecessor effects"):
+        validate_binding(snapshot, unit, binding)
 
 
 @pytest.mark.parametrize(
@@ -813,7 +826,9 @@ def test_ready_refresh_refuses_changed_dirty_fingerprint(quota_child, monkeypatc
 
 
 @pytest.mark.parametrize("change", ["approval", "remaining_allowance"])
-def test_refresh_does_not_mint_new_binding_for_changed_live_constraints(quota_child, monkeypatch, tmp_path, change):
+def test_refresh_does_not_mint_new_binding_for_changed_live_constraints(
+    quota_child, monkeypatch, tmp_path, change
+):
     from bmad_loop import campaign_rearm as rearm
 
     snapshot, unit, runtime = ready_case(quota_child, monkeypatch, tmp_path)

@@ -139,6 +139,20 @@ class DecisionSpec:
     mode: str = "evidence-first"
     sources: tuple[str, ...] = ()
     transcript_sources: tuple[str, ...] = ()
+    delegation_documents: tuple[str, ...] = ()
+
+
+def delegation_document(reference: str) -> tuple[str, str]:
+    """Parse the owner's content pin and exact repository-relative policy path."""
+    pin, _, path = reference.partition(":")
+    if (
+        not re.fullmatch(r"[0-9a-f]{64}", pin)
+        or not path
+        or any(part in {"", ".", ".."} for part in path.split("/"))
+        or any(char in path for char in ("\\", "\0", ":"))
+    ):
+        raise CampaignError("decisions.delegation_documents requires SHA256:relative/path")
+    return pin, path
 
 
 @dataclass(frozen=True)
@@ -413,6 +427,7 @@ def _construct(cls: Any, value: Any, name: str) -> Any:
             "review_teams",
             "sources",
             "transcript_sources",
+            "delegation_documents",
             "labels",
             "stages",
             "purposes",
@@ -840,6 +855,9 @@ def spec_from_dict(value: Mapping[str, Any]) -> CampaignSpec:
         raise CampaignError("managed communication requires an explicit absolute room")
     if spec.decisions.mode not in {"off", "evidence-first"}:
         raise CampaignError("decisions.mode must be off or evidence-first")
+    delegation_paths = [delegation_document(ref)[1] for ref in spec.decisions.delegation_documents]
+    if len(set(delegation_paths)) != len(delegation_paths):
+        raise CampaignError("duplicate decisions.delegation_documents path")
     if spec.resolution.mode not in {"off", "diagnose", "bounded-auto"}:
         raise CampaignError("resolution.mode must be off, diagnose or bounded-auto")
     for scope in spec.intake.allowed_scopes:
@@ -877,6 +895,8 @@ def source_to_dict(source: SourceSelector) -> dict[str, Any]:
 
 def spec_to_dict(spec: CampaignSpec) -> dict[str, Any]:
     raw = asdict(spec)
+    if not spec.decisions.delegation_documents:
+        raw["decisions"].pop("delegation_documents")
     if spec.resources.max_total_sessions is None:
         # Keep old frozen configuration/permit fingerprints byte-equivalent.
         raw["resources"].pop("max_total_sessions")

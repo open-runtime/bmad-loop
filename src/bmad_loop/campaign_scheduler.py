@@ -79,9 +79,7 @@ def session_usage(snapshot: CampaignSnapshot) -> SessionUsage:
     return SessionUsage(model, verification, unknown)
 
 
-def session_capacity_wait(
-    spec: CampaignSpec, resource: str, *, model: int, total: int
-) -> str:
+def session_capacity_wait(spec: CampaignSpec, resource: str, *, model: int, total: int) -> str:
     """Apply the explicit all-worker limit and the compatible model limit."""
     maximum = spec.resources.max_total_sessions
     if maximum is not None and total >= maximum:

@@ -6,8 +6,9 @@ from dataclasses import replace
 
 import pytest
 from test_campaign_parent_closure import submit
-from test_campaign_runtime import diagnose, run_case
+from test_campaign_runtime import diagnose
 from test_campaign_runtime import production_case as production_case
+from test_campaign_runtime import run_case
 from test_campaign_tracking import HierarchyTransport, snapshot
 
 from bmad_loop import campaign_tracking_recovery as recovery
@@ -156,7 +157,13 @@ def finish_close(case):
 
 def finish_completion(case):
     runtime, supervisor, state, service, clock = case
-    refresh = next(row for row in state.outbox if row.kind == "sync-tracking" and row.state == "prepared" and row.payload.get("completion_predecessor"))
+    refresh = next(
+        row
+        for row in state.outbox
+        if row.kind == "sync-tracking"
+        and row.state == "prepared"
+        and row.payload.get("completion_predecessor")
+    )
     state = submit(supervisor, state, refresh)
     return finish_close((runtime, supervisor, state, service, clock))
 
@@ -215,7 +222,9 @@ def test_native_hold_present_before_prepare_blocks_write_then_real_removal_relea
     result = completed.units[unit.id]
     assert result.state == UnitState.DELIVERED
     assert result.spec == spec and result.evidence["acceptance"] == accepted
-    assert service.effects == [("PATCH", "issues/1", {"state": "closed", "state_reason": "completed"})]
+    assert service.effects == [
+        ("PATCH", "issues/1", {"state": "closed", "state_reason": "completed"})
+    ]
 
 
 def test_runtime_ack_then_owner_hold_reopen_release_requires_actual_completed_readback(tracking):
@@ -242,7 +251,9 @@ def test_runtime_ack_then_owner_hold_reopen_release_requires_actual_completed_re
     waiting = retry_case(tracking, state, restart=True)
     assert waiting[2].units[action.unit].state == UnitState.MERGED_PENDING_SYNC
     assert len(service.effects) == 1
-    assert not any(row.kind == "sync-tracking" and row.state == "prepared" for row in waiting[2].outbox)
+    assert not any(
+        row.kind == "sync-tracking" and row.state == "prepared" for row in waiting[2].outbox
+    )
     service.issues[1].update(state="closed", state_reason="completed", updated_at="owner-completed")
     renewed = retry_case(waiting, waiting[2])
     completed = finish_completion(renewed)
@@ -259,15 +270,28 @@ def test_runtime_ack_waits_for_late_current_proof_then_renews_completion_authori
     def late_criterion(snapshot):
         ledger = snapshot.units[action.unit].evidence["acceptance"]
         ledger["revision"] += 1
-        ledger["criteria"].append({"id": "late-required", "text": "Late required criterion", "required": True, "status": "not_run"})
+        ledger["criteria"].append(
+            {
+                "id": "late-required",
+                "text": "Late required criterion",
+                "required": True,
+                "status": "not_run",
+            }
+        )
         return runtime.store.save(snapshot, snapshot.revision)
 
     state = submit(supervisor, state, action, before_harvest=late_criterion)
     assert state.units[action.unit].state == UnitState.MERGED_PENDING_SYNC
     assert len(service.effects) == 1
     waiting = retry_case(tracking, state, restart=True)
-    assert not any(row.kind == "sync-tracking" and row.state == "prepared" for row in waiting[2].outbox)
-    assert any("current required acceptance revision" in row.error for row in waiting[2].outbox if row.kind == "tracking-reconcile")
+    assert not any(
+        row.kind == "sync-tracking" and row.state == "prepared" for row in waiting[2].outbox
+    )
+    assert any(
+        "current required acceptance revision" in row.error
+        for row in waiting[2].outbox
+        if row.kind == "tracking-reconcile"
+    )
     unit = waiting[2].units[action.unit]
     prove_current(unit)  # New controller proof covers the actual current ledger.
     state = waiting[0].store.save(waiting[2], waiting[2].revision)
@@ -275,7 +299,10 @@ def test_runtime_ack_waits_for_late_current_proof_then_renews_completion_authori
     completed = finish_completion(renewed)
     result = completed.units[action.unit]
     assert result.state == UnitState.DELIVERED
-    assert any(row["id"] == "late-required" and row["required"] for row in result.evidence["acceptance"]["criteria"])
+    assert any(
+        row["id"] == "late-required" and row["required"]
+        for row in result.evidence["acceptance"]["criteria"]
+    )
     assert len(service.effects) == 1
     assert historical_action(completed, action.id).payload == original
 
@@ -657,9 +684,7 @@ def test_replan_preserves_late_ledger_obligations_without_changing_unit_spec(tra
     if change == "revision":
         ledger["revision"] += 1
     else:
-        ledger["criteria"].append(
-            {"id": "late-required", "required": True, "status": "not_run"}
-        )
+        ledger["criteria"].append({"id": "late-required", "required": True, "status": "not_run"})
     state = runtime.store.save(state, state.revision)
     resumed = retry_case(tracking, state, restart=True)
     retained = next(iter(resumed[2].units.values()))

@@ -10,8 +10,8 @@ replacement. Remote evidence is untrusted input, not approval authority.
 
 from __future__ import annotations
 
-import dataclasses
 import copy
+import dataclasses
 import hashlib
 import json
 
@@ -153,9 +153,11 @@ def _context(snapshot, unit, parent_key, source_publication=None):
                 "review": member.evidence.get("review"),
                 "developer_families": member.evidence.get("developer_families"),
                 "landing_acceptance": member.evidence.get("landing_acceptance"),
-                "source_publication": source_publication
-                if name == unit.id and source_publication is not None
-                else member.evidence.get("source_publication"),
+                "source_publication": (
+                    source_publication
+                    if name == unit.id and source_publication is not None
+                    else member.evidence.get("source_publication")
+                ),
             }
             for name in _members(snapshot, unit, parent_key)
             for member in (snapshot.units[name],)

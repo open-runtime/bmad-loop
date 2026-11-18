@@ -9,11 +9,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-
 from test_campaign_handoff_flow import campaign as campaign
 from test_campaign_headless import prepared as prepared
-from test_campaign_runtime import diagnose, run_case
+from test_campaign_runtime import diagnose
 from test_campaign_runtime import production_case as production_case
+from test_campaign_runtime import run_case
 
 from bmad_loop.campaign_model import UnitState
 from bmad_loop.campaign_scheduler import CapacityObservation
@@ -23,8 +23,8 @@ def test_retained_rearm_finishes_own_in_progress_ticket_and_keeps_dirty_history(
     project_v7, prepared, tmp_path
 ):
     from conftest import git, ticket_row
-    from test_tickets_engine import _builds, _policy, _tree, _write_plan, make_engine
     from test_campaign_execution_qualification import fixture_writer_capability
+    from test_tickets_engine import _builds, _policy, _tree, _write_plan, make_engine
 
     from bmad_loop import campaign_rearm, runsetup, verify
     from bmad_loop.adapters.mock import MockAdapter
@@ -229,7 +229,9 @@ def test_retained_rearm_finishes_own_in_progress_ticket_and_keeps_dirty_history(
         "digest": template_digest,
     }
     snapshot.bindings["capacity_faults"] = {
-        route.profile + "\0" + route.model: {
+        route.profile
+        + "\0"
+        + route.model: {
             "observed_at": time.time() - 10,
             "reason": "native quota",
             "quota_retry_at": time.time() - 5,
@@ -498,8 +500,13 @@ def test_quota_rearm_survives_restart_and_delivers_with_reasoning_disabled(
         )
         if reached:
             if restart_at == "unlaunched_stop":
-                assert next(row for row in saved.outbox if row.id == first.claim.launch_id).state == "prepared"
-                case.store.enqueue(saved.id, "stop", reason="Scripted stop before retained launch submission")
+                assert (
+                    next(row for row in saved.outbox if row.id == first.claim.launch_id).state
+                    == "prepared"
+                )
+                case.store.enqueue(
+                    saved.id, "stop", reason="Scripted stop before retained launch submission"
+                )
             raise CoordinatorRestart()
         return saved
 
@@ -523,7 +530,8 @@ def test_quota_rearm_survives_restart_and_delivers_with_reasoning_disabled(
             ttl[0] = 120
     old_launch = (
         first.evidence["technical_rearm"]["predecessor"]["launch_id"]
-        if restart_at == "unlaunched_stop" else first.claim.launch_id
+        if restart_at == "unlaunched_stop"
+        else first.claim.launch_id
     )
     canceled_permits = copy.deepcopy(first.evidence.get("continuation_permits", {}))
     reserved_attempt = first.attempt
@@ -563,9 +571,14 @@ def test_quota_rearm_survives_restart_and_delivers_with_reasoning_disabled(
         assert ready_before_restart in first.evidence["technical_rearm_history"]
     assert first.evidence["dev_attempts_spent"] >= spent
     assert first.evidence["developer_families"] == ["openai"]
-    assert len(first.evidence["continuation_permits"]) == (2 if restart_at == "unlaunched_stop" else 1)
+    assert len(first.evidence["continuation_permits"]) == (
+        2 if restart_at == "unlaunched_stop" else 1
+    )
     if restart_at == "unlaunched_stop":
-        assert all(first.evidence["continuation_permits"][key] == value for key, value in canceled_permits.items())
+        assert all(
+            first.evidence["continuation_permits"][key] == value
+            for key, value in canceled_permits.items()
+        )
         assert any(row["phase"] == "canceled" for row in first.evidence["technical_rearm_history"])
     assert not result.jobs
     assert all(unit.state == UnitState.DELIVERED for unit in result.units.values())

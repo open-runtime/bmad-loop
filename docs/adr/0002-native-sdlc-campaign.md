@@ -226,6 +226,23 @@ it can yet complete unattended.
 
 ### Model roles and escalation resolution
 
+For unattended operation the owner participates in initial design and planning.
+The approved plan delegates subsequent routine judgments to a qualified decision
+model. These include attaching existing work, classifying duplicates, choosing
+the next eligible story, selecting a repair and choosing a qualified successor
+after a quota wait. Prefer Muse Wonderful or Codex Astra 6.2 for this decision
+role when the configured route has demonstrated the required capability.
+Python checks the proposal against the plan, remaining budget, current repository
+evidence and review policy before applying it. Record the actual model as the
+decision maker. A model can choose to address a human objection and request
+another review. Only the required reviewer can supply their own approval.
+
+If the available evidence and delegation leave no permitted way forward, ask
+the owner one decision-specific question. Include the recommended option, its
+reason, viable alternatives and their consequences, and the work that can
+continue while the answer is pending. This is a rollout requirement. Existing
+frozen campaigns retain their configured roles and delegation.
+
 The rollout configuration permits Astra or Fable, whichever has eligible capacity,
 for planning, independent planning review, semantic triage, escalation diagnosis
 and decision evidence review through qualified Codex/Claude/TeamRouter profiles.

@@ -2796,23 +2796,19 @@ class Engine:
 
     def _finish_inflight(self) -> None:
         """Complete or roll back tasks interrupted by a pause or crash."""
-        if self.campaign_execution is not None:
-            from .campaign_continuation import validate_resume as validate_review_resume
-            from .campaign_finalization import validate_resume
-
-            for task in self.state.tasks.values():
-                if not task.terminal and not (
-                    validate_resume(self, task) or validate_review_resume(self, task)
-                ):
-                    self._campaign_recovery(task, cause="resume")
         for task in list(self.state.tasks.values()):
             if self.campaign_execution is not None:
                 from .campaign_continuation import continue_task
+                from .campaign_finalization import validate_resume as validate_finalization
 
                 if continue_task(self, task):
                     self._post_story_after_replay(task)
                     self._after_story(task)
                     continue
+                # A concurrent owner hold can revoke a prepared continuation.
+                # Only verified finalization may enter legacy inflight handling.
+                if not task.terminal and not validate_finalization(self, task):
+                    self._campaign_recovery(task, cause="resume")
             if task.stopped_native:
                 self._continue_stopped_native(task)
                 self._post_story_after_replay(task)

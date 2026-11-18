@@ -30,9 +30,11 @@ def configured(tmp_path, count=3, *, held=(), initiatives=None):
         state.units[spec.id] = CampaignUnit(
             spec,
             UnitState.MERGED_PENDING_SYNC if index in held else UnitState.DELIVERED,
-            hold=Hold("owner", "Independent required owner decision", id=f"owner-{index}")
-            if index in held
-            else None,
+            hold=(
+                Hold("owner", "Independent required owner decision", id=f"owner-{index}")
+                if index in held
+                else None
+            ),
         )
         if index not in held:
             from bmad_loop.campaign_acceptance import ensure
@@ -80,13 +82,20 @@ def submit(supervisor, state, action, *, reconcile=False, before_harvest=None):
 def recover_parent(runtime, state):
     from bmad_loop import campaign_tracking_recovery as recovery
 
-    deadline = max(row["next_retry_at"] for unit in state.units.values() for row in unit.evidence.get(recovery.KEY, {}).values() if row["state"] == "waiting")
+    deadline = max(
+        row["next_retry_at"]
+        for unit in state.units.values()
+        for row in unit.evidence.get(recovery.KEY, {}).values()
+        if row["state"] == "waiting"
+    )
     runtime.clock = lambda: deadline
     supervisor = CampaignSupervisor(runtime.store, runtime, clock=runtime.clock)
     proposed = recovery.proposals(state, now=deadline)
     assert len(proposed) == 1
     state = supervisor._queue(state, proposed)
-    action = next(row for row in state.outbox if row.kind == "tracking-reconcile" and row.state == "prepared")
+    action = next(
+        row for row in state.outbox if row.kind == "tracking-reconcile" and row.state == "prepared"
+    )
     state = submit(supervisor, state, action)
     action = next(row for row in state.outbox if row.kind == "github" and row.state == "prepared")
     return submit(supervisor, state, action)
