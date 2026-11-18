@@ -61,6 +61,8 @@ bmad-loop campaign run SPEC [--prepare-only] [--paradev-reflect] [--paradev-proj
 bmad-loop campaign list [--json]
 bmad-loop campaign status ID [--json]
 bmad-loop campaign inbox ID [--unit UNIT] [--after ITEM_ID] [--limit N] [--json]
+bmad-loop campaign rearm ID --unit UNIT --hold-id HOLD [--json]
+bmad-loop campaign answer ID --unit UNIT --decision-id DECISION --number ISSUE_OR_PR --comment-id COMMENT [--json]
 bmad-loop campaign history ID [--unit UNIT] [--role ROLE] [--after SEQUENCE] [--limit N] [--json]
 bmad-loop campaign jobs ID [--unit UNIT] [--job JOB] [--after JOB_ID] [--limit N] [--details] [--json]
 bmad-loop campaign endpoints ID [--after SEQUENCE] [--limit N] [--state STATE] [--json]
@@ -71,7 +73,7 @@ bmad-loop campaign migrate-state ID [--json]
 bmad-loop campaign requalify ID --capabilities FILE --expected-revision REVISION --reason TEXT [--json]
 bmad-loop campaign reconfigure ID --spec FILE --expected-revision REVISION --reason TEXT [--review-policy-source COMMIT:PATH] [--preview] [--json]
 bmad-loop campaign reflect ID [--unit UNIT] [--expected-revision REVISION] [--preview] [--json]
-bmad-loop campaign resume ID [--json]
+bmad-loop campaign resume ID [--active-only] [--json]
 bmad-loop campaign stop ID [--terminate-workers] [--json]
 bmad-loop campaign hold ID --unit UNIT --reason TEXT [--json]
 bmad-loop campaign release ID --unit UNIT [--json]
@@ -87,11 +89,29 @@ bmad-loop campaign transfer ID --unit UNIT --successor ID --successor-unit UNIT 
 is offline and mutation-free. Preflight reports separate planning, execution,
 publication and reflection verdicts without starting agents or changing rules.
 Run/resume supervise in the foreground; reconcile does not launch workers.
+For a boot or crash supervisor, pass `resume ID --active-only`. It recovers an
+existing coordinator or finishes an outstanding drain, preserves retry budgets
+and exits successfully for a stopped, held, delivered, retired or never-started
+campaign. See [service configuration and restart qualification](../campaign-guide.md#automatic-coordinator-restart).
 Controls enqueue durable requests. Stop drains bounded stages unless explicit
 termination is requested. Release only requests removal of an operator hold.
 It observes current process, source and Git identity before clearing that hold
 and invalidates affected acceptance evidence. Hold suppresses automatic input,
 retries and publication while an active actor can finish naturally.
+
+`campaign rearm` queues a fresh observation for an owned development task paused
+on quota. Use the hold ID from the inbox. The running supervisor also schedules
+this recovery automatically. It checks the current pause, route, deadline and
+remaining attempts before continuing the same task. The JSON result acknowledges
+the queued request. Use campaign status or history to observe its outcome.
+
+For a question that needs human input, the owner can reply on the unit's mapped
+issue or PR. Start the comment with `Decision DECISION` on its own line, using
+the full decision ID from the inbox. Place the answer on the next line.
+`campaign answer` queues verification of that comment's native identity,
+authorship and current contents. A verified reply wakes the existing decision
+review. Required GitHub approvals and human attestations have their own
+evidence checks. See campaign history for the recorded answer or refusal.
 
 `authorize-scope` authorizes acceptance reductions already present in a delivered
 revised planning PR. Inspect the unit's `acceptance.revision` and criteria in

@@ -45,6 +45,8 @@ def register(subparsers: Any) -> None:
         ("list", "list repository campaigns"),
         ("status", "show campaign units, holds and links"),
         ("inbox", "read actionable holds, uncertain effects and route waits"),
+        ("rearm", "request a fresh recovery observation for an owned quota-paused task"),
+        ("answer", "bind an authenticated GitHub reply to an outstanding owner decision"),
         ("history", "read bounded campaign events and retained role history"),
         ("jobs", "read bounded reasoning job state and lifecycle receipts"),
         ("messages", "read durable message delivery and application status"),
@@ -120,6 +122,12 @@ def register(subparsers: Any) -> None:
                 )
         elif command not in {"list", "provenance"}:
             child.add_argument("campaign_id", metavar="ID")
+        if command == "resume":
+            child.add_argument(
+                "--active-only",
+                action="store_true",
+                help="recover an active coordinator or finish its drain with existing retry budgets",
+            )
         if command == "provenance":
             child.add_argument("--expected-commit", default="", metavar="SHA")
         if command in {
@@ -130,6 +138,8 @@ def register(subparsers: Any) -> None:
             "adoption-proposal",
             "handoff",
             "authorize-scope",
+            "rearm",
+            "answer",
         }:
             child.add_argument("--unit", required=True, metavar="UNIT")
         if command in {"adopt", "adoption-proposal"}:
@@ -154,6 +164,12 @@ def register(subparsers: Any) -> None:
             child.add_argument("--preview", action="store_true")
         if command == "hold":
             child.add_argument("--reason", required=True)
+        if command == "rearm":
+            child.add_argument("--hold-id", required=True, metavar="HOLD")
+        if command == "answer":
+            child.add_argument("--decision-id", required=True, metavar="DECISION")
+            child.add_argument("--number", required=True, type=int, metavar="ISSUE_OR_PR")
+            child.add_argument("--comment-id", required=True, type=int, metavar="COMMENT")
         if command == "steer":
             child.add_argument("--unit", default="", metavar="UNIT")
             child.add_argument("--text", required=True)
@@ -400,9 +416,9 @@ def _registration_wait(snapshot, claim):
 
 
 def status_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
-    from .campaign_action_history import counts as action_counts
-
     """Project execution identities; omit private configuration and evidence."""
+    from .campaign_action_history import counts as action_counts
+    from .campaign_completion_scope import terminal_completion_wait
     from .campaign_external_provenance import summary as external_provenance_summary
     from .campaign_github_faults import status_waits
     from .campaign_intake_baseline import admission_waits
@@ -469,6 +485,11 @@ def status_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
                 "parent": unit.spec.parent,
                 "kind": unit.spec.kind,
                 "state": str(unit.state),
+                **(
+                    {"completion_wait": _inbox_text(reason)}
+                    if (reason := terminal_completion_wait(snapshot, unit))
+                    else {}
+                ),
                 "after": list(unit.spec.after),
                 "attempt": unit.attempt,
                 "resolution_attempts": unit.resolution_attempts,
@@ -552,14 +573,24 @@ def status_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
             }
         )
     counts = dict(Counter(str(unit.state) for unit in snapshot.units.values()))
+    from .campaign_model import UnitState
+    from .campaign_scheduler import missing_job_claim, session_usage
+
+    usage = session_usage(snapshot)
     active_claims = [
         unit.claim for unit in snapshot.units.values() if unit.claim and not unit.claim.quiescent
     ]
     active_jobs = [
-        row for row in snapshot.jobs.values() if row.get("claim") and not row["claim"]["quiescent"]
+        row
+        for row in snapshot.jobs.values()
+        if (row.get("claim") and not row["claim"]["quiescent"]) or missing_job_claim(row)
     ]
     active_roles = Counter(claim.role for claim in active_claims)
     active_roles.update(row["request"]["role"] for row in active_jobs)
+    active_roles["execution"] += sum(
+        unit.claim is None and unit.state in {UnitState.CLAIMED, UnitState.RUNNING}
+        for unit in snapshot.units.values()
+    )
     for unit in snapshot.units.values():
         if (
             unit.claim
@@ -645,10 +676,17 @@ def status_document(snapshot: CampaignSnapshot) -> dict[str, Any]:
             "max_in_flight_units": snapshot.spec.max_in_flight_units,
             "max_workers_per_epic": snapshot.spec.max_workers_per_epic,
             "max_sessions": snapshot.spec.resources.max_sessions,
+            "max_total_sessions": snapshot.spec.resources.max_total_sessions,
             "max_review_sessions": snapshot.spec.max_review_sessions,
-            "active_sessions": sum(claim.resource != "verify" for claim in active_claims)
-            + len(active_jobs),
-            "active_verifications": sum(claim.resource == "verify" for claim in active_claims),
+            "active_sessions": usage.model,
+            "active_verifications": usage.verification,
+            "active_total_sessions": usage.total,
+            "unknown_session_reservations": usage.unknown,
+            "session_limit_basis": (
+                "model-and-total"
+                if snapshot.spec.resources.max_total_sessions is not None
+                else "legacy-model-only"
+            ),
             "role_limits": {
                 role: {
                     "max_sessions": configured.max_sessions,
@@ -758,8 +796,10 @@ def _inbox_items(snapshot: CampaignSnapshot, *, now: float):
 
     from .campaign_capacity import selected_fault
     from .campaign_child_pause import cause as pause_cause
-    from .campaign_github_faults import status_waits
+    from .campaign_completion_scope import terminal_completion_wait
+    from .campaign_github_faults import actions_with_held_faults, status_waits
     from .campaign_intake_baseline import admission_waits
+    from .campaign_resolution_flow import current_owner_advice, routine_review_pending
     from .campaign_scheduler import CapacityObservation, admit, route_unavailable
     from .model import PauseKind
 
@@ -818,11 +858,17 @@ def _inbox_items(snapshot: CampaignSnapshot, *, now: float):
             hold = unit.hold
             automatic = "No automatic continuation is established by current evidence"
             operator = "Inspect this hold and resolve its actual condition; it remains protected"
+            operator_required = True
             if hold.kind == "operator":
                 operator = "Use campaign release for this unit only when this explicit operator hold may be released"
             elif hold.kind in {"remote_wait", "external_wait"} and hold.actor == "github":
                 automatic = "Reobserve bound GitHub conditions before repeating acceptance"
                 operator = "Resolve the recorded remote condition if intervention is required"
+                operator_required = False
+            elif routine_review_pending(snapshot, unit):
+                automatic = "Collect current evidence and run the configured decision reviewer as route capacity allows"
+                operator = "No decision requested while the reviewer evaluates existing authority"
+                operator_required = False
             elif hold.kind in {
                 "product_choice",
                 "planning_decision",
@@ -875,6 +921,21 @@ def _inbox_items(snapshot: CampaignSnapshot, *, now: float):
                     )
             typed = parsed_cause is not None and parsed_cause.kind != PauseKind.UNKNOWN
             refs = decisions.get((unit.id, hold.id), {"ids": [], "total": 0})
+            advice = current_owner_advice(snapshot, unit)
+            if advice:
+                automatic = "Refresh decision evidence and reconsider when the owner or another source supplies new information"
+                operator = "Review the recommended options and provide evidence for this exact hold"
+                if advice.get("clarification"):
+                    operator = _inbox_text(advice["clarification"])
+                operator_required = True
+                advice["options"] = [
+                    {
+                        "answer": _inbox_text(answer, limit=512),
+                        "reason": _inbox_text(reason),
+                        "source_ids": [_inbox_text(key) for key in ids],
+                    }
+                    for answer, reason, ids in advice["options"]
+                ]
             yield row(
                 "hold",
                 unit.id,
@@ -883,17 +944,14 @@ def _inbox_items(snapshot: CampaignSnapshot, *, now: float):
                 automatic,
                 operator,
                 unit.retry_at,
-                operator_required=(
-                    False
-                    if hold.kind in {"remote_wait", "external_wait"} and hold.actor == "github"
-                    else True
-                ),
+                operator_required=operator_required,
                 hold_id=hold.id,
                 hold_kind=hold.kind,
                 actor=hold.actor,
                 decision_ids=refs["ids"],
                 decision_ids_total=refs["total"],
                 decision_ids_truncated=refs["total"] > len(refs["ids"]),
+                **({"owner_advice": advice} if advice else {}),
                 pause_evidence_status="typed" if typed else "unknown",
                 pause_evidence_reason=pause_reason,
                 pause_cause=(
@@ -905,6 +963,16 @@ def _inbox_items(snapshot: CampaignSnapshot, *, now: float):
                     if parsed_cause
                     else None
                 ),
+            )
+        if reason := terminal_completion_wait(snapshot, unit):
+            yield row(
+                "completion_wait",
+                unit.id,
+                unit.id,
+                reason,
+                "Recheck current member obligations before declaring parent closure",
+                "Inspect this unit's recorded issue, PR and acceptance criteria. Recover missing evidence through a reviewed intake disposition or the normal verification path. A legacy receipt cannot be upgraded by releasing the unit.",
+                operator_required=not (unit.claim and not unit.claim.quiescent),
             )
         handoff = unit.evidence.get("handoff", {})
         if handoff.get("route_wait"):
@@ -941,7 +1009,7 @@ def _inbox_items(snapshot: CampaignSnapshot, *, now: float):
                 "Refresh repository inventory before admitting this unit",
                 "Inspect campaign status discovery details if observation remains unavailable",
             )
-    for action in snapshot.outbox:
+    for action in actions_with_held_faults(snapshot):
         if action.state == "confirmed":
             continue
         external = action.kind.startswith("github") or action.kind in {"push", "checkpoint"}
@@ -963,7 +1031,7 @@ def _inbox_items(snapshot: CampaignSnapshot, *, now: float):
             "unknown_effect" if external and action.state == "sent_unknown" else "effect_wait",
             action.unit,
             action.id,
-            action.error
+            (projected[0]["reason"] if projected else action.error)
             or (
                 "Effect was refused without a recorded reason"
                 if action.state == "rejected"
@@ -1132,6 +1200,19 @@ def _emit(args: argparse.Namespace, result: dict[str, Any]) -> int:
                     print("    " + ", ".join(identities))
                 if item.get("pause_evidence_status") == "unknown":
                     print("    Pause evidence: unknown — " + item["pause_evidence_reason"])
+                advice = item.get("owner_advice")
+                if advice:
+                    if advice["private"]:
+                        print(
+                            "    Private decision options in decision-ledger.json, receipt "
+                            + advice["decision_id"]
+                        )
+                    for index, option in enumerate(advice["options"]):
+                        label = "Recommended" if index == 0 else "Alternative"
+                        print(
+                            f"    Option {index + 1} — {label}: {option['answer']} — {option['reason']}"
+                        )
+                        print("      Evidence: " + ", ".join(option["source_ids"]))
                 print(f"    Next: {item['next_automatic_action']}")
                 if item["retry_at"] is not None:
                     print(f"    Retry at: {item['retry_at']}")
@@ -1297,7 +1378,16 @@ def dispatch(args: argparse.Namespace) -> int:
     snapshot = store.load(campaign_id)
     from .campaign_transfer import require_not_retired
 
-    if command not in {"status", "inbox", "history", "jobs", "messages", "endpoints", "transfer"}:
+    active_only = command == "resume" and args.active_only
+    if not active_only and command not in {
+        "status",
+        "inbox",
+        "history",
+        "jobs",
+        "messages",
+        "endpoints",
+        "transfer",
+    }:
         try:
             require_not_retired(snapshot, operation=command)
         except CampaignError as exc:
@@ -1569,6 +1659,29 @@ def dispatch(args: argparse.Namespace) -> int:
         and args.unit not in snapshot.units
     ):
         raise CampaignError(f"unknown campaign unit {args.unit}")
+    if command == "answer":
+        from .campaign_answer import question
+
+        question(snapshot, args.unit, args.decision_id)
+        if args.number <= 0 or args.comment_id <= 0:
+            raise CampaignError("answer needs positive GitHub issue and comment numbers")
+        request = store.enqueue(
+            campaign_id,
+            command,
+            unit=args.unit,
+            decision_id=args.decision_id,
+            number=args.number,
+            comment_id=args.comment_id,
+        )
+        return _emit(args, _result(command, request=request))
+    if command == "rearm":
+        from .campaign_rearm_control import proposal
+
+        binding = proposal(snapshot, args.unit, args.hold_id, now=time.time())
+        request = store.enqueue(
+            campaign_id, command, unit=args.unit, hold_id=args.hold_id, binding_id=binding["id"]
+        )
+        return _emit(args, _result(command, request=request))
     if command == "authorize-scope":
         from .campaign_scope_authority import proposal
 
@@ -1623,13 +1736,13 @@ def dispatch(args: argparse.Namespace) -> int:
         )
         return _emit(args, _result(command, request=request))
     runtime = _runtime(campaign_runtime, project, store)
-    if command == "resume":
+    if command == "resume" and not active_only:
         runtime.authorize_backup_resume(snapshot)
     if command == "attach":
         return runtime.attach(campaign_id, args.unit, role=args.role)
     supervisor = CampaignSupervisor(store, runtime)
     if command == "resume":
-        result = supervisor.run(campaign_id)
+        result = supervisor.run(campaign_id, active_only=active_only)
     elif command == "reconcile":
         result = supervisor.reconcile(campaign_id)
     else:

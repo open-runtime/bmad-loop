@@ -415,7 +415,7 @@ def input_text(prompt: str, output_schema: dict[str, Any], sources, *, steering=
 
 
 def render_input(
-    request: JobRequest, capability: dict[str, Any], *, steering=()
+    request: JobRequest, capability: dict[str, Any], *, steering=(), read_only_paths=()
 ) -> tuple[bytes, dict[str, Any]]:
     """Deliver source bytes inline, with explicit identities and no tool reads."""
     sources = []
@@ -434,6 +434,10 @@ def render_input(
         if hashlib.sha256(raw).hexdigest() != source["sha256"]:
             raise CampaignError("Reasoning source changed after request creation")
         content = raw.decode("utf-8", errors="strict")
+        if source["source_id"] == "campaign-handoff":
+            from .campaign_handoff_context import verify_working_state_delivery
+
+            verify_working_state_delivery(source, content, read_only_paths)
         sources.append(
             {"source_id": source["source_id"], "sha256": source["sha256"], "content": content}
         )
@@ -659,7 +663,12 @@ class HeadlessRunner:
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         if steering and probe is not None:
             raise CampaignError("Qualification canaries cannot receive steering")
-        payload, delivery = render_input(request, capability, steering=steering or ())
+        payload, delivery = render_input(
+            request,
+            capability,
+            steering=steering or (),
+            read_only_paths=(grants or {}).get("read_only_paths", ()),
+        )
         raw_request = json.loads(json.dumps(asdict(request)))
         envelope = {
             "schema_version": 1,

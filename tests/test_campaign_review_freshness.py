@@ -77,7 +77,33 @@ def test_actual_intake_after_review_reverifies_rereviews_and_merges(production_c
         """    if name=="triage":
         contract=context["triage_result_contract"]
         target=next(row for row in context["existing_units"] if row["id"]=="source:project:first")
-        artifact.update(intake_coordinates=contract["intake_coordinates"],proposal={"schema_version":1,"disposition":"duplicate","input_versions":contract["intake_coordinates"]["input_versions"],"unit_id":target["id"],"rationale":"Existing first story covers this unrelated intake request","acceptance_criteria":target["acceptance"],"dependencies":target["after"],"related_issue":900,"related_pr":None,"within_scope":True,"graph_revision":request["coordinates"]["graph_revision"]},units=[])
+        intake=context["intake"]
+        if "bindings" in intake:
+            binding=intake["bindings"][target["id"]]["issue"]
+        else:
+            from bmad_loop.campaign_stage_prompt import context_artifacts
+            def granted(descriptor):
+                assert descriptor in request["context_artifacts"]
+                assert descriptor in request["headless_grants"]["read_only_paths"]
+                packet,=context_artifacts(Path(sys.argv[1]).parent,[descriptor])
+                return packet.path
+            index=json.loads(granted(context["retrievable_context"]["index"]).read_bytes())
+            pointer=intake["retrievable_fields"]["bindings"]
+            row,=[r for r in index["records"] if r["key"]==pointer and r["collection"]=="" and r["position"]==target["id"]]
+            chunk,=[f for f in index["files"] if f["path"]==row["path"]]
+            with granted(chunk).open("rb") as stream:
+                stream.seek(row["offset"])
+                raw=stream.read(row["size_bytes"])
+            assert len(raw)==row["size_bytes"] and hashlib.sha256(raw).hexdigest()==row["sha256"]
+            binding=json.loads(raw)["issue"]
+        versions=contract["intake_coordinates"]["input_versions"]
+        rows=[]
+        for version,item in zip(versions,context["intake"]["observations"],strict=True):
+            for field in ("title","body"):
+                for line,text in enumerate((item["payload"].get(field) or "").splitlines(),1):
+                    if text.strip():
+                        rows.append({"input_version":version,"field":field,"line":line,"criteria":target["acceptance"],"reason":"The observed request confirms existing first behavior and adds no new scope."})
+        artifact.update(intake_coordinates=contract["intake_coordinates"],proposal={"schema_version":1,"disposition":"duplicate","input_versions":versions,"unit_id":target["id"],"rationale":"The first story owns the requested behavior.","acceptance_criteria":target["acceptance"],"dependencies":target["after"],"related_issue":binding["number"],"related_pr":None,"within_scope":True,"graph_revision":request["coordinates"]["graph_revision"]},duplicate_proof={"target_database_id":binding["database_id"],"remaining":[],"coverage":rows},units=[])
     if name in {"requirements","architecture","decomposition"}:""",
     )
     script.write_text(text, encoding="utf-8")
@@ -110,7 +136,7 @@ def test_actual_intake_after_review_reverifies_rereviews_and_merges(production_c
             case.service.issues[900] = {
                 **incoming.payload,
                 "node_id": "owner-900",
-                "title": "Unrelated intake",
+                "title": "Confirm first story acceptance",
                 "state": "open",
                 "labels": [],
                 "assignees": [],
@@ -151,4 +177,9 @@ def test_actual_intake_after_review_reverifies_rereviews_and_merges(production_c
         sum(row["event"] == "publication-review" and row["unit"] == unit.id for row in reviews) >= 2
     )
     assert result.units[injected["control"]].state == UnitState.CANCELED
+    disposition = result.units[injected["control"]].bindings["intake_control"]["disposition"]
+    assert (
+        disposition["duplicate_target"]["number"]
+        == result.units["source:project:first"].bindings["issue"]["number"]
+    )
     assert case.service.issues[900]["state"] == "open"

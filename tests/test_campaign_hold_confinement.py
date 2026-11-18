@@ -196,7 +196,7 @@ def test_queued_legacy_release_reads_migrated_persisted_hold_before_control(proj
     held_path.parent.rmdir()
     store.enqueue(saved.id, "release", unit=selected.id)
     runtime = CampaignRuntime(project.project, store)
-    runtime.prepare_resume = lambda _: False
+    runtime.prepare_resume = lambda _, **kwargs: False
     original = runtime.control
     called = []
 
@@ -210,7 +210,7 @@ def test_queued_legacy_release_reads_migrated_persisted_hold_before_control(proj
     runtime.control = control
     supervisor = CampaignSupervisor(store, runtime)
     with ThreadPoolExecutor(max_workers=1) as executor:
-        migrated = supervisor._reconciled(saved.id, executor)
+        migrated = supervisor._reconciled(store.load(saved.id), executor)
     assert called == ["release"]
     action = SimpleNamespace(
         unit=selected.id, payload=migrated.units[selected.id].bindings["operator_release"]

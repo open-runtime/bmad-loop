@@ -115,6 +115,24 @@ def test_transfer_cli_preview_then_commit_keeps_successor_stopped(case, monkeypa
     refusal = capsys.readouterr()
     assert not refusal.err
     assert "retired" in json.loads(refusal.out)["problems"][0]
+    retired_revision = case.store.load(case.before.id).revision
+    assert (
+        cli.main(
+            [
+                "campaign",
+                "resume",
+                case.before.id,
+                "--active-only",
+                "--project",
+                str(case.repo),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    campaign = json.loads(capsys.readouterr().out)["campaign"]
+    assert campaign["ownership_retirement"]["successor"] == case.successor.id
+    assert case.store.load(case.before.id).revision == retired_revision
 
 
 def test_retired_worker_refuses_even_non_model_verification(case, tmp_path, monkeypatch):

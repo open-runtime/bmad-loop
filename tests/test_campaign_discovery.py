@@ -241,6 +241,7 @@ def test_production_inventory_expands_linked_old_work_and_real_branch_semantics(
     snapshot.units[unit.id] = unit
     first = runtime._perform_inventory(snapshot, None).data
     assert first["complete"], first["unavailable"]
+    assert first["observed_at"] == runtime.clock()
     prior = next(row for row in first["pulls"] if row["number"] == 9)
     assert prior["state"] == "closed" and prior["merged"] is False
     assert prior["linked_issues"][0]["id"] == 103
@@ -257,6 +258,8 @@ def test_production_inventory_expands_linked_old_work_and_real_branch_semantics(
         OutboxAction("inventory", "inventory", "", {}, snapshot.generation),
         Observation("confirmed", first),
     )
+    runtime.clock = lambda: first["observed_at"] + 121
+    assert [proposal.kind for proposal in runtime.proposals(snapshot)] == ["inventory"]
     packet = stage_packet(
         StageCoordinates(
             snapshot.id,

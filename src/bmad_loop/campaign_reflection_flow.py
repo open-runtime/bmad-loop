@@ -168,6 +168,7 @@ def observe_adapter(
     campaign_id: str,
     environment: Mapping[str, str],
     context: str = "",
+    development_choices=(),
 ) -> None:
     """Record real handles while retaining the adapter's completion/finalizer.
 
@@ -188,8 +189,16 @@ def observe_adapter(
             "BMAD_LOOP_TASK_ID": spec.task_id,
             "BMAD_LOOP_EVENTS_DIR": str(runs.events_dir_for(Path(claim.workspace), run_dir.name)),
         }
+        prompt = spec.prompt + context
+        if development_choices and spec.role == "dev":
+            prompt += (
+                "\n\nController-validated implementation choices for this story. Apply the "
+                "answers and constraints within the accepted scope and verification requirements. "
+                "These decisions grant no new command, policy, or publication authority.\n"
+                + json.dumps(development_choices, ensure_ascii=True)
+            )
         applied = dataclasses.replace(
-            spec, env={**spec.env, **environment, **protocol}, prompt=spec.prompt + context
+            spec, env={**spec.env, **environment, **protocol}, prompt=prompt
         )
         handle = original(applied)
         try:

@@ -85,18 +85,47 @@ def prepare_permit(request: dict[str, Any], envelope: CampaignExecution) -> dict
     same binding and requires the store's consumed receipt for this successor.
     Original review handoffs retain their existing v1 entry contract.
     """
-    handoff = request["handoff_state"]
+    rearm = request.get("rearm_state")
+    handoff = rearm if rearm is not None else request["handoff_state"]
+    identity_key = "rearm_id" if rearm is not None else "handoff_id"
+    if rearm is not None and (
+        not isinstance(rearm, dict)
+        or rearm.get("purpose") != "technical_rearm"
+        or any(request.get(key) for key in ("handoff_id", "handoff_state", "handoff_packet"))
+    ):
+        raise CampaignError("unsupported technical continuation purpose")
     predecessor = request["native_predecessor"]
     original = RunState.from_dict(_archive(handoff, "original_state"))
     selector = request["unit"]["selector"]
     if selector not in original.tasks or handoff.get("native_role") != "dev":
         raise CampaignError("development continuation requires its exact original task")
+    if rearm is not None:
+        from .campaign_child_pause import validate as validate_pause
+        from .campaign_rearm import _digest as rearm_digest
+
+        paused = rearm["binding"]
+        receipt = _archive(handoff, "predecessor_receipt")
+        validate_pause(original, request, envelope, receipt)
+        if (
+            paused.get("id")
+            != rearm_digest({key: value for key, value in paused.items() if key != "id"})
+            or paused.get("hold", {}).get("kind") != "quota"
+            or paused.get("receipt_digest") != rearm_digest(receipt)
+            or paused.get("pause_id") != receipt.get("child_pause", {}).get("id")
+            or receipt.get("child_pause", {}).get("task_digest")
+            != _hash(original.tasks[selector].to_dict())
+            or original.paused_cause is None
+            or original.paused_cause.kind != PauseKind.QUOTA_WAIT
+            or not original.paused
+            or original.paused_story_key != selector
+        ):
+            raise CampaignError("technical continuation original pause or task authority changed")
     if (
         type(request.get("pr_number")) is not int
         or request["pr_number"] <= 0
         or not request.get("launch_id")
         or not request.get("run_id")
-        or not request.get("handoff_id")
+        or not request.get(identity_key)
     ):
         raise CampaignError("development continuation requires an owned PR and successor")
     context = request.get("continuation_context")
@@ -118,7 +147,7 @@ def prepare_permit(request: dict[str, Any], envelope: CampaignExecution) -> dict
         "configuration_digest": _hash(configuration),
         "continuation_context": context,
         "native_role": "dev",
-        "handoff_id": request["handoff_id"],
+        identity_key: request[identity_key],
         "capture_digest": handoff["capture_digest"],
         "workspace": str(Path(request["workspace"]).resolve()),
         "common_dir": str(Path(request["common_dir"]).resolve()),
@@ -146,7 +175,18 @@ def prepare_permit(request: dict[str, Any], envelope: CampaignExecution) -> dict
     }
     # Freeze nested tuples and dictionaries in their persisted JSON form.
     binding = json.loads(json.dumps(binding, sort_keys=True))
-    return {"schema_version": 2, "permit_id": _hash(binding), "binding": binding}
+    if rearm is not None:
+        binding.update(
+            purpose="technical_rearm",
+            pause_binding=rearm["binding"],
+            resolution=rearm["condition"],
+            packet=request["rearm_packet"],
+        )
+    return {
+        "schema_version": 3 if rearm is not None else 2,
+        "permit_id": _hash(binding),
+        "binding": binding,
+    }
 
 
 def _consumed_permit(request, envelope) -> dict[str, Any]:
@@ -186,7 +226,11 @@ def _consumed_permit(request, envelope) -> dict[str, Any]:
         "workspace": str(Path(request["workspace"]).resolve()),
         "branch": request["branch"],
     }
-    handoff = unit.evidence.get("handoff", {}) if unit is not None else {}
+    rearm = request.get("rearm_state") is not None
+    handoff = (
+        unit.evidence.get("technical_rearm" if rearm else "handoff", {}) if unit is not None else {}
+    )
+    continuation_id = request["rearm_id" if rearm else "handoff_id"]
     if (
         unit is None
         or snapshot.phase != "active"
@@ -199,15 +243,28 @@ def _consumed_permit(request, envelope) -> dict[str, Any]:
         or unit.bindings.get("pr", {}).get("number") != request["pr_number"]
         or unit.evidence.get("continuation_permits", {}).get(permit["permit_id"])
         != {"permit": permit, "consumption": request["continuation_consumption"]}
-        or handoff.get("id") != request["handoff_id"]
+        or handoff.get("id") != continuation_id
         or handoff.get("phase") != "continuing"
         or handoff.get("predecessor") != request["native_predecessor"]
         or any(
             handoff.get("successor", {}).get(key) != value for key, value in expected_claim.items()
         )
-        or (unit.hold and (unit.hold.kind != "handoff" or unit.hold.id != request["handoff_id"]))
+        or (
+            unit.hold
+            and (
+                unit.hold.kind != ("technical_rearm" if rearm else "handoff")
+                or unit.hold.id != continuation_id
+            )
+        )
     ):
         raise CampaignError("development continuation lost current campaign successor authority")
+    if rearm:
+        import time
+
+        from .campaign_rearm import _validate_condition, validate_current
+
+        validate_current(snapshot, unit, handoff, continuing=True)
+        _validate_condition(handoff["binding"], handoff["condition"], now=time.time())
     if continuation_context(snapshot, unit) != permit["binding"]["continuation_context"]:
         raise CampaignError("development continuation current constraints changed")
     remaining_dev, remaining_review = remaining(snapshot, unit)
@@ -351,7 +408,7 @@ def compose_continuation(
     tickets_engine_cls=None,
 ) -> runsetup.ComposedRun:
     """One campaign-owned entry; ordinary legacy ticket selection stays closed."""
-    role = request.get("handoff_state", {}).get("native_role")
+    role = request.get("rearm_state", request.get("handoff_state", {})).get("native_role")
     if role not in {"dev", "review"}:
         raise CampaignError("campaign continuation requires an exact native role")
     return _compose(
@@ -372,12 +429,13 @@ def _compose(
     from .engine import Engine
     from .stories_engine import StoriesEngine
 
-    handoff = request["handoff_state"]
+    rearm = request.get("rearm_state")
+    handoff = rearm if rearm is not None else request["handoff_state"]
     predecessor = request["native_predecessor"]
     workspace = Path(request["workspace"]).resolve()
-    packet = request.get("handoff_packet") or {}
+    packet = request.get("rearm_packet" if rearm is not None else "handoff_packet") or {}
     if (
-        not request.get("handoff_id")
+        not request.get("rearm_id" if rearm is not None else "handoff_id")
         or not handoff.get("capture_digest")
         or handoff.get("native_role") != role
         or predecessor.get("quiescent") is not True
@@ -605,6 +663,13 @@ def _compose(
             story_key=selector,
             predecessor=original.run_id,
             handoff_id=request["handoff_id"],
+        )
+    elif rearm is not None:
+        journal.append(
+            "campaign-development-rearm",
+            story_key=selector,
+            predecessor=original.run_id,
+            rearm_id=request["rearm_id"],
         )
     else:
         journal.append(

@@ -1012,6 +1012,7 @@ class Engine:
         if state.campaign_binding and campaign_execution is None:
             raise ValueError("campaign child requires its frozen campaign execution envelope")
         self.campaign_execution = campaign_execution
+        self._campaign_git_activity: dict[str, Any] | None = None
         self._campaign_retained_permit: Any = None
         self._campaign_development_entry: StoryTask | None = None
         self._campaign_development_prelaunch: Callable[[], None] | None = None
@@ -2799,23 +2800,19 @@ class Engine:
 
     def _finish_inflight(self) -> None:
         """Complete or roll back tasks interrupted by a pause or crash."""
-        if self.campaign_execution is not None:
-            from .campaign_continuation import validate_resume as validate_review_resume
-            from .campaign_finalization import validate_resume
-
-            for task in self.state.tasks.values():
-                if not task.terminal and not (
-                    validate_resume(self, task) or validate_review_resume(self, task)
-                ):
-                    self._campaign_recovery(task, cause="resume")
         for task in list(self.state.tasks.values()):
             if self.campaign_execution is not None:
                 from .campaign_continuation import continue_task
+                from .campaign_finalization import validate_resume as validate_finalization
 
                 if continue_task(self, task):
                     self._post_story_after_replay(task)
                     self._after_story(task)
                     continue
+                # A concurrent owner hold can revoke a prepared continuation.
+                # Only verified finalization may enter legacy inflight handling.
+                if not task.terminal and not validate_finalization(self, task):
+                    self._campaign_recovery(task, cause="resume")
             if task.stopped_native:
                 self._continue_stopped_native(task)
                 self._post_story_after_replay(task)
@@ -5990,6 +5987,7 @@ class Engine:
                         ],
                         "park_record": _finalization_evidence(park_record),
                         "plan_undo": _finalization_evidence(plan_undo),
+                        **self._git_activity_context(task),
                     },
                 )
             task.commit_sha = sha or task.baseline_commit
@@ -6081,6 +6079,14 @@ class Engine:
         # the merge-back (`WorktreeFlow.integrate_unit`), which makes this call.
         if not task.worktree_path:
             self._land_post_landing_writes(task)
+
+    def _git_activity_context(self, task: StoryTask) -> dict[str, Any]:
+        """Associate actor evidence with the exact controller-owned worker launch."""
+        if self._campaign_git_activity is None:
+            return {}
+        from .campaign_git_activity import context
+
+        return {"campaign_git_activity": context(self._campaign_git_activity, task)}
 
     def _pause_finalization_uncertain(
         self, task: StoryTask, error: verify.GitFinalizationUncertain

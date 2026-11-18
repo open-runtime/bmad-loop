@@ -30,7 +30,7 @@ def mutation_observation(intent, *, now):
     return Observation(state, data, intent.error, deadline)
 
 
-def _actions_with_held_faults(snapshot):
+def actions_with_held_faults(snapshot):
     from .campaign_action_history import action as recorded_action
 
     yield from snapshot.outbox
@@ -49,7 +49,7 @@ def status_waits(snapshot, *, limit=200):
 
     rows = []
     total = 0
-    for action in _actions_with_held_faults(snapshot):
+    for action in actions_with_held_faults(snapshot):
         if action.state == "confirmed" or not (action.error or action.next_retry_at):
             continue
         total += 1

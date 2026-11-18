@@ -95,6 +95,7 @@ def finalization(project, tmp_path, request):
             "kind": "execution",
             "run_id": engine.state.run_id,
             "source": {"kind": "sprint-status", "id": "source"},
+            "source_revision": "",
             "unit": {
                 "id": context.unit_id,
                 "source": "source",
@@ -111,16 +112,22 @@ def finalization(project, tmp_path, request):
     )
     assert pusher.push("checkpoint", checkpoint).state == "confirmed"
     child = dataclasses.replace(context, directory=tmp_path / "retained-launch")
+    predecessor = json.loads(original_request.read_text())
     request = {
-        "workspace": str(repo),
+        **{
+            key: predecessor[key]
+            for key in ("workspace", "branch", "common_dir", "source", "source_revision", "unit")
+        },
+        "kind": "recovery",
+        "launch_id": child.directory.name,
         "recovery_request": str(original_request.parent / "recovery-request.json"),
-        "branch": "campaign-retained",
         "quiescence_receipt": "daemon-and-engine-terminal",
         "publication_state": str(pusher.root),
         "remote": "campaign-test",
         "recovery_action": "retained-1",
         "run_id": "retained-run",
     }
+    request = json.loads(prepare_launch(child, request).read_text())
     return project, context, engine, adapter, task, child, request, pusher, checkpoint, baseline
 
 

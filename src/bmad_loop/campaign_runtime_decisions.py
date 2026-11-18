@@ -21,10 +21,11 @@ from .campaign_decisions import (
     ObservedFact,
     collect_evidence,
     decision_summary,
+    development_choice,
     project_ledger,
 )
 from .campaign_github import GithubError
-from .campaign_model import CampaignError
+from .campaign_model import CampaignError, Hold
 from .campaign_publication import PublicationController, PublicationRequirements
 from .platform_util import file_lock
 
@@ -206,6 +207,66 @@ def collect(
         unavailable.append("current GitHub approval unavailable: " + str(exc))
         facts = ()
     return MappedEvidence(sources, facts, tuple(unavailable))
+
+
+def execution_choices(runtime, snapshot, unit):
+    """Reobserve outstanding choices immediately before writing the execution request."""
+    from .campaign_resolution_flow import collect_context, execution_input_digest
+
+    pending = unit.evidence.get("pending_delegated_choices", {})
+    if not pending:
+        return [], ""
+    observed = snapshot.clone()
+    subject = observed.units[unit.id]
+    if subject.claim:
+        subject.claim.quiescent = True  # The new worker has not started.
+    previous = runtime._decision_projections(snapshot)
+    choices = []
+    for binding in pending.values():
+        ident = binding["receipt"]
+        receipt = snapshot.bindings["decision_receipts"][ident]
+        subject.hold = Hold(**binding["hold"])
+        mapped = collect(runtime, observed, subject, prior_projections=previous)
+        try:
+            fresh = collect_context(
+                runtime.project,
+                observed,
+                subject.id,
+                "decision",
+                providers={
+                    "github": github_provider(runtime.gateway(snapshot)),
+                    **runtime.evidence_providers,
+                },
+                mapped_sources=mapped.sources,
+                facts=mapped.facts,
+                mapped_unavailable=mapped.unavailable,
+                prior_projections=previous,
+            )
+        except CampaignError:
+            return [], ident
+        if execution_input_digest(fresh["packet"]) != binding["packet_digest"]:
+            return [], ident
+        choices.append(development_choice(receipt))
+    return choices, ""
+
+
+def reopen_choice(snapshot, unit, decision_id):
+    """A stale choice reopens exactly the decision whose execution was refused."""
+    from .campaign_hold import defer_failure
+    from .campaign_store import add_event
+
+    pending = unit.evidence.get("pending_delegated_choices", {})
+    for key, binding in list(pending.items()):
+        if binding["receipt"] == decision_id:
+            hold = Hold(**binding["hold"])
+            if unit.hold:
+                defer_failure(unit, hold)
+            else:
+                unit.hold = hold
+            unit.evidence["delegation_recheck_revision"] = decision_id
+            del pending[key]
+            add_event(snapshot, "delegated-choice-stale", unit=unit.id, decision=decision_id)
+            break
 
 
 def project(runtime, snapshot, action) -> dict[str, Any]:

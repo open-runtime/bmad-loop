@@ -32,6 +32,7 @@ from .campaign_database import (
 from .campaign_model import (
     CampaignError,
     CampaignSnapshot,
+    Hold,
     OutboxAction,
     UnitState,
     snapshot_from_dict,
@@ -267,6 +268,7 @@ class CampaignStore:
                     raise CampaignError("configuration change requires quiescent reasoning jobs")
             for key, unit in previous.units.items():
                 replacement = snapshot.units.get(key)
+                _audit_rearm_cancellation(previous, snapshot, key)
                 prior_permits = unit.evidence.get("continuation_permits", {})
                 next_permits = (
                     replacement.evidence.get("continuation_permits", {}) if replacement else {}
@@ -285,24 +287,42 @@ class CampaignStore:
                     from .campaign_usage import remaining as remaining_allowance
 
                     prior_dev, prior_review = remaining_allowance(previous, unit)
-                    prior_handoff = unit.evidence.get("handoff", {})
+                    technical = expected["permit"]["schema_version"] == 3
+                    evidence_key = "technical_rearm" if technical else "handoff"
+                    identity_key = "rearm_id" if technical else "handoff_id"
+                    prior_handoff = unit.evidence.get(evidence_key, {})
+                    if technical:
+                        from .campaign_rearm import validate_capture, validate_current
+
+                        validate_current(previous, unit, prior_handoff)
+                        validate_capture(previous, unit, prior_handoff, directory=directory)
+                    expected_hold = (
+                        Hold(
+                            "technical_rearm",
+                            "Exact retained development continuation is in progress",
+                            id=prior_handoff.get("id", ""),
+                        )
+                        if technical
+                        else unit.hold
+                    )
                     if (
                         record != expected
                         or ident != expected["permit"]["permit_id"]
                         or prior_handoff.get("phase") != "ready"
-                        or prior_handoff.get("id") != expected["permit"]["binding"]["handoff_id"]
+                        or prior_handoff.get("id") != expected["permit"]["binding"][identity_key]
                         or not unit.claim
                         or not unit.claim.quiescent
                         or unit.claim.launch_id
                         != expected["permit"]["binding"]["predecessor"]["launch_id"]
                         or (
-                            unit.hold
+                            not technical
+                            and unit.hold
                             and (
                                 unit.hold.kind != "handoff"
                                 or unit.hold.id != prior_handoff.get("id")
                             )
                         )
-                        or replacement.hold != unit.hold
+                        or replacement.hold != expected_hold
                         or replacement.attempt != unit.attempt + 1
                         or any(
                             getattr(replacement, field) != getattr(unit, field)
@@ -342,7 +362,7 @@ class CampaignStore:
                             )
                         )
                         or any(
-                            replacement.evidence.get("handoff", {}).get(field)
+                            replacement.evidence.get(evidence_key, {}).get(field)
                             != prior_handoff.get(field)
                             for field in (
                                 "id",
@@ -353,6 +373,11 @@ class CampaignStore:
                                 "predecessor",
                                 "capture",
                                 "packet",
+                                *(
+                                    ("binding", "condition", "capacity", "original_payload")
+                                    if technical
+                                    else ()
+                                ),
                             )
                         )
                         or expected["permit"]["binding"]["remaining_dev_attempts"] != prior_dev
@@ -629,6 +654,8 @@ class CampaignStore:
             "adopt",
             "handoff",
             "authorize-scope",
+            "rearm",
+            "answer",
         }:
             raise CampaignError(f"unknown campaign control {kind}")
         self.load(campaign_id)
@@ -856,6 +883,78 @@ def add_action(
     return action
 
 
+def _audit_rearm_cancellation(previous, snapshot, key) -> None:
+    """A spent successor can return ownership only through proven no-start evidence."""
+    old, new = previous.units[key], snapshot.units.get(key)
+    if new is None:
+        return
+    before = old.evidence.get("technical_rearm", {})
+    after = new.evidence.get("technical_rearm", {})
+    if after.get("phase") != "canceled" or after.get("cancellation") == before.get("cancellation"):
+        return
+    if before.get("phase") != "continuing" or old.claim is None:
+        raise CampaignError("technical cancellation has no consumed successor")
+    proof = after.get("cancellation") or {}
+    projected = previous.clone()
+    projected.phase = snapshot.phase
+    action = next((row for row in projected.outbox if row.id == old.claim.launch_id), None)
+    result = next((row for row in snapshot.outbox if row.id == old.claim.launch_id), None)
+    if action is None or result is None:
+        raise CampaignError("technical cancellation lost its durable launch")
+    from .campaign_rearm import cancel_unlaunched
+
+    expected = cancel_unlaunched(
+        projected,
+        projected.units[key],
+        action,
+        mode=proof.get("mode"),
+        result=result.receipt if proof.get("mode") == "not-launched" else None,
+    )
+    restored = projected.units[key]
+    if (
+        proof != expected
+        or new.claim != restored.claim
+        or new.attempt != old.attempt
+        or new.spec != old.spec
+        or any(
+            new.bindings.get(field) != old.bindings.get(field)
+            for field in (
+                "workspace",
+                "branch",
+                "pr",
+                "issue",
+                "head",
+                "base",
+                "canonical_source",
+                "effective_source",
+                "effective_sources",
+                "private_paths",
+                "source_revision",
+            )
+        )
+        or any(
+            getattr(new, field) != getattr(old, field)
+            for field in ("failure_attempts", "resolution_attempts", "review_attempts")
+        )
+        or any(
+            new.evidence.get(field) != old.evidence.get(field)
+            for field in (
+                "continuation_permits",
+                "worker_history",
+                "acceptance",
+                "usage",
+                "developer_family",
+                "developer_families",
+                "developer_attribution_incomplete",
+                "unresolved_approval_requirements",
+            )
+        )
+        or {k: v for k, v in after.items() if k not in {"phase", "cancellation"}}
+        != {k: v for k, v in before.items() if k not in {"phase", "cancellation"}}
+    ):
+        raise CampaignError("technical cancellation changed retained authority or allowance")
+
+
 def _continuation_record(snapshot, unit, permit) -> dict[str, Any]:
     """Bind a development permit to pinned configuration and captured task bytes."""
     from .campaign_usage import remaining
@@ -864,7 +963,7 @@ def _continuation_record(snapshot, unit, permit) -> dict[str, Any]:
         not isinstance(permit, dict)
         or set(permit) != {"schema_version", "permit_id", "binding"}
         or type(permit.get("schema_version")) is not int
-        or permit["schema_version"] != 2
+        or permit["schema_version"] not in {2, 3}
     ):
         raise CampaignError("unsupported continuation permit")
     binding = permit["binding"]
@@ -877,7 +976,18 @@ def _continuation_record(snapshot, unit, permit) -> dict[str, Any]:
     ):
         raise CampaignError("continuation permit identity changed")
     claim = unit.claim
-    handoff = unit.evidence.get("handoff", {})
+    technical = permit["schema_version"] == 3
+    evidence_key = "technical_rearm" if technical else "handoff"
+    identity_key = "rearm_id" if technical else "handoff_id"
+    handoff = unit.evidence.get(evidence_key, {})
+    if technical:
+        from .campaign_rearm import _validate_condition, validate_capture, validate_current
+
+        if binding.get("purpose") != "technical_rearm":
+            raise CampaignError("unsupported technical continuation purpose")
+        validate_current(snapshot, unit, handoff, continuing=True)
+        validate_capture(snapshot, unit, handoff, directory=Path(claim.run_dir).parents[1])
+        _validate_condition(handoff["binding"], handoff["condition"], now=time.time())
     predecessor = handoff.get("predecessor", {})
     successor = binding.get("successor", {})
     dev, review = remaining(snapshot, unit)
@@ -888,9 +998,9 @@ def _continuation_record(snapshot, unit, permit) -> dict[str, Any]:
         or binding.get("campaign_id") != snapshot.id
         or binding.get("unit_id") != unit.id
         or binding.get("native_role") != "dev"
-        or handoff.get("native_role") != "dev"
+        or (not technical and handoff.get("native_role") != "dev")
         or binding.get("config_revision") != snapshot.config_revision
-        or binding.get("handoff_id") != handoff.get("id")
+        or binding.get(identity_key) != handoff.get("id")
         or handoff.get("phase") != "continuing"
         or binding.get("capture_digest") != handoff.get("capture", {}).get("capture_digest")
         or binding.get("fingerprint")
@@ -940,10 +1050,10 @@ def _continuation_record(snapshot, unit, permit) -> dict[str, Any]:
             and action.generation == claim.generation
             and action.state in {"prepared", "sent_unknown"}
             and action.payload.get("kind") == "execution"
-            and action.payload.get("handoff_id") == handoff.get("id")
+            and action.payload.get(identity_key) == handoff.get("id")
             for action in snapshot.outbox
         )
-        or (unit.hold and (unit.hold.kind != "handoff" or unit.hold.id != handoff.get("id")))
+        or (unit.hold and (unit.hold.kind != evidence_key or unit.hold.id != handoff.get("id")))
     ):
         raise CampaignError(
             "continuation permit is stale, exhausted or not owned by its exact successor"

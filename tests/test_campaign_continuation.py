@@ -586,6 +586,37 @@ def test_development_prelaunch_rechecks_work_changed_by_hooks(development_handof
     assert (composed.run_dir / "continuation-consumed.json").exists()
 
 
+def test_owner_hold_at_continuation_entry_preserves_work_before_legacy_resume(
+    development_handoff, monkeypatch
+):
+    from bmad_loop import campaign_continuation
+    from bmad_loop.campaign_model import Hold
+
+    project, _, adapter, child, request = development_handoff
+    composed = compose_development(development_handoff)
+    store = CampaignStore(Path(request["continuation_authority"]))
+    task = composed.state.tasks[request["unit"]["selector"]]
+    original = task.to_dict()
+
+    def hold_before_entry(engine, task):
+        snapshot = store.load(child.campaign_id)
+        snapshot.units[child.unit_id].hold = Hold("owner", "Wait for the owner's answer")
+        store.save(snapshot, snapshot.revision)
+        return continue_task(engine, task)
+
+    monkeypatch.setattr(campaign_continuation, "continue_task", hold_before_entry)
+    with pytest.raises(RunPaused, match="campaign recovery requested"):
+        composed.engine._finish_inflight()
+    receipt = json.loads((child.directory / "recovery-request.json").read_text())
+    assert receipt["cause"] == "resume"
+    assert receipt["task"] == original
+    assert not adapter.sessions
+    assert (project.project / "owned.py").read_text() == "retained unstaged work\n"
+    assert git(project.project, "show", ":owned.py") == "retained staged work"
+    note = project.project / "preexisting-untracked.txt"
+    assert note.read_text() == "retained untracked work\n"
+
+
 @pytest.mark.parametrize("change", ["stopped", "generation", "hold", "claim", "missing_permit"])
 def test_development_rechecks_campaign_authority_at_entry(development_handoff, monkeypatch, change):
     _, _, _, child, request = development_handoff

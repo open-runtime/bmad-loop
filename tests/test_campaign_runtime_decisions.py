@@ -66,6 +66,8 @@ class Discussions(Service):
                         "node": {
                             "id": identity,
                             "body": item["body"],
+                            "title": item.get("title"),
+                            "createdAt": item["created_at"],
                             "updatedAt": item["updated_at"],
                             "lastEditedAt": item["updated_at"] if editor else None,
                             "editor": (

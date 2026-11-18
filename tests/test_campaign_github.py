@@ -361,8 +361,17 @@ def test_shared_field_human_edit_prevents_update():
     transport.responses["GET", "repos/a/b/issues/7"] = ApiResponse(
         200, {"id": 777, "number": 7, "updated_at": "t2", "milestone": {"number": 9}}, {}
     )
-    with pytest.raises(GithubError, match="human edits"):
-        gateway.execute(replace(intent, state="sent_unknown"), generation=1)
+    transport.responses["PATCH", intent.path] = ApiResponse(
+        200, {"id": 777, "number": 7, "updated_at": "t3", "milestone": {"number": 3}}, {}
+    )
+    refused = gateway.execute(replace(intent, state="sent_unknown"), generation=1)
+    assert refused.state == "rejected"
+    assert refused.fault["category"] == "precondition"
+    assert refused.fault["certainty"] == "not_submitted"
+    assert refused.receipt["precondition"]["submitted"] is False
+    assert refused.receipt["precondition"]["action_id"] == intent.action_id
+    assert refused.receipt["precondition"]["expected"] == intent.coordinates
+    assert refused.receipt["precondition"]["observed"]["updated_at"] == "t2"
     assert all(method == "GET" for method, _, _ in transport.calls)
 
 
@@ -376,6 +385,20 @@ def test_issue_closure_requires_source_and_does_not_rewrite_body():
     )
     intent = gateway.close_issue_intent(7, action_id="a", generation=1, source_confirmed=True)
     assert intent.payload == {"state": "closed", "state_reason": "completed"}
+
+
+@pytest.mark.parametrize("reason", ["not_planned", None, "duplicate"])
+def test_existing_noncompleted_issue_close_is_a_visible_no_send_discrepancy(reason):
+    transport = FakeTransport()
+    gateway = GithubGateway(transport, "a/b")
+    issue = {"id": 777, "number": 7, "updated_at": "t1", "state": "closed", "state_reason": reason}
+    transport.responses["GET", "repos/a/b/issues/7"] = ApiResponse(200, issue, {})
+    intent = gateway.close_issue_intent(7, action_id="close", generation=1, source_confirmed=True)
+    assert intent.state == "rejected"
+    assert intent.fault["category"] == "tracking_discrepancy"
+    assert intent.fault["certainty"] == "not_submitted"
+    assert intent.receipt["state_reason"] == reason
+    assert all(method == "GET" for method, _, _ in transport.calls)
 
 
 def test_pending_merge_ack_is_not_merge_completion_and_conflicting_409_held():

@@ -284,6 +284,7 @@ _JOURNAL_KIND_ALIAS_FIELDS: dict[str, dict[str, str]] = {
     "finalization-uncertain": {"operation": "operation"},
     "campaign-review-handoff": {"predecessor": "run", "handoff_id": "operation"},
     "campaign-development-handoff": {"predecessor": "run", "handoff_id": "operation"},
+    "campaign-development-rearm": {"predecessor": "run", "rearm_id": "operation"},
     # Explicit native recovery correlates through opaque session/task aliases;
     # its profile digest and transcript-derived identity stay local below.
     "stopped-native-armed": {"session_id": "session", "artifact_task_id": "story"},

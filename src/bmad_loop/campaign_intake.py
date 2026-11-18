@@ -32,6 +32,38 @@ class IntakeObservation:
     def version_id(self) -> str:
         return f"{self.repository}:{self.kind}:{self.object_id}:{self.updated_at}:{self.digest}"
 
+    @property
+    def issue_disposition_fingerprint(self) -> str | None:
+        """Identify issue work across lifecycle updates to the same hydrated milestone."""
+        milestone = self.payload.get("milestone")
+        if self.kind != "issue" or not isinstance(milestone, dict):
+            return None
+        if any(
+            type(milestone.get(key)) is not int or milestone[key] <= 0 for key in ("id", "number")
+        ):
+            return None
+        node = milestone.get("node_id")
+        if node is not None and (not isinstance(node, str) or not node):
+            return None
+        assignment = {
+            key: value
+            for key, value in milestone.items()
+            if key not in {"state", "closed_at", "updated_at", "open_issues", "closed_issues"}
+        }
+        subject = [
+            "issue-disposition-v1",
+            self.repository,
+            self.object_id,
+            self.number,
+            self.updated_at,
+            self.author,
+            self.url,
+            {**self.payload, "milestone": assignment},
+        ]
+        return hashlib.sha256(
+            json.dumps(subject, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+
     def to_dict(self) -> JsonObject:
         return asdict(self)
 
@@ -113,12 +145,72 @@ def validate_triage(
         ):
             raise ValueError("New work needs unique identity and actionable acceptance criteria")
     if (
-        proposal.disposition in {"attach", "repair_current_pr"}
+        proposal.disposition in {"attach", "repair_current_pr", "duplicate"}
         and proposal.unit_id not in known_units
     ):
         raise ValueError("Triage attachment references an unknown unit")
     if set(proposal.dependencies) - known_units:
         raise ValueError("Triage proposal references unknown dependencies")
+
+
+def validate_duplicate_coverage(proof, observations, criteria):
+    """Require a semantic explanation for every nonblank line of the frozen incoming intent."""
+    if (
+        not isinstance(proof, dict)
+        or set(proof) != {"target_database_id", "coverage", "remaining"}
+        or proof.get("remaining") != []
+    ):
+        raise ValueError("Duplicate coverage has missing or unresolved obligations")
+    allowed = set(criteria)
+    if not allowed or not all(isinstance(text, str) and text.strip() for text in allowed):
+        raise ValueError("Duplicate requires existing actionable acceptance criteria")
+    expected = set()
+    for observed in observations:
+        if observed.kind not in {"issue", "comment"}:
+            raise ValueError("Duplicate cannot dispose a review finding")
+        lines = set()
+        for field in (("title", "body") if observed.kind == "issue" else ("body",)):
+            text = observed.payload.get(field)
+            if text is None:
+                continue
+            if not isinstance(text, str):
+                raise ValueError("Duplicate source text is malformed")
+            lines.update(
+                (observed.version_id, field, index)
+                for index, line in enumerate(text.splitlines(), 1)
+                if line.strip()
+            )
+        if not lines:
+            raise ValueError("Duplicate input has no observed requirement text")
+        expected.update(lines)
+    covered = set()
+    cited = set()
+    rows = proof.get("coverage")
+    if not isinstance(rows, list) or len(rows) != len(expected):
+        raise ValueError("Duplicate coverage omits or adds incoming requirements")
+    for row in rows:
+        if (
+            not isinstance(row, dict)
+            or set(row) != {"input_version", "field", "line", "criteria", "reason"}
+            or type(row.get("line")) is not int
+        ):
+            raise ValueError("Duplicate coverage requires an exact source line")
+        key = (row.get("input_version"), row.get("field"), row["line"])
+        supports = row.get("criteria")
+        if (
+            key not in expected
+            or key in covered
+            or not isinstance(supports, list)
+            or not supports
+            or not set(supports) <= allowed
+            or not isinstance(row.get("reason"), str)
+            or not row["reason"].strip()
+        ):
+            raise ValueError("Duplicate requirement lacks unique evidence or accepted criterion")
+        covered.add(key)
+        cited.update(supports)
+    if cited != allowed:
+        raise ValueError("Duplicate disposition claims criteria outside its cited coverage")
 
 
 class GithubIntake:

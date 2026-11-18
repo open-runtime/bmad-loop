@@ -19,11 +19,13 @@ import re
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Literal, get_args
 
 from .campaign_github import GithubError, GithubGateway, JsonObject
 from .fences import fenced_spans
 from .verify import GitError, git_bytes
+
+INVENTORY_REFRESH_SECONDS = 120
 
 
 @dataclass(frozen=True)
@@ -117,15 +119,52 @@ def validate_overlap(
     adoption_authorized: bool = False,
     delivery_verified: bool = False,
 ) -> None:
-    if disposition.inventory_digest != inventory.digest:
+    validate_overlap_evidence(
+        disposition,
+        inventory_digest=inventory.digest,
+        complete=inventory.complete,
+        available=evidence_ids(inventory),
+        owned_pr=owned_pr,
+        adoption_authorized=adoption_authorized,
+        delivery_verified=delivery_verified,
+    )
+
+
+def validate_overlap_evidence(
+    disposition: OverlapDisposition,
+    *,
+    inventory_digest: str,
+    complete: bool,
+    available: frozenset[str],
+    owned_pr: int | None = None,
+    adoption_authorized: bool = False,
+    delivery_verified: bool = False,
+) -> None:
+    if disposition.inventory_digest != inventory_digest:
         raise ValueError("Overlap disposition uses a different inventory revision")
-    if not disposition.reason.strip() or not disposition.acceptance_coverage:
+    if disposition.disposition not in get_args(OverlapKind):
+        raise ValueError("Unknown overlap disposition")
+    if (
+        not isinstance(disposition.reason, str)
+        or not disposition.reason.strip()
+        or not disposition.acceptance_coverage
+    ):
         raise ValueError("Overlap disposition requires acceptance coverage and rationale")
-    if not inventory.complete:
+    if any(
+        not isinstance(values, (list, tuple)) or not all(isinstance(item, str) for item in values)
+        for values in (
+            disposition.evidence_ids,
+            disposition.acceptance_coverage,
+            disposition.remaining,
+            disposition.exclusions,
+        )
+    ):
+        raise ValueError("Overlap disposition lists must contain strings")
+    if complete is not True:
         raise ValueError("Incomplete inventory cannot authorize work admission")
     if disposition.disposition != "new_work" and not disposition.evidence_ids:
         raise ValueError("Overlap disposition requires exact source/PR/commit evidence")
-    if set(disposition.evidence_ids) - evidence_ids(inventory):
+    if set(disposition.evidence_ids) - available:
         raise ValueError("Overlap disposition cites evidence absent from the observed inventory")
     if disposition.disposition == "already_delivered" and not delivery_verified:
         raise ValueError("Delivery requires independent merged/source verification")

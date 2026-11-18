@@ -35,6 +35,10 @@ class Observation:
     retry_at: float | None = None
 
 
+class ObservationStale(CampaignError):
+    """An observation lost current authority; refresh it without replaying a write."""
+
+
 class CampaignDriver(Protocol):
     def proposals(self, snapshot: CampaignSnapshot) -> tuple[Proposal, ...]: ...
     def perform(self, snapshot: CampaignSnapshot, action: OutboxAction) -> Observation: ...
@@ -72,13 +76,18 @@ class CampaignSupervisor:
     def _executors(self):
         # Git/source observations can be slow. They must not occupy the slots
         # needed to observe or stop already-owned native coding processes.
-        with ThreadPoolExecutor(max_workers=2) as controls:
-            with ThreadPoolExecutor(max_workers=self.io_workers) as effects:
-                self._control_executor = controls
-                try:
-                    yield effects
-                finally:
-                    self._control_executor = None
+        try:
+            with ThreadPoolExecutor(max_workers=2) as controls:
+                with ThreadPoolExecutor(max_workers=self.io_workers) as effects:
+                    self._control_executor = controls
+                    try:
+                        yield effects
+                    finally:
+                        self._control_executor = None
+        finally:
+            close = getattr(self.driver, "close_observers", None)
+            if close is not None:
+                close()
 
     def _save(self, snapshot: CampaignSnapshot) -> CampaignSnapshot:
         return self.store.save(snapshot, snapshot.revision, expected_generation=snapshot.generation)
@@ -192,6 +201,10 @@ class CampaignSupervisor:
                         raise
                     observation = Observation(
                         "waiting", observation.data, reason=str(exc), retry_at=self.clock() + 5
+                    )
+                except ObservationStale as exc:
+                    observation = Observation(
+                        "waiting", observation.data, reason=str(exc), retry_at=self.clock() + 1
                     )
             if observation.state == "confirmed":
                 action.state = "confirmed"
@@ -327,10 +340,15 @@ class CampaignSupervisor:
             changed = True
         return self._save(snapshot) if changed else snapshot
 
-    def _reconciled(self, campaign_id: str, executor: ThreadPoolExecutor) -> CampaignSnapshot:
+    def _reconciled(
+        self,
+        snapshot: CampaignSnapshot,
+        executor: ThreadPoolExecutor,
+        *,
+        rearm_preparation: bool = True,
+    ) -> CampaignSnapshot:
         # Queued holds/stops must reach the authority before an uncertain
         # effect can authorize any retry during startup reconciliation.
-        snapshot = self.store.load(campaign_id)
         from .campaign_transfer import require_not_retired
 
         require_not_retired(snapshot, operation="supervise or reconcile")
@@ -340,7 +358,9 @@ class CampaignSupervisor:
             snapshot = self._save(snapshot)
         snapshot = self._commands(snapshot)
         prepare_resume = getattr(self.driver, "prepare_resume", None)
-        if prepare_resume is not None and prepare_resume(snapshot):
+        if prepare_resume is not None and prepare_resume(
+            snapshot, rearm_preparation=rearm_preparation
+        ):
             snapshot = self._save(snapshot)
         for action in tuple(snapshot.outbox):
             if action.state == "sent_unknown":
@@ -370,13 +390,18 @@ class CampaignSupervisor:
                 self._wake.wait(0.05)
         return snapshot
 
-    def reconcile(self, campaign_id: str) -> CampaignSnapshot:
+    @contextmanager
+    def _owned(self, campaign_id: str):
         snapshot = self.store.load(campaign_id)
         with self.store.coordinator(
             snapshot.common_dir, snapshot.spec.target, campaign_id=campaign_id
         ):
+            yield self.store.load(campaign_id)
+
+    def reconcile(self, campaign_id: str) -> CampaignSnapshot:
+        with self._owned(campaign_id) as snapshot:
             with self._executors() as executor:
-                snapshot = self._reconciled(campaign_id, executor)
+                snapshot = self._reconciled(snapshot, executor)
                 snapshot = self._commands(snapshot)
                 observations = getattr(self.driver, "reconciliation_observations", None)
                 if observations is not None:
@@ -395,19 +420,28 @@ class CampaignSupervisor:
                             self._wake.wait(0.05)
                 return snapshot
 
-    def run(self, campaign_id: str, *, max_ticks: int | None = None) -> CampaignSnapshot:
-        snapshot = self.store.load(campaign_id)
-        with self.store.coordinator(
-            snapshot.common_dir, snapshot.spec.target, campaign_id=campaign_id
-        ):
+    def run(
+        self, campaign_id: str, *, active_only: bool = False, max_ticks: int | None = None
+    ) -> CampaignSnapshot:
+        from .campaign_transfer import retired
+
+        with self._owned(campaign_id) as snapshot:
+            # Boot services have no authority to start a never-supervised campaign
+            # or reopen one that the operator, delivery or transfer has closed.
+            if active_only and (
+                not snapshot.generation
+                or snapshot.phase not in {"active", "draining"}
+                or retired(snapshot)
+            ):
+                return snapshot
             # Reconcile old effects under their original coordinates before a
             # new coordinator generation can admit fresh work.
             with self._executors() as executor:
-                snapshot = self._reconciled(campaign_id, executor)
+                snapshot = self._reconciled(snapshot, executor, rearm_preparation=not active_only)
                 snapshot.generation += 1
-                if snapshot.phase == "stopped":
+                if snapshot.phase == "stopped" and not active_only:
                     snapshot.bindings.pop("terminate_requested", None)
-                snapshot.phase = "active" if snapshot.phase == "stopped" else snapshot.phase
+                    snapshot.phase = "active"
                 for action in snapshot.outbox:
                     if action.state == "prepared":
                         # Prepared is durably never sent. Adopt the same intent

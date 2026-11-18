@@ -83,6 +83,7 @@ independent = true
 [resources]
 verify_slots = 2
 max_sessions = 6
+max_total_sessions = 6
 
 [github]
 enabled = true
@@ -193,6 +194,20 @@ explicitly; `scm.max_parallel` remains the existing single-run setting. There is
 no implicit one-worker limit per epic. `max_workers_per_epic` is optional and only
 restricts admission when configured. Execution, review, verification, resolver,
 active-epic and total in-flight limits are distinct.
+
+`resources.max_sessions` retains its historical model-worker limit. Set
+`resources.max_total_sessions` to bound execution, planning, review, resolution,
+verification and reasoning reservations together. Each stage's own limit also
+applies. Prepared and uncertain actors keep their reservations until quiescence
+is confirmed; waiting for GitHub without an actor consumes no session slot.
+
+The total limit is a positive integer. Omitting it preserves an old frozen
+configuration and its identity; it does not establish an all-worker ceiling.
+`campaign status --json` reports `active_total_sessions`, `max_total_sessions`,
+`unknown_session_reservations` and `session_limit_basis` alongside the existing
+model and verification counts. `legacy-model-only` means the total limit is
+absent. The 32-session workload must explicitly configure a total limit of 32
+and count verification reservations in its independent measurement.
 
 ## Models and planning
 
@@ -356,8 +371,21 @@ back to normal intake; status exposes a pending comparison and other stories can
 continue. A mirror marker or matching issue identity alone never proves coverage.
 Repository discovery includes existing PRs, branches and accessible local work.
 Triage proposes attachment, same-PR repair, new planning work, duplicate links,
-clarification or a hold. An incoming issue is evidence and product intent;
-it cannot change runtime policy or authorize an unrelated action.
+clarification or a hold. The campaign treats incoming issues as product evidence.
+Execution authority comes from the frozen campaign configuration.
+
+For a duplicate, the triage model identifies the existing campaign unit and its
+observed issue or PR in the same repository. It explains which current
+acceptance criterion covers each nonblank line of the incoming title and body.
+The controller rechecks the target identity and outstanding work before
+recording the disposition. An uncovered requirement stays open for a planning
+amendment or a decision. The original issue and its contents remain available.
+
+An intake control with a completed administrative disposition can finish its
+parent once the controller verifies its native cancellations and unchanged
+branch. Added acceptance criteria, human objections, pending approvals or an
+unproven duplicate target keep the parent open. The controller checks these
+conditions again before finalizing the campaign.
 
 Meaningful checkpoints are committed by the worker and pushed as immutable
 commit IDs. Draft checkpoints can be incomplete. A soft time target encourages
@@ -412,6 +440,24 @@ failed checks enter bounded repair after confirmed queue removal when enqueued.
 These checks do not replace the separate verification of a queue's combined
 candidate. Outstanding user or team review requests also wait, even when the
 approval count is otherwise sufficient.
+
+Review threads use manual resolution by default. To receive verified resolution
+recommendations, set `github.verified_thread_bot_ids` to the GitHub GraphQL node
+IDs of the bots whose findings the campaign should follow. The campaign checks
+every comment's native actor type and ID. It links a finding to a verified
+repair that changed the reported file. An independent publication reviewer must
+identify the finding and fix, cite a successful verification command on the
+current PR head, and explain how it exercises the reported behavior.
+
+A qualifying story shows the thread IDs in its wait reason. A maintainer can
+inspect the recommendation and resolve the conversation on GitHub. The campaign
+rereads the thread and resumes publication checks after confirmed resolution.
+An edited conversation or changed head during this wait triggers fresh review.
+Human replies and uncertain authors keep the finding outside this policy.
+GitHub's resolution mutation cannot require an expected head or comment revision,
+so the campaign leaves the final thread action to the maintainer.
+[GitHub GraphQL pull request reference](https://docs.github.com/en/graphql/reference/pulls#resolvereviewthreadinput)
+
 Configured `github.hold_labels` (default `bmad:hold`) apply to fresh publication
 and merge retries. Read-only reconciliation of an issued merge continues while
 held, without authorizing another merge write.
@@ -577,6 +623,92 @@ owner authority. Imported arbitrary JSON and unqualified harness stores are
 refused; unavailable or oversized evidence remains visible.
 
 Existing decisions and delegated choices can settle routine product questions.
+For example, an owner can approve post-planning decisions by Muse Wonderful
+or Codex Astra 6.2 and permit coding to continue on either Claude model or
+Codex. The following role settings belong in the campaign specification.
+Use the effort and profile for which the installation has current proof.
+
+```toml
+[role_pools.post_planning]
+candidates = [
+  { profile = "muse", model = "muse-wonder-full-1.0", effort = "xhigh" },
+  { profile = "codex", model = "gpt-6.2-astra", effort = "high" },
+]
+
+[roles.decision_review]
+pool = "post_planning"
+
+[roles.escalation]
+pool = "post_planning"
+
+[roles.triage]
+pool = "post_planning"
+
+[role_pools.development]
+candidates = [
+  { profile = "claude", model = "claude-opus-5-5", effort = "high" },
+  { profile = "claude", model = "claude-fable-5-2", effort = "high" },
+  { profile = "codex", model = "gpt-6.2-astra", effort = "high" },
+]
+
+[roles.execution]
+pool = "development"
+```
+
+Handoff requires enabled reasoning, qualified summary and audit routes, and
+fresh destination capacity. A shared Claude quota can block both Claude
+models. An eligible Codex route can then continue, or the campaign can wait
+for quota to recover. Publication review must be independent of every family
+that contributed to the work. When both Claude and Codex have written to one
+PR, configure a qualified independent reviewer under the repository's policy.
+
+A campaign owner can delegate implementation choices after planning by setting
+`[decisions] delegation_documents` to an array of `SHA256:relative/path`
+references. Each digest pins the exact UTF-8 bytes of a committed repository
+document describing which choices the model may make. The decision reviewer
+receives the accepted story scope and criteria together with that document.
+Configure its qualified model and fallback pool through `[roles.decision_review]`.
+A missing, changed, or uncommitted delegation document leaves the hold in place.
+Before development starts, the controller checks the decision inputs again.
+The assigned development session receives the validated action, answer,
+constraints and observed decision model. The source documents and quotations
+stay in the decision ledger. A change to the story, policy, or observed decision
+evidence reopens the original hold for review.
+
+To ask a specific implementation question before a story starts, put it in the
+approved campaign configuration. Use the qualified unit ID and a committed
+delegation document pinned by its SHA-256 digest.
+
+```toml
+[[decisions.implementation_choices]]
+unit = "stories:platform:local-cache"
+question = "Which SQLite journal mode should this story use?"
+delegation_document = "<64-character SHA-256 digest>:docs/cache-delegation.md"
+```
+
+When that story's draft PR is ready, its decision reviewer receives the question
+and the accepted scope. A choice within the delegation proceeds to development.
+If the reviewer escalates, an authenticated `campaign answer` reply can supply the
+implementation choice. The development session receives the exact directed
+reply and its verified author. This pre-development stage preserves operator
+stops and the separate workflow for interrupted coding sessions.
+
+An owner can reply to the mapped GitHub discussion with `Decision DECISION_ID` on
+the first line and `Option 2` on the second. When the matching list has a
+second option, the developer receives the owner's words, the original question,
+the ordered reviewer proposals and the selected number. An ambiguous selection
+returns to the inbox for clarification. A newly observed owner comment wakes
+decision review. Controller summary comments can update the activity time of
+an issue or PR while its decision evidence stays current. The controller checks
+the source body, its verified author and editor, the time of creation or edit,
+repository scope and all mapped discussion comments before dispatch.
+
+When a decision reviewer needs the owner's judgment, it ranks the viable options
+and gives a reason and evidence references for each. `campaign inbox` shows the
+current recommendation and alternatives. If the stage used private sources, the
+inbox gives the receipt ID for the full options in the local
+`decision-ledger.json`. Older decisions retain their original evidence.
+
 A specific owner stop needs a later authorized release or its verified release
 condition. Required GitHub approval needs actual current eligible approval;
 fresh-signoff checkpoints and human-only attestations keep their own requirements.
@@ -841,6 +973,80 @@ sending a check-in. Queued mail is not proof of delivery to a running model, and
 one-shot process with no receive loop cannot answer it. Peer messages remain
 advisory; use campaign controls for holds, releases and other controller state
 changes. A delegated agent's message does not itself establish owner approval.
+
+## Automatic coordinator restart
+
+After starting a campaign, copy its full ID from `campaign list`. An external
+process supervisor can run the following foreground command on boot and retry
+it after an abnormal exit. Pin the installed executable, project, state root
+and service account to the same values as the original run.
+
+```bash
+bmad-loop campaign resume CAMPAIGN_ID --active-only --project /path/to/project --json
+```
+
+Under the repository coordinator lock, this command reads the exact campaign
+again, applies any queued controls, and reconciles due uncertain effects before
+advancing the generation. An existing drain finishes with admissions closed.
+A never-started, stopped, held, retired or delivered campaign returns its
+current status and exits successfully. An absent ID fails. Development,
+review and checkpoint budgets survive service restarts. Only an explicit
+operator resume can grant another capped checkpoint write budget.
+
+For example, an administrator can configure the following macOS LaunchDaemon
+in `/Library/LaunchDaemons/org.example.bmad-campaign.plist`. Replace the example
+paths, account and ID. Give the service account its normal command search path
+and access to its credentials, state, worktrees and configured transports.
+A user LaunchAgent starts in that user's login session. Qualify a LaunchDaemon
+before relying on operation before login, especially with GUI-backed transports
+or a login keychain.
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>org.example.bmad-campaign</string>
+  <key>UserName</key><string>campaign</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/bmad/venv/bin/bmad-loop</string>
+    <string>campaign</string><string>resume</string><string>CAMPAIGN_ID</string>
+    <string>--active-only</string><string>--project</string><string>/srv/project</string>
+    <string>--json</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>BMAD_LOOP_STATE_DIR</key><string>/srv/bmad-state</string>
+    <key>PATH</key><string>/opt/bmad/venv/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>StandardOutPath</key><string>/srv/bmad-state/service.out</string>
+  <key>StandardErrorPath</key><string>/srv/bmad-state/service.err</string>
+</dict>
+</plist>
+```
+
+Use `campaign stop ID` for a durable stop. A process supervisor may retry a
+killed PID. The durable stop also applies when the coordinator is offline.
+Check the campaign's phase and outstanding claims after the next invocation.
+
+For process-crash qualification, run the sandbox test.
+
+```bash
+uv run pytest -q tests/test_campaign_service_restart.py
+```
+
+Its sandbox kills only a test CLI
+process, starts a fresh CLI against the same store, and checks the campaign ID,
+generation, exhausted budget and offline owner controls. Host reboot qualification
+requires a separately authorized disposable host with the chosen boot service.
+Record the host boot identity and campaign ID, generation, claims, effect IDs,
+budget usage and holds before reboot. After reboot, verify the boot identity
+changed and the service acquired the same campaign automatically. Inspect
+history for reconciled effects, stable attempts and any unresolved worker
+ownership. Repeat with a stopped campaign and verify its revision stays fixed.
 
 ## Operator controls
 

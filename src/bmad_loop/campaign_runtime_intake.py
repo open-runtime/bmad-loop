@@ -40,6 +40,10 @@ from .campaign_supervisor import Proposal
 
 CONTRACT = "intake-triage-v1"
 _NONWORK = frozenset({"attach", "repair_current_pr", "duplicate", "needs_information", "hold"})
+CONTROL_ACCEPTANCE = (
+    "Disposition the exact incoming GitHub evidence within approved scope.",
+    "Review and deliver any proposed BMAD source graph before implementation.",
+)
 
 
 def _digest(value: Any) -> str:
@@ -397,10 +401,7 @@ def create_control(snapshot: CampaignSnapshot, payload: Mapping[str, Any]) -> st
         "intake",
         f"Triage GitHub issue #{number}",
         kind="planning",
-        acceptance=(
-            "Disposition the exact incoming GitHub evidence within approved scope.",
-            "Review and deliver any proposed BMAD source graph before implementation.",
-        ),
+        acceptance=CONTROL_ACCEPTANCE,
         scopes=("resource:campaign-plan",),
         order=-1,
     )
@@ -518,7 +519,12 @@ def stage_context(snapshot: CampaignSnapshot, unit_id: str) -> dict[str, Any]:
 
 
 def apply_triage(
-    snapshot: CampaignSnapshot, unit_id: str, receipt: Mapping[str, Any], *, launch_id: str
+    snapshot: CampaignSnapshot,
+    unit_id: str,
+    receipt: Mapping[str, Any],
+    *,
+    launch_id: str,
+    duplicate_readback=None,
 ) -> str | None:
     unit = snapshot.units[unit_id]
     value = control(unit)
@@ -551,7 +557,12 @@ def apply_triage(
     ):
         raise CampaignError("landed work requires a new scoped story, not repair of a merged PR")
     proposal_id = flow.accept_triage(
-        snapshot, raw, attempt_id=launch_id, observed_role=observed, planning_unit_id=unit_id
+        snapshot,
+        raw,
+        attempt_id=launch_id,
+        observed_role=observed,
+        planning_unit_id=unit_id,
+        duplicate_readback=duplicate_readback,
     )
     disposition = snapshot.bindings[flow.INBOX]["attempts"][launch_id]["disposition"]
     value["disposition"] = disposition
@@ -602,7 +613,12 @@ def apply_triage(
 
 
 def validate_receipt(
-    snapshot: CampaignSnapshot, unit_id: str, receipt: Mapping[str, Any], *, launch_id: str
+    snapshot: CampaignSnapshot,
+    unit_id: str,
+    receipt: Mapping[str, Any],
+    *,
+    launch_id: str,
+    duplicate_readback=None,
 ) -> None:
     """Validate on a clone after the caller observes actual actor teardown.
 
@@ -614,7 +630,9 @@ def validate_receipt(
     if not unit.claim or unit.claim.launch_id != launch_id:
         raise CampaignError("triage receipt no longer owns its launch")
     unit.claim.quiescent = True
-    apply_triage(candidate, unit_id, receipt, launch_id=launch_id)
+    apply_triage(
+        candidate, unit_id, receipt, launch_id=launch_id, duplicate_readback=duplicate_readback
+    )
 
 
 def fail_stage(
@@ -639,7 +657,13 @@ def fail_stage(
         value["state"] = "triage_pending"
         transition(snapshot, unit_id, UnitState.READY)
     else:
-        unit.hold = Hold("triage_attempts_exhausted", reason, id=launch_id, actor="intake")
+        from .campaign_hold import PROTECTED_HOLDS, defer_failure
+
+        exhausted = Hold("triage_attempts_exhausted", reason, id=launch_id, actor="intake")
+        if unit.hold and unit.hold.kind in PROTECTED_HOLDS:
+            defer_failure(unit, exhausted)
+        else:
+            unit.hold = exhausted
 
 
 def disposition_intent(
@@ -661,7 +685,9 @@ def disposition_intent(
     pr = unit.bindings.get("pr") or {}
     if pr.get("url"):
         text += f"\n\nPlanning/triage draft: {pr['url']}"
-    if disposition.get("related_pr"):
+    if target := disposition.get("duplicate_target"):
+        text += f"\n\nCovered by existing {target['kind']}: {target['url']}"
+    elif disposition.get("related_pr"):
         text += f"\n\nRelated PR: https://github.com/{snapshot.repository}/pull/{disposition['related_pr']}"
     text += "\n\nEvidence:\n" + "\n".join(
         f"- {row['url']} ({row['updated_at']}, `{row['digest']}`)" for row in evidence

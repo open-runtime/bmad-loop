@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, Mapping
 
-from .campaign_completion_scope import retained_parent_reason
+from .campaign_completion_scope import parent_wait_reason, retained_parent_reason
 from .campaign_github import GithubError, GithubGateway, JsonObject, MutationIntent, managed_marker
 from .campaign_model import CampaignSnapshot, CampaignUnit, UnitState
 from .fences import fenced_spans
@@ -495,7 +495,7 @@ class HierarchyCoordinator:
                 + f"{unit.spec.source}:{unit.spec.initiative or snapshot.spec.name}:{unit.spec.epic}"
                 == key
             ]
-            if not members or any(not _settled_member(unit) for unit in members):
+            if not members or parent_wait_reason(snapshot, key):
                 continue
             reason = retained_parent_reason(snapshot, key)
             if reason:
@@ -525,11 +525,17 @@ class HierarchyCoordinator:
                     {},
                     reason="Parent has open required or unmanaged native subissues",
                 )
-            intent = self.gateway.close_issue_intent(
+            from .campaign_completion_scope import parent_members
+            from .campaign_tracking_recovery import prepare_close
+
+            intent = prepare_close(
+                self.gateway,
+                snapshot,
+                snapshot.units[parent_members(snapshot, key)[0]],
                 binding["number"],
                 action_id=action_key,
-                generation=snapshot.generation,
                 source_confirmed=True,
+                parent_key=key,
             )
             return TrackingStep(action_key, intent, bindings, {})
         for key, binding in bindings.items():
@@ -543,7 +549,7 @@ class HierarchyCoordinator:
                 for unit in snapshot.units.values()
                 if f"{unit.spec.source}:{unit.spec.initiative or snapshot.spec.name}" == namespace
             ]
-            if not members or any(not _settled_member(unit) for unit in members):
+            if not members or parent_wait_reason(snapshot, key):
                 continue
             reason = retained_parent_reason(snapshot, key)
             if reason:

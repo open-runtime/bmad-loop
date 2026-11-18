@@ -22,7 +22,13 @@ from test_campaign_runtime_queue import QueuedServer
 
 from bmad_loop import campaign_runtime
 from bmad_loop.campaign_headless import file_digest
-from bmad_loop.campaign_model import ReasoningSpec, ResourceSpec, RoleSpec, SourceSelector
+from bmad_loop.campaign_model import (
+    ReasoningSpec,
+    ResourceSpec,
+    RoleSpec,
+    SourceSelector,
+    UnitState,
+)
 from bmad_loop.campaign_scheduler import CapacityObservation
 
 
@@ -157,7 +163,7 @@ def test_48_stories_24_epics_verify8_and_reasoning_drain_resume(
         max_active_epics=24,
         max_in_flight_units=48,
         max_review_sessions=8,
-        resources=ResourceSpec(verify_slots=8, max_sessions=32),
+        resources=ResourceSpec(verify_slots=8, max_sessions=32, max_total_sessions=32),
         roles=roles,
         role_pools=(*case.snapshot.spec.role_pools, ("scale-reporting", (candidate,))),
         reasoning=ReasoningSpec(
@@ -221,8 +227,18 @@ def test_48_stories_24_epics_verify8_and_reasoning_drain_resume(
                 for row in snapshot.jobs.values()
             ),
         )
-        shared = sum(unit.claim.resource != "verify" for unit in live) + sum(
+        # Independent all-actor oracle: verification is inside the shared cap.
+        # Keep this distinct from the production admission counter.
+        shared = len(live) + sum(
             bool(row.get("claim") and not row["claim"]["quiescent"])
+            for row in snapshot.jobs.values()
+        )
+        shared += sum(
+            unit.claim is None and unit.state in {UnitState.CLAIMED, UnitState.RUNNING}
+            for unit in snapshot.units.values()
+        )
+        shared += sum(
+            row.get("state") in {"prepared", "running", "uncertain"} and not row.get("claim")
             for row in snapshot.jobs.values()
         )
         metrics["max_shared_sessions"] = max(metrics["max_shared_sessions"], shared)

@@ -11,7 +11,7 @@ from collections import Counter
 from typing import Any
 
 from .campaign_model import CampaignSnapshot, OutboxAction, UnitState
-from .campaign_scheduler import admit, resource_available
+from .campaign_scheduler import admit, resource_available, session_usage
 from .campaign_store import add_event
 
 
@@ -169,7 +169,12 @@ def document(snapshot: CampaignSnapshot, *, now: float) -> dict[str, Any]:
         "verify": snapshot.spec.resources.verify_slots,
         "resolution": snapshot.spec.resolution.max_sessions,
         "sessions": snapshot.spec.resources.max_sessions,
+        "total_sessions": snapshot.spec.resources.max_total_sessions,
     }
+    usage = session_usage(snapshot)
+    used["model_sessions"] = usage.model
+    used["total_sessions"] = usage.total
+    used["unknown_reservations"] = usage.unknown
     return {
         "observed_at": now,
         "admission_wait_s": dict(admission_totals),

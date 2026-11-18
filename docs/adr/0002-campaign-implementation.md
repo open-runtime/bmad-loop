@@ -39,9 +39,12 @@ command and preservation authority, GitHub delivery/recovery, repository intake
 and organization, autonomous recovery, reasoning/handoff/messaging, and operator
 visibility/parallelism. Historical passing rows do not close that repair ledger.
 Typed child-pause receipts, single-use permits for owned quota/transport development
-continuation, and the read-only `campaign inbox` are implemented. General technical
-rearm and the proposed `campaign answer` and `campaign rearm` interfaces remain
-unfinished; legacy unknown pauses and protected owner/authentication holds do not
+continuation, and the read-only `campaign inbox` are implemented. The
+`campaign rearm` control can request the scheduler's normal observation for a
+quota-paused task. The `campaign answer` control requests verification of a
+decision-specific reply on a mapped issue or PR. An authenticated reply reopens
+evidence review. General technical rearm remains unfinished. Legacy unknown
+pauses and protected owner/authentication holds do not
 gain continuation authority. Existing `campaign reconcile` supplies observation without granting
 worker launch or permission to replay an uncertain mutation. Bot-thread resolution
 remains manual; automatic resolution requires explicitly configured identities,
@@ -49,16 +52,21 @@ linked fixes, independent current-head verification and fresh thread evidence.
 Human objections remain protected even within a bot-created thread.
 
 The accepted shared-session ceiling covers execution, review, reasoning and
-verification. Existing model-session accounting does not bound all four classes;
-that aggregate ceiling and its sustained-load qualification remain unfinished.
+verification. An explicit `resources.max_total_sessions` now bounds their durable
+reservations together; the historical `max_sessions` remains a model-worker limit.
+Omitted total limits retain old frozen identities and are visibly model-only.
+The revised all-worker measurement still requires frozen sustained-load and native
+qualification; earlier model-only measurements cannot satisfy it.
 
 Controller verification derives executable argv from frozen approved configuration.
 Diagnosis results may propose commands but cannot expand that authority; persisted
 proposals are revalidated at dispatch and the child checks the frozen binding.
 Child environments exclude `GH_*` and `GITHUB_*` credentials while retaining provider
-authentication. This environment separation does not establish confinement of
-file-backed credentials or system credential helpers; that remains a separate
-unfulfilled security requirement. Rejected diagnosis artifacts retain the original
+authentication. The owner excluded additional isolation of controller GitHub
+credentials across agents, verification commands and hooks from this rollout.
+File and credential-helper access remains a recorded limitation. The delivery
+gates still require current review and test evidence, authorized publication,
+and reconciliation of uncertain writes. Rejected diagnosis artifacts retain the original
 hold and failed-attempt evidence instead of inventing a replacement condition.
 
 Local finalization retains original history and index preimages before mutation.

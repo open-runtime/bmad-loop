@@ -437,11 +437,13 @@ def test_additional_release_keeps_first_fence_and_same_named_successor(case, mon
 
     monkeypatch.setattr(campaign_native_inventory, "NativeServiceObserver", native_default)
     case.observer = None
+    second_pr = copy.deepcopy(case.pr)
+    second_pr.update(id=808, number=8, node_id="PR-8", html_url="https://github.com/a/b/pull/8")
+    second_pr["head"].update(ref=binding["branch"], sha=binding["head"])
+    case.pulls["repos/a/b/pulls/8"] = second_pr
     first = invoke(case)
     assert set(calls[-1]) == {row["id"] for row in case.host.workspaces}
     retired_before = case.store.load(snapshot.id)
-    case.pr.update(number=8, node_id="PR-8")
-    case.pr["head"].update(ref=binding["branch"], sha=binding["head"])
     second = dataclasses.replace(
         case.request,
         unit=second_spec.id,
@@ -457,6 +459,13 @@ def test_additional_release_keeps_first_fence_and_same_named_successor(case, mon
     )
     result = invoke(case, request=second)
     after = case.store.load(snapshot.id)
+    for record, pr, unit_id in (
+        (first["record"], case.pr, case.unit.id),
+        (result["record"], second_pr, second_spec.id),
+    ):
+        assert (record["pr_number"], record["pr_node_id"]) == (pr["number"], pr["node_id"])
+        assert (record["branch"], record["head"]) == (pr["head"]["ref"], pr["head"]["sha"])
+        assert (record["successor"], record["successor_unit"]) == (recipient.id, unit_id)
     assert len(after.bindings["ownership_transfers"]) == 2
     assert after.bindings["ownership_retirement"] == retired_before.bindings["ownership_retirement"]
     assert transfer.read_release(case.store, snapshot.id, case.unit.id) == first["record"]

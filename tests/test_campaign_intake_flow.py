@@ -14,6 +14,7 @@ from bmad_loop.campaign_intake_flow import (
     accept_triage,
     activate_proposal,
     apply_batch,
+    duplicate_current,
     fail_triage,
 )
 from bmad_loop.campaign_intake_flow import next as next_triage
@@ -380,3 +381,161 @@ def test_stale_graph_and_unknown_model_pool_refuse_before_source_mutation(snapsh
     with pytest.raises(CampaignError, match="changed during"):
         accept_triage(snapshot, raw, attempt_id=attempt, observed_role=ROLE)
     assert set(snapshot.units) == {"source:epic:existing"}
+
+
+@pytest.mark.parametrize("kind", ["issue", "pr"])
+def test_duplicate_requires_owned_native_identity_and_complete_requirement_coverage(snapshot, kind):
+    target = next(iter(snapshot.units.values()))
+    number, database_id, node_id = 12, 2012, "native-12"
+    collection, segment = ("issues", "issues") if kind == "issue" else ("pulls", "pull")
+    url = f"https://github.com/a/b/{segment}/{number}"
+    target.bindings[kind] = {"number": number, "url": url, "node_id": node_id}
+    snapshot.bindings["inventory"][collection] = [
+        {"id": database_id, "node_id": node_id, "number": number, "html_url": url, "state": "open"}
+    ]
+    if kind == "pr":
+        target.bindings["branch"] = "owned-branch"
+        snapshot.bindings["inventory"][collection][0].update(
+            head={"ref": "owned-branch", "repo": {"full_name": "a/b"}},
+            base={"ref": snapshot.spec.target, "repo": {"full_name": "a/b"}},
+        )
+    version = ingest(snapshot, observation(body="Keep behavior\nPreserve the existing behavior."))
+    attempt = prepare(snapshot, version)
+    raw = triage_raw(snapshot, [version], disposition="duplicate", unit_id=target.id, issue=None)
+    raw["proposal"].update(
+        acceptance_criteria=["Keep behavior"],
+        rationale="Both requests preserve the existing behavior.",
+    )
+    raw["proposal"]["related_" + kind] = number
+    raw["duplicate_proof"] = {
+        "target_database_id": database_id,
+        "remaining": [],
+        "coverage": [
+            {
+                "input_version": version,
+                "field": "body",
+                "line": n,
+                "criteria": ["Keep behavior"],
+                "reason": "This request preserves the existing behavior covered by the target.",
+            }
+            for n in (1, 2)
+        ],
+    }
+    assert accept_triage(snapshot, raw, attempt_id=attempt, observed_role=ROLE) is None
+    inbox = snapshot.bindings["intake_inbox"]
+    saved = inbox["records"][version]
+    assert (
+        saved["state"] == "resolved"
+        and saved["disposition"]["duplicate_proof"] == raw["duplicate_proof"]
+    )
+    assert saved["disposition"]["duplicate_target"] == {
+        "kind": kind,
+        "database_id": database_id,
+        "node_id": node_id,
+        "number": number,
+        "url": url,
+        "unit_id": target.id,
+        "inventory_digest": raw["intake_coordinates"]["inventory_digest"],
+    }
+    assert not inbox["proposals"] and set(snapshot.units) == {target.id}
+    receipt = inbox["attempts"][attempt]
+    assert duplicate_current(snapshot, receipt, saved["disposition"])
+    legacy = {k: v for k, v in saved["disposition"].items() if k != "duplicate_proof"}
+    assert not duplicate_current(snapshot, {**receipt, "disposition": legacy}, legacy)
+    unknown = {**saved["disposition"], "schema_version": 2}
+    assert not duplicate_current(snapshot, {**receipt, "disposition": unknown}, unknown)
+    native = snapshot.bindings["inventory"][collection][0]
+    native["body"] = "Owner changed the target contract"
+    assert not duplicate_current(snapshot, receipt, saved["disposition"])
+    del native["body"]
+    if kind == "pr":
+        snapshot.bindings["inventory"]["pulls"][0]["head"]["repo"]["full_name"] = "fork/repo"
+        assert not duplicate_current(snapshot, receipt, saved["disposition"])
+    snapshot.bindings["inventory"][collection][0][
+        "html_url"
+    ] = f"https://github.com/other/repo/{segment}/{number}"
+    assert not duplicate_current(snapshot, receipt, saved["disposition"])
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "unknown-unit",
+        "self",
+        "not-owned",
+        "ambiguous-owner",
+        "swapped-binding",
+        "foreign",
+        "not-observed",
+        "wrong-native-id",
+        "canceled",
+        "legacy-proof",
+        "remaining",
+        "partial",
+        "unknown-source",
+        "new-obligation",
+        "no-reason",
+    ],
+)
+def test_unproved_duplicate_does_not_resolve_intake(snapshot, fault):
+    target = next(iter(snapshot.units.values()))
+    url = "https://github.com/a/b/issues/8"
+    target.bindings["issue"] = {"number": 8, "database_id": 1008, "url": url}
+    native = {"id": 1008, "number": 8, "html_url": url, "state": "open"}
+    snapshot.bindings["inventory"]["issues"] = [native]
+    if fault == "foreign":
+        native["html_url"] = "https://github.com/other/repo/issues/8"
+    elif fault == "not-observed":
+        snapshot.bindings["inventory"]["issues"].clear()
+    elif fault == "ambiguous-owner":
+        sibling = dataclasses.replace(target.spec, id="other")
+        snapshot.units[sibling.id] = CampaignUnit(sibling, bindings=copy.deepcopy(target.bindings))
+    version = ingest(snapshot, observation(body="Keep behavior\nKeep existing output"))
+    attempt = prepare(snapshot, version)
+    raw = triage_raw(snapshot, [version], disposition="duplicate", unit_id=target.id, issue=8)
+    raw["proposal"]["acceptance_criteria"] = ["Keep behavior"]
+    proof = raw["duplicate_proof"] = {
+        "target_database_id": 1008,
+        "remaining": [],
+        "coverage": [
+            {
+                "input_version": version,
+                "field": "body",
+                "line": n,
+                "criteria": ["Keep behavior"],
+                "reason": "Existing behavior includes the existing output.",
+            }
+            for n in (1, 2)
+        ],
+    }
+    if fault == "unknown-unit":
+        raw["proposal"]["unit_id"] = "absent"
+    elif fault == "self":
+        raw["proposal"]["related_issue"] = 7
+    elif fault == "not-owned":
+        target.bindings.clear()
+    elif fault == "swapped-binding":
+        target.bindings["issue"]["database_id"] = 500
+    elif fault == "wrong-native-id":
+        proof["target_database_id"] = 500
+    elif fault == "canceled":
+        target.state = UnitState.CANCELED
+    elif fault == "legacy-proof":
+        raw.pop("duplicate_proof")
+    elif fault == "remaining":
+        proof["remaining"] = ["Needs an additional target behavior"]
+    elif fault == "partial":
+        proof["coverage"].pop()
+    elif fault == "unknown-source":
+        proof["coverage"][1]["line"] = 3
+    elif fault == "new-obligation":
+        raw["proposal"]["acceptance_criteria"] = ["New behavior"]
+        for row in proof["coverage"]:
+            row["criteria"] = ["New behavior"]
+    elif fault == "no-reason":
+        proof["coverage"][0]["reason"] = ""
+    before = snapshot.clone()
+    with pytest.raises(CampaignError, match="triage artifact refused"):
+        accept_triage(snapshot, raw, attempt_id=attempt, observed_role=ROLE)
+    assert snapshot == before
+    assert snapshot.bindings["intake_inbox"]["records"][version]["state"] == "triaging"

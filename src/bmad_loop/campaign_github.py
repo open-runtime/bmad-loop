@@ -308,7 +308,14 @@ def managed_body(text: str, marker: str, links: tuple[str, ...] = ()) -> str:
 
 
 class GithubGateway:
-    def __init__(self, transport: GithubTransport, repository: str, *, max_pages: int = 1000):
+    def __init__(
+        self,
+        transport: GithubTransport,
+        repository: str,
+        *,
+        max_pages: int = 1000,
+        thread_provenance: bool = False,
+    ):
         if not re.fullmatch(r"[\w.-]+/[\w.-]+", repository):
             raise ValueError("repository must be owner/name")
         if max_pages < 1:
@@ -317,6 +324,7 @@ class GithubGateway:
         self.repository = repository
         self.root = f"repos/{repository}"
         self.max_pages = max_pages
+        self.thread_provenance = thread_provenance
         self._repository_id: int | None = None
 
     def get(self, path: str) -> Any:
@@ -522,17 +530,29 @@ class GithubGateway:
     def files(self, number: int) -> list[JsonObject]:
         return self.pages(f"{self.root}/pulls/{number}/files")
 
+    def _thread_query(self, query: str) -> str:
+        selection = (
+            "totalCount nodes{id body author{__typename login ... on Bot{id}} createdAt updatedAt url}"
+            if self.thread_provenance
+            else "nodes{id body author{login} createdAt url}"
+        )
+        return query.replace("COMMENT_FIELDS", selection).replace(
+            "THREAD_COUNT ", "totalCount " if self.thread_provenance else ""
+        )
+
     def review_threads(self, number: int) -> list[JsonObject]:
         owner, name = self.repository.split("/", 1)
         cursor: str | None = None
         rows: list[JsonObject] = []
+        thread_count = None
+        thread_ids: set[str] = set()
         for _ in range(self.max_pages):
-            query = """query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100,after:$cursor){nodes{id isResolved isOutdated path line comments(first:100){nodes{id body author{login} createdAt url} pageInfo{hasNextPage endCursor}}} pageInfo{hasNextPage endCursor}}}}}"""
+            query = """query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100,after:$cursor){THREAD_COUNT nodes{id isResolved isOutdated path line comments(first:100){COMMENT_FIELDS pageInfo{hasNextPage endCursor}}} pageInfo{hasNextPage endCursor}}}}}"""
             response = self.transport.request(
                 "POST",
                 "graphql",
                 {
-                    "query": query,
+                    "query": self._thread_query(query),
                     "variables": {"owner": owner, "name": name, "number": number, "cursor": cursor},
                 },
             )
@@ -541,11 +561,28 @@ class GithubGateway:
             try:
                 page = response.data["data"]["repository"]["pullRequest"]["reviewThreads"]
                 nodes = page["nodes"]
+                if self.thread_provenance:
+                    count = page.get("totalCount")
+                    if type(count) is not int or (
+                        thread_count is not None and count != thread_count
+                    ):
+                        raise GithubError(
+                            "Review thread count unavailable or changed during pagination"
+                        )
+                    thread_count = count
                 for node in nodes:
+                    if self.thread_provenance:
+                        if not node.get("id") or node["id"] in thread_ids:
+                            raise GithubError(
+                                "Review threads include missing or duplicate native identities"
+                            )
+                        thread_ids.add(node["id"])
                     if node["comments"]["pageInfo"]["hasNextPage"]:
                         self._expand_thread(node)
                 rows.extend(nodes)
                 if not page["pageInfo"]["hasNextPage"]:
+                    if self.thread_provenance and len(thread_ids) != thread_count:
+                        raise GithubError("Incomplete review thread coverage")
                     return rows
                 next_cursor = page["pageInfo"]["endCursor"]
                 if not next_cursor or next_cursor == cursor:
@@ -563,11 +600,14 @@ class GithubGateway:
             cursor = page["pageInfo"].get("endCursor")
             if not cursor:
                 raise GithubError("Review comment cursor missing")
-            query = "query($id:ID!,$cursor:String){node(id:$id){... on PullRequestReviewThread{comments(first:100,after:$cursor){nodes{id body author{login} createdAt url} pageInfo{hasNextPage endCursor}}}}}"
+            query = "query($id:ID!,$cursor:String){node(id:$id){... on PullRequestReviewThread{comments(first:100,after:$cursor){COMMENT_FIELDS pageInfo{hasNextPage endCursor}}}}}"
             response = self.transport.request(
                 "POST",
                 "graphql",
-                {"query": query, "variables": {"id": node["id"], "cursor": cursor}},
+                {
+                    "query": self._thread_query(query),
+                    "variables": {"id": node["id"], "cursor": cursor},
+                },
             )
             if response.status != 200 or response.data.get("errors"):
                 raise GithubError("Review comment pagination failed")
@@ -575,6 +615,10 @@ class GithubGateway:
                 page = response.data["data"]["node"]["comments"]
                 if page["pageInfo"]["hasNextPage"] and page["pageInfo"].get("endCursor") == cursor:
                     raise GithubError("Review comment cursor did not advance")
+                if self.thread_provenance:
+                    if page.get("totalCount") != node["comments"].get("totalCount"):
+                        raise GithubError("Review comment count changed during pagination")
+                    node["comments"]["pageInfo"] = page["pageInfo"]
                 node["comments"]["nodes"].extend(page["nodes"])
             except (KeyError, TypeError) as exc:
                 raise GithubError("Review comment coverage incomplete") from exc
@@ -619,14 +663,45 @@ class GithubGateway:
             raise GithubError("Stale coordinator generation cannot mutate GitHub")
         if intent.state != "sent_unknown":
             raise GithubError("Persist sent_unknown before executing an outbound action")
+        if intent.kind in {"close_issue", "close_milestone"} and (intent.coordinates or {}).get(
+            "tracking_acknowledgement"
+        ):
+            raise GithubError(
+                "An acknowledged close is readback-only and cannot be submitted again",
+                category="precondition",
+                certainty="not_submitted",
+            )
         if intent.coordinates and "updated_at" in intent.coordinates and intent.path != "graphql":
             current = self.get(intent.path)
             if (
                 current.get("id") != intent.coordinates.get("id")
                 or current.get("updated_at") != intent.coordinates["updated_at"]
             ):
-                raise GithubError(
-                    "Remote shared field changed; reconcile human edits before mutation"
+                fault = GithubError(
+                    "Remote shared field changed before submission",
+                    category="precondition",
+                    certainty="not_submitted",
+                )
+                return replace(
+                    intent,
+                    state="rejected",
+                    error=str(fault),
+                    fault=fault.to_dict(),
+                    receipt={
+                        "precondition": {
+                            "schema_version": 1,
+                            "repository": self.repository,
+                            "action_id": intent.action_id,
+                            "generation": intent.generation,
+                            "kind": intent.kind,
+                            "method": intent.method,
+                            "path": intent.path,
+                            "payload": intent.payload,
+                            "expected": intent.coordinates,
+                            "observed": current,
+                            "submitted": False,
+                        }
+                    },
                 )
         try:
             response = self.transport.request(intent.method, intent.path, intent.payload)
@@ -890,6 +965,29 @@ class GithubGateway:
             raise GithubError("Canonical source publication must precede issue closure")
         issue = self.issue(number)
         if issue.get("state") == "closed":
+            if issue.get("state_reason") != "completed":
+                fault = GithubError(
+                    "Issue was closed with a reason other than completed; human closure is retained",
+                    category="tracking_discrepancy",
+                    certainty="not_submitted",
+                )
+                return MutationIntent(
+                    action_id,
+                    "close_issue",
+                    "PATCH",
+                    f"{self.root}/issues/{number}",
+                    {"state": "closed", "state_reason": "completed"},
+                    state="rejected",
+                    receipt=issue,
+                    error=str(fault),
+                    fault=fault.to_dict(),
+                    generation=generation,
+                    coordinates={
+                        "id": issue["id"],
+                        "updated_at": issue.get("updated_at"),
+                        "source_confirmed": True,
+                    },
+                )
             return MutationIntent(
                 action_id,
                 "close_issue",
@@ -969,7 +1067,12 @@ class GithubGateway:
     ) -> MutationIntent:
         """Read desired fields back; unknown outcomes never erase human changes."""
         if intent.state == "confirmed":
-            return intent
+            if intent.kind in {"close_issue", "close_milestone"} and (intent.coordinates or {}).get(
+                "tracking_acknowledgement"
+            ):
+                intent = replace(intent, state="sent_unknown")
+            else:
+                return intent
         if intent.kind == "queue_dequeue":
             from .campaign_queue import reconcile_dequeue
 
@@ -1069,6 +1172,14 @@ class GithubGateway:
 
         if all(field_matches(key, value) for key, value in intent.payload.items()):
             return replace(intent, state="confirmed", receipt=current, error="")
+        if intent.kind in {"close_issue", "close_milestone"} and (intent.coordinates or {}).get(
+            "tracking_acknowledgement"
+        ):
+            return replace(
+                intent,
+                state="sent_unknown",
+                error="Acknowledged close differs from current native state; readback-only",
+            )
         if allow_retry:
             allowed = {
                 "close_issue": {"state", "state_reason"},

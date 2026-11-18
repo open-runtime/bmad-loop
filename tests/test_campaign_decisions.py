@@ -155,12 +155,22 @@ def test_delegated_routine_choice_needs_no_verbatim_prior_answer():
 
 
 @pytest.mark.parametrize(
+    "kind", ["design_choice", "planning_decision", "owner_stop", "required_review"]
+)
+def test_routine_delegation_cannot_answer_protected_decisions(kind):
+    ctx = context(kind=kind, sources=[source(authority="delegation")])
+    with pytest.raises(CampaignError, match="limited to routine post-planning"):
+        validate_decision(artifact(ctx, disposition="delegated_choice"), ctx)
+
+
+@pytest.mark.parametrize(
     "change,match",
     [
         ({"coordinates": {}}, "coordinates"),
         ({"hold_id": "other"}, "hold identity"),
         ({"action": "increase_budget"}, "policy envelope"),
         ({"affected_paths": ["secrets/.env"]}, "unapproved path"),
+        ({"affected_paths": ["src/cache/../../secrets/.env"]}, "unapproved path"),
         (
             {"support": [{"source_id": "owner-note", "revision": "old", "quote": "SQLite"}]},
             "stale source",
@@ -306,6 +316,80 @@ def test_unanswered_decision_is_deduplicated_and_does_not_clear_hold():
     assert state.units["s:e:u"].hold is not None
     assert len(state.bindings["decision_requests"]) == 1
     assert len([event for event in state.events if event["kind"] == "owner-decision-needed"]) == 1
+    revised = validate_decision(
+        artifact(ctx, disposition="needs_new_owner_decision", answer="Postpone"), ctx
+    )
+    apply_decision(state, "s:e:u", revised)
+    (request,) = state.bindings["decision_requests"].values()
+    assert request["original_receipt"] == receipt.id and request["receipt"] == revised.id
+    assert state.bindings["decision_receipts"][receipt.id]["answer"] == "SQLite"
+    assert request["recommended_answer"] == "Postpone"
+
+
+def test_legacy_decision_packet_and_receipt_stay_readable_without_new_advice():
+    from bmad_loop.campaign_resolution_flow import _decision, decision_context
+
+    packet = decision_packet(context())
+    del packet["require_owner_options"]
+    restored = decision_context(packet)
+    receipt = validate_decision(
+        artifact(restored, disposition="needs_new_owner_decision"), restored
+    )
+    historical = json.loads(json.dumps(asdict(receipt)))
+    del historical["options"]
+    assert _decision(historical).options == ()
+
+
+@pytest.mark.parametrize(
+    "options,match",
+    [
+        ([], "one to four"),
+        ([{"answer": "SQLite", "reason": " ", "source_ids": ["owner-note"]}], "answer and reason"),
+        (
+            [{"answer": "SQLite", "reason": "Durable", "source_ids": ["fabricated"]}],
+            "validated support",
+        ),
+        (
+            [{"answer": "Redis", "reason": "Fast", "source_ids": ["owner-note"]}],
+            "recommended answer",
+        ),
+    ],
+)
+def test_new_owner_request_requires_explained_recommendation_and_known_evidence(options, match):
+    ctx = replace(context(), require_owner_options=True)
+    raw = artifact(ctx, disposition="needs_new_owner_decision", options=options)
+    with pytest.raises(CampaignError, match=match):
+        validate_decision(raw, ctx)
+
+
+def test_clarifying_private_options_keeps_their_original_visibility():
+    from bmad_loop.campaign_resolution_flow import _clarify_reply
+
+    ctx = context()
+    decision = validate_decision(artifact(ctx), ctx)
+    earlier = {
+        "id": "original",
+        "question": ctx.question,
+        "options": [["private choice", "private reason", ["private-note"]]],
+        "private_sources": ["private-note"],
+    }
+    clarified = _clarify_reply(decision, earlier, "new-reply", ctx, "Please select one option.")
+    assert not clarified.clear_hold and clarified.options
+    assert clarified.private_sources == ("private-note",)
+    assert "private choice" not in json.dumps(decision_summary(clarified))
+
+
+def test_escalation_does_not_publish_advice_derived_from_uncited_private_input():
+    ctx = replace(context(sources=[source(private=True)]), require_owner_options=True)
+    options = [
+        {"answer": "SQLite", "reason": "Private owner preference", "source_ids": ["hold:hold-1"]}
+    ]
+    receipt = validate_decision(
+        artifact(ctx, disposition="conflicting_evidence", support=[], options=options), ctx
+    )
+    assert receipt.options and not receipt.clear_hold
+    public = json.dumps(decision_summary(receipt))
+    assert "SQLite" not in public and "Private owner preference" not in public
 
 
 def test_operational_holds_do_not_become_model_approval_decisions():

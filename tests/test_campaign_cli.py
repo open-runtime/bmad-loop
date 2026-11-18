@@ -70,8 +70,8 @@ def runtime(tmp_path, monkeypatch):
         def __init__(self, saved_store, driver):
             self.store = saved_store
 
-        def run(self, campaign_id):
-            calls.append(("run", campaign_id))
+        def run(self, campaign_id, *, active_only=False):
+            calls.append(("active-only" if active_only else "run", campaign_id))
             return self.store.load(campaign_id)
 
         def reconcile(self, campaign_id):
@@ -964,6 +964,10 @@ def test_resume_and_reconcile_use_distinct_no_launch_entrypoints(runtime, capsys
     assert json.loads(capsys.readouterr().out)["command"] == "campaign.reconcile"
     assert ("reconcile", snapshot.id) in calls
     assert ("run", snapshot.id) not in calls
+    assert ("backup-resume", snapshot.id) not in calls
+    assert cli.main(["campaign", "resume", snapshot.id, "--active-only", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["command"] == "campaign.resume"
+    assert ("active-only", snapshot.id) in calls
     assert ("backup-resume", snapshot.id) not in calls
     assert cli.main(["campaign", "resume", snapshot.id, "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["command"] == "campaign.resume"

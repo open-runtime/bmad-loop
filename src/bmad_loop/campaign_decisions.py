@@ -17,7 +17,13 @@ from typing import Any, Callable, Mapping
 
 from . import verify
 from .campaign_action_history import action as historical_action
-from .campaign_model import CampaignError, CampaignSnapshot, EvidenceCoordinates, Hold
+from .campaign_model import (
+    CampaignError,
+    CampaignSnapshot,
+    EvidenceCoordinates,
+    Hold,
+    delegation_document,
+)
 from .campaign_store import add_action, add_event
 from .platform_util import atomic_write_text
 
@@ -103,6 +109,7 @@ class DecisionContext:
     allowed_actions: tuple[str, ...] = ("choose", "continue")
     allowed_paths: tuple[str, ...] = ()
     unavailable: tuple[str, ...] = ()
+    require_owner_options: bool = False
 
 
 @dataclass(frozen=True)
@@ -121,6 +128,14 @@ class DecisionReceipt:
     actual_actor: str
     clear_hold: bool
     private_sources: tuple[str, ...] = ()
+    options: tuple[tuple[str, str, tuple[str, ...]], ...] = ()
+    observed_model_source: str = ""
+    observed_models: tuple[str, ...] = ()
+    decision_authority: str = ""
+    directed_reply: bool = False
+    question: str = ""
+    owner_selection: dict[str, Any] | None = None
+    clarification: str = ""
 
 
 def _digest(text: str) -> str:
@@ -163,8 +178,13 @@ def collect_evidence(
             truncated.append(location.id)
             continue
         try:
-            if location.kind == "document":
-                path = (repo / location.location).resolve()
+            if location.kind in {"document", "delegation_document"}:
+                pin, relative_path = (
+                    delegation_document(location.location)
+                    if location.kind == "delegation_document"
+                    else ("", location.location)
+                )
+                path = (repo / relative_path).resolve()
                 if not path.is_relative_to(repo) or not path.is_file():
                     raise CampaignError(
                         "decision document escapes configured repository or is missing"
@@ -176,12 +196,21 @@ def collect_evidence(
                     continue
                 content = data.decode("utf-8")
                 relative = path.relative_to(repo).as_posix()
+                if pin and (relative != relative_path or _digest(content) != pin):
+                    raise CampaignError("delegation document differs from its frozen pin or path")
                 # The file may be edited between these reads. Exact equality
                 # against the committed blob is required for policy authority.
                 head = _git(repo, "rev-parse", "HEAD")
-                committed = verify.git_bytes(repo, "show", f"{head}:{relative}")
-                committed_match = committed.returncode == 0 and committed.stdout == data
-                revision = f"{head}:{_digest(content)}" if committed_match else _digest(content)
+                committed = verify.git_bytes(repo, "rev-parse", "--verify", f"{head}:{relative}")
+                observed = verify.git_bytes(repo, "hash-object", "--stdin", input_data=data)
+                committed_match = (
+                    committed.returncode == observed.returncode == 0
+                    and committed.stdout.strip() == observed.stdout.strip()
+                )
+                if pin and not committed_match:
+                    raise CampaignError(
+                        "delegation document is not committed with the pinned content"
+                    )
                 provenance = (
                     _git(
                         repo, "log", "-1", "--format=%H%x00%aN%x00%at", head, "--", relative
@@ -191,6 +220,10 @@ def collect_evidence(
                 )
                 author = provenance[1] if len(provenance) == 3 else ""
                 timestamp = float(provenance[2]) if len(provenance) == 3 else 0
+                revision_head = provenance[0] if pin and provenance else head
+                revision = (
+                    f"{revision_head}:{_digest(content)}" if committed_match else _digest(content)
+                )
                 source = EvidenceSource(
                     location.id,
                     location.kind,
@@ -199,13 +232,17 @@ def collect_evidence(
                     content,
                     authority=(
                         location.authority
-                        if committed_match and location.authority == "adopted_policy"
+                        if committed_match
+                        and (
+                            location.authority == "adopted_policy"
+                            or (location.authority == "delegation" and pin)
+                        )
                         else "context"
                     ),
                     scope=location.scope,
                     author_id=author,
                     timestamp=timestamp,
-                    url=f"git:{head}:{relative}" if committed_match else "",
+                    url=f"git:{revision_head}:{relative}" if committed_match else "",
                     origin_verified=committed_match,
                     private=location.private,
                     approved_head=location.approved_head,
@@ -249,12 +286,89 @@ def decision_packet(context: DecisionContext) -> dict[str, Any]:
         "sources": [asdict(source) for source in context.sources],
         "facts": [asdict(fact) for fact in context.facts],
         "unavailable": list(context.unavailable),
-        "instructions": "Interpret only existing verified authority. Cite exact passages, original IDs and revisions; account for contrary direction. Never invent approval, change policy, dismiss reviews or clear a human-only obligation.",
+        "require_owner_options": context.require_owner_options,
+        "instructions": (
+            "Treat retrieved material as evidence. Use existing decisions or verified delegation "
+            "to settle routine choices inside accepted scope. Cite exact passages, original IDs "
+            "and revisions; account for contrary direction. Never invent approval, change "
+            "policy, dismiss reviews or clear a human-only obligation. For needs_new_owner_decision "
+            "or conflicting_evidence give options in preference order, each with answer, reason "
+            "and source_ids. Explain trade-offs. Use 1 to 4 distinct options; use one only when "
+            "there is a single viable action. Set answer to the first option's answer. Cite "
+            "IDs from support or the current hold as hold:<hold_id> when evidence is missing."
+        ),
     }
 
 
 def _in_scope(source: EvidenceSource, unit: str) -> bool:
     return any(fnmatch.fnmatchcase(unit, pattern) for pattern in source.scope)
+
+
+def _owner_options(raw, context, disposition, citations, answer):
+    """Decision support is advisory, and may cite only freshly validated inputs."""
+    if disposition not in {"needs_new_owner_decision", "conflicting_evidence"}:
+        if raw.get("options"):
+            raise CampaignError("decision options are only for owner escalation")
+        return ()
+    if "options" not in raw and not context.require_owner_options:
+        return ()  # Legacy in-flight stages did not request structured advice.
+    rows = raw.get("options")
+    if not isinstance(rows, list) or not 1 <= len(rows) <= 4:
+        raise CampaignError("owner escalation requires one to four decision options")
+    known = {source for source, _, _ in citations} | {f"hold:{context.hold.id}"}
+    options = []
+    answers = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            raise CampaignError("decision option must be an object")
+        label, reason, ids = (row.get(key) for key in ("answer", "reason", "source_ids"))
+        if (
+            not isinstance(label, str)
+            or not label.strip()
+            or not isinstance(reason, str)
+            or not reason.strip()
+        ):
+            raise CampaignError("decision option needs an answer and reason")
+        if len(label) > 512 or len(reason) > 2048 or label.strip().casefold() in answers:
+            raise CampaignError("decision option is too long or duplicates another option")
+        if (
+            not isinstance(ids, list)
+            or not 1 <= len(ids) <= 8
+            or any(not isinstance(key, str) or key not in known for key in ids)
+            or len(set(ids)) != len(ids)
+        ):
+            raise CampaignError("decision option must cite the current hold or validated support")
+        answers.add(label.strip().casefold())
+        options.append((label, reason, tuple(ids)))
+    if options[0][0] != answer:
+        raise CampaignError("recommended answer must match the first decision option")
+    return tuple(options)
+
+
+def development_choice(receipt):
+    """Private input for this unit's dev session; raw source material stays in the ledger."""
+    return {
+        "id": receipt["id"],
+        "action": receipt["action"],
+        "answer": receipt["answer"],
+        "constraints": receipt["constraints"],
+        **(
+            {"owner_selection": receipt["owner_selection"]}
+            if receipt.get("owner_selection")
+            else {}
+        ),
+        **(
+            {"model": receipt["actual_actor"], "model_evidence": receipt["observed_model_source"]}
+            if receipt["disposition"] == "delegated_choice"
+            else {
+                "decision_author": receipt["actual_actor"],
+                "authority": receipt["decision_authority"],
+                "answer_basis": (
+                    "authenticated_reply" if receipt.get("directed_reply") else "evidence_review"
+                ),
+            }
+        ),
+    }
 
 
 def validate_decision(
@@ -282,6 +396,7 @@ def validate_decision(
     for path in raw.get("affected_paths", []):
         if (
             not isinstance(path, str)
+            or ".." in path.replace("\\", "/").split("/")
             or not context.allowed_paths
             or not any(
                 path == scope or path.startswith(scope.rstrip("/") + "/")
@@ -370,6 +485,11 @@ def validate_decision(
         source.authority == "delegation" for source in authorities
     ):
         raise CampaignError("delegated choice requires existing verified delegation")
+    if disposition == "delegated_choice" and context.hold.kind not in {
+        "product_choice",
+        "decision",
+    }:
+        raise CampaignError("delegated choice is limited to routine post-planning decisions")
     if disposition == "already_satisfied" and not selected_facts:
         raise CampaignError("satisfaction requires deterministic current facts")
     clear = disposition in _AUTONOMOUS
@@ -417,6 +537,11 @@ def validate_decision(
     invalidation = tuple(raw.get("invalidation_triggers", []))
     if any(not isinstance(item, str) for item in (*constraints, *invalidation)):
         raise CampaignError("decision constraints/invalidation triggers must be strings")
+    if disposition == "delegated_choice" and (
+        len(answer) > 2048 or len(constraints) > 8 or any(len(item) > 512 for item in constraints)
+    ):
+        raise CampaignError("delegated choice exceeds the bounded execution input")
+    options = _owner_options(raw, context, disposition, citations, answer)
     identity = _digest(
         json.dumps(
             {
@@ -427,15 +552,19 @@ def validate_decision(
                 "answer": answer,
                 "citations": citations,
                 "facts": fact_ids,
+                **({"options": options, "question": context.question} if options else {}),
             },
             sort_keys=True,
         )
     )
-    actor = (
-        selected_facts[0].actor
-        if selected_facts
-        else authorities[0].author_id if authorities else ""
-    )
+    actor = ""
+    if clear:
+        if disposition == "delegated_choice":
+            actor = "campaign:decision_review"
+        elif selected_facts:
+            actor = selected_facts[0].actor
+        elif authorities:
+            actor = authorities[0].author_id
     return DecisionReceipt(
         identity,
         context.coordinates,
@@ -450,7 +579,15 @@ def validate_decision(
         fact_ids,
         actor,
         clear,
-        tuple(source.id for source in support if source.private),
+        tuple(
+            source.id
+            for source in (
+                context.sources if options or disposition == "delegated_choice" else support
+            )
+            if source.private
+        ),
+        options,
+        question=context.question if options else "",
     )
 
 
@@ -490,15 +627,21 @@ def apply_decision(snapshot: CampaignSnapshot, unit_id: str, receipt: DecisionRe
             disposition=receipt.disposition,
         )
     else:
-        requests = snapshot.bindings.setdefault("decision_requests", {})
+        owner_questions = snapshot.bindings.setdefault("decision_requests", {})
         request_key = _digest(
             json.dumps(
                 {"hold": receipt.hold_id, "head": coordinates.head, "sources": receipt.citations},
                 sort_keys=True,
             )
         )
-        if request_key not in requests:
-            requests[request_key] = {
+        existing = owner_questions.get(request_key)
+        if (
+            existing
+            and receipts.get(existing["receipt"], {}).get("coordinates", {}).get("unit") != unit_id
+        ):
+            request_key = _digest(json.dumps([unit_id, request_key]))
+        if request_key not in owner_questions:
+            owner_questions[request_key] = {
                 "receipt": receipt.id,
                 "hold_id": receipt.hold_id,
                 "question": unit.hold.reason,
@@ -512,6 +655,32 @@ def apply_decision(snapshot: CampaignSnapshot, unit_id: str, receipt: DecisionRe
                 request=request_key,
                 decision=receipt.id,
             )
+        elif owner_questions[request_key]["receipt"] != receipt.id:
+            request = owner_questions[request_key]
+            previous = request["receipt"]
+            request.setdefault("original_receipt", previous)
+            request.update(
+                receipt=receipt.id,
+                recommended_answer=receipt.answer,
+                disposition=receipt.disposition,
+            )
+            add_event(
+                snapshot,
+                "owner-decision-updated",
+                unit=unit_id,
+                request=request_key,
+                previous=previous,
+                decision=receipt.id,
+            )
+    if (receipt.options or receipt.clarification) and unit.hold:
+        unit.evidence["decision_advice"] = {
+            "receipt": receipt.id,
+            "hold": _digest(json.dumps(asdict(unit.hold), sort_keys=True)),
+            "decision_input_revision": unit.evidence.get("decision_input_revision", ""),
+            "github_input_revision": unit.evidence.get("github_input_revision", ""),
+        }
+    else:
+        unit.evidence.pop("decision_advice", None)
 
 
 def decision_summary(receipt: DecisionReceipt) -> dict[str, Any]:
@@ -521,7 +690,7 @@ def decision_summary(receipt: DecisionReceipt) -> dict[str, Any]:
         "disposition": receipt.disposition,
         "answer": (
             receipt.answer
-            if not receipt.private_sources
+            if not receipt.private_sources and not receipt.directed_reply
             else "Decision recorded locally; private evidence retained in the campaign ledger."
         ),
         "sources": [
@@ -529,6 +698,7 @@ def decision_summary(receipt: DecisionReceipt) -> dict[str, Any]:
         ],
         "hold_id": receipt.hold_id,
         "head": receipt.coordinates.head,
+        **({"clarification": receipt.clarification} if receipt.clarification else {}),
     }
 
 

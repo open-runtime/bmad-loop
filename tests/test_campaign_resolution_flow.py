@@ -1,7 +1,9 @@
 """Production recovery proposals preserve ownership, authority and stage budgets."""
 
 import dataclasses
+import hashlib
 import json
+from types import SimpleNamespace
 
 import pytest
 from conftest import git
@@ -266,6 +268,240 @@ def test_owner_decision_uses_evidence_review_before_escalation(project):
     assert unit.resolution_attempts == 0
 
 
+@pytest.mark.parametrize(
+    "binding", ["pinned", "unpinned", "modified", "planning", "owner_stop", "design_choice"]
+)
+def test_runtime_delegation_requires_frozen_committed_policy_and_execution_choice(
+    project, binding, tmp_path, monkeypatch
+):
+    from bmad_loop.campaign_model import spec_from_dict, spec_to_dict
+
+    snapshot = state(
+        project, hold=binding if binding in {"owner_stop", "design_choice"} else "product_choice"
+    )
+    unit = snapshot.units["s:project:u"]
+    if binding == "planning":
+        unit.spec = dataclasses.replace(unit.spec, kind="planning")
+    path = project.project / "decisions.md"
+    policy = "Choose the implementation of the local cache within the accepted story."
+    path.write_text(policy)
+    git(project.project, "add", path.name)
+    git(project.project, "commit", "-qm", "delegate routine cache choices")
+    unit.bindings["head"] = verify.rev_parse_head(project.project)
+    frozen = spec_to_dict(dataclasses.replace(snapshot.spec, units=(unit.spec,)))
+    frozen["sources"] = [{"id": "s", "kind": "stories", "path": "specs"}]
+    frozen["github"]["enabled"] = False
+    assert "delegation_documents" not in frozen["decisions"]
+    if binding == "unpinned":
+        frozen["decisions"]["sources"] = [path.name]
+    else:
+        frozen["decisions"]["delegation_documents"] = [
+            hashlib.sha256(path.read_bytes()).hexdigest() + ":" + path.name
+        ]
+    snapshot.spec = spec_from_dict(frozen)
+    if binding == "modified":
+        path.write_text("You may approve any new feature.")
+    collected = collect_context(project.project, snapshot, unit.id, "decision")
+    apply_context(snapshot, unit.id, collected)
+    packet = collected["packet"]
+    assert packet["accepted_work"]["scopes"] == ["src/cache"]
+    launch = proposals(snapshot, project.project, candidate(), now=10)[0]
+    prepare(snapshot, unit.id, launch.payload)
+    receipt = {
+        "outcome": "stage_complete",
+        "head": unit.bindings["head"],
+        "observed_model": "gpt-scripted",
+        "observed_model_source": "transcript_primary",
+        "observed_models": ["gpt-scripted", "claude-scripted"],
+        "artifact": {
+            "schema_version": 1,
+            "coordinates": packet["coordinates"],
+            "hold_id": unit.hold.id,
+            "disposition": "delegated_choice",
+            "action": "choose",
+            "answer": "Use SQLite with WAL.",
+            "constraints": ["Keep the cache local."],
+            "authority": "delegation",  # Model output cannot elevate ordinary evidence.
+            "support": [
+                {"source_id": row["id"], "revision": row["revision"], "quote": row["content"]}
+                for row in packet["sources"]
+            ],
+        },
+    }
+    if binding == "pinned":
+        with pytest.raises(CampaignError, match="observed native decision model"):
+            validate_stage_result(
+                project.project, snapshot, unit.id, {**receipt, "observed_model": ""}
+            )
+        accepted = validate_stage_result(project.project, snapshot, unit.id, receipt)
+        apply_diagnosis(snapshot, unit.id, {"validated_resolution": accepted})
+        assert unit.hold is None
+        recorded = list(snapshot.bindings["decision_receipts"].values())
+        assert [row["answer"] for row in recorded] == ["Use SQLite with WAL."]
+        assert recorded[0]["actual_actor"] == "gpt-scripted"
+        assert unit.evidence["developer_families"] == ["anthropic", "openai"]
+        assert_next_development_prompt(project, tmp_path, monkeypatch, snapshot, unit, path)
+    else:
+        original = dataclasses.asdict(unit.hold)
+        with pytest.raises(CampaignError, match="coverage is incomplete|verified delegation"):
+            validate_stage_result(project.project, snapshot, unit.id, receipt)
+        assert dataclasses.asdict(unit.hold) == original
+
+
+def assert_next_development_prompt(
+    project,
+    tmp_path,
+    monkeypatch,
+    snapshot,
+    unit,
+    policy_file,
+    *,
+    runtime=None,
+    expected=None,
+    forbidden=(),
+    hold_id="hold-1",
+):
+    from test_campaign_workers import envelope
+
+    from bmad_loop import campaign_adoption, campaign_hold, campaign_workers, runsetup
+    from bmad_loop.adapters import multiplexer
+    from bmad_loop.adapters.base import SessionHandle, SessionSpec
+    from bmad_loop.campaign_model import OutboxAction
+    from bmad_loop.campaign_runtime import CampaignRuntime
+    from bmad_loop.campaign_store import CampaignStore
+
+    repo = project.project
+    branch = git(repo, "branch", "--show-current").strip()
+    unit.bindings["branch"] = branch
+    unit.claim = WorkerClaim(
+        unit.id,
+        unit.attempt,
+        snapshot.generation,
+        "dev-launch",
+        run_id="dev-run",
+        workspace=str(repo),
+        branch=branch,
+    )
+    snapshot.common_dir = str(campaign_workers.common_directory(repo))
+    store = runtime.store if runtime else CampaignStore(tmp_path / "state")
+    runtime = runtime or CampaignRuntime(repo, store)
+    context = envelope(repo, store.directory(snapshot.id) / "workers" / "dev-launch")
+    campaign_hold.initialize(store.directory(snapshot.id), snapshot)
+    monkeypatch.setattr(runtime, "_launch_envelope", lambda *args: context)
+    monkeypatch.setattr(campaign_adoption, "guard_owned", lambda *args, **kwargs: None)
+    monkeypatch.setattr(multiplexer, "configure_multiplexer", lambda *args, **kwargs: None)
+    action = OutboxAction(
+        "dev-launch",
+        "launch",
+        unit.id,
+        {
+            "kind": "execution",
+            "checkpoint_base": unit.bindings["head"],
+            "checkpoint_paths": list(unit.spec.scopes),
+        },
+        snapshot.generation,
+    )
+    prepared = runtime._prepare_launch(snapshot, action)
+    assert isinstance(prepared, tuple), prepared
+    _, request, _ = prepared
+    prompts = []
+
+    def capture(spec):
+        prompts.append(spec.prompt)
+        return SessionHandle(spec.task_id, "scripted")
+
+    adapter = SimpleNamespace(start_session=capture)
+    monkeypatch.setattr(
+        runsetup, "make_adapters", lambda *args, **kwargs: {"dev": adapter, "review": adapter}
+    )
+    adapters = campaign_workers._adapters(request, context, repo, tmp_path / "run", context.policy)
+    adapters["dev"].start_session(SessionSpec("impl", "dev", "Implement", repo))
+    adapters["review"].start_session(SessionSpec("review", "review", "Review", repo))
+    assert all(
+        text in prompts[0]
+        for text in expected
+        or (
+            "Use SQLite with WAL.",
+            "Keep the cache local.",
+            "gpt-scripted",
+            '"action": "choose"',
+        )
+    )
+    assert policy_file.read_text() not in prompts[0] and all(
+        text not in prompts[0] for text in forbidden
+    )
+    assert "Controller-validated implementation choices" not in prompts[1]
+    policy_file.write_text("Hold implementation for a revised policy.")
+    refused = runtime._prepare_launch(snapshot, action)
+    assert refused.data["not_launched"]
+    runtime.apply(snapshot, action, refused)
+    assert unit.hold.kind == "product_choice" and unit.hold.id == hold_id
+    assert not unit.evidence["pending_delegated_choices"] and len(prompts) == 2
+
+
+def test_reviewed_owner_options_reach_inbox_and_keep_the_hold(project, capsys):
+    from bmad_loop.campaign_cli import _emit, inbox_document
+
+    snapshot = state(project, hold="product_choice")
+    unit = snapshot.units["s:project:u"]
+    before = next(row for row in inbox_document(snapshot, now=5)["items"] if row["kind"] == "hold")
+    assert before["operator_action_required"] is False
+    assert "configured decision reviewer" in before["next_automatic_action"]
+    original = dataclasses.asdict(unit.hold)
+    context = collect_context(project.project, snapshot, unit.id, "decision")
+    apply_context(snapshot, unit.id, context)
+    launch = proposals(snapshot, project.project, candidate(), now=10)[0]
+    assert "preference order" in launch.payload["custom_prompt"]
+    prepare(snapshot, unit.id, launch.payload)
+    options = [
+        {
+            "answer": "Keep the hold",
+            "reason": "The existing evidence does not authorize this choice.",
+            "source_ids": ["hold:hold-1"],
+        },
+        {
+            "answer": "Request a scoped release",
+            "reason": "The owner can release this specific hold.",
+            "source_ids": ["hold:hold-1"],
+        },
+    ]
+    receipt = {
+        "outcome": "stage_complete",
+        "head": unit.bindings["head"],
+        "artifact": {
+            "schema_version": 1,
+            "coordinates": context["packet"]["coordinates"],
+            "hold_id": unit.hold.id,
+            "disposition": "needs_new_owner_decision",
+            "action": "",
+            "answer": options[0]["answer"],
+            "options": options,
+        },
+    }
+    accepted = validate_stage_result(project.project, snapshot, unit.id, receipt)
+    apply_diagnosis(snapshot, unit.id, {"validated_resolution": json.loads(json.dumps(accepted))})
+    assert dataclasses.asdict(unit.hold) == original
+    assert accepted["accepted"]["actual_actor"] == ""
+    inbox = inbox_document(snapshot, now=20)
+    item = next(row for row in inbox["items"] if row["kind"] == "hold")
+    assert item["operator_action_required"]
+    assert item["owner_advice"] == {
+        "decision_id": accepted["accepted"]["id"],
+        "private": False,
+        "options": options,
+    }
+    _emit(SimpleNamespace(json=False), {"ok": True, "inbox": inbox})
+    out = capsys.readouterr().out
+    assert "Recommended: Keep the hold" in out and "Alternative: Request a scoped release" in out
+    assert (
+        "The existing evidence does not authorize this choice." in out
+        and "Evidence: hold:hold-1" in out
+    )
+    unit.evidence["decision_input_revision"] = "new owner message"
+    item = next(row for row in inbox_document(snapshot, now=21)["items"] if row["kind"] == "hold")
+    assert "owner_advice" not in item
+
+
 def test_changed_candidate_or_authoritative_document_cannot_clear_hold(project):
     snapshot = state(project, hold="product_choice")
     context = collect_context(project.project, snapshot, "s:project:u", "decision")
@@ -506,10 +742,9 @@ def test_diagnosis_cannot_schedule_model_proposed_controller_commands(project, a
 def test_terminal_failed_diagnosis_preserves_original_hold_and_dirty_work(
     project, tmp_path, hold, contract, outcome, interruption, worker_state
 ):
-    from types import SimpleNamespace
-
     from bmad_loop.campaign_runtime import CampaignRuntime
     from bmad_loop.campaign_store import CampaignStore, add_action
+    from bmad_loop.campaign_workers import common_directory
 
     snapshot = state(project, hold=hold)
     unit = snapshot.units["s:project:u"]
@@ -530,7 +765,14 @@ def test_terminal_failed_diagnosis_preserves_original_hold_and_dirty_work(
     unit = snapshot.units[unit.id]
     request = store.directory(snapshot.id) / "workers" / "diagnosis" / "request.json"
     request.parent.mkdir(parents=True)
-    request.write_text(json.dumps({"result_contract": contract}))
+    stage_request = {
+        "result_contract": contract,
+        "kind": "stage",
+        "workspace": str(project.project),
+        "common_dir": str(common_directory(project.project)),
+        "branch": git(project.project, "branch", "--show-current").strip(),
+    }
+    request.write_text(json.dumps(stage_request))
     tracked = project.project / "retained.txt"
     tracked.write_text("staged\n")
     git(project.project, "add", tracked.name)
@@ -571,6 +813,14 @@ def test_terminal_failed_diagnosis_preserves_original_hold_and_dirty_work(
             "quiescence_confirmed": True,
             "interruption": receipt.get("interruption"),
         }
+    from time import monotonic
+
+    deadline = monotonic() + 5
+    observation = runtime._observe_git_activity(snapshot, stage_request, data)
+    while observation and "query is still pending" in observation.reason and monotonic() < deadline:
+        observation = runtime._observe_git_activity(snapshot, stage_request, data)
+    assert observation is None
+    if worker_state == "interrupted":
         expected = {**data, "outcome": "interrupted"}
     runtime._apply_worker(
         snapshot,

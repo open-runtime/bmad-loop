@@ -85,6 +85,9 @@ class ResourceSpec:
     verify_slots: int = 1
     max_sessions: int = 4
     budget_usd: float | None = None
+    # Absent in historical frozen configurations: max_sessions retains its
+    # original model-worker meaning. The explicit total also counts verifiers.
+    max_total_sessions: int | None = None
 
 
 @dataclass(frozen=True)
@@ -112,6 +115,7 @@ class GitHubSpec:
     max_remote_head_refreshes: int = 8
     allow_publication_wait: bool = False
     allow_admin_merge: bool = False
+    verified_thread_bot_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -132,10 +136,58 @@ class CheckpointSpec:
 
 
 @dataclass(frozen=True)
+class ImplementationChoice:
+    unit: str
+    question: str
+    delegation_document: str
+
+
+@dataclass(frozen=True)
 class DecisionSpec:
     mode: str = "evidence-first"
     sources: tuple[str, ...] = ()
     transcript_sources: tuple[str, ...] = ()
+    delegation_documents: tuple[str, ...] = ()
+    implementation_choices: tuple[ImplementationChoice, ...] = ()
+
+
+def delegation_document(reference: str) -> tuple[str, str]:
+    """Parse the owner's content pin and exact repository-relative policy path."""
+    pin, _, path = reference.partition(":")
+    if (
+        not re.fullmatch(r"[0-9a-f]{64}", pin)
+        or not path
+        or any(part in {"", ".", ".."} for part in path.split("/"))
+        or any(char in path for char in ("\\", "\0", ":"))
+    ):
+        raise CampaignError("decisions.delegation_documents requires SHA256:relative/path")
+    return pin, path
+
+
+def _implementation_choices(value) -> tuple[ImplementationChoice, ...]:
+    if not isinstance(value, (list, tuple)) or len(value) > 1024:
+        raise CampaignError("decisions.implementation_choices requires a bounded array")
+    choices = []
+    units = set()
+    for raw in value:
+        row = _table(raw, "implementation_choice")
+        if set(row) != {"unit", "question", "delegation_document"} or not all(
+            isinstance(item, str) and item.strip() for item in row.values()
+        ):
+            raise CampaignError(
+                "implementation choice requires unit, question and delegation_document"
+            )
+        choice = ImplementationChoice(**row)
+        if (
+            not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]*", choice.unit)
+            or choice.unit in units
+            or len(choice.question) > 2048
+        ):
+            raise CampaignError("implementation choice requires a unique unit and bounded question")
+        delegation_document(choice.delegation_document)
+        units.add(choice.unit)
+        choices.append(choice)
+    return tuple(choices)
 
 
 @dataclass(frozen=True)
@@ -408,13 +460,17 @@ def _construct(cls: Any, value: Any, name: str) -> Any:
             "merge_executor",
             "review_users",
             "review_teams",
+            "verified_thread_bot_ids",
             "sources",
             "transcript_sources",
+            "delegation_documents",
             "labels",
             "stages",
             "purposes",
         }:
             out[key] = _strings(item, f"{name}.{key}")
+        elif key == "implementation_choices":
+            out[key] = _implementation_choices(item)
         elif key in {"inventory_metadata_bytes", "inventory_pr_detail_bytes"}:
             _positive(item, f"{name}.{key}")
         elif key == "history_max_bytes":
@@ -427,6 +483,7 @@ def _construct(cls: Any, value: Any, name: str) -> Any:
         elif key in {
             "verify_slots",
             "max_sessions",
+            "max_total_sessions",
             "target_interval_s",
             "max_attempts_per_unit",
             "batch_size",
@@ -836,6 +893,17 @@ def spec_from_dict(value: Mapping[str, Any]) -> CampaignSpec:
         raise CampaignError("managed communication requires an explicit absolute room")
     if spec.decisions.mode not in {"off", "evidence-first"}:
         raise CampaignError("decisions.mode must be off or evidence-first")
+    if spec.decisions.implementation_choices and spec.decisions.mode == "off":
+        raise CampaignError("implementation choices require evidence-first decision review")
+    unit_kinds = {unit.id: unit.kind for unit in spec.units}
+    for choice in spec.decisions.implementation_choices:
+        if choice.unit in unit_kinds and unit_kinds[choice.unit] != "story":
+            raise CampaignError("implementation choices apply only to execution stories")
+        if choice.unit not in unit_kinds and not spec.sources and not spec.planning.enabled:
+            raise CampaignError("implementation choice names an unknown execution story")
+    delegation_paths = [delegation_document(ref)[1] for ref in spec.decisions.delegation_documents]
+    if len(set(delegation_paths)) != len(delegation_paths):
+        raise CampaignError("duplicate decisions.delegation_documents path")
     if spec.resolution.mode not in {"off", "diagnose", "bounded-auto"}:
         raise CampaignError("resolution.mode must be off, diagnose or bounded-auto")
     for scope in spec.intake.allowed_scopes:
@@ -873,6 +941,15 @@ def source_to_dict(source: SourceSelector) -> dict[str, Any]:
 
 def spec_to_dict(spec: CampaignSpec) -> dict[str, Any]:
     raw = asdict(spec)
+    if not spec.github.verified_thread_bot_ids:
+        raw["github"].pop("verified_thread_bot_ids")
+    if not spec.decisions.delegation_documents:
+        raw["decisions"].pop("delegation_documents")
+    if not spec.decisions.implementation_choices:
+        raw["decisions"].pop("implementation_choices")
+    if spec.resources.max_total_sessions is None:
+        # Keep old frozen configuration/permit fingerprints byte-equivalent.
+        raw["resources"].pop("max_total_sessions")
     raw["sources"] = tuple(source_to_dict(source) for source in spec.sources)
     raw["role_pools"] = {
         name: {"candidates": [asdict(c) for c in candidates]}

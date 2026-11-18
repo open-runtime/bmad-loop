@@ -1526,6 +1526,7 @@ JOURNAL_KINDS = frozenset(
         # exact permit/entry and ticket lifecycle are covered by continuation tests.
         "campaign-development-continuation",
         "campaign-development-handoff",
+        "campaign-development-rearm",
         # Finalization's publication boundary; SHA/branch fields use existing
         # diagnostic aliases. Native replay coverage: test_fork_finalize_target.
         "baseline-adopted-from-target",
