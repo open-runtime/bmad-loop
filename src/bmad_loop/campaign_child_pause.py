@@ -129,6 +129,13 @@ def hold_kind(receipt) -> str:
     typed = cause(receipt)
     if typed is None:
         return "pause_unknown"
+    if (
+        receipt.get("outcome") == "recovery_required"
+        and typed.kind == PauseKind.TECHNICAL_FAILURE
+        and typed.producer == "engine.campaign_recovery"
+        and typed.code == "request_persisted"
+    ):
+        return "recovery_required"
     return {
         PauseKind.SOURCE_CHECKPOINT: "checkpoint",
         PauseKind.TECHNICAL_FAILURE: "technical_failure",

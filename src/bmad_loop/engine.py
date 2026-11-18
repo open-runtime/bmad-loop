@@ -1186,7 +1186,8 @@ class Engine:
         """Hand off before reset, ledger restoration or lifecycle normalization.
 
         A supplied pause cause comes from the current producer, never the
-        recovery reason. Unclassified recovery remains explicitly unknown.
+        recovery reason. A generic request identifies only the already sealed
+        campaign recovery operation. It carries no permission for a route switch.
         """
         assert self.campaign_execution is not None
         self._env_probes_fresh_root = None
@@ -1200,7 +1201,10 @@ class Engine:
         self._escalation_pause(
             "campaign recovery requested; checkpoint history preserved",
             task.story_key,
-            pause_cause=pause_cause,
+            pause_cause=pause_cause
+            or PauseCause(
+                PauseKind.TECHNICAL_FAILURE, "engine.campaign_recovery", "request_persisted"
+            ),
         )
 
     def _escalation_pause(
