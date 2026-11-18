@@ -54,7 +54,9 @@ def paused_child(project, tmp_path, monkeypatch):
     (repo / "untracked.txt").write_text("untracked contribution\n")
     dirty = git(repo, "status", "--porcelain")
     policy = policy_mod.loads('[gates]\nmode="none"\n[notify]\ndesktop=false\n')
-    context = envelope(repo, tmp_path / "execution", policy)
+    context = envelope(
+        repo, tmp_path / "parent-state" / "campaign-1" / "workers" / "launch-1", policy
+    )
     source = SourceSelector("stories", id="s", path=SPEC_FOLDER)
     spec = UnitSpec(
         context.unit_id,
@@ -169,6 +171,23 @@ def parent_for(case, tmp_path, *, hold=None):
     return runtime, snapshot, unit, action
 
 
+def apply_terminal(runtime, snapshot, unit, action, case, observed):
+    """Collect the controller's Git activity evidence before applying the receipt."""
+    import time
+
+    deadline = time.monotonic() + 10
+    try:
+        while True:
+            wait = runtime._observe_git_activity(snapshot, case.request, observed)
+            if wait is None:
+                break
+            assert time.monotonic() < deadline, wait.reason
+            time.sleep(0.01)
+        runtime._apply_worker(snapshot, unit, action, observed)
+    finally:
+        runtime.close_observers()
+
+
 @pytest.mark.parametrize(
     "kind,expected",
     [
@@ -200,7 +219,7 @@ def test_persisted_pause_crosses_worker_observation_and_parent_classification(
     assert sealed["task_selector"] == case.spec.selector and sealed["task_digest"]
     assert sealed["binding"]["launch_id"] == case.request["launch_id"]
     runtime, snapshot, unit, action = parent_for(case, tmp_path)
-    runtime._apply_worker(snapshot, unit, action, observed)
+    apply_terminal(runtime, snapshot, unit, action, case, observed)
     assert unit.hold.kind == expected
     assert unit.hold.evidence["child_pause"] == sealed
     assert unit.evidence["child_pause"] == sealed
@@ -255,7 +274,7 @@ def test_child_failure_producer_limits_environment_host_repair_authority(
     assert observed["state"] == "finished"
     assert observed["receipt"]["child_pause"]["cause"] == expected_pause.to_dict()
     runtime, snapshot, unit, action = parent_for(case, tmp_path)
-    runtime._apply_worker(snapshot, unit, action, observed)
+    apply_terminal(runtime, snapshot, unit, action, case, observed)
     assert unit.hold.kind == "technical_failure"
     assert unit.hold.evidence["child_pause"]["binding"]["launch_id"] == unit.hold.id
     failure = typed_failure(snapshot, unit.id)
@@ -367,7 +386,7 @@ def test_parent_retains_original_protected_hold_and_defers_new_failure(
     )
     before = dataclasses.asdict(original)
     runtime, snapshot, unit, action = parent_for(case, tmp_path, hold=original)
-    runtime._apply_worker(snapshot, unit, action, observed)
+    apply_terminal(runtime, snapshot, unit, action, case, observed)
     assert dataclasses.asdict(unit.hold) == before
     assert unit.evidence["pending_failure_hold"]["kind"] == "technical_failure"
     assert (
@@ -384,7 +403,7 @@ def test_historical_receipt_without_typed_pause_stays_unknown(paused_child, tmp_
     observed = workers.observe(case.context.directory, expected=case.request)
     assert observed["state"] == "finished"
     runtime, snapshot, unit, action = parent_for(case, tmp_path)
-    runtime._apply_worker(snapshot, unit, action, observed)
+    apply_terminal(runtime, snapshot, unit, action, case, observed)
     assert unit.hold.kind == "pause_unknown"
     assert campaign_child_pause.cause(observed["receipt"]) is None
 

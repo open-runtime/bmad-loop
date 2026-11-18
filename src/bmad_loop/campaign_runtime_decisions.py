@@ -211,7 +211,7 @@ def collect(
 
 def execution_choices(runtime, snapshot, unit):
     """Reobserve outstanding choices immediately before writing the execution request."""
-    from .campaign_resolution_flow import _digest, collect_context
+    from .campaign_resolution_flow import collect_context, execution_input_digest
 
     pending = unit.evidence.get("pending_delegated_choices", {})
     if not pending:
@@ -244,7 +244,7 @@ def execution_choices(runtime, snapshot, unit):
             )
         except CampaignError:
             return [], ident
-        if _digest(fresh["packet"]) != binding["packet_digest"]:
+        if execution_input_digest(fresh["packet"]) != binding["packet_digest"]:
             return [], ident
         choices.append(development_choice(receipt))
     return choices, ""

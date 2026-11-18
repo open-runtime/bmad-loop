@@ -270,7 +270,11 @@ class CampaignRuntime:
             self._git_activity_observer = None
 
     def gateway(self, snapshot: CampaignSnapshot) -> GithubGateway:
-        return self._gateway or GithubGateway(GhTransport(), snapshot.repository)
+        return self._gateway or GithubGateway(
+            GhTransport(),
+            snapshot.repository,
+            thread_provenance=bool(snapshot.spec.github.verified_thread_bot_ids),
+        )
 
     @staticmethod
     def _set_hold(unit, hold: Hold) -> None:
@@ -1773,6 +1777,8 @@ class CampaignRuntime:
                 snapshot.last_epic = epic_key(
                     unit.spec.source, unit.spec.initiative, unit.spec.epic
                 )
+                if payload.get("result_contract") == "decision-v1":
+                    return  # The read-only reviewer owns a claim, not the development phase.
                 if unit.state == UnitState.READY:
                     transition(snapshot, unit.id, UnitState.CLAIMED)
                 elif unit.state == UnitState.LOCALLY_COMPLETE:
@@ -4655,6 +4661,10 @@ class CampaignRuntime:
                 from .campaign_acceptance import context as acceptance_context
 
                 context["acceptance_ledger"] = acceptance_context(unit)
+                if stage == "publication_review" and snapshot.spec.github.verified_thread_bot_ids:
+                    from .campaign_bot_threads import review_context
+
+                    context.update(review_context(unit))
                 context["diff"] = git(
                     workspace, "diff", "--stat", coordinates.base + "..." + coordinates.head
                 )
@@ -5093,9 +5103,24 @@ class CampaignRuntime:
                 ):
                     raise CampaignError("overlap disposition omits accepted criteria")
                 inventory_data = dict(snapshot.bindings["inventory"])
-                inventory_data.pop("digest", None)
+                recorded_digest = inventory_data.pop("digest", None)
                 inventory = CoverageReceipt(**inventory_data)
-                validate_overlap(disposition, inventory, owned_pr=unit.bindings["pr"]["number"])
+                current_digest = inventory.digest
+                if recorded_digest != current_digest:
+                    raise CampaignError(
+                        "Current admission inventory does not match its stored digest"
+                    )
+                owned_pr = unit.bindings["pr"]["number"]
+                if disposition.inventory_digest != coordinates.inventory_digest:
+                    raise CampaignError(
+                        "Admission answer does not match its assigned inventory revision"
+                    )
+                if current_digest == coordinates.inventory_digest:
+                    validate_overlap(disposition, inventory, owned_pr=owned_pr)
+                else:
+                    from .campaign_admission_review import validate_original
+
+                    validate_original(request, disposition, owned_pr=owned_pr)
                 receipt["validated_admission"] = raw
             if coordinates.stage == "native_review_pair":
                 from .campaign_codex_review_pair import stage_evidence
@@ -5273,6 +5298,14 @@ class CampaignRuntime:
             now=controller.clock(),
             requirements=PublicationRequirements.from_spec(snapshot.spec.github),
         )
+        if snapshot.spec.github.verified_thread_bot_ids:
+            from .campaign_bot_threads import disposition
+
+            advice = disposition(
+                self, snapshot, unit, candidate, observation, remote_defects, now=controller.clock()
+            )
+            if advice:
+                return Observation("confirmed", advice)
         if remote_defects is not None:
             return Observation("confirmed", {"remote_feedback": dataclasses.asdict(remote_defects)})
         if observation.base_head != candidate.base:
@@ -6253,7 +6286,10 @@ class CampaignRuntime:
                     return
             self._queue_intent(snapshot, unit, data)
         elif kind == "ready":
+            from .campaign_resolution_flow import request_implementation_choice
+
             transition(snapshot, unit.id, UnitState.READY)
+            request_implementation_choice(snapshot, unit)
         elif kind == "planning-complete":
             artifacts = {}
             for receipt in unit.evidence["planning_flow"]["stages"].values():
@@ -6288,7 +6324,13 @@ class CampaignRuntime:
         elif kind == "remote-wait":
             if unit.hold and unit.hold.id == data["hold_id"]:
                 unit.evidence["remote_wait_observation"] = data
-                if data.get("ready_to_reaccept"):
+                if data.get("bot_thread_review_changed"):
+                    from .campaign_review_freshness import invalidate
+
+                    if invalidate(snapshot, unit):
+                        unit.hold = None
+                        unit.retry_at = None
+                elif data.get("ready_to_reaccept"):
                     unit.hold = None
                     unit.retry_at = None
                     add_event(snapshot, "remote-wait-cleared", unit=unit.id)
@@ -6637,6 +6679,14 @@ class CampaignRuntime:
                 from .campaign_remote_head import apply as apply_remote
 
                 apply_remote(self, snapshot, unit, data)
+            elif (
+                data.get("bot_thread_wait")
+                or data.get("bot_threads_closed")
+                or data.get("bot_thread_objection")
+            ):
+                from .campaign_bot_threads import apply as apply_bot_threads
+
+                apply_bot_threads(snapshot, unit, data, action.id)
             elif data.get("remote_feedback"):
                 from .campaign_remote_feedback import RemoteFeedback
                 from .campaign_remote_feedback import apply as apply_remote_feedback
@@ -6644,7 +6694,12 @@ class CampaignRuntime:
                 raw = dict(data["remote_feedback"])
                 raw["candidate"] = Candidate(**raw["candidate"])
                 raw["defects"] = tuple(raw["defects"])
-                apply_remote_feedback(snapshot, unit.id, RemoteFeedback(**raw))
+                feedback = RemoteFeedback(**raw)
+                apply_remote_feedback(snapshot, unit.id, feedback)
+                if unit.evidence.get("bot_thread_dispositions"):
+                    from .campaign_bot_threads import bind_new_feedback
+
+                    bind_new_feedback(unit, feedback)
             elif data.get("external_followup_hold"):
                 unit.evidence["observed_external_merge"] = data["merge"]
                 self._set_hold(
@@ -7143,6 +7198,14 @@ class CampaignRuntime:
             ).hexdigest()
             transition(snapshot, unit.id, UnitState.LOCALLY_COMPLETE)
         elif stage == "admission_review":
+            if (
+                receipt["validated_admission"]["inventory_digest"]
+                != snapshot.bindings["inventory"]["digest"]
+            ):
+                from .campaign_boundary_sync import invalidate
+
+                invalidate(self, snapshot, unit, {"request": {}, "receipt": receipt})
+                return
             unit.evidence["admission"] = receipt["validated_admission"]
             transition(snapshot, unit.id, UnitState.READY)
         elif receipt.get("result_contract") == "repair-v1":

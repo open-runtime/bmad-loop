@@ -226,7 +226,14 @@ def test_retained_writer_is_attributed_before_boundary_acceptance(project, tmp_p
     )
     directory = runtime.store.directory(snapshot.id) / "workers" / "writer"
     directory.mkdir(parents=True)
-    request = {"stage_boundary": {"inputs": before}, "coordinates": {"head": unit.bindings["head"]}}
+    request = {
+        "kind": "stage",
+        "workspace": unit.bindings["workspace"],
+        "branch": unit.bindings["branch"],
+        "common_dir": snapshot.common_dir,
+        "stage_boundary": {"inputs": before},
+        "coordinates": {"head": unit.bindings["head"]},
+    }
     (directory / "request.json").write_text(json.dumps(request), encoding="utf-8")
     receipt = {
         "outcome": "stage_complete",
@@ -240,7 +247,15 @@ def test_retained_writer_is_attributed_before_boundary_acceptance(project, tmp_p
     action = OutboxAction(
         "observe", "observe-worker", unit.id, {"launch_id": "writer"}, snapshot.generation
     )
-    runtime._apply_worker(snapshot, unit, action, {"state": "finished", "receipt": receipt})
+    from bmad_loop.campaign_git_activity import GitActivityObserver
+
+    terminal = {"state": "finished", "receipt": receipt}
+    runtime._git_activity_observer = GitActivityObserver(wait_s=1)
+    try:
+        assert runtime._observe_git_activity(snapshot, request, terminal) is None
+        runtime._apply_worker(snapshot, unit, action, terminal)
+    finally:
+        runtime.close_observers()
     assert unit.evidence["developer_families"] == ["anthropic", "openai"]
     assert unit.evidence["stage_sync_debt"]["receipt"] == receipt
     assert "planning_results" not in unit.evidence

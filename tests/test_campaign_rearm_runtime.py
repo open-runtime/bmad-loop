@@ -392,6 +392,14 @@ def test_retained_rearm_finishes_own_in_progress_ticket_and_keeps_dirty_history(
 def test_quota_rearm_survives_restart_and_delivers_with_reasoning_disabled(
     campaign, production_case, tmp_path, restart_at
 ):
+    result = exercise_quota_restart(campaign, production_case, tmp_path, restart_at)
+    assert all(unit.state == UnitState.DELIVERED for unit in result.units.values())
+    assert len(production_case.service.pulls) == 3
+    assert all(pr["merged"] for pr in production_case.service.pulls.values())
+
+
+def exercise_quota_restart(campaign, production_case, tmp_path, restart_at):
+    """Run the owned successor through the production supervisor and terminal assertions."""
     _, configured, _, _ = campaign
     case = production_case
     initial = case.store.load(case.snapshot.id)
@@ -581,9 +589,7 @@ def test_quota_rearm_survives_restart_and_delivers_with_reasoning_disabled(
         )
         assert any(row["phase"] == "canceled" for row in first.evidence["technical_rearm_history"])
     assert not result.jobs
-    assert all(unit.state == UnitState.DELIVERED for unit in result.units.values())
     events = [json.loads(line) for line in case.events.read_text().splitlines()]
     assert sum(row["event"] == "quota" for row in events) == 1
     assert sum(row["event"] == "retained-successor" for row in events) == 1
-    assert len(case.service.pulls) == 3
-    assert all(pr["merged"] for pr in case.service.pulls.values())
+    return result

@@ -36,6 +36,15 @@ def observe(runtime, snapshot, action):
     )
     observed = controller.inspect(candidate.pr_number)
     pr = observed.pr
+    if hold.evidence.get("bot_thread_wait"):
+        from .campaign_bot_threads import changed_while_waiting
+
+        if changed_while_waiting(snapshot.spec.github.verified_thread_bot_ids, hold, observed):
+            return {
+                **result,
+                "bot_thread_review_changed": True,
+                "reasons": ["The reviewed thread or PR head changed. Repeat independent review."],
+            }
     reasons = []
     if (
         observed.repository != candidate.repository
@@ -49,6 +58,15 @@ def observe(runtime, snapshot, action):
         or not 0 <= controller.clock() - observed.observed_at <= controller.max_observation_age_s
     ):
         return {**result, "reasons": ["Remote identity/state/rules observation is not current"]}
+    if hold.evidence.get("bot_thread_objection"):
+        target = hold.evidence["bot_thread_objection"]
+        if not any(
+            row.get("id") == target and row.get("isResolved") is False for row in observed.threads
+        ):
+            return {
+                **result,
+                "reasons": [f"Maintainer must reopen the updated GitHub conversation {target}"],
+            }
     labels = {str(row.get("name", "")).lower() for row in observed.issue.get("labels", [])}
     if labels.intersection(label.lower() for label in requirements.hold_labels):
         reasons.append("Remote owner/review hold is active")

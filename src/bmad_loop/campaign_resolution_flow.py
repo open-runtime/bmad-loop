@@ -123,6 +123,15 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
+def execution_input_digest(packet):
+    """An intake wake schedules a fresh read. The resulting native sources bind execution."""
+    if "implementation_authority_revision" not in packet:
+        return _digest(packet)
+    return _digest(
+        {key: value for key, value in packet.items() if key != "decision_input_revision"}
+    )
+
+
 def _coordinates(snapshot: CampaignSnapshot, unit_id: str) -> EvidenceCoordinates:
     unit = snapshot.units[unit_id]
     integrated = unit.evidence.get("integrated", {})
@@ -222,7 +231,7 @@ def current_owner_advice(snapshot, unit):
     binding = unit.evidence.get("decision_advice", {})
     receipt = snapshot.bindings.get("decision_receipts", {}).get(binding.get("receipt"), {})
     if (
-        not receipt.get("options")
+        not (receipt.get("options") or receipt.get("clarification"))
         or not unit.hold
         or binding.get("hold") != _digest(dataclasses.asdict(unit.hold))
         or not _context_current(
@@ -236,6 +245,7 @@ def current_owner_advice(snapshot, unit):
         "decision_id": receipt["id"],
         "private": bool(receipt.get("private_sources")),
         "options": () if receipt.get("private_sources") else receipt["options"],
+        **({"clarification": receipt["clarification"]} if receipt.get("clarification") else {}),
     }
 
 
@@ -246,6 +256,56 @@ def _routine_choice(unit):
         and unit.spec.kind != "planning"
         and unit.state not in {UnitState.PENDING, UnitState.PLANNING, UnitState.DRAFT}
     )
+
+
+def _planned_choice(snapshot, unit):
+    return next(
+        (item for item in snapshot.spec.decisions.implementation_choices if item.unit == unit.id),
+        None,
+    )
+
+
+def _choice_binding(unit, choice):
+    return _digest(
+        [
+            dataclasses.asdict(choice),
+            unit.id,
+            unit.spec.source,
+            unit.spec.selector,
+            unit.spec.scopes,
+            unit.spec.paths,
+            unit.spec.acceptance,
+        ]
+    )
+
+
+def request_implementation_choice(snapshot, unit):
+    """Issue the frozen plan's question once, after the story's draft PR is ready."""
+    from .campaign_existing import requires_existing
+    from .campaign_hold import defer_failure
+
+    choice = _planned_choice(snapshot, unit)
+    if (
+        choice is None
+        or unit.spec.kind != "story"
+        or unit.evidence.get("planned_choice_id")
+        or requires_existing(snapshot, unit)
+    ):
+        return
+    binding = _choice_binding(unit, choice)
+    hold = Hold(
+        "product_choice",
+        choice.question,
+        id="implementation:" + binding,
+        actor="campaign",
+        evidence={"planned_choice": binding},
+    )
+    if unit.hold:
+        defer_failure(unit, hold)
+    else:
+        unit.hold = hold
+    unit.evidence["planned_choice_id"] = hold.id
+    add_event(snapshot, "implementation-choice-requested", unit=unit.id, hold=hold.id)
 
 
 def routine_review_pending(snapshot, unit):
@@ -391,6 +451,24 @@ def proposals(
     return tuple(output)
 
 
+def _directed_source(snapshot, unit_id, source):
+    """Keep a directed message visible; its authority applies only to its outstanding question."""
+    if (
+        source.kind == "github"
+        and source.identity.startswith("gh:comment:")
+        and source.authority == "owner"
+    ):
+        header = re.match(r"Decision ([0-9a-f]{64})\n", source.content.strip())
+        if header:
+            from .campaign_answer import question
+
+            try:
+                question(snapshot, unit_id, header[1])
+            except CampaignError:
+                return dataclasses.replace(source, authority="context")
+    return source
+
+
 def collect_context(
     project: Path,
     snapshot: CampaignSnapshot,
@@ -415,7 +493,20 @@ def collect_context(
         from .campaign_decision_sources import configured_locations, controller_comment
 
         locations = configured_locations(snapshot.spec.decisions.sources, scope=(unit_id,))
+        unavailable = ()
         if _routine_choice(unit):
+            documents = snapshot.spec.decisions.delegation_documents
+            if binding := unit.hold.evidence.get("planned_choice"):
+                choice = _planned_choice(snapshot, unit)
+                if (
+                    choice
+                    and _choice_binding(unit, choice) == binding
+                    and unit.hold.id == "implementation:" + binding
+                ):
+                    documents = (choice.delegation_document,)
+                else:
+                    documents = ()
+                    unavailable = ("planned implementation question or its accepted scope changed",)
             locations += tuple(
                 EvidenceLocation(
                     "delegation:" + ref,
@@ -424,7 +515,7 @@ def collect_context(
                     authority="delegation",
                     scope=(unit_id,),
                 )
-                for ref in snapshot.spec.decisions.delegation_documents
+                for ref in documents
             )
         locations += tuple(
             EvidenceLocation(
@@ -443,13 +534,14 @@ def collect_context(
             unit.hold,
             unit.hold.reason,
             tuple(
-                source
+                _directed_source(snapshot, unit_id, source)
                 for source in (*collection.sources, *mapped_sources)
                 if not controller_comment(snapshot, source, prior_projections=prior_projections)
             ),
             facts,
             allowed_paths=unit.spec.scopes,
             unavailable=(
+                *unavailable,
                 *collection.unavailable,
                 *(f"{source}: truncated" for source in collection.truncated),
                 *mapped_unavailable,
@@ -462,6 +554,26 @@ def collect_context(
             "scopes": list(unit.spec.scopes),
             "acceptance": list(unit.spec.acceptance),
         }
+        if _routine_choice(unit):
+            wake = unit.evidence.get("decision_input_revision", "")
+            record = snapshot.bindings.get("intake_inbox", {}).get("records", {}).get(wake, {})
+            observation = record.get("observation", {})
+            mapped = {
+                value.get("number") if isinstance(value, dict) else value
+                for name in ("issue", "epic_issue", "pr")
+                if (value := unit.bindings.get(name))
+            }
+            mapped_wake = (
+                observation.get("repository") == snapshot.repository
+                and observation.get("number") in mapped
+                and observation.get("kind") in {"issue", "comment"}
+            )
+            answers = unit.evidence.get("owner_answers", {})
+            active_reply = unit.evidence.get("owner_answer_revisions", {}).get(unit.hold.id, "")
+            packet["implementation_authority_revision"] = {
+                "owner_answer": active_reply,
+                "other": "" if mapped_wake or (wake == active_reply and wake in answers) else wake,
+            }
         if revision := unit.evidence.get("delegation_recheck_revision"):
             packet["delegation_recheck_revision"] = revision
     elif mode == "diagnosis":
@@ -610,6 +722,153 @@ def prepare(snapshot: CampaignSnapshot, unit_id: str, payload: Mapping[str, Any]
     unit.evidence["active_resolution_packet"] = dict(packet)
 
 
+def _ordinal_reply(answer, earlier):
+    """Only an explicit number in the original ranked list can select an option."""
+    direct = re.fullmatch(
+        r"(?:(?:I\s+)?(?:choose|select|use)\s+)?(?:option|choice)\s+#?([1-9][0-9]{0,2})[.!]?",
+        answer,
+        re.IGNORECASE,
+    )
+    options = earlier.get("options", ())
+    if (
+        direct
+        and isinstance(options, (list, tuple))
+        and 1 <= int(direct[1]) <= len(options) <= 4
+        and isinstance(earlier.get("question"), str)
+        and earlier["question"].strip()
+        and all(
+            isinstance(row, (list, tuple))
+            and len(row) == 3
+            and isinstance(row[0], str)
+            and row[0].strip()
+            for row in options
+        )
+    ):
+        return {
+            "decision_id": earlier["id"],
+            "question": earlier["question"],
+            "reviewer_proposed_options": [row[0] for row in options],
+            "owner_selected_number": int(direct[1]),
+        }, ""
+    if direct or re.search(
+        r"\b(?:options?|choices?|alternatives?)\s*#?\s*(?:\d|one\b|two\b|three\b|four\b|[A-D]\b)"
+        r"|\b(?:first|second|third|fourth|last|other)\s+(?:one|choice|option|alternative)\b"
+        r"|^(?:#?\d+|first|second|third|fourth|the latter|the former)[.!]?$",
+        answer,
+        re.IGNORECASE,
+    ):
+        return (
+            None,
+            "Reply with exactly one listed option number (for example, Option 2), or write the complete implementation choice.",
+        )
+    return None, ""
+
+
+def _clarify_reply(decision, earlier, revision, context, message):
+    return dataclasses.replace(
+        decision,
+        id=_digest([earlier["id"], revision, "clarification"]),
+        disposition="needs_new_owner_decision",
+        action="",
+        answer=message,
+        actual_actor="",
+        clear_hold=False,
+        constraints=(),
+        options=tuple(earlier.get("options") or ()),
+        question=earlier.get("question") or context.question,
+        clarification=message,
+        private_sources=tuple(
+            dict.fromkeys(
+                [*earlier.get("private_sources", ()), *(s.id for s in context.sources if s.private)]
+            )
+        ),
+    )
+
+
+def _prior_implementation_choice(snapshot, unit, decision, context):
+    """Attribute existing authority; a reply to this question supplies its exact answer."""
+    ids = {ident for ident, _, _ in decision.citations}
+    sources = [
+        source
+        for source in context.sources
+        if source.id in ids
+        and source.origin_verified
+        and source.authority in {"owner", "adopted_policy"}
+    ]
+    source = next((item for item in sources if item.authority == "owner"), sources[0])
+    answer = decision.answer
+    revision = unit.evidence.get("owner_answer_revisions", {}).get(
+        unit.hold.id, unit.evidence.get("decision_input_revision", "")
+    )
+    reply = unit.evidence.get("owner_answers", {}).get(revision)
+    directed = bool(reply and reply.get("hold_id") == unit.hold.id)
+    if not directed:
+        replies = []
+        for item in sources:
+            header = re.match(r"Decision ([0-9a-f]{64})\n", item.content.strip())
+            if not (
+                header
+                and item.authority == "owner"
+                and item.kind == "github"
+                and item.identity.startswith("gh:comment:")
+            ):
+                continue
+            replies.append((item, header[1]))
+        if len(replies) > 1:
+            return _clarify_reply(
+                decision,
+                snapshot.bindings["decision_receipts"][replies[0][1]],
+                sorted(item.revision for item, _ in replies),
+                context,
+                "Multiple directed replies address this decision. Confirm the current implementation choice in a single reply to this question.",
+            )
+        if replies:
+            item, decision_id = replies[0]
+            reply = {"source": item.identity, "actor": item.author_id, "decision_id": decision_id}
+            revision = item.revision
+            directed = True
+    selection = None
+    if directed:
+        question = snapshot.bindings.get("decision_receipts", {}).get(reply["decision_id"], {})
+        matched = next(
+            (
+                item
+                for item in sources
+                if item.identity == reply["source"]
+                and item.revision == revision
+                and item.author_id == reply["actor"]
+                and item.authority == "owner"
+            ),
+            None,
+        )
+        prefix = "Decision " + reply["decision_id"] + "\n"
+        if (
+            not matched
+            or not matched.content.strip().startswith(prefix)
+            or question.get("coordinates") != dataclasses.asdict(context.coordinates)
+            or question.get("hold_id") != unit.hold.id
+            or (question.get("question") and question["question"] != context.question)
+        ):
+            raise CampaignError(
+                "prior choice requires the current authenticated reply to this question"
+            )
+        source = matched
+        answer = source.content.strip()[len(prefix) :].strip()
+        selection, clarification = _ordinal_reply(answer, question)
+        if clarification:
+            return _clarify_reply(decision, question, revision, context, clarification)
+    return dataclasses.replace(
+        decision,
+        answer=answer,
+        actual_actor=source.author_id,
+        decision_authority=source.authority,
+        directed_reply=directed,
+        owner_selection=selection,
+        constraints=() if directed else decision.constraints,
+        private_sources=tuple(s.id for s in context.sources if s.private),
+    )
+
+
 def validate_stage_result(
     project: Path,
     snapshot: CampaignSnapshot,
@@ -664,9 +923,26 @@ def validate_stage_result(
         if refreshed.unavailable:
             context = dataclasses.replace(context, unavailable=refreshed.unavailable)
         accepted = validate_decision(receipt["artifact"], context, current_sources=fresh_sources)
+        prior_choice = accepted.disposition == "prior_decision_applies" and _routine_choice(unit)
+        if prior_choice:
+            accepted = _prior_implementation_choice(snapshot, unit, accepted, context)
+            accepted = dataclasses.replace(
+                accepted,
+                id=_digest(
+                    [
+                        accepted.id,
+                        accepted.answer,
+                        accepted.actual_actor,
+                        accepted.constraints,
+                        _digest(packet),
+                    ]
+                ),
+            )
         if accepted.disposition == "delegated_choice":
-            if _digest(fresh["packet"]) != _digest(packet):
-                raise CampaignError("delegated decision inputs changed during review")
+            if context.hold.id in unit.evidence.get("owner_answer_revisions", {}):
+                raise CampaignError(
+                    "a registered owner reply must be reviewed as existing authority"
+                )
             actor = receipt.get("observed_model")
             source = receipt.get("observed_model_source")
             observed_models = receipt.get("observed_models", [])
@@ -700,6 +976,15 @@ def validate_stage_result(
                 observed_model_source=source,
                 observed_models=tuple(dict.fromkeys([actor, *observed_models])),
             )
+        if accepted.disposition == "delegated_choice" or (prior_choice and accepted.clear_hold):
+            if _digest(fresh["packet"]) != _digest(packet):
+                raise CampaignError("implementation decision inputs changed during review")
+            if (
+                len(accepted.answer) > 2048
+                or len(accepted.constraints) > 8
+                or any(len(item) > 512 for item in accepted.constraints)
+            ):
+                raise CampaignError("implementation choice exceeds the bounded execution input")
             pending = [
                 development_choice(snapshot.bindings["decision_receipts"][binding["receipt"]])
                 for key, binding in unit.evidence.get("pending_delegated_choices", {}).items()
@@ -708,6 +993,8 @@ def validate_stage_result(
             choices = json.dumps([*pending, development_choice(dataclasses.asdict(accepted))])
             if len(choices.encode()) > 32_000 or _redact(choices) != choices:
                 raise CampaignError("delegated choices exceed the safe bounded development input")
+        if not accepted.clear_hold and (accepted.options or accepted.clarification):
+            accepted = dataclasses.replace(accepted, id=_digest([snapshot.id, accepted.id]))
         return {"kind": "decision", "accepted": dataclasses.asdict(accepted)}
     context = resolution_context(packet)
     accepted = validate_proposal(receipt["artifact"], context, snapshot.spec.resolution)
@@ -784,10 +1071,11 @@ def apply_diagnosis(
                     "observed_models": decision.observed_models,
                 },
             )
+        if original and (decision.observed_model_source or decision.decision_authority):
             unit.evidence.setdefault("pending_delegated_choices", {})[decision.hold_id] = {
                 "receipt": decision.id,
                 "hold": original,
-                "packet_digest": _digest(unit.evidence["active_resolution_packet"]),
+                "packet_digest": execution_input_digest(unit.evidence["active_resolution_packet"]),
             }
         return None
     proposal = _proposal(validated["accepted"])

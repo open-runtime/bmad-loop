@@ -470,7 +470,8 @@ def after_effect(runtime, snapshot, action):
     )
     receipt = dict(debt["receipt"])
     validated = False
-    if inputs["complete"] and not changed:
+    admission = receipt["stage"] == "admission_review"
+    if inputs["complete"] and (not changed or admission):
         from .campaign_github import GithubError
 
         try:
@@ -479,6 +480,10 @@ def after_effect(runtime, snapshot, action):
             raise
         except (CampaignError, ValueError, TypeError, KeyError) as exc:
             receipt.update(outcome="invalid_stage_result", error=str(exc))
+        if admission:
+            changed = receipt["outcome"] != "invalid_stage_result" and (
+                changed or _admission_inventory_changed(snapshot, receipt)
+            )
         validated = True
     return Observation(
         "confirmed",
@@ -528,6 +533,13 @@ def after_apply(runtime, snapshot, action, data):
         or semantic(snapshot, unit, before, allowed_heads=allowed)
         != semantic(snapshot, unit, data["inputs"], allowed_heads=allowed)
     )
+    if data["receipt"]["stage"] == "admission_review":
+        # A forged or malformed answer remains a failure even if its inputs
+        # moved. Recheck a valid answer against the actual commit-time receipt.
+        changed = data["receipt"].get("outcome") != "invalid_stage_result" and (
+            changed or _admission_inventory_changed(snapshot, data["receipt"])
+        )
+        unit.evidence["stage_boundary_history"][-1]["changed"] = changed
     if not changed and not data["validated"]:
         add_event(
             snapshot, "stage-sync-revalidation-pending", unit=unit.id, launch=data["launch_id"]
@@ -537,7 +549,7 @@ def after_apply(runtime, snapshot, action, data):
         from .campaign_usage import finalize_stage_usage
 
         finalize_stage_usage(snapshot, unit, data["receipt"], administrative=True)
-        invalidate(runtime, snapshot, unit, debt, inputs=data["inputs"])
+        invalidate(runtime, snapshot, unit, debt, inputs=data["inputs"], validated=data["receipt"])
     elif data["receipt"].get("outcome") == "invalid_stage_result" and data["receipt"].get(
         "landing"
     ):
@@ -582,10 +594,26 @@ def after_apply(runtime, snapshot, action, data):
     )
 
 
-def invalidate(runtime, snapshot, unit, debt, *, inputs=None):
+def _admission_inventory_changed(snapshot, receipt):
+    answer = receipt.get("validated_admission")
+    return (
+        answer is not None
+        and answer["inventory_digest"] != snapshot.bindings["inventory"]["digest"]
+    )
+
+
+def invalidate(runtime, snapshot, unit, debt, *, inputs=None, validated=None):
     receipt = debt["receipt"]
     history = unit.evidence.setdefault("stage_input_invalidations", [])
-    history.append({"receipt": receipt, "reason": "GitHub inputs/graph changed during stage"})
+    entry = {"receipt": receipt, "reason": "GitHub inputs/graph changed during stage"}
+    if receipt["stage"] == "admission_review" and _admission_inventory_changed(
+        snapshot, validated or receipt
+    ):
+        entry.update(
+            reason="Repository inventory changed during admission review",
+            superseding_inventory=snapshot.bindings["inventory"]["digest"],
+        )
+    history.append(entry)
     stage = receipt["stage"]
     if debt["request"].get("result_contract") in {"decision-v1", "resolution-v1", "repair-v1"}:
         old = {

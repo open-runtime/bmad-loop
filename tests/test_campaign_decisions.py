@@ -362,6 +362,23 @@ def test_new_owner_request_requires_explained_recommendation_and_known_evidence(
         validate_decision(raw, ctx)
 
 
+def test_clarifying_private_options_keeps_their_original_visibility():
+    from bmad_loop.campaign_resolution_flow import _clarify_reply
+
+    ctx = context()
+    decision = validate_decision(artifact(ctx), ctx)
+    earlier = {
+        "id": "original",
+        "question": ctx.question,
+        "options": [["private choice", "private reason", ["private-note"]]],
+        "private_sources": ["private-note"],
+    }
+    clarified = _clarify_reply(decision, earlier, "new-reply", ctx, "Please select one option.")
+    assert not clarified.clear_hold and clarified.options
+    assert clarified.private_sources == ("private-note",)
+    assert "private choice" not in json.dumps(decision_summary(clarified))
+
+
 def test_escalation_does_not_publish_advice_derived_from_uncited_private_input():
     ctx = replace(context(sources=[source(private=True)]), require_owner_options=True)
     options = [

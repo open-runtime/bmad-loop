@@ -131,6 +131,11 @@ class DecisionReceipt:
     options: tuple[tuple[str, str, tuple[str, ...]], ...] = ()
     observed_model_source: str = ""
     observed_models: tuple[str, ...] = ()
+    decision_authority: str = ""
+    directed_reply: bool = False
+    question: str = ""
+    owner_selection: dict[str, Any] | None = None
+    clarification: str = ""
 
 
 def _digest(text: str) -> str:
@@ -347,8 +352,22 @@ def development_choice(receipt):
         "action": receipt["action"],
         "answer": receipt["answer"],
         "constraints": receipt["constraints"],
-        "model": receipt["actual_actor"],
-        "model_evidence": receipt["observed_model_source"],
+        **(
+            {"owner_selection": receipt["owner_selection"]}
+            if receipt.get("owner_selection")
+            else {}
+        ),
+        **(
+            {"model": receipt["actual_actor"], "model_evidence": receipt["observed_model_source"]}
+            if receipt["disposition"] == "delegated_choice"
+            else {
+                "decision_author": receipt["actual_actor"],
+                "authority": receipt["decision_authority"],
+                "answer_basis": (
+                    "authenticated_reply" if receipt.get("directed_reply") else "evidence_review"
+                ),
+            }
+        ),
     }
 
 
@@ -533,7 +552,7 @@ def validate_decision(
                 "answer": answer,
                 "citations": citations,
                 "facts": fact_ids,
-                **({"options": options} if options else {}),
+                **({"options": options, "question": context.question} if options else {}),
             },
             sort_keys=True,
         )
@@ -568,6 +587,7 @@ def validate_decision(
             if source.private
         ),
         options,
+        question=context.question if options else "",
     )
 
 
@@ -652,7 +672,7 @@ def apply_decision(snapshot: CampaignSnapshot, unit_id: str, receipt: DecisionRe
                 previous=previous,
                 decision=receipt.id,
             )
-    if receipt.options and unit.hold:
+    if (receipt.options or receipt.clarification) and unit.hold:
         unit.evidence["decision_advice"] = {
             "receipt": receipt.id,
             "hold": _digest(json.dumps(asdict(unit.hold), sort_keys=True)),
@@ -670,7 +690,7 @@ def decision_summary(receipt: DecisionReceipt) -> dict[str, Any]:
         "disposition": receipt.disposition,
         "answer": (
             receipt.answer
-            if not receipt.private_sources
+            if not receipt.private_sources and not receipt.directed_reply
             else "Decision recorded locally; private evidence retained in the campaign ledger."
         ),
         "sources": [
@@ -678,6 +698,7 @@ def decision_summary(receipt: DecisionReceipt) -> dict[str, Any]:
         ],
         "hold_id": receipt.hold_id,
         "head": receipt.coordinates.head,
+        **({"clarification": receipt.clarification} if receipt.clarification else {}),
     }
 
 

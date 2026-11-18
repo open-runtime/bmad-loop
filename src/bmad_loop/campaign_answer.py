@@ -90,6 +90,9 @@ def apply(snapshot, unit_id, evidence):
     if evidence["revision"] in records:
         return
     records[evidence["revision"]] = dict(evidence)
+    unit.evidence.setdefault("owner_answer_revisions", {})[receipt["hold_id"]] = evidence[
+        "revision"
+    ]
     # The ordinary decision worker fetches the mapped comment again and must
     # satisfy the original hold-specific rules. This receipt only wakes review.
     unit.evidence["decision_input_revision"] = evidence["revision"]

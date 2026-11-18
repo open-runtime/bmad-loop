@@ -913,6 +913,8 @@ def _inbox_items(snapshot: CampaignSnapshot, *, now: float):
             if advice:
                 automatic = "Refresh decision evidence and reconsider when the owner or another source supplies new information"
                 operator = "Review the recommended options and provide evidence for this exact hold"
+                if advice.get("clarification"):
+                    operator = _inbox_text(advice["clarification"])
                 operator_required = True
                 advice["options"] = [
                     {
@@ -1185,7 +1187,9 @@ def _emit(args: argparse.Namespace, result: dict[str, Any]) -> int:
                         )
                     for index, option in enumerate(advice["options"]):
                         label = "Recommended" if index == 0 else "Alternative"
-                        print(f"    {label}: {option['answer']} — {option['reason']}")
+                        print(
+                            f"    Option {index + 1} — {label}: {option['answer']} — {option['reason']}"
+                        )
                         print("      Evidence: " + ", ".join(option["source_ids"]))
                 print(f"    Next: {item['next_automatic_action']}")
                 if item["retry_at"] is not None:

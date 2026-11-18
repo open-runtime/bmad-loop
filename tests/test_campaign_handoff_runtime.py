@@ -227,15 +227,25 @@ def test_scripted_observation_replays_only_recorded_completion(scripted_reasonin
 
 
 @pytest.mark.parametrize(
-    "claude_models",
+    "routes_to_test",
     [
         pytest.param(None, id="cross-harness"),
-        pytest.param(("claude-opus-5-5", "claude-fable-5-2"), id="opus-to-fable"),
-        pytest.param(("claude-fable-5-2", "claude-opus-5-5"), id="fable-to-opus"),
+        pytest.param(
+            (("claude", "claude-opus-5-5"), ("claude", "claude-fable-5-2")), id="opus-to-fable"
+        ),
+        pytest.param(
+            (("claude", "claude-fable-5-2"), ("claude", "claude-opus-5-5")), id="fable-to-opus"
+        ),
+        pytest.param(
+            (("claude", "claude-opus-5-5"), ("codex", "gpt-6.2-astra")), id="opus-to-astra"
+        ),
+        pytest.param(
+            (("codex", "gpt-6.2-astra"), ("claude", "claude-fable-5-2")), id="astra-to-fable"
+        ),
     ],
 )
 def test_real_worker_quota_continues_same_pr_through_normal_supervisor(
-    campaign, production_case, tmp_path, claude_models
+    campaign, production_case, tmp_path, routes_to_test
 ):
     configured_runtime, configured, _, _ = campaign
     case = production_case
@@ -248,8 +258,11 @@ def test_real_worker_quota_continues_same_pr_through_normal_supervisor(
     roles.update(fixture_roles)
     first, last = configured.spec.candidates("execution")
     routes = copy.deepcopy(configured.config_snapshot["reasoning_capabilities"])
-    if claude_models:
-        first, last = (dataclasses.replace(last, model=model) for model in claude_models)
+    if routes_to_test:
+        profiles = {route.profile: route for route in (first, last)}
+        first, last = (
+            dataclasses.replace(profiles[profile], model=model) for profile, model in routes_to_test
+        )
         for candidate in (first, last):
             routes[f"{candidate.profile}:{candidate.model}"] = {
                 "execution": configured_runtime.fixture_cap(candidate, True)
@@ -288,7 +301,7 @@ def test_real_worker_quota_continues_same_pr_through_normal_supervisor(
         if candidate == unavailable:
             return CapacityObservation(False, known=False, reason="quota unknown for this model")
         if (
-            claude_models
+            routes_to_test
             and candidate == last
             and not (tmp_path / "parallel-markers/first").exists()
         ):
@@ -379,14 +392,16 @@ def test_real_worker_quota_continues_same_pr_through_normal_supervisor(
         for row in first.evidence["worker_history"]
     )
     assert first.evidence["developer_families"] == (
-        ["anthropic"] if claude_models else ["anthropic", "openai"]
+        ["anthropic"]
+        if routes_to_test and all(profile == "claude" for profile, _ in routes_to_test)
+        else ["anthropic", "openai"]
     )
     assert first.evidence["handoff"]["phase"] == "continuing"
     continuation = first.evidence["handoff"]["candidate"]
     previous = first.evidence["handoff"]["previous_route"]
-    if claude_models:
-        assert previous == ["claude", claude_models[0]]
-        assert (continuation["profile"], continuation["model"]) == ("claude", claude_models[1])
+    if routes_to_test:
+        assert tuple(previous) == routes_to_test[0]
+        assert (continuation["profile"], continuation["model"]) == routes_to_test[1]
     else:
         assert continuation["model"] in {"gpt-test", "claude-test"}
         assert continuation["profile"] != previous[0]

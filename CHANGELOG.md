@@ -9,6 +9,7 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- Open frozen per-story implementation questions before coding and carry authenticated owner replies into the assigned development session.
 - Delegate routine post-planning choices through pinned policies and show evidence-backed recommendations for outstanding owner decisions in the campaign inbox.
 - Add an explicit campaign total-session limit covering verification and model workers, with separate status counts and unchanged legacy configuration fingerprints.
 - Expose actionable campaign holds, uncertain effects and route waits through a bounded read-only inbox.

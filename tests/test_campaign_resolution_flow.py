@@ -348,7 +348,19 @@ def test_runtime_delegation_requires_frozen_committed_policy_and_execution_choic
         assert dataclasses.asdict(unit.hold) == original
 
 
-def assert_next_development_prompt(project, tmp_path, monkeypatch, snapshot, unit, policy_file):
+def assert_next_development_prompt(
+    project,
+    tmp_path,
+    monkeypatch,
+    snapshot,
+    unit,
+    policy_file,
+    *,
+    runtime=None,
+    expected=None,
+    forbidden=(),
+    hold_id="hold-1",
+):
     from test_campaign_workers import envelope
 
     from bmad_loop import campaign_adoption, campaign_hold, campaign_workers, runsetup
@@ -371,8 +383,8 @@ def assert_next_development_prompt(project, tmp_path, monkeypatch, snapshot, uni
         branch=branch,
     )
     snapshot.common_dir = str(campaign_workers.common_directory(repo))
-    store = CampaignStore(tmp_path / "state")
-    runtime = CampaignRuntime(repo, store)
+    store = runtime.store if runtime else CampaignStore(tmp_path / "state")
+    runtime = runtime or CampaignRuntime(repo, store)
     context = envelope(repo, store.directory(snapshot.id) / "workers" / "dev-launch")
     campaign_hold.initialize(store.directory(snapshot.id), snapshot)
     monkeypatch.setattr(runtime, "_launch_envelope", lambda *args: context)
@@ -407,19 +419,23 @@ def assert_next_development_prompt(project, tmp_path, monkeypatch, snapshot, uni
     adapters["review"].start_session(SessionSpec("review", "review", "Review", repo))
     assert all(
         text in prompts[0]
-        for text in (
+        for text in expected
+        or (
             "Use SQLite with WAL.",
             "Keep the cache local.",
             "gpt-scripted",
             '"action": "choose"',
         )
     )
-    assert policy_file.read_text() not in prompts[0] and "Use SQLite with WAL." not in prompts[1]
+    assert policy_file.read_text() not in prompts[0] and all(
+        text not in prompts[0] for text in forbidden
+    )
+    assert "Controller-validated implementation choices" not in prompts[1]
     policy_file.write_text("Hold implementation for a revised policy.")
     refused = runtime._prepare_launch(snapshot, action)
     assert refused.data["not_launched"]
     runtime.apply(snapshot, action, refused)
-    assert unit.hold.kind == "product_choice" and unit.hold.id == "hold-1"
+    assert unit.hold.kind == "product_choice" and unit.hold.id == hold_id
     assert not unit.evidence["pending_delegated_choices"] and len(prompts) == 2
 
 
@@ -796,7 +812,13 @@ def test_terminal_failed_diagnosis_preserves_original_hold_and_dirty_work(
             "quiescence_confirmed": True,
             "interruption": receipt.get("interruption"),
         }
-    assert runtime._observe_git_activity(snapshot, stage_request, data) is None
+    from time import monotonic
+
+    deadline = monotonic() + 5
+    observation = runtime._observe_git_activity(snapshot, stage_request, data)
+    while observation and "query is still pending" in observation.reason and monotonic() < deadline:
+        observation = runtime._observe_git_activity(snapshot, stage_request, data)
+    assert observation is None
     if worker_state == "interrupted":
         expected = {**data, "outcome": "interrupted"}
     runtime._apply_worker(

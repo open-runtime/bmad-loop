@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+from datetime import datetime
 
 import pytest
 
@@ -30,6 +31,7 @@ class Service:
             "node_id": "native-node",
             "number": 7,
             "body": "Choose SQLite for the cache.",
+            "created_at": "2026-11-04T10:00:00Z",
             "updated_at": "2026-11-05T10:00:00Z",
             "author_association": "OWNER",
             "user": {"id": 5, "login": "owner", "type": "User"},
@@ -50,6 +52,8 @@ class Service:
                         "node": {
                             "id": self.item["node_id"],
                             "body": self.item["body"],
+                            "title": self.item.get("title"),
+                            "createdAt": self.item["created_at"],
                             "updatedAt": self.item["updated_at"],
                             "lastEditedAt": self.last_edited_at,
                             "editor": self.editor,
@@ -178,6 +182,35 @@ def test_permission_or_body_edits_change_revision_even_timestamp_is_unchanged(pr
     assert demoted.revision != edited.revision and demoted.authority == "context"
 
 
+@pytest.mark.parametrize("kind", ["issue", "pull"])
+def test_parent_activity_never_refreshes_the_body_authority_timestamp(project, kind):
+    service = Service()
+    service.item["html_url"] = (
+        f"https://github.com/org/repo/{'pull' if kind == 'pull' else 'issues'}/7"
+    )
+
+    def fetch():
+        return collect(project, service, f"gh:{kind}:7").sources[0]
+
+    original = fetch()
+    service.item["updated_at"] = "2026-11-07T10:00:00Z"
+    assert fetch() == original
+    assert original.timestamp == datetime.fromisoformat(service.item["created_at"]).timestamp()
+    service.last_edited_at = "2026-11-06T10:00:00Z"
+    service.editor = {"__typename": "User", "databaseId": 5}
+    edited = fetch()
+    assert edited.timestamp == datetime.fromisoformat(service.last_edited_at).timestamp()
+    assert edited.revision != original.revision and edited.origin_verified
+    service.editor = None
+    assert not fetch().origin_verified
+
+
+def test_undated_editor_cannot_establish_owner_authority(project):
+    service = Service()
+    service.editor = {"__typename": "User", "databaseId": 17}
+    assert collect(project, service).sources[0].authority == "context"
+
+
 def test_maintainer_edit_cannot_borrow_original_owner_authority(project):
     service = Service()
     original = collect(project, service).sources[0]
@@ -211,6 +244,23 @@ def test_missing_or_racing_graphql_body_is_visibly_unavailable(project, monkeypa
     monkeypatch.setattr(service, "request", request)
     result = collect(project, service)
     assert not result.sources and "between native observations" in result.unavailable[0]
+
+
+def test_parent_activity_racing_graphql_is_reobserved_once(project, monkeypatch):
+    service = Service()
+    before = collect(project, service).sources[0]
+    calls = []
+    request = service.request
+
+    def racing_request(method, path, payload=None):
+        if path == "graphql":
+            calls.append(path)
+            service.item["updated_at"] = "2026-11-06T10:00:00Z"
+        return request(method, path, payload)
+
+    monkeypatch.setattr(service, "request", racing_request)
+    assert collect(project, service).sources == (before,)
+    assert len(calls) == 2
 
 
 def test_private_transcript_without_authenticated_provider_is_visibly_unavailable(project):

@@ -427,6 +427,24 @@ failed checks enter bounded repair after confirmed queue removal when enqueued.
 These checks do not replace the separate verification of a queue's combined
 candidate. Outstanding user or team review requests also wait, even when the
 approval count is otherwise sufficient.
+
+Review threads use manual resolution by default. To receive verified resolution
+recommendations, set `github.verified_thread_bot_ids` to the GitHub GraphQL node
+IDs of the bots whose findings the campaign should follow. The campaign checks
+every comment's native actor type and ID. It links a finding to a verified
+repair that changed the reported file. An independent publication reviewer must
+identify the finding and fix, cite a successful verification command on the
+current PR head, and explain how it exercises the reported behavior.
+
+A qualifying story shows the thread IDs in its wait reason. A maintainer can
+inspect the recommendation and resolve the conversation on GitHub. The campaign
+rereads the thread and resumes publication checks after confirmed resolution.
+An edited conversation or changed head during this wait triggers fresh review.
+Human replies and uncertain authors keep the finding outside this policy.
+GitHub's resolution mutation cannot require an expected head or comment revision,
+so the campaign leaves the final thread action to the maintainer.
+[GitHub GraphQL pull request reference](https://docs.github.com/en/graphql/reference/pulls#resolvereviewthreadinput)
+
 Configured `github.hold_labels` (default `bmad:hold`) apply to fresh publication
 and merge retries. Read-only reconciliation of an issued merge continues while
 held, without authorizing another merge write.
@@ -637,13 +655,40 @@ references. Each digest pins the exact UTF-8 bytes of a committed repository
 document describing which choices the model may make. The decision reviewer
 receives the accepted story scope and criteria together with that document.
 Configure its qualified model and fallback pool through `[roles.decision_review]`.
-Omitting the field grants no routine-choice delegation. A missing, changed, or
-uncommitted document leaves the hold in place.
+A missing, changed, or uncommitted delegation document leaves the hold in place.
 Before development starts, the controller checks the decision inputs again.
 The assigned development session receives the validated action, answer,
 constraints and observed decision model. The source documents and quotations
 stay in the decision ledger. A change to the story, policy, or observed decision
 evidence reopens the original hold for review.
+
+To ask a specific implementation question before a story starts, put it in the
+approved campaign configuration. Use the qualified unit ID and a committed
+delegation document pinned by its SHA-256 digest.
+
+```toml
+[[decisions.implementation_choices]]
+unit = "stories:platform:local-cache"
+question = "Which SQLite journal mode should this story use?"
+delegation_document = "<64-character SHA-256 digest>:docs/cache-delegation.md"
+```
+
+When that story's draft PR is ready, its decision reviewer receives the question
+and the accepted scope. A choice within the delegation proceeds to development.
+If the reviewer escalates, an authenticated `campaign answer` reply can supply the
+implementation choice. The development session receives the exact directed
+reply and its verified author. This pre-development stage preserves operator
+stops and the separate workflow for interrupted coding sessions.
+
+An owner can reply to the mapped GitHub discussion with `Decision DECISION_ID` on
+the first line and `Option 2` on the second. When the matching list has a
+second option, the developer receives the owner's words, the original question,
+the ordered reviewer proposals and the selected number. An ambiguous selection
+returns to the inbox for clarification. A newly observed owner comment wakes
+decision review. Controller summary comments can update the activity time of
+an issue or PR while its decision evidence stays current. The controller checks
+the source body, its verified author and editor, the time of creation or edit,
+repository scope and all mapped discussion comments before dispatch.
 
 When a decision reviewer needs the owner's judgment, it ranks the viable options
 and gives a reason and evidence references for each. `campaign inbox` shows the

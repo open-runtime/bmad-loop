@@ -92,7 +92,7 @@ def github_provider(gateway: GithubGateway) -> Callable[[EvidenceLocation], Evid
     different comment or borrow an unrelated repository's authority.
     """
 
-    def retrieve(location: EvidenceLocation) -> EvidenceSource:
+    def retrieve(location: EvidenceLocation, *, retry_activity: bool = True) -> EvidenceSource:
         matched = _LOCATION.fullmatch(location.location)
         if location.kind != "github" or not matched:
             raise CampaignError("invalid GitHub decision provider identity")
@@ -148,9 +148,6 @@ def github_provider(gateway: GithubGateway) -> Callable[[EvidenceLocation], Evid
                     "GitHub decision source author differs from adopted numeric pin"
                 )
             stamp = str(item.get("updated_at", ""))
-            parsed = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
-            if parsed.tzinfo is None:
-                raise ValueError("timestamp has no timezone")
             content = item.get("body")
             if not isinstance(content, str):
                 raise CampaignError("GitHub decision source has no text body")
@@ -173,7 +170,7 @@ def github_provider(gateway: GithubGateway) -> Callable[[EvidenceLocation], Evid
                 "POST",
                 "graphql",
                 {
-                    "query": "query($id:ID!){node(id:$id){id ... on Comment{body updatedAt lastEditedAt editor{__typename ... on User{databaseId}}}}}",
+                    "query": "query($id:ID!){node(id:$id){id ... on Issue{title} ... on PullRequest{title} ... on Comment{body createdAt updatedAt lastEditedAt editor{__typename ... on User{databaseId}}}}}",
                     "variables": {"id": node_id},
                 },
             )
@@ -185,14 +182,35 @@ def github_provider(gateway: GithubGateway) -> Callable[[EvidenceLocation], Evid
                 not isinstance(node, dict)
                 or node.get("id") != node_id
                 or node.get("body") != content
-                or node.get("updatedAt") != stamp
+                or (kind != "comment" and node.get("title") != item.get("title"))
+                or not node.get("createdAt")
+                or node["createdAt"] != item.get("created_at")
             ):
                 raise CampaignError("GitHub decision body changed between native observations")
+            if node.get("updatedAt") != stamp:
+                if retry_activity and node.get("updatedAt"):
+                    return retrieve(location, retry_activity=False)
+                raise CampaignError("GitHub decision activity changed between native observations")
             if "lastEditedAt" not in node or "editor" not in node:
                 raise CampaignError("GitHub decision editor coverage is incomplete")
-            editor = node.get("editor") or {}
-            unedited_or_same_author = not node["lastEditedAt"] or (
-                isinstance(editor, dict)
+
+            def moment(value):
+                if not isinstance(value, str):
+                    raise CampaignError("GitHub decision source has no content timestamp")
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    raise CampaignError("GitHub decision content timestamp has no timezone")
+                return parsed.timestamp()
+
+            created = moment(node["createdAt"])
+            edited = node["lastEditedAt"]
+            content_time = created if edited is None else moment(edited)
+            if not created <= content_time <= moment(stamp):
+                raise CampaignError("GitHub decision timestamps disagree")
+            editor = node["editor"]
+            unedited_or_same_author = (edited is None and editor is None) or (
+                edited is not None
+                and isinstance(editor, dict)
                 and editor.get("__typename") == "User"
                 and type(editor.get("databaseId")) is int
                 and editor["databaseId"] == user["id"]
@@ -207,13 +225,38 @@ def github_provider(gateway: GithubGateway) -> Callable[[EvidenceLocation], Evid
                 "parent": number,
                 "body": content,
                 "title": item.get("title"),
-                "updated_at": stamp,
                 "user": {key: user.get(key) for key in ("id", "login", "type")},
                 "association": item.get("author_association"),
                 "owner": {key: owner.get(key) for key in ("id", "type")},
                 "editor": node["editor"],
                 "lastEditedAt": node["lastEditedAt"],
             }
+            if kind == "comment":
+                # Preserve stored native comment revision IDs across upgrades.
+                revision_fields["updated_at"] = stamp
+            else:
+                # A parent's updated_at also advances for discussion activity.
+                # Its individual comments carry their own identities and clocks.
+                revision_fields.update(
+                    created_at=node["createdAt"],
+                    repository_id=repository["id"],
+                    node_id=node_id,
+                    state=item.get("state"),
+                    state_reason=item.get("state_reason"),
+                    draft=item.get("draft"),
+                    locked=item.get("locked"),
+                    milestone=(item.get("milestone") or {}).get("id"),
+                    labels=sorted((label["id"], label["name"]) for label in item.get("labels", ())),
+                    assignees=sorted(person["id"] for person in item.get("assignees", ())),
+                )
+                if kind == "pull":
+                    for side in ("base", "head"):
+                        ref = item.get(side) or {}
+                        revision_fields[side] = [
+                            ref.get("ref"),
+                            ref.get("sha"),
+                            (ref.get("repo") or {}).get("id"),
+                        ]
             revision = hashlib.sha256(
                 json.dumps(revision_fields, sort_keys=True, separators=(",", ":")).encode()
             ).hexdigest()
@@ -230,7 +273,7 @@ def github_provider(gateway: GithubGateway) -> Callable[[EvidenceLocation], Evid
                 authority=location.authority,
                 scope=location.scope,
                 author_id=str(user["id"]),
-                timestamp=parsed.timestamp(),
+                timestamp=content_time,
                 origin_verified=authority_verified,
                 private=bool(repository.get("private")) or location.private,
                 url=url,
@@ -238,7 +281,7 @@ def github_provider(gateway: GithubGateway) -> Callable[[EvidenceLocation], Evid
                 release_hold=location.release_hold,
                 supersedes=location.supersedes,
             )
-        except (GithubError, ValueError, TypeError, KeyError) as exc:
+        except (GithubError, ValueError, TypeError, KeyError, AttributeError) as exc:
             raise CampaignError(
                 f"GitHub decision evidence unavailable: {type(exc).__name__}: {exc}"
             ) from exc
