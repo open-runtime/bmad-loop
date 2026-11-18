@@ -395,8 +395,20 @@ def test_existing_noncompleted_issue_close_is_a_visible_no_send_discrepancy(reas
     transport.responses["GET", "repos/a/b/issues/7"] = ApiResponse(200, issue, {})
     intent = gateway.close_issue_intent(7, action_id="close", generation=1, source_confirmed=True)
     assert intent.state == "rejected"
+    assert intent.payload == {}
+    assert intent.coordinates == {"id": 777}
     assert intent.fault["category"] == "tracking_discrepancy"
     assert intent.fault["certainty"] == "not_submitted"
+    assert intent.receipt["state_reason"] == reason
+    assert all(method == "GET" for method, _, _ in transport.calls)
+    # A live completed PATCH plus retry-enabling preimage would let allow_retry
+    # overwrite the retained human reason; rejected intents must stay inert.
+    live = replace(
+        intent,
+        payload={"state": "closed", "state_reason": "completed"},
+        coordinates={"id": 777, "updated_at": "t1", "source_confirmed": True},
+    )
+    assert gateway.reconcile_update(live, allow_retry=True, generation=1).state == "rejected"
     assert intent.receipt["state_reason"] == reason
     assert all(method == "GET" for method, _, _ in transport.calls)
 

@@ -904,17 +904,13 @@ class GithubGateway:
                     "close_issue",
                     "PATCH",
                     f"{self.root}/issues/{number}",
-                    {"state": "closed", "state_reason": "completed"},
+                    {},
                     state="rejected",
                     receipt=issue,
                     error=str(fault),
                     fault=fault.to_dict(),
                     generation=generation,
-                    coordinates={
-                        "id": issue["id"],
-                        "updated_at": issue.get("updated_at"),
-                        "source_confirmed": True,
-                    },
+                    coordinates={"id": issue["id"]},
                 )
             return MutationIntent(
                 action_id,
@@ -1001,6 +997,8 @@ class GithubGateway:
                 intent = replace(intent, state="sent_unknown")
             else:
                 return intent
+        if intent.state == "rejected":
+            return intent
         if intent.kind == "queue_dequeue":
             from .campaign_queue import reconcile_dequeue
 
