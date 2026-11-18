@@ -308,13 +308,13 @@ def test_lost_reply_ack_keeps_mail_and_reconciles_without_duplicate_send(harness
     actor.start()
     event = fake.message(steer(actor))
     fake.lose = "send"
-    with pytest.raises(subprocess.TimeoutExpired):
-        actor.poll()
+    failed = actor.poll()
     assert inbox(actor, event)["disposition"] == "queued"
-    assert bridge.read(actor.path)["cursor"] == 0
-    assert bridge.read(actor.path)["error"]
+    assert (
+        failed["cursor"] == event["id"] and failed["response_error"] and failed["responses_pending"]
+    )
     result = actor.poll()
-    assert result["cursor"] == event["id"] and not result["error"]
+    assert result["cursor"] == event["id"] and not result["response_error"]
     assert inbox(actor, event)["response_state"] == "confirmed"
     assert fake.count("send") == 1
 
@@ -324,11 +324,10 @@ def test_uncertain_reply_is_not_retried_or_skipped(harness):
     actor.start()
     event = fake.message()
     fake.lose = "send"
-    with pytest.raises(subprocess.TimeoutExpired):
-        actor.poll()
+    assert actor.poll()["responses_pending"]
     response = fake.events.pop()
     result = actor.poll()
-    assert result["cursor"] == 0 and "uncertain" in result["error"]
+    assert result["cursor"] == event["id"] and "uncertain" in result["response_error"]
     assert inbox(actor, event)["response_state"] == "uncertain"
     assert fake.count("send") == 1
     fake.events.append(response)
@@ -491,3 +490,59 @@ def test_bridge_environment_never_inherits_native_identity_or_harness_detection(
         not {"HCOM_INSTANCE_NAME", "CLAUDECODE", "GROK_SESSION_ID", "CODEX_SANDBOX"}
         & environment.keys()
     )
+
+
+def test_response_backlog_rotates_past_unconfirmed_sends_without_resending(harness):
+    actor, fake, _ = harness
+    actor.start()
+    requests = [fake.message() for _ in range(bridge.REPLY_PAGE + 1)]
+    sent = []
+
+    def lose_sends(argv, **kwargs):
+        if argv[1] == "send":
+            sent.append(json.loads(kwargs["input"])["message_id"])
+            if sent[-1] == requests[0]["id"]:
+                raise subprocess.TimeoutExpired(argv, 10)
+        return fake(argv, **kwargs)
+
+    actor.runner = lose_sends
+    assert actor.poll()["cursor"] == requests[-1]["id"]
+    assert sent == [requests[0]["id"]]
+    assert actor.poll()["response_error"]
+    assert sent == [row["id"] for row in requests]
+
+
+def test_preexisting_lost_send_replays_from_original_inbound_cursor(harness):
+    actor, fake, _ = harness
+    actor.start()
+    message = fake.message()
+    fake.lose = "send"
+    legacy = actor.poll()
+    legacy.update(cursor=0, error="Response acknowledgement remains uncertain")
+    legacy.pop("responses_pending")
+    legacy.pop("response_error")
+    bridge.write(actor.path, legacy)
+    (actor.directory / "pending-replies.sqlite3").unlink()
+    response = fake.events.pop()
+    steer_event = fake.message(steer(actor), intent="inform", event_id=response["id"] + 1)
+    assert actor.poll()["cursor"] == steer_event["id"]
+    assert inbox(actor, steer_event)["disposition"] == "queued"
+    fake.events.append(response)
+    fake.events.sort(key=lambda row: row["id"])
+    assert not actor.poll()["responses_pending"]
+    assert inbox(actor, message)["response_state"] == "confirmed" and fake.count("send") == 1
+
+
+def test_ambiguous_reply_requires_exact_ack_before_clearing_debt(harness):
+    actor, fake, _ = harness
+    actor.start()
+    status = fake.message()
+    fake.lose = "send"
+    assert actor.poll()["error"]
+    response = fake.events[-1]
+    response["data"]["intent"] = "inform"
+    assert actor.poll()["responses_pending"]
+    assert inbox(actor, status)["response_state"] == "uncertain"
+    response["data"]["intent"] = "ack"
+    assert not actor.poll()["responses_pending"]
+    assert inbox(actor, status)["response_state"] == "confirmed" and fake.count("send") == 1
