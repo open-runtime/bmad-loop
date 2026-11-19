@@ -636,9 +636,10 @@ class ManagedCommunication:
                         complete = False
                 # Closed actors need no new inbound event to reconcile a lost reply.
                 # A bounded, rotating page excludes settled tombstones from the hot path.
-                with self._db() as db:
+                # Provision the partial index even in an old room containing only tombstones.
+                with self._db(write=True) as db:
                     retired = db.execute(
-                        "SELECT * FROM endpoints WHERE room=? AND state='closed' "
+                        "SELECT * FROM endpoints INDEXED BY endpoint_pending_replies WHERE room=? AND state='closed' "
                         "AND json_extract(record, '$.responses_pending')=1 AND sequence>? "
                         "ORDER BY sequence LIMIT ?",
                         (room, state.get("response_after", 0), PAGE),

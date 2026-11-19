@@ -395,3 +395,33 @@ def test_unknown_status_ack_cannot_block_later_steering_across_restart(managed):
     saved = bridge.read(actor.directory / "inbox" / f"{status['id']}.json")
     assert saved["response_state"] == "confirmed"
     assert not restarted.ledger.pending("u1") and fake.count("send") == 1
+
+
+def test_closed_reply_sweep_migrates_old_index_and_skips_settled_endpoints(managed, monkeypatch):
+    from contextlib import contextmanager
+
+    manager, snapshot, _, _ = managed
+    endpoint = manager.prepare(snapshot, target(snapshot))
+    manager.close(endpoint["target"])
+    with manager._db(write=True) as db:
+        db.execute("DROP INDEX endpoint_pending_replies")  # Endpoint index from an older release.
+
+    queries = []
+    connect = manager._db
+
+    @contextmanager
+    def traced(*, write=False):
+        with connect(write=write) as db:
+            db.set_trace_callback(queries.append)
+            yield db
+
+    monkeypatch.setattr(manager, "_db", traced)
+    assert manager.observe(snapshot)["available"]
+    (sweep,) = [
+        q for q in queries if q.startswith("SELECT * FROM endpoints") and "responses_pending" in q
+    ]
+    with connect() as db:
+        plan = db.execute("EXPLAIN QUERY PLAN " + sweep).fetchall()
+    assert any("USING INDEX endpoint_pending_replies" in row["detail"] for row in plan), [
+        row["detail"] for row in plan
+    ]
