@@ -1,7 +1,9 @@
 """Only actual required remote defect identities request bounded same-PR repair."""
 
 import copy
-from dataclasses import replace
+import hashlib
+import json
+from dataclasses import asdict, replace
 
 import pytest
 from test_campaign_publication import publishable as publishable
@@ -10,11 +12,13 @@ from bmad_loop.campaign_model import (
     CampaignSnapshot,
     CampaignSpec,
     CampaignUnit,
+    GitHubSpec,
+    OutboxAction,
     UnitSpec,
     UnitState,
     WorkerClaim,
 )
-from bmad_loop.campaign_publication import PublicationRequirements
+from bmad_loop.campaign_publication import PublicationController, PublicationRequirements
 from bmad_loop.campaign_remote_feedback import apply, collect
 from bmad_loop.campaign_resolution import CauseCode
 from bmad_loop.campaign_resolution_flow import typed_failure
@@ -221,3 +225,108 @@ def test_remote_repair_preserves_pr_and_attempt_budget_and_must_return_through_f
     unit.evidence["integrated"] = {"head": candidate.head, "base": candidate.base}
     apply(snapshot, unit.id, feedback)
     assert unit.hold.kind == "external_wait"
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [
+        "neutral",
+        "skipped",
+        "real-failure",
+        "different-head",
+        "foreign-source",
+        "tampered",
+        "active",
+    ],
+)
+def test_resume_reobserves_only_proven_inconclusive_legacy_feedback(
+    publishable, tmp_path, monkeypatch, variant
+):
+    from bmad_loop.campaign_runtime import CampaignRuntime
+    from bmad_loop.campaign_store import CampaignStore
+
+    controller, candidate, _, observed = publishable
+    candidate = replace(candidate, config_revision="1", graph_revision=1)
+    requirements = PublicationRequirements(allow_admin_merge=True, repository=candidate.repository)
+    failed = replace(observed, checks=({**observed.checks[0], "conclusion": "failure"},))
+    original = collect(candidate, failed, now=100, requirements=requirements)
+    assert original is not None
+    # Build the exact older producer's typed feedback and pass it through the real hold writer.
+    conclusion = variant if variant in {"neutral", "skipped"} else "skipped"
+    defects = [{**original.defects[0], "conclusion": conclusion}]
+    if variant == "real-failure":
+        defects.append(original.defects[0])
+    original_bytes = json.dumps(
+        {"candidate": asdict(candidate), "rules": original.rules_fingerprint, "defects": defects},
+        sort_keys=True,
+    ).encode()
+    old = replace(
+        original, defects=tuple(defects), digest=hashlib.sha256(original_bytes).hexdigest()
+    )
+    spec = UnitSpec(candidate.unit_id, "s", "e", "Unit")
+    unit = CampaignUnit(
+        spec,
+        UnitState.READY_TO_PUBLISH,
+        claim=WorkerClaim(spec.id, 1, 1, "review", quiescent=True),
+        bindings={
+            "head": candidate.head,
+            "source_revision": candidate.source_revision,
+            "pr": {"number": 1},
+        },
+        evidence={"integrated": {"head": candidate.head, "base": candidate.base}},
+        resolution_attempts=1,
+    )
+    github = GitHubSpec(
+        merge_mode="direct-authorized", allow_admin_merge=True, repository=candidate.repository
+    )
+    snapshot = CampaignSnapshot(
+        "remote",
+        candidate.repository,
+        CampaignSpec("Remote", units=(spec,), github=github),
+        {unit.id: unit},
+    )
+    apply(snapshot, unit.id, old)
+    if variant == "different-head":
+        unit.bindings["head"] = "different"
+    elif variant == "foreign-source":
+        unit.evidence["failure"]["producer"] = "local_verification"
+    elif variant == "tampered":
+        for saved in (unit.evidence["remote_feedback"], unit.hold.evidence["feedback"]):
+            saved["rules_fingerprint"] = "changed"
+    elif variant == "active":
+        unit.claim.quiescent = False
+    store = CampaignStore(tmp_path / "campaigns")
+    store.create(snapshot)
+    snapshot = store.load(snapshot.id)
+    unit = snapshot.units[unit.id]
+    original_hold = copy.deepcopy(unit.hold)
+    driver = CampaignRuntime(tmp_path, store, gateway=controller.gateway, clock=controller.clock)
+    driver.prepare_resume(snapshot)
+    if variant not in {"neutral", "skipped"}:
+        assert unit.hold == original_hold
+        return
+    assert unit.hold.id == original_hold.id and unit.hold.kind == "external_wait"
+    assert unit.hold.evidence["feedback"] == original_hold.evidence["feedback"]
+    assert "remote_feedback" not in unit.evidence and "failure" not in unit.evidence
+    store.save(snapshot, snapshot.revision)
+    snapshot = store.load(snapshot.id)
+    unit = snapshot.units[unit.id]
+    restored = unit.evidence["inconclusive_check_history"][old.digest]
+    assert restored["hold"] == asdict(original_hold) and restored["failure"]["id"] == old.digest
+    assert not driver.prepare_resume(snapshot)
+    current = replace(observed, checks=({**observed.checks[0], "conclusion": conclusion},))
+    monkeypatch.setattr(PublicationController, "inspect", lambda *args: current)
+    action = OutboxAction(
+        "wait", "remote-wait", unit.id, {"hold_id": unit.hold.id}, snapshot.generation
+    )
+    waiting = driver._perform_remote_wait(snapshot, action)
+    assert not waiting.data["ready_to_reaccept"]
+    driver.apply(snapshot, action, waiting)
+    assert unit.hold.id == original_hold.id
+    current = observed
+    driver.apply(snapshot, action, driver._perform_remote_wait(snapshot, action))
+    assert unit.hold is None and unit.state == UnitState.SYNCING
+    assert unit.resolution_attempts == 1 and unit.evidence["remote_feedback_attempted"] == [
+        old.digest
+    ]
+    assert controller.gateway.transport.calls == []

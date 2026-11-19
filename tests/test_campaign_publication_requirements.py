@@ -1,7 +1,9 @@
 """Campaign gates keep frozen requirements through every fresh publication check."""
 
+import sys
 import time
 from dataclasses import asdict, replace
+from functools import partial
 
 import pytest
 from test_campaign_github import merged_graphql
@@ -13,6 +15,7 @@ from bmad_loop.campaign_model import (
     CampaignSpec,
     CampaignUnit,
     GitHubSpec,
+    Hold,
     OutboxAction,
     UnitSpec,
     UnitState,
@@ -174,11 +177,22 @@ def test_configured_failure_is_revalidated_before_repair(monkeypatch, publishabl
     assert not repair_current(old.gateway, asdict(feedback), now=100, requirements=requirements)
 
 
-@pytest.mark.parametrize("defect", ["hold", "missing-check", "failed-check", "review-request"])
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "hold",
+        "missing-check",
+        "failed-check",
+        "review-request",
+        "no-hosted-evidence",
+        "skipped-check",
+        "neutral-check",
+    ],
+)
 def test_runtime_prepare_uses_frozen_campaign_requirements(
     project, tmp_path, monkeypatch, publishable, defect
 ):
-    from bmad_loop import campaign_ownership
+    from bmad_loop import campaign_native_merge, campaign_ownership
 
     old, candidate, evidence, observed = publishable
     observed = replace(
@@ -190,6 +204,15 @@ def test_runtime_prepare_uses_frozen_campaign_requirements(
         observed = replace(observed, checks=observed.checks[:1])
     elif defect == "failed-check":
         observed = replace(observed, checks=observed.checks[:1] + (security(candidate, "failure"),))
+    elif defect in {"skipped-check", "neutral-check"}:
+        observed = replace(
+            observed,
+            checks=(observed.checks[0], security(candidate, defect.removesuffix("-check"))),
+        )
+    elif defect == "no-hosted-evidence":
+        observed = replace(
+            observed, rules=replace(observed.rules, checks=()), checks=(), statuses=()
+        )
     else:
         observed = replace(observed, requested_teams=("security",))
     unit = CampaignUnit(
@@ -197,10 +220,23 @@ def test_runtime_prepare_uses_frozen_campaign_requirements(
         state=UnitState.READY_TO_PUBLISH,
         bindings={"workspace": str(project.project), "pr": {"number": 1}},
     )
+    administrative = defect in {"no-hosted-evidence", "skipped-check", "neutral-check"}
+    if administrative:
+        monkeypatch.setattr(
+            campaign_native_merge,
+            "prepare",
+            partial(campaign_native_merge.prepare, executable=sys.executable),
+        )
     spec = CampaignSpec(
         "gate",
         units=(unit.spec,),
-        github=GitHubSpec(hold_labels=("custom:wait",), required_checks=("security-scan",)),
+        github=GitHubSpec(
+            hold_labels=("custom:wait",),
+            required_checks=() if defect == "no-hosted-evidence" else ("security-scan",),
+            repository=candidate.repository,
+            merge_mode="direct-authorized" if administrative else "direct-strict",
+            allow_admin_merge=administrative,
+        ),
     )
     snapshot = CampaignSnapshot("gate", "a/b", spec, {unit.id: unit})
     driver = CampaignRuntime(
@@ -233,12 +269,15 @@ def test_runtime_prepare_uses_frozen_campaign_requirements(
         assert result.data["remote_feedback"]["defects"][0]["context"] == "security-scan"
     else:
         assert result.state == "waiting" and not result.data["gate"]["ready"]
+        assert unit.state == UnitState.READY_TO_PUBLISH and unit.resolution_attempts == 0
+        assert "remote_feedback" not in result.data
     assert "intent" not in result.data and old.gateway.transport.calls == []
 
     # Removing only the remote condition reaches real merge preparation with
     # the same current local review, instead of bypassing freshness.
     observed = replace(
         publishable[3],
+        rules=observed.rules,
         observed_at=time.time(),
         checks=publishable[3].checks + (security(candidate),),
     )
@@ -246,8 +285,58 @@ def test_runtime_prepare_uses_frozen_campaign_requirements(
         snapshot, OutboxAction("ready", "prepare-merge", unit.id, {}, 0)
     )
     assert ready.state == "confirmed" and ready.data["purpose"] == "merge"
-    assert ready.data["intent"]["payload"]["sha"] == candidate.head
+    if administrative:
+        assert ready.data["intent"]["payload"]["candidate"]["head"] == candidate.head
+    else:
+        assert ready.data["intent"]["payload"]["sha"] == candidate.head
     assert old.gateway.transport.calls == []
+
+
+@pytest.mark.parametrize("required", [(), ("CI",)])
+def test_saved_administrative_wait_rechecks_hosted_evidence_without_repair(
+    tmp_path, publishable, monkeypatch, required
+):
+    controller, candidate, _, observed = publishable
+    unit = CampaignUnit(
+        UnitSpec(candidate.unit_id, "s", "e", "Unit"),
+        UnitState.READY_TO_PUBLISH,
+        hold=Hold(
+            "external_wait",
+            "Await hosted CI",
+            id="wait",
+            actor="github",
+            evidence={"candidate": asdict(candidate)},
+        ),
+    )
+    spec = CampaignSpec(
+        "gate",
+        units=(unit.spec,),
+        github=GitHubSpec(
+            repository=candidate.repository,
+            merge_mode="direct-authorized",
+            allow_admin_merge=True,
+            required_checks=required,
+        ),
+    )
+    snapshot = CampaignSnapshot("gate", candidate.repository, spec, {unit.id: unit})
+    driver = CampaignRuntime(
+        tmp_path,
+        CampaignStore(tmp_path / "state"),
+        gateway=controller.gateway,
+        clock=controller.clock,
+    )
+    current = replace(
+        observed,
+        rules=replace(observed.rules, checks=()),
+        checks=({**observed.checks[0], "conclusion": "skipped"},),
+    )
+    monkeypatch.setattr(PublicationController, "inspect", lambda *args: current)
+    action = OutboxAction("watch", "remote-wait", unit.id, {"hold_id": "wait"}, snapshot.generation)
+    waiting = driver._perform_remote_wait(snapshot, action)
+    assert not waiting.data["ready_to_reaccept"] and waiting.data["reasons"]
+    current = replace(current, checks=observed.checks)
+    assert driver._perform_remote_wait(snapshot, action).data["ready_to_reaccept"]
+    assert controller.gateway.transport.calls == [] and unit.resolution_attempts == 0
 
 
 @pytest.mark.parametrize("defect", ["hold", "missing-check", "review-request"])
