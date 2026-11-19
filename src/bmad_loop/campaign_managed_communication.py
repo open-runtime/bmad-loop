@@ -195,6 +195,8 @@ class ManagedCommunication:
                         "CREATE INDEX IF NOT EXISTS endpoint_name ON endpoints(room,name,sequence);"
                         "CREATE INDEX IF NOT EXISTS endpoint_state ON endpoints(room,state,sequence);"
                         "CREATE INDEX IF NOT EXISTS endpoint_open ON endpoints(sequence) WHERE state!='closed';"
+                        "CREATE INDEX IF NOT EXISTS endpoint_pending_replies ON endpoints(room,sequence) "
+                        "WHERE state='closed' AND json_extract(record, '$.responses_pending')=1;"
                         "CREATE INDEX IF NOT EXISTS endpoint_error ON endpoints(sequence) WHERE error!='';"
                         "CREATE INDEX IF NOT EXISTS endpoint_projection ON endpoints((state='closed'),sequence DESC);"
                         "CREATE TABLE IF NOT EXISTS rooms (room TEXT PRIMARY KEY,record TEXT NOT NULL);"
@@ -217,7 +219,7 @@ class ManagedCommunication:
         return self.bridge_factory(self.directory / "actors" / _key(target), **kwargs)
 
     def _save(self, room, target, record, error=""):
-        error = error or record.get("error", "")
+        error = error or record.get("error") or record.get("response_error", "")
         with self._db(write=True) as db:
             db.execute(
                 "INSERT INTO endpoints(id,room,name,state,target,record,error) VALUES(?,?,?,?,?,?,?) "
@@ -259,7 +261,8 @@ class ManagedCommunication:
             "cursor": record.get("cursor", 0),
             "facts": record.get("facts", {}),
             "delivery": record.get("delivery", []),
-            "error": error or record.get("error", ""),
+            "error": error or record.get("error") or record.get("response_error", ""),
+            "responses_pending": bool(record.get("responses_pending")),
             "sequence": sequence,
         }
 
@@ -456,8 +459,10 @@ class ManagedCommunication:
                     ).fetchone()
                 if closed is None:
                     raise
-                receipt.update(disposition="closed", closure_reason=closed["reason"])
-                write(path, receipt)
+                with actor._locked():
+                    receipt = read(path)
+                    receipt.update(disposition="closed", closure_reason=closed["reason"])
+                    write(path, receipt)
                 continue
             accepted += 1
         return accepted
@@ -614,9 +619,10 @@ class ManagedCommunication:
                         )
                         queued += self._queue(actor, events)
                         self._save(room, target, record)
+                        # A returned poll durably captured the inbound page. A pending
+                        # reply remains visible without withholding that page's cursor.
                         if record.get("error"):
                             errors.append(record["error"])
-                            complete = False
                     except (
                         BridgeError,
                         CommunicationError,
@@ -628,6 +634,44 @@ class ManagedCommunication:
                         self._save(room, target, read(actor.path), f"{type(exc).__name__}: {exc}")
                         errors.append(str(exc))
                         complete = False
+                # Closed actors need no new inbound event to reconcile a lost reply.
+                # A bounded, rotating page excludes settled tombstones from the hot path.
+                # Provision the partial index even in an old room containing only tombstones.
+                with self._db(write=True) as db:
+                    retired = db.execute(
+                        "SELECT * FROM endpoints INDEXED BY endpoint_pending_replies WHERE room=? AND state='closed' "
+                        "AND json_extract(record, '$.responses_pending')=1 AND sequence>? "
+                        "ORDER BY sequence LIMIT ?",
+                        (room, state.get("response_after", 0), PAGE),
+                    ).fetchall()
+                state["response_after"] = retired[-1]["sequence"] if len(retired) == PAGE else 0
+                addressed = {row["id"] for row in rows}
+                for row in retired:
+                    if row["id"] in addressed:
+                        continue
+                    target = json.loads(row["target"])
+                    actor = self._actor(room, target)
+                    try:
+                        closed = actor.poll(
+                            events=[],
+                            roster=[],
+                            watermark=watermark,
+                            database_epoch=epoch,
+                            bindings={},
+                        )
+                        self._save(room, target, closed)
+                    except (
+                        BridgeError,
+                        CommunicationError,
+                        CampaignError,
+                        OSError,
+                        ValueError,
+                        subprocess.SubprocessError,
+                    ) as exc:
+                        self._save(
+                            room, target, json.loads(row["record"]), f"{type(exc).__name__}: {exc}"
+                        )
+                        errors.append(str(exc))
                 state["watermark"] = watermark
                 if complete:
                     state["cursor"] = (

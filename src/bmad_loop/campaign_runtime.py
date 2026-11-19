@@ -606,6 +606,7 @@ class CampaignRuntime:
     def prepare_resume(self, snapshot: CampaignSnapshot, *, rearm_preparation: bool = True) -> bool:
         from .campaign_attribution import restore
         from .campaign_native_review_flow import current, required
+        from .campaign_remote_feedback import restore_inconclusive_check_wait
         from .campaign_review_freshness import invalidate, stale
 
         changed = restore(snapshot)
@@ -616,6 +617,12 @@ class CampaignRuntime:
                 and not current(snapshot, unit)
             ):
                 changed = invalidate(snapshot, unit) or changed
+            if (
+                unit.hold
+                and unit.hold.kind == "verification_failed"
+                and not self._pending(snapshot, unit.id)
+            ):
+                changed = restore_inconclusive_check_wait(snapshot, unit) or changed
             hold = unit.hold
             if (
                 rearm_preparation

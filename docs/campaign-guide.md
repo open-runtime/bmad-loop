@@ -540,8 +540,12 @@ bypass in strict or queue mode.
 setting. It uses ordinary exact-head GitHub merge first. The explicit admin
 permission allows an administrative retry only after a definitive policy refusal
 and fresh gate checks; an ambiguous response is reconciled before any retry.
-This mode retains holds,
-configured checks, selected local reviews, verification and history preservation.
+
+This mode retains holds, configured checks, selected local reviews, verification
+and history preservation. When neither GitHub nor the campaign names a required
+check, at least one current hosted check or commit status must show success on
+the exact PR head. A skipped or neutral required check waits for a conclusive
+result. An actionable failure can enter product repair.
 It does not claim server-enforced atomic freshness of the base. The actual landed
 commit must pass acceptance before delivery; failed landing proof creates one
 linked repair PR and keeps original tracking pending until the repair is accepted.
@@ -947,6 +951,10 @@ Acceptance, inclusion in a completed stage and compliance are distinct: an
 `applied` receipt does not assert the model obeyed the message. Inspect `messages`
 for pending, applied or closed receipts. Oversized messages are rejected; mail
 that cannot fit a reasoning request remains queued.
+
+The bridge records inbound messages independently of acknowledgements for its
+outbound replies. A reply with uncertain delivery remains available for
+reconciliation while later steering can reach the campaign inbox.
 
 A busy managed-registration lock before any worker request is sealed produces a
 visible `launch_wait` in campaign status and an `effect-wait` history event.

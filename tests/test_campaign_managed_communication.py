@@ -356,3 +356,72 @@ def test_observe_mode_has_no_managed_side_effects_and_endpoint_pages_are_bounded
     )
     assert manager.observe(snapshot)["mode"] == "observe"
     assert len(fake.calls) == before
+
+
+def test_unknown_status_ack_cannot_block_later_steering_across_restart(managed):
+    manager, snapshot, fake, _ = managed
+    endpoint = manager.prepare(snapshot, target(snapshot))
+    status = fake.message("Status?", name=endpoint["name"])
+    first = send(fake, endpoint, "First steer", intent="inform")
+    for _ in range(98):
+        fake.message("Unrelated room traffic", name="soma", intent="inform")
+    later = send(fake, endpoint, "Next page", intent="inform")
+    fake.lose = "send"
+    result = manager.observe(snapshot)
+    assert not result["available"]
+    assert [row["text"] for row in manager.ledger.pending("u1")] == ["First steer"]
+    response = fake.events.pop()
+    assert response["data"]["thread"].startswith("bmad-")
+
+    restarted = ManagedCommunication(
+        manager.directory.parent, executable="fake-hcom", runner=fake, clock=lambda: 102
+    )
+    result = restarted.observe(snapshot)
+    assert not result["available"] and any(
+        "uncertain" in problem.lower() for problem in result["errors"]
+    )
+    queue = restarted.ledger.freeze("u1", "successor")
+    assert [row["source"]["event_id"] for row in queue] == [first["id"], later["id"]]
+    restarted.ledger.applied([row["id"] for row in queue], launch_id="successor", unit="u1")
+    assert not restarted.ledger.pending("u1")
+    assert len(restarted.ledger.list(unit="u1")) == 2 and fake.count("send") == 1
+
+    snapshot.units["u1"].claim.quiescent = True
+    assert restarted.observe(snapshot)["counts"] == {"closed": 1}
+    fake.events.append(response)
+    result = restarted.observe(snapshot)
+    assert result["available"] and result["counts"] == {"closed": 1}
+    actor = restarted._actor(endpoint["room"], endpoint["target"])
+    saved = bridge.read(actor.directory / "inbox" / f"{status['id']}.json")
+    assert saved["response_state"] == "confirmed"
+    assert not restarted.ledger.pending("u1") and fake.count("send") == 1
+
+
+def test_closed_reply_sweep_migrates_old_index_and_skips_settled_endpoints(managed, monkeypatch):
+    from contextlib import contextmanager
+
+    manager, snapshot, _, _ = managed
+    endpoint = manager.prepare(snapshot, target(snapshot))
+    manager.close(endpoint["target"])
+    with manager._db(write=True) as db:
+        db.execute("DROP INDEX endpoint_pending_replies")  # Endpoint index from an older release.
+
+    queries = []
+    connect = manager._db
+
+    @contextmanager
+    def traced(*, write=False):
+        with connect(write=write) as db:
+            db.set_trace_callback(queries.append)
+            yield db
+
+    monkeypatch.setattr(manager, "_db", traced)
+    assert manager.observe(snapshot)["available"]
+    (sweep,) = [
+        q for q in queries if q.startswith("SELECT * FROM endpoints") and "responses_pending" in q
+    ]
+    with connect() as db:
+        plan = db.execute("EXPLAIN QUERY PLAN " + sweep).fetchall()
+    assert any("USING INDEX endpoint_pending_replies" in row["detail"] for row in plan), [
+        row["detail"] for row in plan
+    ]

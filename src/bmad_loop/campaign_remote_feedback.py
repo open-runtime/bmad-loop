@@ -10,10 +10,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any
 
-from .campaign_model import CampaignError, CampaignSnapshot, Hold, UnitState
+from .campaign_model import CampaignError, CampaignSnapshot, CampaignUnit, Hold, UnitState
 from .campaign_publication import Candidate, PublicationObservation, PublicationRequirements
 from .campaign_store import add_event, transition
 
@@ -25,6 +25,11 @@ class RemoteFeedback:
     defects: tuple[dict[str, Any], ...]
     digest: str
     observed_at: float
+
+
+def _feedback_digest(candidate, rules, defects):
+    body = {"candidate": candidate, "rules": rules, "defects": defects}
+    return hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
 
 
 def collect(
@@ -60,8 +65,6 @@ def collect(
         "startup_failure",
         "stale",
     }
-    if requirements.allow_admin_merge and requirements.repository == candidate.repository:
-        failed_conclusions |= {"neutral", "skipped"}
     for required in requirements.checks(observation.rules.checks):
         checks = [
             row
@@ -72,7 +75,7 @@ def collect(
         ]
         suites = {}
         for row in checks:
-            suite = (row.get("check_suite") or {}).get("id", "legacy")
+            suite = ((row.get("app") or {}).get("id"), (row.get("check_suite") or {}).get("id"))
             if suite not in suites or int(row.get("id", 0)) > int(suites[suite].get("id", 0)):
                 suites[suite] = row
         for newest in suites.values():
@@ -98,7 +101,10 @@ def collect(
                 )
         if required.app_id is None:
             statuses = [
-                row for row in observation.statuses if row.get("context") == required.context
+                row
+                for row in observation.statuses
+                if row.get("context") == required.context
+                and row.get("sha", candidate.head) == candidate.head
             ]
             if statuses:
                 newest = max(statuses, key=lambda row: int(row.get("id", 0)))
@@ -152,12 +158,7 @@ def collect(
             )
     if not defects:
         return None
-    body = {
-        "candidate": asdict(candidate),
-        "rules": observation.rules.fingerprint,
-        "defects": defects,
-    }
-    digest = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
+    digest = _feedback_digest(asdict(candidate), observation.rules.fingerprint, defects)
     return RemoteFeedback(
         candidate, observation.rules.fingerprint, tuple(defects), digest, observation.observed_at
     )
@@ -252,6 +253,92 @@ def _apply(
         revision=feedback.digest,
         defect_count=len(feedback.defects),
     )
+
+
+def restore_inconclusive_check_wait(snapshot: CampaignSnapshot, unit: CampaignUnit) -> bool:
+    """Keep a legacy check-only hold until ordinary GitHub readback permits reacceptance."""
+    hold = unit.hold
+    if (
+        not hold
+        or hold.kind != "verification_failed"
+        or hold.actor != "github"
+        or unit.state != UnitState.SYNCING
+        or unit.resume_state != UnitState.SYNCING
+        or not unit.claim
+        or not unit.claim.quiescent
+        or snapshot.spec.github.merge_mode != "direct-authorized"
+        or not snapshot.spec.github.allow_admin_merge
+        or snapshot.spec.github.repository != snapshot.repository
+        or unit.evidence.get("required_findings")
+        or unit.evidence.get("resolution_owner_review_pending")
+        or unit.evidence.get("accepted_resolution")
+    ):
+        return False
+    feedback = hold.evidence.get("feedback")
+    failure = unit.evidence.get("failure")
+    if (
+        not isinstance(feedback, dict)
+        or feedback != unit.evidence.get("remote_feedback")
+        or not isinstance(failure, dict)
+        or failure.get("producer") != "github.authenticated_publication_observation"
+        or failure.get("code") != hold.kind
+        or failure.get("id") != hold.id
+        or failure.get("revision") != hold.id
+        or hold.id not in unit.evidence.get("remote_feedback_attempted", ())
+    ):
+        return False
+    try:
+        candidate = Candidate(**feedback["candidate"])
+    except (KeyError, TypeError):
+        return False
+    pr = unit.bindings.get("pr")
+    defects = feedback.get("defects")
+    rules = feedback.get("rules_fingerprint")
+    if (
+        candidate.repository != snapshot.repository
+        or candidate.unit_id != unit.id
+        or type(candidate.pr_number) is not int
+        or candidate.pr_number <= 0
+        or candidate.target != snapshot.spec.target
+        or not candidate.base
+        or not candidate.head
+        or candidate.head != unit.bindings.get("head")
+        or candidate.pr_number != (pr.get("number") if isinstance(pr, dict) else pr)
+        or candidate.source_revision != unit.bindings.get("source_revision", "")
+        or candidate.graph_revision != snapshot.graph_revision
+        or candidate.config_revision != str(snapshot.config_revision)
+        or not isinstance(rules, str)
+        or not rules
+        or not isinstance(defects, (list, tuple))
+        or not defects
+        or any(
+            not isinstance(row, dict)
+            or row.get("kind") != "required_check"
+            or row.get("head") != candidate.head
+            or row.get("conclusion") not in ("skipped", "neutral")
+            or not isinstance(row.get("id"), str)
+            or not row["id"].isdecimal()
+            or not isinstance(row.get("context"), str)
+            or not row["context"].strip()
+            or not row.get("revision")
+            for row in defects
+        )
+        or feedback.get("digest") != hold.id
+        or _feedback_digest(asdict(candidate), rules, defects) != hold.id
+    ):
+        return False
+    # The wait keeps its native evidence. Archive the superseded repair authority
+    # so it cannot be consulted for a later, unrelated repair on the same unit.
+    unit.hold = replace(
+        hold, kind="external_wait", reason="Waiting for a successful required hosted check"
+    )
+    unit.evidence.setdefault("inconclusive_check_history", {})[hold.id] = {
+        "hold": asdict(hold),
+        "failure": failure,
+    }
+    del unit.evidence["remote_feedback"], unit.evidence["failure"]
+    add_event(snapshot, "inconclusive-check-wait-restored", unit=unit.id, hold=hold.id)
+    return True
 
 
 def repair_current(

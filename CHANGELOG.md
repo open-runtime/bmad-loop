@@ -18,6 +18,8 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Keep incoming steering available while the bridge reconciles an uncertain outgoing reply.
+- Require current hosted success for direct-authorized publication and wait for conclusive results on skipped or neutral required checks.
 - Bind intake duplicates to an observed issue or PR and check outstanding obligations before closing administrative parents.
 - Retain exact quota-paused tasks across same-route continuation, stale observations, and canceled successor launches.
 - Reconcile proven-unsent issue closes and acknowledged tracking debt without replaying uncertain writes or overriding human closure decisions.

@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from collections import defaultdict
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
@@ -47,6 +48,39 @@ class PublicationRequirements:
             if context not in known
         )
         return server + extra
+
+    def check_reasons(
+        self, observation: PublicationObservation, head: str, *, require_success: bool
+    ) -> list[str]:
+        required = self.checks(observation.rules.checks)
+        if not required and not require_success:
+            return []
+        runs: dict[str, list[JsonObject]] = defaultdict(list)
+        statuses: dict[str, list[JsonObject]] = defaultdict(list)
+        for row in observation.checks:
+            name = row.get("name")
+            if isinstance(name, str) and name.strip() and row.get("head_sha") == head:
+                runs[name].append(row)
+        # inspect() obtains legacy statuses from the immutable /commits/{head}/statuses
+        # endpoint. Some transports also include that SHA on each returned row.
+        for row in observation.statuses:
+            context = row.get("context")
+            if isinstance(context, str) and context.strip() and row.get("sha", head) == head:
+                statuses[context].append(row)
+
+        def reason(check: RequiredCheck) -> str:
+            return _check_reason(
+                check, runs[check.context], statuses[check.context], require_success
+            )
+
+        if required:
+            return [problem for check in required if (problem := reason(check))]
+        # With no mandatory context, an administrative merge still needs one real
+        # success. Evaluate each name's latest results so an old green cannot qualify.
+        for name in runs.keys() | statuses.keys():
+            if not reason(RequiredCheck(name)):
+                return []
+        return ["Waiting for a successful hosted check or commit status on the exact PR head"]
 
 
 @dataclass(frozen=True)
@@ -407,16 +441,11 @@ class PublicationController:
                 reasons.append("Required merge_group candidate evidence producer is missing")
         else:
             reasons.append("Unsupported merge mode")
-        for check in self.requirements.checks(rules.checks):
-            check_reason = _check_reason(
-                check,
-                observation.checks,
-                observation.statuses,
-                candidate.head,
-                require_success=project_admin,
+        reasons.extend(
+            self.requirements.check_reasons(
+                observation, candidate.head, require_success=project_admin
             )
-            if check_reason:
-                reasons.append(check_reason)
+        )
         # A review's commit_id must match this head. Dismissed/replaced reviews do not count.
         latest: dict[str, JsonObject] = {}
         for review in sorted(observation.reviews, key=lambda row: row.get("id", 0)):
@@ -659,33 +688,30 @@ class PublicationController:
 
 def _check_reason(
     required: RequiredCheck,
-    checks: tuple[JsonObject, ...],
-    statuses: tuple[JsonObject, ...],
-    head: str,
-    *,
-    require_success: bool = False,
+    checks: list[JsonObject],
+    statuses: list[JsonObject],
+    require_success: bool,
 ) -> str:
     matching_checks = [
         row
         for row in checks
-        if row.get("name") == required.context
-        and row.get("head_sha") == head
-        and (required.app_id is None or row.get("app", {}).get("id") == required.app_id)
+        if required.app_id is None or (row.get("app") or {}).get("id") == required.app_id
     ]
-    matching_statuses = [
-        row
-        for row in statuses
-        if row.get("context") == required.context and (required.app_id is None)
-    ]
+    matching_statuses = statuses if required.app_id is None else []
     # Checks and statuses with the same name are both required by GitHub.
     if not matching_checks and not matching_statuses:
         return f"Required check missing: {required.context} (app {required.app_id})"
+    if require_success and any(
+        type(row.get("id")) is not int or row["id"] <= 0
+        for row in (*matching_checks, *matching_statuses)
+    ):
+        return f"Missing hosted result identity: {required.context}"
     if matching_checks:
         # Independent workflows can publish the same required context. A
         # newer green run in one suite cannot hide a failure in another.
         suites: dict[object, JsonObject] = {}
         for row in matching_checks:
-            suite = (row.get("check_suite") or {}).get("id", "legacy")
+            suite = ((row.get("app") or {}).get("id"), (row.get("check_suite") or {}).get("id"))
             if suite not in suites or row.get("id", 0) > suites[suite].get("id", 0):
                 suites[suite] = row
         accepted = {"success"} if require_success else {"success", "neutral", "skipped"}
@@ -693,6 +719,8 @@ def _check_reason(
             row.get("status") != "completed" or row.get("conclusion") not in accepted
             for row in suites.values()
         ):
+            if require_success:
+                return f"Waiting for a successful hosted check: {required.context}"
             return f"Required check pending/failed: {required.context}"
     if matching_statuses:
         newest = max(matching_statuses, key=lambda row: row.get("id", 0))

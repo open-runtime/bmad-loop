@@ -18,7 +18,7 @@ import subprocess
 import threading
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any, Callable
 
@@ -27,6 +27,7 @@ from .process_host import get_process_host
 
 NAME = re.compile(r"[a-z][a-z0-9_-]{2,31}")
 LIMIT = 512 * 1024
+REPLY_PAGE = 16
 
 
 class BridgeError(RuntimeError):
@@ -362,7 +363,12 @@ class MessageBridge:
                 row = self._owned_row()
             if row is None:
                 raise BridgeError("hcom registration was not observed")
-            record.update(name=row["name"], state="accepting", observed_at=self.clock(), error="")
+            record.update(
+                name=row["name"],
+                state="accepting",
+                observed_at=self.clock(),
+                error=record.get("response_error", ""),
+            )
             write(self.path, record)
         if background and self._thread is None:
             self._thread = threading.Thread(
@@ -435,10 +441,12 @@ class MessageBridge:
             if (
                 len(matches) == 1
                 and isinstance(matches[0], dict)
+                and matches[0].get("type") == "message"
                 and (
                     isinstance(matches[0].get("data"), dict)
                     and (matches[0].get("data") or {}).get("text") == prior["text"]
                     and (matches[0].get("data") or {}).get("from") == record["name"]
+                    and (matches[0].get("data") or {}).get("intent") == "ack"
                     and (matches[0].get("data") or {}).get("thread") == thread
                     and sender in (matches[0].get("data") or {}).get("mentions", [])
                     and not matches[0].get("truncated")
@@ -450,6 +458,11 @@ class MessageBridge:
                 receipt["response_state"] = "confirmed"
             else:
                 receipt["response_state"] = "uncertain"
+            return
+        if receipt.get("response_state") in {"confirmed", "uncertain"}:
+            raise BridgeError("Bridge response has lost its durable send intent")
+        if record["state"] == "closed" or record.get("stop_sent"):
+            receipt["response_state"] = "closed"
             return
         facts = read(self.path).get("facts", {})
         response = json.dumps(
@@ -470,6 +483,7 @@ class MessageBridge:
             target,
             {"state": "sent_unknown", "text": response, "event_id": event["id"], "thread": thread},
         )
+        receipt["response_state"] = "uncertain"
         self._call(
             [
                 "send",
@@ -490,6 +504,85 @@ class MessageBridge:
             {"state": "confirmed", "text": response, "event_id": event["id"], "thread": thread},
         )
         receipt["response_state"] = "confirmed"
+
+    def _service_replies(self, record, requests):
+        """Commit response work before advancing inbound progress. Rotate unresolved
+        requests so later ones can still receive replies, including after restart."""
+        path = self.directory / "pending-replies.sqlite3"
+        if is_link_like(path) or (record.get("responses_pending") and not path.is_file()):
+            raise BridgeError("Bridge reply queue is missing or redirected")
+        if not requests and not record.get("responses_pending"):
+            write(self.path, record)
+            return
+        try:
+            with closing(sqlite3.connect(path, timeout=2)) as db:
+                with db:
+                    db.execute(
+                        "CREATE TABLE IF NOT EXISTS pending (sequence INTEGER PRIMARY KEY AUTOINCREMENT, event_id INTEGER NOT NULL UNIQUE, event_sha TEXT NOT NULL, error TEXT NOT NULL DEFAULT '')"
+                    )
+                    db.execute(
+                        "CREATE INDEX IF NOT EXISTS reply_errors ON pending(sequence) WHERE error != ''"
+                    )
+                    db.executemany(
+                        "INSERT OR IGNORE INTO pending(event_id,event_sha) VALUES(?,?)", requests
+                    )
+                record["responses_pending"] = True
+                write(self.path, record)
+                page = db.execute(
+                    "SELECT event_id,event_sha FROM pending ORDER BY sequence LIMIT ?",
+                    (REPLY_PAGE,),
+                ).fetchall()
+                for event_id, event_sha in page:
+                    failed = False
+                    try:
+                        error = self._respond_to_event(record, event_id, event_sha)
+                    except (BridgeError, OSError, ValueError, subprocess.SubprocessError) as exc:
+                        failed = True
+                        error = f"Response acknowledgement uncertain: {type(exc).__name__}: {exc}"[
+                            :512
+                        ]
+                    with db:
+                        db.execute("DELETE FROM pending WHERE event_id=?", (event_id,))
+                        if error:
+                            db.execute(
+                                "INSERT INTO pending(event_id,event_sha,error) VALUES(?,?,?)",
+                                (event_id, event_sha, error),
+                            )
+                    if failed:
+                        break  # One unavailable transport must not spend a page of timeouts.
+                record["responses_pending"] = (
+                    db.execute("SELECT 1 FROM pending LIMIT 1").fetchone() is not None
+                )
+                issue = db.execute(
+                    "SELECT error FROM pending WHERE error != '' ORDER BY sequence LIMIT 1"
+                ).fetchone()
+                record["response_error"] = record["error"] = issue[0] if issue else ""
+                write(self.path, record)
+        except sqlite3.Error as exc:
+            raise BridgeError("Bridge response queue unavailable") from exc
+
+    def _respond_to_event(self, record, event_id, event_sha):
+        path = self.directory / "inbox" / f"{event_id}.json"
+        receipt = read(path)
+        event = receipt.get("event", {})
+        if (
+            not isinstance(event, dict)
+            or event.get("id") != event_id
+            or receipt.get("target") != self.target
+            or hashlib.sha256(json.dumps(event, sort_keys=True).encode()).hexdigest() != event_sha
+        ):
+            raise BridgeError("Queued bridge response belongs to a different event or launch")
+        prior = receipt.get("response_state")
+        try:
+            self._reply(record, event, receipt)
+        finally:
+            if prior != receipt.get("response_state"):
+                write(path, receipt)
+        return (
+            "Response acknowledgement remains uncertain"
+            if receipt["response_state"] == "uncertain"
+            else ""
+        )
 
     def _disposition(self, record: dict, event: dict) -> tuple[str, str]:
         """Only explicitly addressed steering can cross a launch generation.
@@ -591,6 +684,7 @@ class MessageBridge:
                 raise BridgeError("Bridge message observation is partial, reset or invalid")
             if events is None:
                 self._check_epoch(record, watermark=self._watermark())
+            requests = []
             for event in sorted(batch, key=lambda row: row["id"]):
                 data, event_id = event.get("data", {}), event.get("id")
                 if event.get("type") != "message":
@@ -633,18 +727,16 @@ class MessageBridge:
                     raise BridgeError("Durable bridge message differs from the observed event")
                 write(path, receipt)
                 if data.get("intent") == "request" and record["state"] != "closed":
-                    self._reply(record, event, receipt)
-                    write(path, receipt)
-                    if receipt.get("response_state") == "uncertain":
-                        record["error"] = "Response acknowledgement remains uncertain"
-                        write(self.path, record)
-                        return record
+                    requests.append(
+                        (
+                            event_id,
+                            hashlib.sha256(json.dumps(event, sort_keys=True).encode()).hexdigest(),
+                        )
+                    )
                 record["cursor"] = event_id
-                record["observed_at"] = self.clock()
-                write(self.path, record)
             record["error"] = ""
             record["observed_at"] = self.clock()
-            write(self.path, record)
+            self._service_replies(record, requests)
             return record
 
     def update(self, **facts: Any) -> dict:
@@ -698,7 +790,9 @@ class MessageBridge:
                         raise
                 if self._owned_row(name=record["name"]) is not None:
                     raise BridgeError("Bridge disconnect is not confirmed")
-            record.update(state="closed", closed_at=self.clock(), error="")
+            record.update(
+                state="closed", closed_at=self.clock(), error=record.get("response_error", "")
+            )
             write(self.path, record)
             # A send can resolve its recipient before stop and log afterward.
             # Retain this tombstone and continue room-level late reconciliation;

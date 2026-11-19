@@ -277,6 +277,44 @@ def test_new_hold_blocks_admin_and_removal_resumes_known_unsent_attempt(
     assert result.state == "confirmed" and len(calls) == 2
 
 
+def test_lost_hosted_evidence_blocks_admin_retry_until_exact_head_success_returns(
+    project, tmp_path, publishable, monkeypatch
+):
+    controller, candidate, evidence, intent, merged = native_case(publishable, monkeypatch)
+    initial = controller.inspect(1)
+    observed = replace(initial, rules=replace(initial.rules, checks=()))
+    monkeypatch.setattr(controller, "inspect", lambda _: observed)
+    calls = []
+
+    def runner(argv, **kwargs):
+        nonlocal observed
+        calls.append(argv)
+        if "--admin" not in argv:
+            observed = replace(observed, checks=())
+            return ChildRun(
+                1,
+                "",
+                "Pull request a/b#1 is not mergeable: the base branch policy prohibits the merge.",
+            )
+        merged[0] = True
+        return ChildRun(0, "", "")
+
+    directory = tmp_path / "native"
+    options = dict(evidence=evidence, generation=1, runner=runner)
+    waiting = execute(intent, project.project, directory, controller, **options)
+    assert len(calls) == 1 and "--admin" not in calls[0]
+    assert waiting.state == "sent_unknown" and waiting.receipt["submission"] == "not-submitted"
+    observed = replace(observed, checks=initial.checks)
+    completed = execute(intent, project.project, directory, controller, reconcile=True, **options)
+    assert completed.state == "confirmed" and len(calls) == 2
+    assert calls[1] == calls[0] + ["--admin"]
+    assert (
+        execute(intent, project.project, directory, controller, reconcile=True, **options).state
+        == "confirmed"
+    )
+    assert len(calls) == 2
+
+
 def test_main_moving_after_policy_refusal_returns_to_integration(
     project, tmp_path, publishable, monkeypatch
 ):
@@ -334,7 +372,61 @@ def test_native_required_checks_require_real_success(publishable, conclusion):
     feedback = collect(
         candidate, observed, now=controller.clock(), requirements=controller.requirements
     )
-    assert feedback is not None and feedback.defects[0]["conclusion"] == conclusion
+    assert feedback is None
+
+
+@pytest.mark.parametrize(
+    "case,ready",
+    [
+        ("missing", False),
+        ("wrong-head", False),
+        ("pending-rerun", False),
+        ("failed-status-rerun", False),
+        ("wrong-status-head", False),
+        ("masked-suite", False),
+        ("skipped", False),
+        ("success", True),
+        ("commit-status", True),
+        ("independent-optional-failure", True),
+    ],
+)
+def test_authorized_merge_needs_a_current_hosted_success_without_named_requirements(
+    publishable, case, ready
+):
+    controller, candidate, evidence, observed = admin(publishable)
+    run = observed.checks[0]
+    checks, statuses = (), ()
+    if case == "wrong-head":
+        checks = ({**run, "head_sha": "previous-head"},)
+    elif case == "pending-rerun":
+        checks = (run, {**run, "id": 2, "status": "in_progress", "conclusion": None})
+    elif case == "failed-status-rerun":
+        statuses = (
+            {"id": 1, "context": "build", "state": "success"},
+            {"id": 2, "context": "build", "state": "failure"},
+        )
+    elif case == "wrong-status-head":
+        statuses = ({"id": 1, "context": "build", "state": "success", "sha": "old"},)
+    elif case == "masked-suite":
+        checks = (
+            {**run, "id": 2, "app": {"id": 9}, "conclusion": "failure"},
+            {**run, "id": 3, "conclusion": "success"},
+        )
+    elif case == "commit-status":
+        statuses = ({"id": 1, "context": "build", "state": "success"},)
+    elif case == "skipped":
+        checks = ({**run, "conclusion": "skipped"},)
+    elif case == "success":
+        checks = (run,)
+    elif case == "independent-optional-failure":
+        checks = (run, {**run, "id": 2, "name": "optional", "conclusion": "failure"})
+    observed = replace(
+        observed, rules=replace(observed.rules, checks=()), checks=checks, statuses=statuses
+    )
+    gate = controller.evaluate(candidate, evidence, observed, merge_mode="direct-authorized")
+    assert gate.ready is ready
+    if not ready:
+        assert "hosted" in " ".join(gate.reasons)
 
 
 def test_remote_repair_cannot_ignore_failed_sibling_check_suite(publishable):

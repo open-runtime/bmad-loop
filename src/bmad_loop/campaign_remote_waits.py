@@ -12,7 +12,6 @@ from .campaign_publication import (
     Candidate,
     PublicationController,
     PublicationRequirements,
-    _check_reason,
 )
 from .campaign_remote_feedback import collect
 
@@ -78,16 +77,9 @@ def observe(runtime, snapshot, action):
     if feedback is not None and not changed_defect:
         reasons.append("Remote defect revision was already attempted")
     if not changed_defect:
-        for check in requirements.checks(observed.rules.checks):
-            reason = _check_reason(
-                check,
-                observed.checks,
-                observed.statuses,
-                candidate.head,
-                require_success=administrative,
-            )
-            if reason:
-                reasons.append(reason)
+        reasons.extend(
+            requirements.check_reasons(observed, candidate.head, require_success=administrative)
+        )
         if observed.requested_reviewers or observed.requested_teams:
             reasons.append("Outstanding requested GitHub reviews remain")
         latest = {}
